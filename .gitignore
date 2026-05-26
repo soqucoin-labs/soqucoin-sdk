@@ -1,0 +1,6 @@
+_staging/
+dist/
+*.exe
+*.test
+*.out
+vendor/
