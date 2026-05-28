@@ -9,11 +9,13 @@ Step-by-step guide for listing Soqucoin (SOQ) on your exchange.
 To support SOQ deposits and withdrawals, your exchange needs to:
 
 1. **Generate deposit addresses** — one unique address per user
-2. **Monitor deposits** — subscribe to address activity via ElectrumX
+2. **Monitor deposits** — track UTXOs via ElectrumX polling
 3. **Process withdrawals** — build, sign, and broadcast transactions
 4. **Confirm transactions** — wait for sufficient block confirmations
 
 SOQ uses **NIST FIPS 204 ML-DSA-44** (Dilithium) for all signatures. Transaction structure is similar to Bitcoin/Dogecoin (UTXO model), but witness data contains Dilithium signatures (~2,420 bytes) and public keys (~1,312 bytes).
+
+**Important:** All production Soqucoin nodes run with `disablewallet=1`. You cannot use `listunspent`, `getbalance`, or other wallet RPCs. The SDK uses ElectrumX for UTXO queries instead.
 
 ---
 
@@ -22,24 +24,20 @@ SOQ uses **NIST FIPS 204 ML-DSA-44** (Dilithium) for all signatures. Transaction
 Create a unique deposit address for each user. Store the keypair securely — you'll need it to sweep funds.
 
 ```go
-package main
-
 import (
-	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 // GenerateDepositAddress creates a new deposit address for a user.
-// Returns the address string and the seed bytes for secure storage.
-func GenerateDepositAddress() (addr string, seed []byte, err error) {
-	kp, err := keys.Generate()
+func GenerateDepositAddress() (addr string, kp *keys.KeyPair, err error) {
+	// Use types.Mainnet.HRP for production ("sq" → sq1p... addresses)
+	// Use types.Stagenet.HRP for testing ("ssq" → ssq1p... addresses)
+	kp, err = keys.GenerateKeyForNetwork(types.Mainnet.HRP)
 	if err != nil {
 		return "", nil, err
 	}
-
-	addr = address.FromPublicKey(kp.PublicKey)
-	seed = kp.Seed()
-	return addr, seed, nil
+	return kp.Address, kp, nil
 }
 ```
 
@@ -49,58 +47,59 @@ func GenerateDepositAddress() (addr string, seed []byte, err error) {
 
 ## Step 2: Monitor Deposits
 
-Use the ElectrumX client to subscribe to address notifications and detect incoming deposits:
+Use the ElectrumX client to poll for UTXO changes across all deposit addresses:
 
 ```go
-package main
-
 import (
-	"context"
 	"log"
+	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-func MonitorDeposits(ctx context.Context, addresses []string) error {
-	client, err := electrumx.Dial(ctx, "electrumx.soqu.org:50002", electrumx.WithTLS())
-	if err != nil {
-		return err
+func StartDepositMonitor(depositAddresses []string) {
+	// Connect to your ElectrumX server
+	client := electrumx.NewClient("electrumx.example.com:50001", 15*time.Second)
+	client.HRP = types.Mainnet.HRP
+	if err := client.Connect(); err != nil {
+		log.Fatal(err)
 	}
-	defer client.Close()
+	defer client.Stop()
 
-	// Subscribe to each deposit address
-	for _, addr := range addresses {
-		notifications, err := client.SubscribeAddress(ctx, addr)
+	// Track all deposit addresses (can be thousands)
+	client.TrackAddresses(depositAddresses)
+
+	// Start background polling (refreshes every 15 seconds)
+	client.StartPolling()
+
+	// Check for confirmed deposits periodically
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		tipHeight, err := client.GetTip()
 		if err != nil {
-			log.Printf("Failed to subscribe %s: %v", addr, err)
+			log.Printf("Cannot get tip: %v", err)
 			continue
 		}
 
-		go func(addr string, ch <-chan electrumx.StatusNotification) {
-			for notif := range ch {
-				log.Printf("Activity on %s: status=%s", addr, notif.Status)
-
-				// Fetch the full transaction history
-				history, err := client.GetHistory(ctx, addr)
-				if err != nil {
-					log.Printf("Error fetching history: %v", err)
+		for _, addr := range depositAddresses {
+			utxos := client.GetUTXOs(addr)
+			for _, u := range utxos {
+				if u.Height == 0 || u.AssetType != types.AssetTypeSOQ {
 					continue
 				}
 
-				for _, entry := range history {
-					if entry.Confirmations >= 6 {
-						log.Printf("Confirmed deposit: txid=%s amount=%s",
-							entry.TxID, entry.Amount)
-						// Credit user account here
-					}
+				confirmations := tipHeight - u.Height + 1
+				if confirmations >= 6 {
+					// Credit user — use txid:vout as idempotency key
+					log.Printf("Confirmed deposit: %s:%d — %.8f SOQ (%d conf)",
+						u.TxID[:12], u.Vout,
+						float64(u.Value)/float64(types.SatoshisPerSOQ),
+						confirmations)
 				}
 			}
-		}(addr, notifications)
+		}
 	}
-
-	// Block until context is cancelled
-	<-ctx.Done()
-	return nil
 }
 ```
 
@@ -108,62 +107,79 @@ func MonitorDeposits(ctx context.Context, addresses []string) error {
 
 ## Step 3: Process Withdrawals
 
-When a user requests a withdrawal, build a transaction from your hot wallet UTXOs:
+When a user requests a withdrawal, build a transaction from your hot wallet UTXOs.
+Use the full defense stack to prevent stale UTXO failures:
 
 ```go
-package main
-
 import (
-	"context"
-
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
-	"github.com/soqucoin-labs/soqucoin-sdk/keys"
-	"github.com/soqucoin-labs/soqucoin-sdk/tx"
-	"github.com/soqucoin-labs/soqucoin-sdk/types"
+	"github.com/soqucoin-labs/soqucoin-sdk/resilience"
+	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
+	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
 
-// ProcessWithdrawal sends SOQ from the hot wallet to a user's external address.
+var (
+	// Circuit breaker — halt after 3 consecutive failures
+	cb       = resilience.NewCircuitBreaker(3, 15*time.Minute)
+	// Persistent spent set — survives process restarts
+	spentSet = utxo.NewSpentSet("/var/lib/exchange/spent_set.json")
+	selector = utxo.NewCoinSelector(spentSet)
+)
+
 func ProcessWithdrawal(
-	ctx context.Context,
-	hotWalletSeed []byte,
-	toAddress string,
-	amount types.Amount,
+	elxClient  *electrumx.Client,
+	rpcClient  *rpc.Client,
+	toAddress  string,
+	amount     int64,  // in satoshis
+	hotWalletAddr string,
 ) (txid string, err error) {
-	// 1. Reconstruct hot wallet keypair
-	kp, err := keys.FromSeed(hotWalletSeed)
+	// 1. Check circuit breaker
+	if err := cb.Allow(); err != nil {
+		return "", fmt.Errorf("withdrawals halted: %w", err)
+	}
+
+	// 2. Get chain tip
+	tipHeight, err := rpcClient.GetBlockCount()
 	if err != nil {
+		cb.RecordFailure(err)
 		return "", err
 	}
 
-	// 2. Connect to ElectrumX
-	ec, err := electrumx.Dial(ctx, "electrumx.soqu.org:50002", electrumx.WithTLS())
+	// 3. Select UTXOs (largest-first, spent-set-aware)
+	fee := int64(100_000) // 0.001 SOQ
+	allUTXOs := elxClient.GetAllUTXOs()
+	selected, total, err := selector.SelectUTXOs(allUTXOs, amount+fee, 1, tipHeight, nil)
 	if err != nil {
-		return "", err
-	}
-	defer ec.Close()
-
-	// 3. Gather UTXOs from hot wallet
-	hotAddr := address.FromPublicKey(kp.PublicKey)
-	utxos, err := ec.ListUnspent(ctx, hotAddr)
-	if err != nil {
+		cb.RecordFailure(err)
 		return "", err
 	}
 
-	// 4. Build transaction
-	builder := tx.NewBuilder()
-	builder.AddInputs(utxos...)
-	builder.AddOutput(toAddress, amount)
-	builder.SetChangeAddress(hotAddr)
-	builder.SetFeeRate(tx.RecommendedFeeRate) // ~1 SOQ/KB
-
-	// 5. Sign
-	signedTx, err := builder.Sign(kp)
+	// 4. Defense 11: Verify each UTXO is still unspent on-chain
+	verified, err := rpcClient.VerifyAndFilterUTXOs(
+		selected,
+		elxClient.EvictUTXO,     // Remove stale UTXOs from cache
+		elxClient.SetAssetType,  // Stamp asset type from node
+	)
 	if err != nil {
+		cb.RecordFailure(err)
 		return "", err
 	}
 
-	// 6. Broadcast
-	return ec.BroadcastTransaction(ctx, signedTx)
+	// 5. Build, sign, broadcast (use tx package with your keystore)
+	// rawTx := tx.Build(verified, outputs, hotWalletAddr, fee, keystore)
+	// txid, err := rpcClient.SendRawTransaction(rawTx)
+
+	// 6. Mark spent (prevents re-selection)
+	spentSet.MarkBroadcast(verified, txid)
+
+	// 7. Inject change for immediate availability (Defense 13)
+	changeAmount := total - amount - fee
+	if changeAmount > 0 {
+		elxClient.AddChangeUTXO(txid, 1, changeAmount, hotWalletAddr)
+	}
+
+	cb.RecordSuccess()
+	return txid, nil
 }
 ```
 
@@ -180,27 +196,6 @@ SOQ uses a 1-minute block target. Recommended confirmation thresholds:
 | Large deposits (>100K SOQ) | 30 | ~30 minutes |
 | Withdrawal finality | 6 | ~6 minutes |
 
-```go
-// Poll for confirmations
-func WaitForConfirmations(ctx context.Context, ec *electrumx.Client, txid string, required int) error {
-	for {
-		info, err := ec.GetTransaction(ctx, txid)
-		if err != nil {
-			return err
-		}
-		if info.Confirmations >= required {
-			return nil // Confirmed
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(30 * time.Second):
-			// Poll again
-		}
-	}
-}
-```
-
 ---
 
 ## Important Notes
@@ -215,26 +210,27 @@ SOQ transactions are larger than Bitcoin transactions due to Dilithium signature
 | Dilithium signature | 2,420 bytes |
 | Typical 1-in-1-out TX | ~4.8 KB |
 | Typical 2-in-1-out TX | ~8.5 KB |
-
-Plan your block size and fee estimation accordingly.
+| Max inputs per TX | 80 (due to MAX_STANDARD_TX_WEIGHT) |
 
 ### Fee Estimation
 
-The SDK provides fee estimation helpers:
-
 ```go
-feeRate := tx.RecommendedFeeRate    // Standard: ~1 SOQ/KB
-feeRate := tx.HighPriorityFeeRate   // Priority: ~2 SOQ/KB
+// Query the node for dynamic fee estimates
+feeRate, err := rpcClient.EstimateSmartFee(6) // target 6 blocks
 
-// Or query the node for dynamic estimates
-feeRate, err := rpcClient.EstimateFee(ctx, 6) // target 6 blocks
+// Or use a generous fallback (typical for Soqucoin's low-fee environment)
+const defaultFee = 100_000 // 0.001 SOQ — covers most single-output TXs
 ```
 
-### Confirmation Times
+### UTXO Consolidation
 
-- **Block time:** ~1 minute target
-- **Block reward:** follows halving schedule (see whitepaper)
-- **Reorg protection:** 6 confirmations recommended minimum for deposits
+Exchanges accumulate many small UTXOs from deposits. Periodically consolidate them to avoid hitting the 80-input limit during large withdrawals:
+
+```go
+// Select the smallest UTXOs for consolidation
+smallUTXOs, total, err := selector.SelectSmallestUTXOs(allUTXOs, 50, 6, tipHeight, nil)
+// Build a single TX that merges them into one output to your hot wallet
+```
 
 ---
 
@@ -244,9 +240,10 @@ feeRate, err := rpcClient.EstimateFee(ctx, 6) // target 6 blocks
 |---------|---------------|
 | **Key storage** | Encrypt seeds with AES-256-GCM at rest. Use HSM for production hot wallets. |
 | **Key rotation** | Generate fresh deposit addresses periodically. Sweep old addresses to cold storage. |
-| **Cold storage** | Keep >95% of funds in air-gapped cold wallets with multi-signature schemes. |
-| **Monitoring** | Set up alerts for unusual withdrawal patterns and large deposits. |
+| **Cold storage** | Keep >95% of funds in air-gapped cold wallets. |
+| **Monitoring** | Use the `resilience.Alerter` for Slack notifications on circuit breaker state changes. |
 | **Rate limiting** | Enforce withdrawal rate limits and require manual approval above thresholds. |
+| **Spent tracking** | Always use `utxo.SpentSet` with persistence. Never re-select a broadcast UTXO. |
 
 See the full [Security Guide](SECURITY.md) for detailed recommendations.
 
