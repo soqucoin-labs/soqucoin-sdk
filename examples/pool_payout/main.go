@@ -89,20 +89,20 @@ func main() {
 
 		// Check circuit breaker BEFORE each payout
 		if err := cb.Allow(); err != nil {
-			log.Printf("⚠️ Circuit breaker blocked payout: %v", err)
+			log.Printf("Circuit breaker blocked payout: %v", err)
 			log.Printf("Remaining payouts will be retried next cycle")
 			os.Exit(1)
 		}
 
 		err := executePayout(rpcClient, elxClient, selector, spentSet, payout, poolAddress)
 		if err != nil {
-			log.Printf("❌ Payout failed: %v", err)
+			log.Printf("Payout failed: %v", err)
 			cb.RecordFailure(err)
 			continue
 		}
 
 		cb.RecordSuccess()
-		log.Printf("✅ Payout %d/%d complete", i+1, len(payouts))
+		log.Printf("Payout %d/%d complete", i+1, len(payouts))
 	}
 
 	log.Println("All payouts processed.")
@@ -152,7 +152,7 @@ func executePayout(
 		return fmt.Errorf("UTXO verification: %w", err)
 	}
 	if len(verified) < len(selected) {
-		log.Printf("  ⚠️ Defense 11 filtered %d stale UTXOs", len(selected)-len(verified))
+		log.Printf("  Defense 11 filtered %d stale UTXOs", len(selected)-len(verified))
 	}
 
 	// Step 5: Build and sign the transaction
@@ -183,6 +183,6 @@ func executePayout(
 		elxClient.AddChangeUTXO(txid, 1, changeAmount, changeAddr)
 	}
 
-	log.Printf("  ✅ Broadcast TX %s", txid[:12])
+	log.Printf("  Broadcast TX %s", txid[:12])
 	return nil
 }
