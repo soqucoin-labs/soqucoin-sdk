@@ -108,7 +108,7 @@ func checkDeposits(client *electrumx.Client, addresses []string) {
 			confirmations := tipHeight - u.Height + 1
 			if confirmations >= minConfirmations {
 				// This deposit is confirmed — credit the user
-				fmt.Printf("✅ CONFIRMED DEPOSIT: %s:%d — %.8f SOQ (%d confirmations)\n",
+				fmt.Printf("CONFIRMED DEPOSIT: %s:%d — %.8f SOQ (%d confirmations)\n",
 					u.TxID[:12], u.Vout,
 					float64(u.Value)/float64(types.SatoshisPerSOQ),
 					confirmations)

@@ -121,7 +121,7 @@ func main() {
 	if err != nil {
 		log.Fatal("verify:", err)
 	}
-	fmt.Printf("Signature verification: %v ✓\n", sigValid)
+	fmt.Printf("Signature verification: %v\n", sigValid)
 	fmt.Println()
 	fmt.Println("In production, broadcast via: rpc.Client.SendRawTransaction(rawTx)")
 }

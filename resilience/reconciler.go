@@ -126,7 +126,7 @@ func (r *Reconciler) run() {
 
 		if cbState == CircuitOpen {
 			msg := fmt.Sprintf("Circuit breaker is OPEN during reconciliation — operations halted (%d consecutive failures)", cbFailures)
-			log.Printf("[reconciler] ⚠️ %s", msg)
+			log.Printf("[reconciler] %s", msg)
 			if r.OnAlert != nil {
 				r.OnAlert(msg)
 			}
@@ -136,7 +136,7 @@ func (r *Reconciler) run() {
 	// Step 5: Verify expected balance range
 	if utxoCount > 0 && confirmed == 0 && unconfirmed == 0 {
 		msg := fmt.Sprintf("%d UTXOs tracked but zero balance — possible asset type mismatch or all spent-pending", utxoCount)
-		log.Printf("[reconciler] ⚠️ ALERT: %s", msg)
+		log.Printf("[reconciler] ALERT: %s", msg)
 		if r.OnAlert != nil {
 			r.OnAlert(msg)
 		}

@@ -175,7 +175,7 @@ func (c *Client) SendMany(transactions map[string]float64) (string, error) {
 		return "", fmt.Errorf("marshal sendmany request: %w", err)
 	}
 
-	log.Printf("[soqsigner] 📤 Sending batch of %d payments via /api/v1/sendmany", len(recipients))
+	log.Printf("[soqsigner] Sending batch of %d payments via /api/v1/sendmany", len(recipients))
 
 	httpReq, err := http.NewRequest("POST", c.config.URL+"/api/v1/sendmany", bytes.NewReader(body))
 	if err != nil {
@@ -208,7 +208,7 @@ func (c *Client) SendMany(transactions map[string]float64) (string, error) {
 		return "", fmt.Errorf("parse sendmany response: %w", err)
 	}
 
-	log.Printf("[soqsigner] ✅ Batch payment sent: txid=%s, %d inputs, %d outputs, elapsed=%s",
+	log.Printf("[soqsigner] Batch payment sent: txid=%s, %d inputs, %d outputs, elapsed=%s",
 		result.TxID, result.Inputs, result.Outputs, result.Elapsed)
 
 	return result.TxID, nil
