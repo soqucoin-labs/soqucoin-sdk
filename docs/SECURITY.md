@@ -90,7 +90,7 @@ The SDK's built-in verification functions already use constant-time comparison i
 
 ### Signature Malleability
 
-SOQ transactions use Dilithium signatures which are not malleable by design (FIPS 204 §3.6). However, always verify signatures against the canonical transaction hash — never re-serialize a transaction after signature attachment.
+SOQ transactions use Dilithium signatures which are not malleable by design (FIPS 204 §3.6). However, always verify signatures against the canonical transaction hash, never re-serialize a transaction after signature attachment.
 
 ---
 
@@ -116,7 +116,7 @@ When connecting to `soqucoind`, always use authenticated RPC:
 rpcClient, err := rpc.Dial("http://127.0.0.1:19335", rpc.WithAuth("rpcuser", "rpcpassword"))
 ```
 
-- Bind RPC to `127.0.0.1` only — never expose to the public internet
+- Bind RPC to `127.0.0.1` only, never expose to the public internet
 - Use a strong, randomly generated RPC password
 - Consider TLS for RPC connections, even on localhost
 
@@ -148,7 +148,7 @@ if network != address.Mainnet {
 ```go
 import "github.com/soqucoin-labs/soqucoin-sdk/types"
 
-// Amounts use fixed-point arithmetic — no floating point
+// Amounts use fixed-point arithmetic, no floating point
 amount, err := types.ParseAmount("1000.5") // 1000.5 SOQ
 if err != nil {
     return fmt.Errorf("invalid amount: %w", err)
@@ -212,11 +212,11 @@ We maintain a security hall of fame for responsible disclosures. Reporters will 
 ## Audit Status
 
 The Soqucoin SDK builds on:
-- **[Cloudflare CIRCL](https://github.com/cloudflare/circl)** — widely reviewed ML-DSA implementation
-- **Soqucoin Core** — audited by [Halborn Security](https://halborn.com) (SSC report available on request)
+- **[Cloudflare CIRCL](https://github.com/cloudflare/circl)**: widely reviewed ML-DSA implementation
+- **Soqucoin Core**: audited by [Halborn Security](https://halborn.com) (SSC report available on request)
 
 The SDK itself has not yet undergone a formal third-party audit. We recommend exchange integrators perform their own security review before handling significant funds.
 
 ---
 
-© 2026 Soqucoin Labs Inc. — [soqucoin.com](https://soqucoin.com)
+© 2026 Soqucoin Labs Inc., [soqucoin.com](https://soqucoin.com)

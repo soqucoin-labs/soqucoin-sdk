@@ -8,31 +8,31 @@ Step-by-step guide for listing Soqucoin (SOQ) on your exchange.
 
 To support SOQ deposits and withdrawals, your exchange needs to:
 
-1. **Generate deposit addresses** — one unique address per user
-2. **Monitor deposits** — track UTXOs via ElectrumX polling
-3. **Process withdrawals** — build, sign, and broadcast transactions
-4. **Confirm transactions** — wait for sufficient block confirmations
+1. **Generate deposit addresses**: one unique address per user
+2. **Monitor deposits**: track UTXOs via ElectrumX polling
+3. **Process withdrawals**: build, sign, and broadcast transactions
+4. **Confirm transactions**: wait for sufficient block confirmations
 
 SOQ uses **NIST FIPS 204 ML-DSA-44** (Dilithium) for all signatures. Transaction structure is similar to Bitcoin/Dogecoin (UTXO model), but witness data contains Dilithium signatures (~2,420 bytes) and public keys (~1,312 bytes).
 
 ---
 
-## Integration model — read this first
+## Integration model, read this first
 
 **You run our node. You do not use the node's built-in wallet.** Those are different things and the
 distinction is the whole integration:
 
 | | |
 |---|---|
-| ✅ **You run** | `soqucoind`, our node — this is how you see the chain and broadcast |
+| ✅ **You run** | `soqucoind`, our node, this is how you see the chain and broadcast |
 | ❌ **You do not use** | the wallet subsystem *inside* that node. It ships disabled (`disablewallet=1`), so `listunspent`, `getbalance` and `sendtoaddress` are not part of the integration surface |
-| ✅ **You still need, and still do** | wallet *functions* — address derivation, key custody, signing. Those run in **your** infrastructure via this SDK |
+| ✅ **You still need, and still do** | wallet *functions*, address derivation, key custody, signing. Those run in **your** infrastructure via this SDK |
 
 In other words the node is a chain reader and broadcaster; your key vault stays your key vault.
 Exchanges already work this way for other UTXO coins rather than keeping customer keys inside
 `bitcoind`.
 
-This is the same pattern exchanges use to integrate any UTXO chain at scale — deposit addresses
+This is the same pattern exchanges use to integrate any UTXO chain at scale, deposit addresses
 derived from your own key store, chain watched by an indexer, withdrawals signed in your own signing
 infrastructure, and the node used only to read the chain and broadcast. **It is not a
 Soqucoin-specific arrangement**, and if you already integrate Bitcoin or Litecoin this way, the
@@ -47,18 +47,18 @@ shape will be familiar.
 
 **Why the node wallet is not used:** ML-DSA-44 keys are roughly 60x larger than the ECDSA keys a
 Bitcoin-derived wallet was designed around (2,560-byte private, 1,312-byte public, versus ~32 and
-~33). At exchange scale — one deposit address per user — that key material belongs in your own
+~33). At exchange scale, one deposit address per user, that key material belongs in your own
 storage rather than in the node's embedded wallet database. Nothing about this reduces what you can
 do; it moves key custody to where you want it anyway.
 
 **What this means for your integration estimate:** the node is a standard Bitcoin-style JSON-RPC
 daemon for every call in this guide, and the post-quantum specifics are confined to signature
 construction, which this SDK handles. Be aware, however, that this is **not** the templated
-`getnewaddress` / `sendtoaddress` integration path — it requires wiring this SDK into your deposit
+`getnewaddress` / `sendtoaddress` integration path, it requires wiring this SDK into your deposit
 and withdrawal flow, plus an ElectrumX indexer. See the next section, which is the item most likely
 to affect your estimate.
 
-### ⚠️ ElectrumX indexer — a decision we need from you
+### ⚠️ ElectrumX indexer, a decision we need from you
 
 Because the node's wallet is disabled, there is no address index to query for deposits. The SDK
 reads UTXOs from an **ElectrumX indexer**, and one has to exist. There are two ways to arrange it,
@@ -71,7 +71,7 @@ and we would rather you choose than discover it later:
 
 **We recommend Option A, and the software is published:**
 
-> **https://github.com/soqucoin-labs/electrumx** — branch `soqucoin`
+> **https://github.com/soqucoin-labs/electrumx**, branch `soqucoin`
 
 Upstream ElectrumX ships no Soqucoin coin definition, so that fork is what you need. It is based on
 a pinned upstream commit rather than tracking `master`, so the entire Soqucoin delta is reviewable
@@ -91,14 +91,14 @@ in that repository documents the configuration and the caveats, including the fa
 you expect to connect to one we operate? That answer changes both the integration effort and where
 the operational risk sits, so it is worth settling before scoping.
 
-If neither option suits your architecture, tell us — we would rather adapt than have you commit to
+If neither option suits your architecture, tell us, we would rather adapt than have you commit to
 something that does not fit your operations.
 
 ---
 
 ## Step 1: Generate Deposit Addresses
 
-Create a unique deposit address for each user. Store the keypair securely — you'll need it to sweep funds.
+Create a unique deposit address for each user. Store the keypair securely, you'll need it to sweep funds.
 
 ```go
 import (
@@ -172,8 +172,8 @@ func StartDepositMonitor(depositAddresses []string) {
 				const minConfirmations = 288
 				confirmations := tipHeight - u.Height + 1
 				if confirmations >= minConfirmations {
-					// Credit user — use txid:vout as idempotency key
-					log.Printf("Confirmed deposit: %s:%d — %.8f SOQ (%d conf)",
+					// Credit user, use txid:vout as idempotency key
+					log.Printf("Confirmed deposit: %s:%d, %.8f SOQ (%d conf)",
 						u.TxID[:12], u.Vout,
 						float64(u.Value)/float64(types.SatoshisPerSOQ),
 						confirmations)
@@ -200,9 +200,9 @@ import (
 )
 
 var (
-	// Circuit breaker — halt after 3 consecutive failures
+	// Circuit breaker, halt after 3 consecutive failures
 	cb       = resilience.NewCircuitBreaker(3, 15*time.Minute)
-	// Persistent spent set — survives process restarts
+	// Persistent spent set, survives process restarts
 	spentSet = utxo.NewSpentSet("/var/lib/exchange/spent_set.json")
 	selector = utxo.NewCoinSelector(spentSet)
 )
@@ -307,7 +307,7 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 
 ---
 
-## Test Coverage — current status
+## Test Coverage, current status
 
 Every package now carries unit tests. Measured with `go test -cover ./...`:
 
@@ -327,11 +327,11 @@ UTXO cache is shared between the polling goroutine and caller threads.
 
 **Where the coverage is thin, and why.** The two low numbers are honest rather than accidental:
 
-- **`electrumx` (30.5%)** — the covered part is the UTXO cache, which is where incorrect state can
+- **`electrumx` (30.5%)**: the covered part is the UTXO cache, which is where incorrect state can
   exist without any network error being raised. The uncovered majority is the TCP transport,
   reconnection and polling loop. Simulating that faithfully needs an ElectrumX protocol double; the
   transport is instead exercised continuously in production.
-- **`resilience` (33.8%)** — circuit breaker transitions are covered. The reconciler and the Slack
+- **`resilience` (33.8%)**: circuit breaker transitions are covered. The reconciler and the Slack
   alerter are not, and both are operational conveniences rather than parts of the money path.
 
 **What the tests deliberately target.** Rather than chasing a percentage, they pin the invariants
@@ -340,7 +340,7 @@ exclusion of witness data from the txid, USDSOQ never counted as native SOQ, spe
 never double-selected, a stale UTXO both dropped *and* evicted from cache, and RPC errors never
 surfacing as usable zero values.
 
-Two real defects were found and fixed while writing them, both in the payout path — see the
+Two real defects were found and fixed while writing them, both in the payout path, see the
 `v0.3.0` release notes.
 
 If coverage on a specific path is a gating requirement for your review, tell us which and we will
@@ -369,7 +369,7 @@ SOQ transactions are larger than Bitcoin transactions due to Dilithium signature
 feeRate, err := rpcClient.EstimateSmartFee(6) // target 6 blocks
 
 // Or use a generous fallback (typical for Soqucoin's low-fee environment)
-const defaultFee = 100_000 // 0.001 SOQ — covers most single-output TXs
+const defaultFee = 100_000 // 0.001 SOQ, covers most single-output TXs
 ```
 
 ### UTXO Consolidation
