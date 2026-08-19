@@ -29,6 +29,7 @@ package electrumx
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -65,6 +66,34 @@ type Client struct {
 	// OnRefresh is called after each successful UTXO refresh with the address
 	// and current UTXO count. Useful for monitoring/logging.
 	OnRefresh func(address string, utxoCount int)
+
+	// TLSConfig, when non-nil, wraps the connection in TLS. It applies to
+	// Reconnect as well, so a connection cannot silently downgrade to plaintext
+	// after a reconnect.
+	//
+	// Leave it nil only when the transport is already private: ElectrumX on
+	// localhost, or over a tunnel you control. An ElectrumX server sees every
+	// address you track, so over the public internet a plaintext connection
+	// discloses your entire deposit set to anyone on the path, and lets them
+	// alter the balances and UTXOs you act on.
+	//
+	// ServerName is filled in from the host when empty. The zero value of
+	// tls.Config verifies the server certificate against the system roots,
+	// which is what you want; see UseTLS.
+	TLSConfig *tls.Config
+}
+
+// UseTLS enables TLS with certificate verification against the system roots.
+// This is the setting an exchange should use for any ElectrumX server it does
+// not reach over a private network.
+//
+//	client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second)
+//	client.UseTLS()
+//	client.Connect()
+//
+// For a private CA or a pinned certificate, set TLSConfig directly instead.
+func (c *Client) UseTLS() {
+	c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 }
 
 // request is a JSON-RPC request to ElectrumX.
@@ -96,22 +125,65 @@ func NewClient(host string, pollInterval time.Duration) *Client {
 	}
 }
 
-// Connect establishes a TCP connection to ElectrumX with keepalive enabled.
+// dial opens the transport. Keepalive is set on the TCP connection underneath
+// any TLS layer, so it survives the wrapping.
+//
+// The TLS handshake carries its own deadline. Without one a server that accepts
+// the TCP connection and then stalls would hang Connect indefinitely, which is
+// exactly how a reconnect loop wedges.
+func (c *Client) dial() (net.Conn, error) {
+	raw, err := net.DialTimeout("tcp", c.host, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("connect to electrumx %s: %w", c.host, err)
+	}
+
+	// F5: Enable TCP keepalive to prevent broken pipe after idle periods.
+	if tcpConn, ok := raw.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		log.Printf("[electrumx] TCP keepalive enabled (30s interval)")
+	}
+
+	if c.TLSConfig == nil {
+		return raw, nil
+	}
+
+	cfg := c.TLSConfig.Clone()
+	if cfg.ServerName == "" && !cfg.InsecureSkipVerify {
+		host, _, splitErr := net.SplitHostPort(c.host)
+		if splitErr != nil {
+			host = c.host
+		}
+		cfg.ServerName = host
+	}
+
+	tlsConn := tls.Client(raw, cfg)
+	if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("electrumx %s: set handshake deadline: %w", c.host, err)
+	}
+	if err := tlsConn.Handshake(); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("electrumx %s: tls handshake: %w", c.host, err)
+	}
+	// Clear the handshake deadline; per-call timeouts govern from here.
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("electrumx %s: clear handshake deadline: %w", c.host, err)
+	}
+	return tlsConn, nil
+}
+
+// Connect establishes a connection to ElectrumX with keepalive enabled, over TLS
+// if TLSConfig is set.
 //
 // Production lesson (F5): ElectrumX connections sit idle between poll intervals.
 // NAT/firewall timeouts silently kill the connection after ~4h on DigitalOcean
 // droplets. TCP keepalive at 30s prevents this.
 func (c *Client) Connect() error {
-	conn, err := net.DialTimeout("tcp", c.host, 10*time.Second)
+	conn, err := c.dial()
 	if err != nil {
-		return fmt.Errorf("connect to electrumx %s: %w", c.host, err)
-	}
-
-	// F5: Enable TCP keepalive to prevent broken pipe after idle periods.
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		log.Printf("[electrumx] TCP keepalive enabled (30s interval)")
+		return err
 	}
 
 	c.conn = conn
@@ -121,7 +193,11 @@ func (c *Client) Connect() error {
 	// in Go 1.26's bufio.ReadSlice when response > 4KB.
 	// 4MB accommodates ~50,000 UTXOs with margin.
 	c.reader = bufio.NewReaderSize(conn, 4*1024*1024)
-	log.Printf("[electrumx] Connected to ElectrumX at %s", c.host)
+	if c.TLSConfig != nil {
+		log.Printf("[electrumx] Connected to ElectrumX at %s over TLS", c.host)
+	} else {
+		log.Printf("[electrumx] Connected to ElectrumX at %s in plaintext", c.host)
+	}
 
 	// Server version handshake
 	resp, err := c.call("server.version", []interface{}{"soqucoin-sdk/1.0", "1.4"})
