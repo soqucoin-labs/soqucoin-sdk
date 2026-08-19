@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"time"
 )
@@ -149,10 +150,20 @@ func (c *Client) SendMany(transactions map[string]float64) (string, error) {
 		return "", fmt.Errorf("pre-flight health check: %w", err)
 	}
 
-	// Convert float64 SOQ amounts to int64 satoshis
+	// Convert float64 SOQ amounts to int64 satoshis.
+	//
+	// math.Round, not a plain int64 conversion. A truncating conversion is
+	// systematically short because binary floating point cannot represent most
+	// decimal SOQ amounts exactly: 0.29 SOQ evaluates to 28999999.999999996 and
+	// truncates to 28,999,999, one satoshi less than owed. It is always short and
+	// never over, so across a payout run the shortfall accumulates as unexplained
+	// dust in the hot wallet and the payout ledger stops reconciling exactly.
+	//
+	// Prefer Send, which takes int64 satoshis directly, when the caller already
+	// has an integer amount. Float is lossy at this API boundary by construction.
 	recipients := make(map[string]int64, len(transactions))
 	for address, amountSOQ := range transactions {
-		amountSat := int64(amountSOQ * 1e8)
+		amountSat := int64(math.Round(amountSOQ * 1e8))
 		if amountSat <= 0 {
 			log.Printf("[soqsigner] Skipping zero/negative amount for %s: %.8f SOQ", address, amountSOQ)
 			continue

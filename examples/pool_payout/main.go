@@ -85,7 +85,7 @@ func main() {
 	// ── Step 4: Execute payouts with circuit breaker ──
 	for i, payout := range payouts {
 		log.Printf("Processing payout %d/%d: %s → %.4f SOQ",
-			i+1, len(payouts), payout.Address[:20], float64(payout.Amount)/1e8)
+			i+1, len(payouts), shortID(payout.Address, 20), float64(payout.Amount)/1e8)
 
 		// Check circuit breaker BEFORE each payout
 		if err := cb.Allow(); err != nil {
@@ -158,11 +158,11 @@ func executePayout(
 	// Step 5: Build and sign the transaction
 	// (In production, use tx.Build() with your keystore)
 	log.Printf("  Building TX: %d inputs → 1 output + change", len(verified))
-	log.Printf("  Payment: %.4f SOQ to %s...", float64(payout.Amount)/1e8, payout.Address[:20])
+	log.Printf("  Payment: %.4f SOQ to %s...", float64(payout.Amount)/1e8, shortID(payout.Address, 20))
 
 	changeAmount := total - payout.Amount - fee
 	if changeAmount > 0 {
-		log.Printf("  Change: %.4f SOQ to %s...", float64(changeAmount)/1e8, changeAddr[:20])
+		log.Printf("  Change: %.4f SOQ to %s...", float64(changeAmount)/1e8, shortID(changeAddr, 20))
 	}
 
 	// NOTE: Transaction building and signing requires the tx package and
@@ -183,6 +183,14 @@ func executePayout(
 		elxClient.AddChangeUTXO(txid, 1, changeAmount, changeAddr)
 	}
 
-	log.Printf("  Broadcast TX %s", txid[:12])
+	log.Printf("  Broadcast TX %s", shortID(txid, 12))
 	return nil
+}
+
+// shortID truncates an identifier for display without panicking on short input.
+func shortID(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

@@ -120,7 +120,7 @@ func (ss *SpentSet) MarkBroadcast(inputs []types.UTXO, broadcastTxID string) {
 
 	if len(broadcastTxID) >= 12 {
 		log.Printf("[utxo] Spent set: added %d UTXOs from TX %s (total tracked: %d)",
-			len(inputs), broadcastTxID[:12], len(ss.entries))
+			len(inputs), shortID(broadcastTxID, 12), len(ss.entries))
 	}
 
 	ss.persist()
@@ -428,4 +428,14 @@ func (cs *CoinSelector) SelectSmallestUTXOs(
 	}
 
 	return candidates, totalValue, nil
+}
+
+// shortID truncates an identifier for logging without panicking on short input.
+// Log formatting must never be able to crash the caller: these helpers sit on
+// error paths, and a panic there replaces a handled error with process death.
+func shortID(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

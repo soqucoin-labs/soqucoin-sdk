@@ -45,7 +45,7 @@ func main() {
 	// Hook into refresh events for monitoring
 	client.OnRefresh = func(addr string, utxoCount int) {
 		if utxoCount > 0 {
-			log.Printf("Refreshed %s... — %d UTXOs", addr[:20], utxoCount)
+			log.Printf("Refreshed %s... — %d UTXOs", shortID(addr, 20), utxoCount)
 		}
 	}
 
@@ -109,7 +109,7 @@ func checkDeposits(client *electrumx.Client, addresses []string) {
 			if confirmations >= minConfirmations {
 				// This deposit is confirmed — credit the user
 				fmt.Printf("CONFIRMED DEPOSIT: %s:%d — %.8f SOQ (%d confirmations)\n",
-					u.TxID[:12], u.Vout,
+					shortID(u.TxID, 12), u.Vout,
 					float64(u.Value)/float64(types.SatoshisPerSOQ),
 					confirmations)
 
@@ -119,4 +119,12 @@ func checkDeposits(client *electrumx.Client, addresses []string) {
 			}
 		}
 	}
+}
+
+// shortID truncates an identifier for display without panicking on short input.
+func shortID(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

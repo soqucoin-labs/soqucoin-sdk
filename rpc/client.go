@@ -313,11 +313,11 @@ func (c *Client) VerifyAndFilterUTXOs(
 	for _, u := range utxos {
 		exists, assetType, err := c.VerifyUTXO(u.TxID, u.Vout)
 		if err != nil {
-			return nil, fmt.Errorf("verify UTXO %s:%d: %w", u.TxID[:12], u.Vout, err)
+			return nil, fmt.Errorf("verify UTXO %s:%d: %w", shortID(u.TxID, 12), u.Vout, err)
 		}
 		if !exists {
 			if len(u.TxID) >= 12 {
-				fmt.Printf("[rpc] Defense 11: UTXO %s:%d is STALE (gettxout=null), skipping\n", u.TxID[:12], u.Vout)
+				fmt.Printf("[rpc] Defense 11: UTXO %s:%d is STALE (gettxout=null), skipping\n", shortID(u.TxID, 12), u.Vout)
 			}
 			if evictFn != nil {
 				evictFn(u.TxID, u.Vout)
@@ -335,4 +335,14 @@ func (c *Client) VerifyAndFilterUTXOs(
 	}
 
 	return verified, nil
+}
+
+// shortID truncates an identifier for logging without panicking on short input.
+// Log formatting must never be able to crash the caller: these helpers sit on
+// error paths, and a panic there replaces a handled error with process death.
+func shortID(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

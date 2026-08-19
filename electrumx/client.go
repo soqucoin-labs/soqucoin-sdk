@@ -453,7 +453,7 @@ func (c *Client) EvictUTXO(txid string, vout uint32) {
 		for i, u := range utxos {
 			if u.TxID == txid && u.Vout == vout {
 				c.utxos[addr] = append(utxos[:i], utxos[i+1:]...)
-				log.Printf("[electrumx] Evicted stale UTXO %s:%d from cache", txid[:12], vout)
+				log.Printf("[electrumx] Evicted stale UTXO %s:%d from cache", shortID(txid, 12), vout)
 				return
 			}
 		}
@@ -482,10 +482,11 @@ func (c *Client) AddChangeUTXO(txid string, vout uint32, value int64, addr strin
 	}
 
 	c.utxos[addr] = append(c.utxos[addr], changeUTXO)
-	if len(txid) >= 12 && len(addr) >= 20 {
-		log.Printf("[electrumx] Added change UTXO %s:%d (%d sat) for %s...",
-			txid[:12], vout, value, addr[:20])
-	}
+	// Previously this whole log was skipped when either identifier was short,
+	// which silently dropped the diagnostic for exactly the inputs most likely to
+	// be wrong. shortID keeps the line and truncates safely instead.
+	log.Printf("[electrumx] Added change UTXO %s:%d (%d sat) for %s...",
+		shortID(txid, 12), vout, value, shortID(addr, 20))
 }
 
 // SetAssetType stamps the asset type on a cached UTXO. Called by Defense 11
@@ -574,4 +575,14 @@ func (c *Client) BroadcastTx(rawTxHex string) (string, error) {
 		return "", fmt.Errorf("parse broadcast result: %w", err)
 	}
 	return txid, nil
+}
+
+// shortID truncates an identifier for logging without panicking on short input.
+// Log formatting must never be able to crash the caller: these helpers sit on
+// error paths, and a panic there replaces a handled error with process death.
+func shortID(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
