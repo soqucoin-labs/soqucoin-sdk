@@ -2,7 +2,8 @@
 //
 // Handles witness v0/v1 P2WPKH-Dilithium transactions with BIP143 sighash
 // computation, fee estimation, and Soqucoin-specific CTxOut serialization
-// (nVisibility and nAssetType extension bytes).
+// CTxOut is standard Bitcoin (value + scriptPubKey) since migration Phase 4;
+// asset and visibility follow the witness version, not extension bytes.
 package tx
 
 import (
@@ -71,12 +72,17 @@ type TxInput struct {
 }
 
 // TxOutput represents a transaction output.
-// Soqucoin CTxOut includes nVisibility and nAssetType after scriptPubKey.
+//
+// CTxOut migration Phase 4: the nVisibility/nAssetType extension bytes were
+// REMOVED. CTxOut is now standard Bitcoin (value + scriptPubKey), identical to the
+// foreign/AuxPoW-parent encoding. Asset and visibility follow the WITNESS VERSION
+// (USDSOQ = v7 OP_7, confidential = v4 OP_4), so an output carries no extra bytes.
+//
+// This mirrors soq-signer/internal/txbuilder, the production reference, and is
+// pinned byte-identically to the node by the golden vector in the tests.
 type TxOutput struct {
 	Value        int64  // Output value in satoshis
 	ScriptPubKey []byte // Output script
-	Visibility   uint8  // 0x00=transparent (default), 0x01=confidential
-	AssetType    uint8  // 0x00=native SOQ (default), 0x01=USDSOQ
 }
 
 // Transaction represents a raw Soqucoin transaction.
@@ -254,8 +260,6 @@ func (tx *Transaction) Serialize() []byte {
 		binary.Write(&buf, binary.LittleEndian, output.Value)
 		writeVarInt(&buf, uint64(len(output.ScriptPubKey)))
 		buf.Write(output.ScriptPubKey)
-		buf.WriteByte(output.Visibility) // nVisibility (Soqucoin CTxOut extension)
-		buf.WriteByte(output.AssetType)  // nAssetType  (Soqucoin CTxOut extension)
 	}
 
 	// Witness data (if present)
@@ -306,8 +310,6 @@ func (tx *Transaction) TxID() string {
 		binary.Write(&buf, binary.LittleEndian, output.Value)
 		writeVarInt(&buf, uint64(len(output.ScriptPubKey)))
 		buf.Write(output.ScriptPubKey)
-		buf.WriteByte(output.Visibility) // nVisibility (Soqucoin CTxOut extension)
-		buf.WriteByte(output.AssetType)  // nAssetType  (Soqucoin CTxOut extension)
 	}
 
 	// Locktime
@@ -358,8 +360,6 @@ func serializeAllOutputs(outputs []TxOutput) []byte {
 		binary.Write(&buf, binary.LittleEndian, output.Value)
 		writeVarInt(&buf, uint64(len(output.ScriptPubKey)))
 		buf.Write(output.ScriptPubKey)
-		buf.WriteByte(output.Visibility) // nVisibility (Soqucoin CTxOut extension)
-		buf.WriteByte(output.AssetType)  // nAssetType  (Soqucoin CTxOut extension)
 	}
 	return buf.Bytes()
 }
@@ -394,15 +394,39 @@ func ScriptP2WPKH(pubkeyHash []byte) []byte {
 	return script
 }
 
-// AddOutputUSDSOQ adds a USDSOQ output (nAssetType=0x01) to the transaction.
+// ScriptV7USDSOQHolding creates a witness v7 USDSOQ holding scriptPubKey:
+// OP_7 || PUSH_32 || SHA256(pubkey).
+//
+// Post-Phase-4 the witness version IS the asset discriminator. The node checks
+// exactly this shape (CTxOut::IsV7USDSOQHolding: size 34, byte0 OP_7, byte1 32),
+// and a v7 holding is spent through the audited v1 single-key Dilithium path.
+func ScriptV7USDSOQHolding(pubkeyHash []byte) []byte {
+	if len(pubkeyHash) != 32 {
+		panic(fmt.Sprintf("invalid pubkey hash length: %d, want 32", len(pubkeyHash)))
+	}
+	script := make([]byte, 34)
+	script[0] = 0x57 // OP_7 (witness version 7 = USDSOQ holding)
+	script[1] = 0x20 // Push 32 bytes
+	copy(script[2:], pubkeyHash)
+	return script
+}
+
+// AddOutputUSDSOQ adds a USDSOQ output.
+//
+// The caller must pass a witness v7 scriptPubKey (see ScriptV7USDSOQHolding).
+// There is no nAssetType byte to set: asset type is carried by the witness
+// version, so a non-v7 script here would produce a NATIVE SOQ output rather than a
+// USDSOQ one. The check below makes that failure loud instead of silent.
 // Used for minting USDSOQ tokens. The recipient receives USDSOQ, while any
 // change outputs should use AddOutput (native SOQ for fee change).
 func (tx *Transaction) AddOutputUSDSOQ(value int64, scriptPubKey []byte) {
+	if !(len(scriptPubKey) == 34 && scriptPubKey[0] == 0x57 && scriptPubKey[1] == 0x20) {
+		panic("AddOutputUSDSOQ requires a witness v7 scriptPubKey (OP_7 <32>); " +
+			"asset type follows the witness version, use ScriptV7USDSOQHolding")
+	}
 	tx.Outputs = append(tx.Outputs, TxOutput{
 		Value:        value,
 		ScriptPubKey: scriptPubKey,
-		Visibility:   0x00, // Transparent (USDSOQ is always transparent per consensus)
-		AssetType:    0x01, // USDSOQ asset type
 	})
 }
 
@@ -431,8 +455,6 @@ func (tx *Transaction) AddOutputWitnessV5(authorityPKHash []byte) {
 	tx.Outputs = append(tx.Outputs, TxOutput{
 		Value:        0, // No value locked in the authority marker
 		ScriptPubKey: ScriptWitnessV5(authorityPKHash),
-		Visibility:   0x00,
-		AssetType:    0x00, // Authority output is typed as SOQ (not USDSOQ)
 	})
 }
 
@@ -440,9 +462,9 @@ func (tx *Transaction) AddOutputWitnessV5(authorityPKHash []byte) {
 //
 // The transaction structure is:
 //
-//	vout[0]: USDSOQ recipient output (nAssetType=0x01, amount=mint amount)
+//	vout[0]: USDSOQ recipient output (witness v7, amount=mint amount)
 //	vout[1]: Witness v5 authority marker (OP_5 || 0x20 || SHA256(authority_pk), value=0)
-//	vout[2]: SOQ change output (nAssetType=0x00, for fee change, if above dust)
+//	vout[2]: native SOQ change output (witness v1, for fee change, if above dust)
 //
 // The witness v5 authority marker is required by ConnectBlock (validation.cpp L2210-2216)
 // to identify this as an authority TX. Without it, the asset isolation check rejects
@@ -491,14 +513,14 @@ func BuildMintUSDSOQTransaction(
 			totalInput, fee)
 	}
 
-	// vout[0]: USDSOQ recipient output (AssetType=0x01)
+	// vout[0]: USDSOQ recipient output (witness v7)
 	tx.AddOutputUSDSOQ(amount, recipientScriptPubKey)
 
 	// vout[1]: Witness v5 authority marker output (value=0, OP_5 program)
 	// This is the critical output that ConnectBlock uses to detect authority TXs.
 	tx.AddOutputWitnessV5(authorityPKHash)
 
-	// vout[2]: Native SOQ change output (AssetType=0x00, for fee change)
+	// vout[2]: Native SOQ change output (witness v1, for fee change)
 	if change > DustThreshold {
 		tx.AddOutput(change, changeScriptPubKey)
 	} else {
@@ -512,14 +534,14 @@ func BuildMintUSDSOQTransaction(
 // BuildSendUSDSOQTransaction constructs an unsigned USDSOQ transfer transaction.
 //
 // Asset isolation rules require separate input sets:
-//   - usdsoqInputs: USDSOQ UTXOs (AssetType=1) that fund the recipient + USDSOQ change
-//   - soqInputs: Native SOQ UTXOs (AssetType=0) that pay the transaction fee
+//   - usdsoqInputs: USDSOQ UTXOs (witness v7) that fund the recipient + USDSOQ change
+//   - soqInputs: native SOQ UTXOs that pay the transaction fee
 //
 // The transaction structure is:
 //
-//	vout[0]: USDSOQ recipient output (nAssetType=0x01, amount=transfer amount)
-//	vout[1]: USDSOQ change output (nAssetType=0x01, if above dust)
-//	vout[2]: SOQ fee change output (nAssetType=0x00, if above dust)
+//	vout[0]: USDSOQ recipient output (witness v7, amount=transfer amount)
+//	vout[1]: USDSOQ change output (witness v7, if above dust)
+//	vout[2]: native SOQ fee change output (witness v1, if above dust)
 func BuildSendUSDSOQTransaction(
 	usdsoqInputs []types.UTXO,
 	soqInputs []types.UTXO,
@@ -579,16 +601,16 @@ func BuildSendUSDSOQTransaction(
 			totalSOQ, fee)
 	}
 
-	// vout[0]: USDSOQ recipient output (AssetType=0x01)
+	// vout[0]: USDSOQ recipient output (witness v7)
 	tx.AddOutputUSDSOQ(amount, recipientScriptPubKey)
 
-	// vout[1]: USDSOQ change output (AssetType=0x01, if above dust)
+	// vout[1]: USDSOQ change output (witness v7, if above dust)
 	usdsoqChange := totalUSDSOQ - amount
 	if usdsoqChange > DustThreshold {
 		tx.AddOutputUSDSOQ(usdsoqChange, usdsoqChangeScriptPubKey)
 	}
 
-	// vout[2]: SOQ fee change output (AssetType=0x00, if above dust)
+	// vout[2]: native SOQ fee change output (witness v1, if above dust)
 	if soqChange > DustThreshold {
 		tx.AddOutput(soqChange, soqChangeScriptPubKey)
 	}
