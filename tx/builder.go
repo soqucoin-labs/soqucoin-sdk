@@ -23,9 +23,9 @@ const (
 	WitnessFlag   = 0x01
 
 	// Sighash types
-	SigHashAll         = 0x01
-	SigHashNone        = 0x02
-	SigHashSingle      = 0x03
+	SigHashAll          = 0x01
+	SigHashNone         = 0x02
+	SigHashSingle       = 0x03
 	SigHashAnyoneCanPay = 0x80
 
 	// Transaction version
@@ -43,11 +43,11 @@ const (
 	// Estimated weight per input (witness v0/v1 Dilithium)
 	// witness: [sig(2420) + pubkey(1312)] = 3732 bytes witness data
 	// + 41 bytes non-witness (prevout:36 + scriptSig:1 + sequence:4)
-	EstimatedInputWeight = 41*4 + 3732  // 164 + 3732 = 3896 WU
+	EstimatedInputWeight = 41*4 + 3732 // 164 + 3732 = 3896 WU
 
 	// Estimated weight per output (P2WPKH-Dilithium: OP_1 <32-byte hash>)
 	// 8 (value) + 1 (script len) + 34 (scriptPubKey) = 43 bytes
-	EstimatedOutputWeight = 43 * 4  // 172 WU
+	EstimatedOutputWeight = 43 * 4 // 172 WU
 
 	// Transaction overhead: version(4) + marker(1) + flag(1) + input_count(1) + output_count(1) + locktime(4)
 	TxOverheadWeight = 12 * 4 // 48 WU (non-witness) + 2 (witness header)
@@ -429,19 +429,20 @@ func ScriptWitnessV5(authorityPKHash []byte) []byte {
 // validate the authority signatures when this output is later spent.
 func (tx *Transaction) AddOutputWitnessV5(authorityPKHash []byte) {
 	tx.Outputs = append(tx.Outputs, TxOutput{
-		Value:        0,                                  // No value locked in the authority marker
+		Value:        0, // No value locked in the authority marker
 		ScriptPubKey: ScriptWitnessV5(authorityPKHash),
 		Visibility:   0x00,
-		AssetType:    0x00,                                // Authority output is typed as SOQ (not USDSOQ)
+		AssetType:    0x00, // Authority output is typed as SOQ (not USDSOQ)
 	})
 }
 
 // BuildMintUSDSOQTransaction constructs an unsigned USDSOQ authority mint transaction.
 //
 // The transaction structure is:
-//   vout[0]: USDSOQ recipient output (nAssetType=0x01, amount=mint amount)
-//   vout[1]: Witness v5 authority marker (OP_5 || 0x20 || SHA256(authority_pk), value=0)
-//   vout[2]: SOQ change output (nAssetType=0x00, for fee change, if above dust)
+//
+//	vout[0]: USDSOQ recipient output (nAssetType=0x01, amount=mint amount)
+//	vout[1]: Witness v5 authority marker (OP_5 || 0x20 || SHA256(authority_pk), value=0)
+//	vout[2]: SOQ change output (nAssetType=0x00, for fee change, if above dust)
 //
 // The witness v5 authority marker is required by ConnectBlock (validation.cpp L2210-2216)
 // to identify this as an authority TX. Without it, the asset isolation check rejects
@@ -515,9 +516,10 @@ func BuildMintUSDSOQTransaction(
 //   - soqInputs: Native SOQ UTXOs (AssetType=0) that pay the transaction fee
 //
 // The transaction structure is:
-//   vout[0]: USDSOQ recipient output (nAssetType=0x01, amount=transfer amount)
-//   vout[1]: USDSOQ change output (nAssetType=0x01, if above dust)
-//   vout[2]: SOQ fee change output (nAssetType=0x00, if above dust)
+//
+//	vout[0]: USDSOQ recipient output (nAssetType=0x01, amount=transfer amount)
+//	vout[1]: USDSOQ change output (nAssetType=0x01, if above dust)
+//	vout[2]: SOQ fee change output (nAssetType=0x00, if above dust)
 func BuildSendUSDSOQTransaction(
 	usdsoqInputs []types.UTXO,
 	soqInputs []types.UTXO,

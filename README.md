@@ -105,6 +105,18 @@ This SDK was extracted from the canonical `soq-signer` service that has been run
 | **PF-018b** | TCP stream corruption — connection mutex | Concurrent broadcast+poll |
 | **Circuit Breaker** | Infinite retry loops — automatic backoff | Node outage cascade |
 
+## Test Coverage
+
+`address`, `keys`, `resilience` and `utxo` carry unit tests. **Unit tests for `tx`, `rpc`,
+`electrumx` and `client` are actively being written and will be published as soon as they are
+ready.** The current per-package status is tracked in
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage--current-status) and updated as
+each lands.
+
+```bash
+go test ./...
+```
+
 ## Documentation
 
 - **[Quick Start](docs/QUICK_START.md)** — Generate an address, check balance, send SOQ in 5 minutes

@@ -8,12 +8,12 @@ package types
 type UTXO struct {
 	TxID         string `json:"tx_hash"`
 	Vout         uint32 `json:"tx_pos"`
-	Value        int64  `json:"value"`       // Satoshis
-	Height       int64  `json:"height"`      // Block height (0 = unconfirmed)
-	ScriptPubKey []byte `json:"-"`           // Populated on demand
-	Address      string `json:"-"`           // Which address owns this UTXO
-	SpentPending bool   `json:"-"`           // Marked as spent but not confirmed
-	AssetType    uint8  `json:"-"`           // 0=native SOQ, 1=USDSOQ
+	Value        int64  `json:"value"`  // Satoshis
+	Height       int64  `json:"height"` // Block height (0 = unconfirmed)
+	ScriptPubKey []byte `json:"-"`      // Populated on demand
+	Address      string `json:"-"`      // Which address owns this UTXO
+	SpentPending bool   `json:"-"`      // Marked as spent but not confirmed
+	AssetType    uint8  `json:"-"`      // 0=native SOQ, 1=USDSOQ
 }
 
 // Asset type constants.

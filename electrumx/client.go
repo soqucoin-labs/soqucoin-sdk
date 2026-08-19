@@ -47,16 +47,16 @@ import (
 // and provides battle-tested UTXO caching with merge-based refresh
 // (Defense 12) that preserves spend-pending state across poll cycles.
 type Client struct {
-	mu        sync.RWMutex
-	utxos     map[string][]types.UTXO // address -> UTXOs
-	host      string
-	conn      net.Conn
-	reader    *bufio.Reader
-	connMu    sync.Mutex   // PF-018b: Serializes all TCP I/O
-	reqID     atomic.Int64
-	addresses []string
+	mu           sync.RWMutex
+	utxos        map[string][]types.UTXO // address -> UTXOs
+	host         string
+	conn         net.Conn
+	reader       *bufio.Reader
+	connMu       sync.Mutex // PF-018b: Serializes all TCP I/O
+	reqID        atomic.Int64
+	addresses    []string
 	pollInterval time.Duration
-	stopCh    chan struct{}
+	stopCh       chan struct{}
 
 	// Network HRP for address-to-script-hash conversion.
 	// Defaults to "ssq" (stagenet). Set to "sq" for mainnet.
