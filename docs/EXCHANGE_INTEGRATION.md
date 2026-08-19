@@ -96,8 +96,6 @@ something that does not fit your operations.
 
 ---
 
----
-
 ## Step 1: Generate Deposit Addresses
 
 Create a unique deposit address for each user. Store the keypair securely — you'll need it to sweep funds.
@@ -311,30 +309,42 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 
 ## Test Coverage — current status
 
-We would rather state this plainly than have you find it during review.
+Every package now carries unit tests. Measured with `go test -cover ./...`:
 
-| Package | Coverage | Notes |
-|---------|:--------:|-------|
-| `address` | ✅ unit tested | Bech32m encoding and checksum validation |
-| `keys` | ✅ unit tested | Dilithium keypair generation and derivation |
-| `resilience` | ✅ unit tested | Circuit breaker state transitions |
-| `utxo` | ✅ unit tested | Coin selection and persistent spent set |
-| `tx` | ⏳ **in progress** | Transaction construction and signing |
-| `rpc` | ⏳ **in progress** | Node JSON-RPC client |
-| `electrumx` | ⏳ **in progress** | UTXO tracking client |
-| `client` | ⏳ **in progress** | soq-signer HTTP client |
+| Package | Coverage | What is covered |
+|---------|:--------:|-----------------|
+| `address` | **88.8%** | Bech32m encoding, checksum validation, script-hash derivation |
+| `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-satoshi conversion |
+| `utxo` | **83.9%** | Coin selection, persistent spent set |
+| `keys` | **69.2%** | Dilithium keypair generation, keystore encryption |
+| `rpc` | **64.8%** | JSON-RPC plumbing, Defense 11 stale-UTXO filtering |
+| `tx` | **60.3%** | Txid byte order, BIP143 sighash, weight and fee, script builders |
+| `resilience` | **33.8%** | Circuit breaker state transitions |
+| `electrumx` | **30.5%** | UTXO cache, balance filtering, eviction, change injection |
 
-**Unit tests for the remaining packages are actively being written and will be published as soon
-as they are ready.** We will update this table as each lands.
+Also passes under the race detector (`go test -race`), which matters for `electrumx` because its
+UTXO cache is shared between the polling goroutine and caller threads.
 
-Context on the untested packages, offered as explanation rather than excuse: the transaction
-construction, RPC and signer-client code in this SDK is extracted from `soq-signer`, the payout
-service that has been running continuously in production against our live network. It is exercised
-daily by real traffic. That is operational evidence, not unit coverage, and we are not presenting
-it as equivalent — dedicated unit tests are the gap and they are being closed.
+**Where the coverage is thin, and why.** The two low numbers are honest rather than accidental:
 
-If test coverage on a specific path is a gating requirement for your listing review, tell us which
-package matters most and we will prioritise it.
+- **`electrumx` (30.5%)** — the covered part is the UTXO cache, which is where incorrect state can
+  exist without any network error being raised. The uncovered majority is the TCP transport,
+  reconnection and polling loop. Simulating that faithfully needs an ElectrumX protocol double; the
+  transport is instead exercised continuously in production.
+- **`resilience` (33.8%)** — circuit breaker transitions are covered. The reconciler and the Slack
+  alerter are not, and both are operational conveniences rather than parts of the money path.
+
+**What the tests deliberately target.** Rather than chasing a percentage, they pin the invariants
+whose failure is silent: transaction ID byte-order reversal, per-input BIP143 sighash separation,
+exclusion of witness data from the txid, USDSOQ never counted as native SOQ, spent-pending UTXOs
+never double-selected, a stale UTXO both dropped *and* evicted from cache, and RPC errors never
+surfacing as usable zero values.
+
+Two real defects were found and fixed while writing them, both in the payout path — see the
+`v0.3.0` release notes.
+
+If coverage on a specific path is a gating requirement for your review, tell us which and we will
+prioritise it.
 
 ---
 

@@ -136,15 +136,23 @@ This SDK was extracted from the canonical `soq-signer` service that has been run
 
 ## Test Coverage
 
-`address`, `keys`, `resilience` and `utxo` carry unit tests. **Unit tests for `tx`, `rpc`,
-`electrumx` and `client` are actively being written and will be published as soon as they are
-ready.** The current per-package status is tracked in
-[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage--current-status) and updated as
-each lands.
+Every package carries unit tests, and the suite passes under the race detector.
+
+| `address` | `client` | `utxo` | `keys` | `rpc` | `tx` | `resilience` | `electrumx` |
+|:---------:|:--------:|:------:|:------:|:-----:|:----:|:------------:|:-----------:|
+| 88.8% | 86.8% | 83.9% | 69.2% | 64.8% | 60.3% | 33.8% | 30.5% |
 
 ```bash
 go test ./...
+go test -race ./...
+go test -cover ./...
 ```
+
+The tests target invariants whose failure is *silent* rather than a coverage percentage: txid byte
+order, per-input BIP143 sighash separation, USDSOQ never counted as native SOQ, stale UTXOs both
+dropped and evicted, and RPC errors never surfacing as usable zero values. Where coverage is thin
+it is stated plainly, with the reason, in
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage--current-status).
 
 ## Documentation
 
