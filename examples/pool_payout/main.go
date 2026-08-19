@@ -1,190 +1,357 @@
-// Command pool_payout demonstrates a production-grade batch payout system
-// using the SDK's resilience patterns — the same architecture that powers
-// soqupool's live payouts.
+// Command pool_payout is a working batch payout tool built on the SDK's
+// resilience patterns.
 //
-// This example shows:
-//   - Circuit breaker to prevent cascading failures
-//   - Persistent spent set to prevent UTXO re-selection
+// It demonstrates:
+//   - Circuit breaker to stop a run rather than hammer a failing node
+//   - Persistent spent set to prevent UTXO re-selection across restarts
 //   - Defense 11 (gettxout pre-verification) to catch stale UTXOs
 //   - Webhook alerting for operational monitoring
-//   - Batch payment with back-to-back transactions
+//   - Build, sign, broadcast and confirm, with the txid checked against the node
+//
+// # WHAT THIS EXAMPLE USED TO DO, AND WHY IT WAS DANGEROUS
+//
+// This program previously described itself as "production-grade" and as "the
+// same architecture that powers soqupool's live payouts" while building no
+// transaction at all. It assigned rawTxHex = "..." and never broadcast. That by
+// itself would only be misleading; what made it dangerous is that it then went on
+// to mutate state as though it had:
+//
+//   - It called spentSet.MarkBroadcast with the literal txid
+//     "simulated_txid_example", writing that fiction into a PERSISTENT file, so
+//     real UTXOs were recorded as spent against a transaction that did not exist.
+//   - It injected a change UTXO into the ElectrumX cache under the same fake txid.
+//   - It logged "Broadcast TX" and returned nil, so the circuit breaker recorded
+//     SUCCESS for every payout.
+//
+// Adapted for a real pool, that marks miners paid without paying them. The
+// program now performs the payout, and -dry-run stops before any state changes
+// rather than faking its way past them.
 //
 // Usage:
 //
+//	export SOQ_KEYSTORE_PASSPHRASE=...
 //	go run ./examples/pool_payout/ \
 //	  -rpc-url http://127.0.0.1:19332 \
 //	  -rpc-user user -rpc-pass pass \
-//	  -electrumx localhost:50001
+//	  -electrumx localhost:50001 \
+//	  -keystore /var/lib/soq/keystore.enc \
+//	  -pool-address ssq1p... \
+//	  -payouts payouts.json \
+//	  -dry-run
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
+	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/resilience"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
+	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
 
+// Payout is a single payment to a miner. Amount is in satoshis.
+type Payout struct {
+	Address string `json:"address"`
+	Amount  int64  `json:"amount"`
+}
+
 func main() {
-	// ── CLI flags ──
 	rpcURL := flag.String("rpc-url", "http://127.0.0.1:19332", "soqucoind RPC URL")
 	rpcUser := flag.String("rpc-user", "rpcuser", "RPC username")
 	rpcPass := flag.String("rpc-pass", "rpcpassword", "RPC password")
 	elxHost := flag.String("electrumx", "localhost:50001", "ElectrumX host:port")
+	elxTLS := flag.Bool("electrumx-tls", false, "Use TLS to reach ElectrumX (required off-localhost)")
+	keystorePath := flag.String("keystore", "", "Path to the encrypted keystore (required)")
+	poolAddress := flag.String("pool-address", "", "Pool payout address, also receives change (required)")
+	payoutsPath := flag.String("payouts", "", "JSON file: [{\"address\":\"...\",\"amount\":123}] (required)")
+	feeRate := flag.Int64("fee-rate", 1000, "Fee rate in satoshis per vByte")
+	spentSetPath := flag.String("spent-set", "pool_payout_spent_set.json", "Persistent spent-set path")
 	webhookURL := flag.String("webhook", "", "Slack webhook URL for alerts (optional)")
+	dryRun := flag.Bool("dry-run", false, "Build and sign but do not broadcast or record anything")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[pool-payout] ")
 
-	// ── Step 1: Initialize components ──
-	rpcClient := rpc.NewClient(*rpcURL, *rpcUser, *rpcPass)
-	elxClient := electrumx.NewClient(*elxHost, 15*time.Second)
-	elxClient.HRP = types.Stagenet.HRP
+	if err := run(runConfig{
+		rpcURL: *rpcURL, rpcUser: *rpcUser, rpcPass: *rpcPass,
+		elxHost: *elxHost, elxTLS: *elxTLS,
+		keystorePath: *keystorePath, poolAddress: *poolAddress,
+		payoutsPath: *payoutsPath, feeRate: *feeRate,
+		spentSetPath: *spentSetPath, webhookURL: *webhookURL,
+		dryRun: *dryRun,
+	}); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
 
-	// Persistent spent set — survives restarts
-	spentSet := utxo.NewSpentSet("/tmp/pool_payout_spent_set.json")
+type runConfig struct {
+	rpcURL, rpcUser, rpcPass string
+	elxHost                  string
+	elxTLS                   bool
+	keystorePath             string
+	poolAddress              string
+	payoutsPath              string
+	feeRate                  int64
+	spentSetPath             string
+	webhookURL               string
+	dryRun                   bool
+}
+
+func run(cfg runConfig) error {
+	switch {
+	case cfg.keystorePath == "":
+		return errors.New("-keystore is required")
+	case cfg.poolAddress == "":
+		return errors.New("-pool-address is required")
+	case cfg.payoutsPath == "":
+		return errors.New("-payouts is required")
+	}
+
+	payouts, err := loadPayouts(cfg.payoutsPath)
+	if err != nil {
+		return err
+	}
+
+	// Derive the network from the pool address rather than assuming one. Passing
+	// the wrong HRP is how this SDK ended up unable to build mainnet transactions
+	// at all, so nothing here hardcodes a prefix.
+	network, err := address.NetworkOf(cfg.poolAddress)
+	if err != nil {
+		return fmt.Errorf("pool address: %w", err)
+	}
+	log.Printf("Network: %s", network.Name)
+
+	// Every recipient must be on the same network as the pool. Check before
+	// spending anything, not after the first transaction is already on the wire.
+	for _, p := range payouts {
+		n, err := address.NetworkOf(p.Address)
+		if err != nil {
+			return fmt.Errorf("payout to %s: %w", shortID(p.Address, 20), err)
+		}
+		if n.Name != network.Name {
+			return fmt.Errorf("payout to %s is on %s but the pool is on %s",
+				shortID(p.Address, 20), n.Name, network.Name)
+		}
+		if p.Amount <= 0 {
+			return fmt.Errorf("payout to %s has non-positive amount %d",
+				shortID(p.Address, 20), p.Amount)
+		}
+	}
+
+	passphrase := os.Getenv("SOQ_KEYSTORE_PASSPHRASE")
+	if passphrase == "" {
+		return errors.New("SOQ_KEYSTORE_PASSPHRASE is not set")
+	}
+	keystore := keys.NewManager(cfg.keystorePath, passphrase)
+	if err := keystore.Load(); err != nil {
+		return fmt.Errorf("load keystore: %w", err)
+	}
+	// Load treats a missing file as an empty keystore, so an empty result means
+	// a wrong path or a wrong passphrase, not "no keys yet".
+	if keystore.KeyCount() == 0 {
+		return fmt.Errorf("keystore %s holds no keys: wrong path or passphrase",
+			cfg.keystorePath)
+	}
+
+	rpcClient := rpc.NewClient(cfg.rpcURL, cfg.rpcUser, cfg.rpcPass)
+	elxClient := electrumx.NewClient(cfg.elxHost, 15*time.Second)
+	elxClient.HRP = network.HRP
+	if cfg.elxTLS {
+		elxClient.UseTLS()
+	}
+
+	spentSet := utxo.NewSpentSet(cfg.spentSetPath)
 	selector := utxo.NewCoinSelector(spentSet)
 
-	// Circuit breaker: trip after 3 failures, 15 min cooldown
+	// Trip after 3 consecutive failures, then hold for 15 minutes. The point is
+	// to stop a run that is failing for a systemic reason rather than retry into
+	// a node outage.
 	cb := resilience.NewCircuitBreaker(3, 15*time.Minute)
-
-	// Webhook alerter (optional)
-	alerter := resilience.NewAlerter(*webhookURL)
+	alerter := resilience.NewAlerter(cfg.webhookURL)
 	alerter.WireToCircuitBreaker(cb)
 
-	// ── Step 2: Connect to ElectrumX ──
 	if err := elxClient.Connect(); err != nil {
-		log.Fatalf("ElectrumX connect failed: %v", err)
+		return fmt.Errorf("connect to electrumx %s: %w", cfg.elxHost, err)
 	}
 	defer elxClient.Stop()
 
-	// Track the pool's payout address
-	poolAddress := "ssq1p..." // Your pool's payout address
-	elxClient.TrackAddresses([]string{poolAddress})
-
-	// Initial UTXO refresh
+	elxClient.TrackAddresses([]string{cfg.poolAddress})
 	if err := elxClient.RefreshAll(); err != nil {
-		log.Fatalf("Initial UTXO refresh failed: %v", err)
+		return fmt.Errorf("initial UTXO refresh: %w", err)
 	}
 
-	// ── Step 3: Build payout list ──
-	// In production, this comes from your pool's balance database
-	payouts := []Payout{
-		{Address: "ssq1p...", Amount: 5000_00000000}, // 5000 SOQ to miner A
-		{Address: "ssq1p...", Amount: 2500_00000000}, // 2500 SOQ to miner B
-		{Address: "ssq1p...", Amount: 1200_00000000}, // 1200 SOQ to miner C
+	if cfg.dryRun {
+		log.Printf("DRY RUN: transactions will be built and signed but not broadcast, " +
+			"and neither the spent set nor the UTXO cache will be modified")
 	}
 
-	// ── Step 4: Execute payouts with circuit breaker ──
+	var sent, failed int
 	for i, payout := range payouts {
-		log.Printf("Processing payout %d/%d: %s → %.4f SOQ",
-			i+1, len(payouts), shortID(payout.Address, 20), float64(payout.Amount)/1e8)
+		log.Printf("Payout %d/%d: %.4f SOQ to %s",
+			i+1, len(payouts), soq(payout.Amount), shortID(payout.Address, 20))
 
-		// Check circuit breaker BEFORE each payout
 		if err := cb.Allow(); err != nil {
-			log.Printf("Circuit breaker blocked payout: %v", err)
-			log.Printf("Remaining payouts will be retried next cycle")
-			os.Exit(1)
+			log.Printf("Circuit breaker open: %v", err)
+			log.Printf("Stopping. %d sent, %d failed, %d not attempted",
+				sent, failed, len(payouts)-i)
+			return fmt.Errorf("circuit breaker stopped the run after %d payouts", i)
 		}
 
-		err := executePayout(rpcClient, elxClient, selector, spentSet, payout, poolAddress)
+		txid, err := executePayout(rpcClient, elxClient, selector, spentSet, keystore,
+			payout, cfg.poolAddress, cfg.feeRate, cfg.dryRun)
 		if err != nil {
-			log.Printf("Payout failed: %v", err)
+			log.Printf("  FAILED: %v", err)
 			cb.RecordFailure(err)
+			failed++
 			continue
 		}
 
 		cb.RecordSuccess()
-		log.Printf("Payout %d/%d complete", i+1, len(payouts))
+		sent++
+		if cfg.dryRun {
+			log.Printf("  would broadcast %s", shortID(txid, 16))
+		} else {
+			log.Printf("  broadcast %s", shortID(txid, 16))
+		}
 	}
 
-	log.Println("All payouts processed.")
+	log.Printf("Done: %d sent, %d failed, of %d", sent, failed, len(payouts))
+	if failed > 0 {
+		return fmt.Errorf("%d of %d payouts failed", failed, len(payouts))
+	}
+	return nil
 }
 
-// Payout represents a single payout to a miner.
-type Payout struct {
-	Address string
-	Amount  int64 // Satoshis
-}
-
-// executePayout performs a single payout using production-hardened patterns.
+// executePayout builds, signs and broadcasts one payout, returning the txid.
+//
+// State is mutated only after the node has accepted the transaction. That
+// ordering is the whole point: marking UTXOs spent before a successful broadcast
+// loses them from selection while they are still spendable, and the previous
+// version of this file did exactly that against a txid it invented.
 func executePayout(
 	rpcClient *rpc.Client,
 	elxClient *electrumx.Client,
 	selector *utxo.CoinSelector,
 	spentSet *utxo.SpentSet,
+	signer tx.Signer,
 	payout Payout,
 	changeAddr string,
-) error {
-	// Step 1: Get chain tip
+	feeRate int64,
+	dryRun bool,
+) (string, error) {
 	tipHeight, err := rpcClient.GetBlockCount()
 	if err != nil {
-		return fmt.Errorf("get block count: %w", err)
+		return "", fmt.Errorf("get block count: %w", err)
 	}
 
-	// Step 2: Get all UTXOs
-	allUTXOs := elxClient.GetAllUTXOs()
+	// feeRate is per vByte. A single-input ML-DSA payment is roughly 1,073 vB and
+	// each additional input adds about another 1,000, so budget generously here
+	// and let the builder compute the real fee from the final size.
+	feeBudget := 4000 * feeRate
 
-	// Step 3: Coin selection (largest-first, with spent set filtering)
-	fee := int64(100_000) // 0.001 SOQ fee (generous for PQ signatures)
-	targetAmount := payout.Amount + fee
-
-	selected, total, err := selector.SelectUTXOs(allUTXOs, targetAmount, 1, tipHeight, nil)
+	selected, total, err := selector.SelectUTXOs(
+		elxClient.GetAllUTXOs(), payout.Amount+feeBudget, 1, tipHeight, nil)
 	if err != nil {
-		return fmt.Errorf("coin selection: %w", err)
+		return "", fmt.Errorf("coin selection: %w", err)
 	}
-	log.Printf("  Selected %d UTXOs totaling %.4f SOQ", len(selected), float64(total)/1e8)
+	log.Printf("  selected %d UTXOs totaling %.4f SOQ", len(selected), soq(total))
 
-	// Step 4: Defense 11 — verify each UTXO is still unspent on-chain
+	// Defense 11: an ElectrumX cache can be stale. Confirm each input is still
+	// unspent according to the node before signing over it.
 	verified, err := rpcClient.VerifyAndFilterUTXOs(
-		selected,
-		elxClient.EvictUTXO,    // Remove stale UTXOs from cache
-		elxClient.SetAssetType, // Stamp asset type from gettxout
-	)
+		selected, elxClient.EvictUTXO, elxClient.SetAssetType)
 	if err != nil {
-		return fmt.Errorf("UTXO verification: %w", err)
+		return "", fmt.Errorf("UTXO verification: %w", err)
 	}
 	if len(verified) < len(selected) {
 		log.Printf("  Defense 11 filtered %d stale UTXOs", len(selected)-len(verified))
 	}
-
-	// Step 5: Build and sign the transaction
-	// (In production, use tx.Build() with your keystore)
-	log.Printf("  Building TX: %d inputs → 1 output + change", len(verified))
-	log.Printf("  Payment: %.4f SOQ to %s...", float64(payout.Amount)/1e8, shortID(payout.Address, 20))
-
-	changeAmount := total - payout.Amount - fee
-	if changeAmount > 0 {
-		log.Printf("  Change: %.4f SOQ to %s...", float64(changeAmount)/1e8, shortID(changeAddr, 20))
+	if len(verified) == 0 {
+		return "", errors.New("no spendable UTXOs remain after verification")
 	}
 
-	// NOTE: Transaction building and signing requires the tx package and
-	// your keystore. This example shows the flow pattern — substitute your
-	// actual tx.Build() call here.
-	rawTxHex := "..." // tx.Build(verified, outputs, changeAddr, fee, keystore)
-	_ = rawTxHex
+	recipientSPK, err := address.ScriptFor(payout.Address)
+	if err != nil {
+		return "", fmt.Errorf("recipient address: %w", err)
+	}
+	changeSPK, err := address.ScriptFor(changeAddr)
+	if err != nil {
+		return "", fmt.Errorf("change address: %w", err)
+	}
 
-	// Step 6: Broadcast
-	// txid, err := rpcClient.SendRawTransaction(rawTxHex)
+	// tx.BuildAndSign does these three steps in one call. They are separate here
+	// only so the change value can be read off the transaction: the fee follows
+	// from feeRate and the final size, so it cannot be recomputed as
+	// total - amount - fee.
+	transaction, err := tx.BuildSendTransaction(
+		verified, recipientSPK, payout.Amount, changeSPK, feeRate)
+	if err != nil {
+		return "", fmt.Errorf("build: %w", err)
+	}
+	if err := transaction.SignAll(signer); err != nil {
+		return "", fmt.Errorf("sign: %w", err)
+	}
+	rawTxHex, builtTxID := transaction.SerializeHex(), transaction.TxID()
 
-	// Step 7: Mark spent in persistent set (prevents re-selection)
-	txid := "simulated_txid_example" // Replace with actual txid
+	var changeAmount int64
+	if len(transaction.Outputs) > 1 {
+		changeAmount = transaction.Outputs[1].Value
+	}
+	log.Printf("  built %s: %d inputs, %d vB, change %.4f SOQ",
+		shortID(builtTxID, 16), len(verified), transaction.EstimateWeight()/4, soq(changeAmount))
+
+	if dryRun {
+		return builtTxID, nil
+	}
+
+	txid, err := rpcClient.SendRawTransaction(rawTxHex)
+	if err != nil {
+		return "", fmt.Errorf("broadcast: %w", err)
+	}
+	// If the node computed a different txid, our serialization disagrees with
+	// consensus. Do not record anything against it and do not retry.
+	if txid != builtTxID {
+		return "", fmt.Errorf("txid mismatch: node %s, SDK %s", txid, builtTxID)
+	}
+
+	// Only now, with the transaction accepted, record the effects.
 	spentSet.MarkBroadcast(verified, txid)
-
-	// Step 8: Inject change UTXO for immediate availability (Defense 13)
 	if changeAmount > 0 {
+		// Defense 13: make change spendable immediately rather than waiting for
+		// the next ElectrumX poll, so back-to-back payouts do not stall.
 		elxClient.AddChangeUTXO(txid, 1, changeAmount, changeAddr)
 	}
+	return txid, nil
+}
 
-	log.Printf("  Broadcast TX %s", shortID(txid, 12))
-	return nil
+func loadPayouts(path string) ([]Payout, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read payouts: %w", err)
+	}
+	var payouts []Payout
+	if err := json.Unmarshal(data, &payouts); err != nil {
+		return nil, fmt.Errorf("parse payouts %s: %w", path, err)
+	}
+	if len(payouts) == 0 {
+		return nil, fmt.Errorf("payouts file %s is empty", path)
+	}
+	return payouts, nil
+}
+
+func soq(sats int64) float64 {
+	return float64(sats) / float64(types.SatoshisPerSOQ)
 }
 
 // shortID truncates an identifier for display without panicking on short input.
