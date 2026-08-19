@@ -247,3 +247,24 @@ func Validate(hrp string, addr string) error {
 	_, _, err := Decode(hrp, addr)
 	return err
 }
+
+// HRPOf extracts the human-readable prefix from a bech32m address without
+// requiring the caller to know it in advance.
+//
+// Every other function here takes the HRP as a parameter, which forces a caller
+// that is handling addresses from an unknown network to guess. Guessing is how
+// tx.Build*Transaction came to hardcode "ssq" and silently reject every mainnet
+// address: Decode returns ErrInvalidHRP on mismatch, so the failure looked like a
+// malformed address rather than a wrong assumption.
+//
+// This performs no network validation. It returns the prefix as written, and the
+// caller decides whether that prefix is a network it accepts. Pair it with Decode,
+// which validates the checksum against the prefix and so rejects a fabricated one.
+func HRPOf(addr string) (string, error) {
+	a := strings.ToLower(strings.TrimSpace(addr))
+	pos := strings.LastIndex(a, "1")
+	if pos < 1 || pos+7 > len(a) {
+		return "", ErrInvalidHRP
+	}
+	return a[:pos], nil
+}

@@ -404,3 +404,15 @@ func (m *Manager) KeyCount() int {
 	defer m.mu.RUnlock()
 	return len(m.keys)
 }
+
+// PublicKeyFor returns the public key for a managed address.
+//
+// This exists so that tx.Signer can be satisfied by *Manager directly, without
+// the tx package needing to import this one.
+func (m *Manager) PublicKeyFor(address string) ([]byte, error) {
+	kp, err := m.GetKeyForAddress(address)
+	if err != nil {
+		return nil, err
+	}
+	return kp.PublicKey, nil
+}
