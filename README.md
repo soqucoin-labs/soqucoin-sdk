@@ -22,22 +22,28 @@ Requires **Go 1.25+** (per the `go` directive in `go.mod`).
 
 ## Integration model
 
-**You do not run a Soqucoin wallet.** Nodes run as a pure blockchain interface with
-`disablewallet=1`, so wallet RPCs are not part of the integration surface. Key management stays in
-your own infrastructure.
+**You run the node. You do not use the node's built-in wallet.** `soqucoind` ships with
+`disablewallet=1`, so wallet RPCs (`listunspent`, `getbalance`, `sendtoaddress`) are not part of the
+integration surface. You still perform wallet *functions* — address derivation, key custody,
+signing — but they run in your own infrastructure through this SDK. The node is a chain reader and
+broadcaster; your key vault stays your key vault.
 
 | Component | What you use | SDK package |
 |-----------|--------------|-------------|
 | Address derivation | Your own key store | [`keys`](./keys), [`address`](./address) |
-| Chain watching | ElectrumX indexer | [`electrumx`](./electrumx) |
+| Chain watching | **ElectrumX indexer** (required — see note) | [`electrumx`](./electrumx) |
 | Signing | Your signing infrastructure | [`keys`](./keys), [`tx`](./tx) |
 | Broadcast + chain reads | Node JSON-RPC | [`rpc`](./rpc) |
 
-This is the standard pattern for integrating a UTXO chain at scale, not a Soqucoin-specific
-arrangement — the node behaves as an ordinary Bitcoin-style JSON-RPC daemon, and the post-quantum
-specifics are confined to signature construction, which this SDK handles. See
-[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model--read-this-first) for the
-full walkthrough.
+The node behaves as an ordinary Bitcoin-style JSON-RPC daemon, and the post-quantum specifics are
+confined to signature construction, which this SDK handles.
+
+⚠️ **ElectrumX is required.** With the node wallet disabled there is no address index to query, so
+deposit monitoring reads from an ElectrumX indexer. Upstream ElectrumX does not ship Soqucoin
+support, so we supply the coin definition. You can run your own instance (recommended — no
+dependency on our infrastructure) or connect to one we operate. See
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model--read-this-first) for both
+options and the full walkthrough.
 
 ## Features
 

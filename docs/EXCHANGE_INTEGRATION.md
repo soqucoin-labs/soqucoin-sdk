@@ -19,9 +19,18 @@ SOQ uses **NIST FIPS 204 ML-DSA-44** (Dilithium) for all signatures. Transaction
 
 ## Integration model — read this first
 
-**You do not run our wallet software.** Soqucoin nodes run as a pure blockchain interface with
-`disablewallet=1`, so wallet RPCs (`listunspent`, `getbalance`, `sendtoaddress`) are not part of the
-integration surface. Key management stays in your infrastructure, where you already keep it.
+**You run our node. You do not use the node's built-in wallet.** Those are different things and the
+distinction is the whole integration:
+
+| | |
+|---|---|
+| ✅ **You run** | `soqucoind`, our node — this is how you see the chain and broadcast |
+| ❌ **You do not use** | the wallet subsystem *inside* that node. It ships disabled (`disablewallet=1`), so `listunspent`, `getbalance` and `sendtoaddress` are not part of the integration surface |
+| ✅ **You still need, and still do** | wallet *functions* — address derivation, key custody, signing. Those run in **your** infrastructure via this SDK |
+
+In other words the node is a chain reader and broadcaster; your key vault stays your key vault.
+Exchanges already work this way for other UTXO coins rather than keeping customer keys inside
+`bitcoind`.
 
 This is the same pattern exchanges use to integrate any UTXO chain at scale — deposit addresses
 derived from your own key store, chain watched by an indexer, withdrawals signed in your own signing
@@ -43,8 +52,33 @@ storage rather than in the node's embedded wallet database. Nothing about this r
 do; it moves key custody to where you want it anyway.
 
 **What this means for your integration estimate:** the node is a standard Bitcoin-style JSON-RPC
-daemon for every call in this guide. The post-quantum specifics are confined to signature
-construction, which this SDK handles for you.
+daemon for every call in this guide, and the post-quantum specifics are confined to signature
+construction, which this SDK handles. Be aware, however, that this is **not** the templated
+`getnewaddress` / `sendtoaddress` integration path — it requires wiring this SDK into your deposit
+and withdrawal flow, plus an ElectrumX indexer. See the next section, which is the item most likely
+to affect your estimate.
+
+### ⚠️ ElectrumX indexer — a decision we need from you
+
+Because the node's wallet is disabled, there is no address index to query for deposits. The SDK
+reads UTXOs from an **ElectrumX indexer**, and one has to exist. There are two ways to arrange it,
+and we would rather you choose than discover it later:
+
+| Option | What it means | Trade-off |
+|--------|---------------|-----------|
+| **A. You run your own** | You operate an ElectrumX instance alongside your node, as you may already do for other UTXO coins | ✅ No dependency on our infrastructure, no shared point of failure. ⚠️ Requires the Soqucoin coin definition from us |
+| **B. You connect to ours** | You point the SDK at an ElectrumX endpoint we operate | ✅ Nothing extra to run. ⚠️ Creates a hard dependency on our availability for your deposit crediting, which most exchanges reasonably refuse |
+
+**We recommend Option A** and will provide the Soqucoin coin definition and configuration needed to
+run it. Upstream ElectrumX does not ship Soqucoin support, so this is something we supply rather
+than something you can pull from `spesmilo/electrumx` directly.
+
+**So the question we need answered:** do you run your own indexer for UTXO-model coins, or would
+you expect to connect to one we operate? That answer changes both the integration effort and where
+the operational risk sits, so it is worth settling before scoping.
+
+If neither option suits your architecture, tell us — we would rather adapt than have you commit to
+something that does not fit your operations.
 
 ---
 
