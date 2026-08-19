@@ -15,7 +15,38 @@ To support SOQ deposits and withdrawals, your exchange needs to:
 
 SOQ uses **NIST FIPS 204 ML-DSA-44** (Dilithium) for all signatures. Transaction structure is similar to Bitcoin/Dogecoin (UTXO model), but witness data contains Dilithium signatures (~2,420 bytes) and public keys (~1,312 bytes).
 
-**Important:** All production Soqucoin nodes run with `disablewallet=1`. You cannot use `listunspent`, `getbalance`, or other wallet RPCs. The SDK uses ElectrumX for UTXO queries instead.
+---
+
+## Integration model — read this first
+
+**You do not run our wallet software.** Soqucoin nodes run as a pure blockchain interface with
+`disablewallet=1`, so wallet RPCs (`listunspent`, `getbalance`, `sendtoaddress`) are not part of the
+integration surface. Key management stays in your infrastructure, where you already keep it.
+
+This is the same pattern exchanges use to integrate any UTXO chain at scale — deposit addresses
+derived from your own key store, chain watched by an indexer, withdrawals signed in your own signing
+infrastructure, and the node used only to read the chain and broadcast. **It is not a
+Soqucoin-specific arrangement**, and if you already integrate Bitcoin or Litecoin this way, the
+shape will be familiar.
+
+| Component | What you use | SDK package |
+|-----------|--------------|-------------|
+| **Deposit addresses** | Derive per-user keypairs in your own key store | [`keys`](../keys), [`address`](../address) |
+| **Deposit monitoring** | ElectrumX indexer, polled for UTXO changes | [`electrumx`](../electrumx) |
+| **Withdrawal signing** | Your signing infrastructure, offline or HSM-backed | [`keys`](../keys), [`tx`](../tx) |
+| **Broadcast + chain reads** | Node JSON-RPC (`sendrawtransaction`, `gettxout`, `getblock`) | [`rpc`](../rpc) |
+
+**Why the node wallet is not used:** ML-DSA-44 keys are roughly 60x larger than the ECDSA keys a
+Bitcoin-derived wallet was designed around (2,560-byte private, 1,312-byte public, versus ~32 and
+~33). At exchange scale — one deposit address per user — that key material belongs in your own
+storage rather than in the node's embedded wallet database. Nothing about this reduces what you can
+do; it moves key custody to where you want it anyway.
+
+**What this means for your integration estimate:** the node is a standard Bitcoin-style JSON-RPC
+daemon for every call in this guide. The post-quantum specifics are confined to signature
+construction, which this SDK handles for you.
+
+---
 
 ---
 
