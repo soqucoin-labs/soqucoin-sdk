@@ -246,14 +246,40 @@ func ProcessWithdrawal(
 		return "", err
 	}
 
-	// 5. Build, sign, broadcast (use tx package with your keystore)
-	// rawTx := tx.Build(verified, outputs, hotWalletAddr, fee, keystore)
-	// txid, err := rpcClient.SendRawTransaction(rawTx)
+	// 5. Build, sign and serialize. *keys.Manager satisfies tx.Signer.
+	//    feeRate is per vByte, not a flat fee: see the note below.
+	recipientSPK, err := address.ScriptFor(toAddr)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
+	changeSPK, err := address.ScriptFor(hotWalletAddr)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
+	rawTx, builtTxID, err := tx.BuildAndSign(
+		verified, recipientSPK, amount, changeSPK, feeRate, keystore)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
 
-	// 6. Mark spent (prevents re-selection)
+	// 6. Broadcast. The node's txid must equal the one BuildAndSign computed;
+	//    if it does not, serialization disagrees with consensus. Do not proceed.
+	txid, err := rpcClient.SendRawTransaction(rawTx)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
+	if txid != builtTxID {
+		return "", fmt.Errorf("txid mismatch: node %s, SDK %s", txid, builtTxID)
+	}
+
+	// 7. Mark spent (prevents re-selection)
 	spentSet.MarkBroadcast(verified, txid)
 
-	// 7. Inject change for immediate availability (Defense 13)
+	// 8. Inject change for immediate availability (Defense 13)
 	changeAmount := total - amount - fee
 	if changeAmount > 0 {
 		elxClient.AddChangeUTXO(txid, 1, changeAmount, hotWalletAddr)
@@ -307,30 +333,53 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 
 ---
 
+## Verification: a real confirmed transaction
+
+Rather than asking you to trust that the signing path works, there is a
+[verification record](VERIFICATION.md) for a stagenet transaction **built, signed,
+serialized, broadcast and confirmed entirely by this SDK**:
+
+| | |
+|---|---|
+| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` |
+| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` |
+| Witness stack | `[2421, 1313]` bytes, the consensus-required format |
+
+The transaction id the SDK computed matches the one the node assigned, which
+independently confirms that serialization agrees with consensus byte for byte.
+
+That document also gives the exact witness format consensus requires, a table
+mapping `testmempoolaccept` rejections to their causes, and the steps to reproduce
+the transaction against your own node. Worth reading before you scope the
+integration.
+
+---
+
 ## Test Coverage, current status
 
 Every package now carries unit tests. Measured with `go test -cover ./...`:
 
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
-| `address` | **88.8%** | Bech32m encoding, checksum validation, script-hash derivation |
+| `address` | **91.1%** | Bech32m encoding, checksum validation, script derivation, network detection |
 | `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-satoshi conversion |
 | `utxo` | **83.9%** | Coin selection, persistent spent set |
-| `keys` | **69.2%** | Dilithium keypair generation, keystore encryption |
+| `tx` | **70.5%** | Txid byte order, BIP143 sighash, witness format, consensus format vectors, all three networks |
+| `keys` | **67.3%** | Dilithium keypair generation, keystore encryption |
 | `rpc` | **64.8%** | JSON-RPC plumbing, Defense 11 stale-UTXO filtering |
-| `tx` | **60.3%** | Txid byte order, BIP143 sighash, weight and fee, script builders |
+| `electrumx` | **51.3%** | UTXO cache, balance filtering, eviction, change injection, TLS negotiation and reconnect |
 | `resilience` | **33.8%** | Circuit breaker state transitions |
-| `electrumx` | **30.5%** | UTXO cache, balance filtering, eviction, change injection |
 
 Also passes under the race detector (`go test -race`), which matters for `electrumx` because its
 UTXO cache is shared between the polling goroutine and caller threads.
 
-**Where the coverage is thin, and why.** The two low numbers are honest rather than accidental:
+**Where the coverage is thin, and why.** These numbers are reported rather than rounded up:
 
-- **`electrumx` (30.5%)**: the covered part is the UTXO cache, which is where incorrect state can
-  exist without any network error being raised. The uncovered majority is the TCP transport,
-  reconnection and polling loop. Simulating that faithfully needs an ElectrumX protocol double; the
-  transport is instead exercised continuously in production.
+- **`electrumx` (51.3%)**: the UTXO cache is covered, which is where incorrect state can exist
+  without any network error being raised, as is connection establishment including TLS negotiation
+  and the guarantee that a reconnect cannot silently downgrade to plaintext. What remains uncovered
+  is the long-running polling loop, which needs a fuller ElectrumX protocol double to exercise
+  faithfully; it is exercised continuously in production instead.
 - **`resilience` (33.8%)**: circuit breaker transitions are covered. The reconciler and the Slack
   alerter are not, and both are operational conveniences rather than parts of the money path.
 
@@ -340,8 +389,9 @@ exclusion of witness data from the txid, USDSOQ never counted as native SOQ, spe
 never double-selected, a stale UTXO both dropped *and* evicted from cache, and RPC errors never
 surfacing as usable zero values.
 
-Two real defects were found and fixed while writing them, both in the payout path, see the
-`v0.3.0` release notes.
+Serialization is additionally pinned to the node's own format vectors, so the SDK and consensus
+cannot diverge without a test failing, and the documentation itself is checked in CI: every Go
+snippet in these docs is compiled and every API reference resolved against the real package.
 
 If coverage on a specific path is a gating requirement for your review, tell us which and we will
 prioritise it.
@@ -354,22 +404,62 @@ prioritise it.
 
 SOQ transactions are larger than Bitcoin transactions due to Dilithium signatures:
 
+Sizes below are measured by building and signing with this SDK, not estimated.
+Each figure is for a payment plus a change output, which is what the builders
+produce whenever a remainder is left over.
+
 | Component | Size |
 |-----------|------|
-| Dilithium public key | 1,312 bytes |
-| Dilithium signature | 2,420 bytes |
-| Typical 1-in-1-out TX | ~4.8 KB |
-| Typical 2-in-1-out TX | ~8.5 KB |
-| Max inputs per TX | 80 (due to MAX_STANDARD_TX_WEIGHT) |
+| ML-DSA-44 public key | 1,312 bytes |
+| ML-DSA-44 signature | 2,420 bytes |
+| Witness stack per input | 3,734 bytes (2,421 + 1,313, including the sighash byte and the `0x00` key prefix) |
+| 1-in, 2-out | 3,880 bytes, 4,288 WU, ~1,072 vB |
+| 2-in, 2-out | 7,662 bytes, 8,184 WU, ~2,046 vB |
+| 10-in, 2-out | 37,918 bytes, 39,352 WU, ~9,838 vB |
+| 80-in, 2-out | 302,658 bytes, 312,072 WU, ~78,018 vB |
+| Max inputs per TX | 80, enforced by `utxo.MaxInputsPerTX` |
 
-### Fee Estimation
+Roughly 3,782 bytes per additional input, so estimate
+`3,880 + 3,782 x (inputs - 1)` bytes.
+
+**The 80-input cap is not the node's weight limit.** `MAX_STANDARD_TX_WEIGHT` is
+800,000 WU, and 80 inputs use 312,072 of it, about 39%. The cap is sized against
+the older 400,000 WU limit because not every production node runs the build that
+raised it. It was reverted from 200 to 80 in May 2026 after transactions were
+rejected in production for size. Treat it as an operational floor that will rise,
+not as a protocol constant.
+
+`SelectUTXOs` returns `ErrInputLimitReached` with a partial selection when it hits
+the cap before reaching the target. Handle that case: it means the payment needs
+consolidation first, and ignoring the error sends less than intended.
+
+### Fee estimation
+
+**`feeRate` is satoshis per vByte, not a flat fee.** This trips people up because
+the numbers are small: at a feeRate of 10, a ~1,072 vB payment pays about 10,700
+satoshis, which the node treats as effectively free and rate-limits rather than
+relays. Start at 1,000. The [verification record](VERIFICATION.md) maps the
+rejection you get if you go lower.
 
 ```go
-// Query the node for dynamic fee estimates
-feeRate, err := rpcClient.EstimateSmartFee(6) // target 6 blocks
+// Query the node for a dynamic estimate. It returns SOQ per kB.
+soqPerKB, err := rpcClient.EstimateSmartFee(6) // target: 6 blocks
+if err != nil {
+    return err
+}
+feeRate := int64(soqPerKB * float64(types.SatoshisPerSOQ) / 1000) // satoshis per vByte
+if feeRate < 1000 {
+    feeRate = 1000 // floor: below this the node rate-limits as free
+}
+```
 
-// Or use a generous fallback (typical for Soqucoin's low-fee environment)
-const defaultFee = 100_000 // 0.001 SOQ, covers most single-output TXs
+`EstimateSmartFee` falls back to 0.01 SOQ/kB when the node has no estimate, which
+is exactly 1,000 satoshis per vByte, so the floor above and the fallback agree.
+
+Always confirm before you rely on a broadcast:
+
+```bash
+soqucoin-cli testmempoolaccept '["<rawHex>"]'
 ```
 
 ### UTXO Consolidation

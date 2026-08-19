@@ -4,9 +4,11 @@ package address
 // Implements BIP-350 (bech32m for witness version >= 1).
 //
 // Usage:
-//   witVer, witProg, err := Decode("ssq", "ssq1p...")
-//   scriptPubKey := WitnessProgram(witVer, witProg)
+//   scriptPubKey, err := ScriptFor("ssq1p...")   // network derived from the address
 //   electrumHash := ScriptHash(scriptPubKey)
+//
+// Decode and WitnessProgram are the lower-level primitives behind ScriptFor and
+// require the caller to know the HRP in advance. Prefer ScriptFor.
 
 import (
 	"crypto/sha256"
@@ -14,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 var (
@@ -246,4 +250,62 @@ func New(hrp string, witVer byte, pubkeyHash []byte) (string, error) {
 func Validate(hrp string, addr string) error {
 	_, _, err := Decode(hrp, addr)
 	return err
+}
+
+// HRPOf extracts the human-readable prefix from a bech32m address without
+// requiring the caller to know it in advance.
+//
+// Every other function here takes the HRP as a parameter, which forces a caller
+// that is handling addresses from an unknown network to guess. Guessing is how
+// tx.Build*Transaction came to hardcode "ssq" and silently reject every mainnet
+// address: Decode returns ErrInvalidHRP on mismatch, so the failure looked like a
+// malformed address rather than a wrong assumption.
+//
+// This performs no network validation. It returns the prefix as written, and the
+// caller decides whether that prefix is a network it accepts. Pair it with Decode,
+// which validates the checksum against the prefix and so rejects a fabricated one.
+func HRPOf(addr string) (string, error) {
+	a := strings.ToLower(strings.TrimSpace(addr))
+	pos := strings.LastIndex(a, "1")
+	if pos < 1 || pos+7 > len(a) {
+		return "", ErrInvalidHRP
+	}
+	return a[:pos], nil
+}
+
+// NetworkOf returns the network an address belongs to, derived from its prefix.
+// A prefix that belongs to no supported network is refused, because a fabricated
+// prefix can otherwise carry a perfectly valid checksum.
+func NetworkOf(addr string) (types.Network, error) {
+	hrp, err := HRPOf(addr)
+	if err != nil {
+		return types.Network{}, err
+	}
+	for _, n := range []types.Network{types.Mainnet, types.Stagenet, types.Regtest} {
+		if hrp == n.HRP {
+			return n, nil
+		}
+	}
+	return types.Network{}, fmt.Errorf("%w: unknown network prefix %q in %s",
+		ErrInvalidHRP, hrp, addr)
+}
+
+// ScriptFor returns the scriptPubKey for an address, deriving the network from
+// the address itself.
+//
+// Prefer this over Decode plus WitnessProgram, which require the caller to supply
+// the HRP and so invite hardcoding one. The script produced here is what BIP143
+// commits to as the scriptCode, which makes a wrong network a signing fault
+// rather than merely a decoding one, so it should come from the address and not
+// from a constant at the call site.
+func ScriptFor(addr string) ([]byte, error) {
+	n, err := NetworkOf(addr)
+	if err != nil {
+		return nil, err
+	}
+	witVer, witProg, err := Decode(n.HRP, addr)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", addr, err)
+	}
+	return WitnessProgram(witVer, witProg), nil
 }

@@ -46,7 +46,7 @@ definition, so we publish a fork:
 
 Run your own instance (recommended: no dependency on our infrastructure) or connect to one we
 operate. See
-[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model--read-this-first) for both
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model-read-this-first) for both
 options and the full walkthrough.
 
 ## Features
@@ -98,12 +98,18 @@ inputs, total, err := selector.SelectUTXOs(allUTXOs, amount+fee, 1, tipHeight, n
 // 2. Verify on-chain (Defense 11)
 verified, err := rpcClient.VerifyAndFilterUTXOs(inputs, elxClient.EvictUTXO, nil)
 
-// 3. Build, sign, broadcast
-rawTx := tx.Build(verified, outputs, changeAddr, fee, keystore)
-txid, err := rpcClient.SendRawTransaction(rawTx)
+// 3. Build, sign and serialize in one call. feeRate is per vByte; a
+//    Dilithium transaction is ~1,073 vB, so 10 is low enough that the node
+//    rate-limits it as free.
+recipientSPK, err := address.ScriptFor(recipientAddr)
+changeSPK, err := address.ScriptFor(changeAddr)
+rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, feeRate, keystore)
 
-// 4. Mark spent (Defense 12)
-spentSet.MarkBroadcast(verified, txid)
+// 4. Broadcast. The txid BuildAndSign computed must match the node's.
+sentTxID, err := rpcClient.SendRawTransaction(rawTx)
+
+// 5. Mark spent (Defense 12)
+spentSet.MarkBroadcast(verified, sentTxID)
 ```
 
 ## Packages
@@ -120,9 +126,11 @@ spentSet.MarkBroadcast(verified, txid)
 | [`resilience`](./resilience) | Circuit breaker, reconciler, and Slack webhook alerter |
 | [`client`](./client) | High-level client combining RPC + ElectrumX for common flows |
 
-## Production-Hardened
+## Provenance
 
-This SDK was extracted from the canonical `soq-signer` service that has been running in production since May 2026. Every defense layer comes from a real incident:
+**The UTXO, network and resilience layers were extracted** from the `soq-signer`
+service that has run in production since May 2026. Every defense below exists
+because of a specific incident:
 
 | Defense | What it prevents | Origin |
 |---------|-----------------|--------|
@@ -134,13 +142,27 @@ This SDK was extracted from the canonical `soq-signer` service that has been run
 | **PF-018b** | TCP stream corruption, via a connection mutex | Concurrent broadcast+poll |
 | **Circuit Breaker** | Infinite retry loops, via automatic backoff | Node outage cascade |
 
+**The transaction construction and signing layer is a separate implementation**,
+so rather than rest on the production record above, it is verified directly:
+
+- **A confirmed on-chain transaction**, built, signed, serialized, broadcast and
+  confirmed entirely by this SDK, with the identifiers to decode it yourself and
+  the steps to reproduce it. See [Verification](docs/VERIFICATION.md).
+- **Serialization pinned to the node's own format vectors**, so the SDK and
+  consensus cannot diverge without a test failing.
+- **Construction tested across all three networks**, with transactions that mix
+  networks refused outright.
+
+We think that is a stronger basis than shared lineage, because it is evidence you
+can check rather than provenance you have to trust.
+
 ## Test Coverage
 
 Every package carries unit tests, and the suite passes under the race detector.
 
-| `address` | `client` | `utxo` | `keys` | `rpc` | `tx` | `resilience` | `electrumx` |
-|:---------:|:--------:|:------:|:------:|:-----:|:----:|:------------:|:-----------:|
-| 88.8% | 86.8% | 83.9% | 69.2% | 64.8% | 60.3% | 33.8% | 30.5% |
+| `address` | `client` | `utxo` | `tx` | `keys` | `rpc` | `electrumx` | `resilience` |
+|:---------:|:--------:|:------:|:----:|:------:|:-----:|:-----------:|:------------:|
+| 91.1% | 86.8% | 83.9% | 70.5% | 67.3% | 64.8% | 51.3% | 33.8% |
 
 ```bash
 go test ./...
@@ -152,13 +174,14 @@ The tests target invariants whose failure is *silent* rather than a coverage per
 order, per-input BIP143 sighash separation, USDSOQ never counted as native SOQ, stale UTXOs both
 dropped and evicted, and RPC errors never surfacing as usable zero values. Where coverage is thin
 it is stated plainly, with the reason, in
-[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage--current-status).
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage-current-status).
 
 ## Documentation
 
 - **[Quick Start](docs/QUICK_START.md)**: Generate an address, check balance, send SOQ in 5 minutes
 - **[Exchange Integration](docs/EXCHANGE_INTEGRATION.md)**: Step-by-step guide for listing SOQ on your exchange
 - **[Security](docs/SECURITY.md)**: Key storage, memory hygiene, vulnerability reporting
+- **[Verification](docs/VERIFICATION.md)**: a confirmed transaction built and signed by this SDK, with the identifiers to decode it yourself and the steps to reproduce it
 
 ## Post-Quantum Cryptography
 

@@ -78,27 +78,23 @@ func main() {
 	fmt.Printf("Estimated fee: %d satoshis\n", unsignedTx.EstimateFee(10))
 	fmt.Println()
 
-	// 6. Sign each input
+	// 6. Sign every input.
+	//
+	// SignAll installs the witness in the format consensus requires:
+	//   stack[0] = signature || sighash-type byte  (2421 bytes)
+	//   stack[1] = 0x00 || public key              (1313 bytes)
+	// This example previously assembled [][]byte{sig, pubKey} directly, with
+	// neither the sighash byte nor the 0x00 FIPS 204 marker, and every
+	// transaction it produced was rejected with "bad-txns-requires-dilithium".
 	mgr := keys.NewManager("/dev/null", "example-passphrase")
 	_ = mgr.ImportPrivateKey(sender.PrivateKey, sender.PublicKey, sender.Address)
 
-	for i := range unsignedTx.Inputs {
-		// Compute BIP143 sighash for this input
-		sigHash, err := unsignedTx.ComputeSigHash(i, tx.SigHashAll)
-		if err != nil {
-			log.Fatal("compute sighash:", err)
-		}
-
-		// Sign with Dilithium
-		sig, err := mgr.Sign(sender.Address, sigHash)
-		if err != nil {
-			log.Fatal("sign:", err)
-		}
-
-		// Set witness data: [signature, pubkey]
-		unsignedTx.Inputs[i].WitnessData = [][]byte{sig, sender.PublicKey}
-
-		fmt.Printf("Input %d signed: %d-byte Dilithium signature\n", i, len(sig))
+	if err := unsignedTx.SignAll(mgr); err != nil {
+		log.Fatal("sign: ", err)
+	}
+	for i, in := range unsignedTx.Inputs {
+		fmt.Printf("Input %d signed: witness items %d and %d bytes\n",
+			i, len(in.WitnessData[0]), len(in.WitnessData[1]))
 	}
 
 	// 7. Serialize the signed transaction

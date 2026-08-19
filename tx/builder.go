@@ -479,6 +479,9 @@ func BuildMintUSDSOQTransaction(
 	authorityPKHash []byte,
 	feeRate int64,
 ) (*Transaction, error) {
+	if err := requireSameNetwork(inputs); err != nil {
+		return nil, err
+	}
 	if len(authorityPKHash) != 32 {
 		return nil, fmt.Errorf("authority pubkey hash must be 32 bytes, got %d", len(authorityPKHash))
 	}
@@ -488,11 +491,10 @@ func BuildMintUSDSOQTransaction(
 	// Add inputs (SOQ UTXOs for fee payment)
 	var totalInput int64
 	for _, u := range inputs {
-		witVer, witProg, err := soqaddr.Decode("ssq", u.Address)
+		inputSPK, err := inputScriptPubKey(u.Address)
 		if err != nil {
-			return nil, fmt.Errorf("decode input address %s: %w", u.Address, err)
+			return nil, err
 		}
-		inputSPK := soqaddr.WitnessProgram(witVer, witProg)
 
 		if err := tx.AddInput(u, inputSPK); err != nil {
 			return nil, fmt.Errorf("add input: %w", err)
@@ -551,16 +553,18 @@ func BuildSendUSDSOQTransaction(
 	soqChangeScriptPubKey []byte,
 	feeRate int64,
 ) (*Transaction, error) {
+	if err := requireSameNetwork(usdsoqInputs, soqInputs); err != nil {
+		return nil, err
+	}
 	tx := NewTransaction()
 
 	// Add USDSOQ inputs
 	var totalUSDSOQ int64
 	for _, u := range usdsoqInputs {
-		witVer, witProg, err := soqaddr.Decode("ssq", u.Address)
+		inputSPK, err := inputScriptPubKey(u.Address)
 		if err != nil {
-			return nil, fmt.Errorf("decode usdsoq input address %s: %w", u.Address, err)
+			return nil, err
 		}
-		inputSPK := soqaddr.WitnessProgram(witVer, witProg)
 
 		if err := tx.AddInput(u, inputSPK); err != nil {
 			return nil, fmt.Errorf("add usdsoq input: %w", err)
@@ -571,11 +575,10 @@ func BuildSendUSDSOQTransaction(
 	// Add SOQ inputs (for fee payment)
 	var totalSOQ int64
 	for _, u := range soqInputs {
-		witVer, witProg, err := soqaddr.Decode("ssq", u.Address)
+		inputSPK, err := inputScriptPubKey(u.Address)
 		if err != nil {
-			return nil, fmt.Errorf("decode soq input address %s: %w", u.Address, err)
+			return nil, err
 		}
-		inputSPK := soqaddr.WitnessProgram(witVer, witProg)
 
 		if err := tx.AddInput(u, inputSPK); err != nil {
 			return nil, fmt.Errorf("add soq input: %w", err)
@@ -627,6 +630,9 @@ func BuildSendTransaction(
 	changeScriptPubKey []byte,
 	feeRate int64,
 ) (*Transaction, error) {
+	if err := requireSameNetwork(inputs); err != nil {
+		return nil, err
+	}
 	tx := NewTransaction()
 
 	// Add inputs
@@ -635,11 +641,10 @@ func BuildSendTransaction(
 		// Derive the input's scriptPubKey from the UTXO's bech32m address.
 		// This is critical for BIP143 sighash computation — the scriptCode
 		// field must match what the node uses during verification.
-		witVer, witProg, err := soqaddr.Decode("ssq", u.Address)
+		inputSPK, err := inputScriptPubKey(u.Address)
 		if err != nil {
-			return nil, fmt.Errorf("decode input address %s: %w", u.Address, err)
+			return nil, err
 		}
-		inputSPK := soqaddr.WitnessProgram(witVer, witProg)
 
 		if err := tx.AddInput(u, inputSPK); err != nil {
 			return nil, fmt.Errorf("add input: %w", err)
@@ -671,4 +676,145 @@ func BuildSendTransaction(
 	}
 
 	return tx, nil
+}
+
+// inputScriptPubKey derives an input's scriptPubKey from its bech32m address,
+// taking the network from the address rather than assuming one.
+//
+// The scriptPubKey is what BIP143 commits to as the scriptCode, so the network
+// must never be a constant at the call site: a mismatch would not simply fail to
+// decode, it would sign over the wrong message.
+//
+// The derivation lives in soqaddr.ScriptFor so the SDK keeps exactly one
+// implementation of "address to scriptCode" rather than two that could drift.
+func inputScriptPubKey(addr string) ([]byte, error) {
+	return soqaddr.ScriptFor(addr)
+}
+
+// requireSameNetwork rejects a set of inputs that mix networks. Mixing them is
+// never legitimate, and silently building such a transaction would spend against
+// the wrong chain's scriptCode.
+func requireSameNetwork(utxos ...[]types.UTXO) error {
+	var first, firstAddr string
+	for _, set := range utxos {
+		for _, u := range set {
+			hrp, err := soqaddr.HRPOf(u.Address)
+			if err != nil {
+				return fmt.Errorf("address %s: %w", u.Address, err)
+			}
+			if first == "" {
+				first, firstAddr = hrp, u.Address
+				continue
+			}
+			if hrp != first {
+				return fmt.Errorf("inputs mix networks: %s is %q but %s is %q",
+					firstAddr, first, u.Address, hrp)
+			}
+		}
+	}
+	return nil
+}
+
+// ── Signing ────────────────────────────────────────────────────────────────
+
+// Signer produces a Dilithium signature over a digest for a managed address, and
+// the corresponding public key. *keys.Manager satisfies this interface.
+type Signer interface {
+	Sign(address string, digest []byte) ([]byte, error)
+	PublicKeyFor(address string) ([]byte, error)
+}
+
+// SignInput signs input i and installs the witness in the exact format consensus
+// requires.
+//
+// The format is not the obvious one, and getting it wrong produces a transaction
+// the node rejects with "bad-txns-requires-dilithium":
+//
+//	stack[0] = signature || sighash-type byte   (2421 bytes)
+//	stack[1] = 0x00 || public key               (1313 bytes)
+//
+// The trailing sighash byte follows Bitcoin convention. The leading 0x00 on the
+// public key is required by CTransaction::HasDilithiumSignatures, which checks
+// pk_blob[0] == 0x00 because NIST FIPS 204 Table 3 specifies that ML-DSA-44
+// public keys begin with that byte.
+//
+// Before this helper existed, the only signing example in the SDK assembled
+// [][]byte{sig, pubKey} with neither the sighash byte nor the 0x00 prefix, so
+// every transaction it produced was rejected by the node.
+func (tx *Transaction) SignInput(i int, signer Signer, hashType uint32) error {
+	if i < 0 || i >= len(tx.Inputs) {
+		return fmt.Errorf("input index %d out of range [0, %d)", i, len(tx.Inputs))
+	}
+	addr := tx.Inputs[i].Address
+	if addr == "" {
+		return fmt.Errorf("input %d has no address to sign for", i)
+	}
+
+	digest, err := tx.ComputeSigHash(i, hashType)
+	if err != nil {
+		return fmt.Errorf("sighash for input %d: %w", i, err)
+	}
+	sig, err := signer.Sign(addr, digest)
+	if err != nil {
+		return fmt.Errorf("sign input %d: %w", i, err)
+	}
+	pub, err := signer.PublicKeyFor(addr)
+	if err != nil {
+		return fmt.Errorf("public key for input %d (%s): %w", i, addr, err)
+	}
+	if len(sig) != types.SignatureSize {
+		return fmt.Errorf("input %d: signature is %d bytes, want %d",
+			i, len(sig), types.SignatureSize)
+	}
+	if len(pub) != types.PublicKeySize {
+		return fmt.Errorf("input %d: public key is %d bytes, want %d",
+			i, len(pub), types.PublicKeySize)
+	}
+
+	sigWithHashType := make([]byte, len(sig)+1)
+	copy(sigWithHashType, sig)
+	sigWithHashType[len(sig)] = byte(hashType)
+
+	prefixedPK := make([]byte, 1+len(pub))
+	prefixedPK[0] = 0x00 // FIPS 204 ML-DSA-44 marker, checked by consensus
+	copy(prefixedPK[1:], pub)
+
+	tx.Inputs[i].WitnessData = [][]byte{sigWithHashType, prefixedPK}
+	return nil
+}
+
+// SignAll signs every input with SIGHASH_ALL.
+func (tx *Transaction) SignAll(signer Signer) error {
+	for i := range tx.Inputs {
+		if err := tx.SignInput(i, signer, SigHashAll); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BuildAndSign builds, signs and serializes a simple send in one call, returning
+// the raw hex ready for sendrawtransaction and the transaction id.
+//
+// Prefer this over hand-wiring build, sighash, sign, witness assembly and
+// serialize: the witness format is Soqucoin-specific and easy to get wrong by a
+// byte at each end. Use BuildSendTransaction plus SignAll directly only when you
+// need the transaction itself, for example to read the change output's value.
+func BuildAndSign(
+	inputs []types.UTXO,
+	recipientScriptPubKey []byte,
+	amount int64,
+	changeScriptPubKey []byte,
+	feeRate int64,
+	signer Signer,
+) (rawHex string, txid string, err error) {
+	t, err := BuildSendTransaction(inputs, recipientScriptPubKey, amount,
+		changeScriptPubKey, feeRate)
+	if err != nil {
+		return "", "", err
+	}
+	if err := t.SignAll(signer); err != nil {
+		return "", "", err
+	}
+	return t.SerializeHex(), t.TxID(), nil
 }
