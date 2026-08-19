@@ -3,22 +3,16 @@
 //
 // CTxOut serialization golden vectors, pinned byte-identically to the C++ node.
 //
-// WHY THIS FILE EXISTS
+// These vectors are an EXTERNAL reference, which is the point of the file. A
+// serializer tested only against itself (determinism, byte-order reversal,
+// per-input sighash separation) cannot detect a format that is self-consistently
+// wrong, and CTxOut is exactly that kind of target: migration Phase 4 removed the
+// nVisibility and nAssetType extension bytes, so CTxOut is now standard Bitcoin
+// and asset and visibility follow the WITNESS VERSION instead. A stray two bytes
+// per output changes every txid and every BIP143 preimage while every
+// self-referential test still passes.
 //
-// Until v0.3.1 this SDK serialized two extra bytes after every scriptPubKey
-// (nVisibility, nAssetType). CTxOut migration Phase 4 removed those bytes from
-// consensus — CTxOut is now standard Bitcoin, and asset and visibility follow the
-// WITNESS VERSION instead. So every transaction this package produced was
-// malformed, every txid it computed was wrong, and because the same mistake was in
-// serializeAllOutputs, every BIP143 sighash was computed over the wrong preimage.
-//
-// The package had 60% statement coverage and a green suite at the time. Those
-// tests checked the serializer against ITSELF — determinism, byte-order reversal,
-// per-input sighash separation — which cannot detect a format that is
-// self-consistently wrong.
-//
-// The fix for that class of blind spot is an EXTERNAL reference. The vectors below
-// come from the production reference implementation
+// The vectors come from the production reference implementation
 // (soq-signer/internal/txbuilder/ctxout_matrix_test.go), which is itself pinned to
 // the node's own ctxout_format_matrix_tests.cpp. If consensus changes shape again,
 // these fail.

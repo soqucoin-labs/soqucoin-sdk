@@ -679,22 +679,14 @@ func BuildSendTransaction(
 }
 
 // inputScriptPubKey derives an input's scriptPubKey from its bech32m address,
-// deriving the network from the address rather than assuming one.
+// taking the network from the address rather than assuming one.
 //
-// This function exists because all four builders previously called
-// soqaddr.Decode("ssq", …), hardcoding the STAGENET prefix. Decode rejects a
-// mismatched prefix, so every builder failed on every mainnet address with
-// "expected ssq, got sq" — a message that reads like a malformed address rather
-// than a wrong assumption in the SDK. The SDK could not construct a mainnet
-// transaction at all.
+// The scriptPubKey is what BIP143 commits to as the scriptCode, so the network
+// must never be a constant at the call site: a mismatch would not simply fail to
+// decode, it would sign over the wrong message.
 //
-// The scriptPubKey is what BIP143 commits to as the scriptCode, so getting the
-// network wrong here would not merely fail loudly: if it ever succeeded, it would
-// produce a signature over the wrong message.
-//
-// The derivation itself lives in soqaddr.ScriptFor so that this SDK has exactly
-// one implementation of "address to scriptCode". Two would be free to drift, and
-// this is the function whose drift produced the fault above.
+// The derivation lives in soqaddr.ScriptFor so the SDK keeps exactly one
+// implementation of "address to scriptCode" rather than two that could drift.
 func inputScriptPubKey(addr string) ([]byte, error) {
 	return soqaddr.ScriptFor(addr)
 }
@@ -804,9 +796,10 @@ func (tx *Transaction) SignAll(signer Signer) error {
 // BuildAndSign builds, signs and serializes a simple send in one call, returning
 // the raw hex ready for sendrawtransaction and the transaction id.
 //
-// This is the function the documentation previously described as tx.Build, which
-// never existed. Callers had to hand-wire build, sighash, sign, witness assembly
-// and serialize, and the one example that did so assembled the witness wrongly.
+// Prefer this over hand-wiring build, sighash, sign, witness assembly and
+// serialize: the witness format is Soqucoin-specific and easy to get wrong by a
+// byte at each end. Use BuildSendTransaction plus SignAll directly only when you
+// need the transaction itself, for example to read the change output's value.
 func BuildAndSign(
 	inputs []types.UTXO,
 	recipientScriptPubKey []byte,

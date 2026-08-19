@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """Documentation integrity checks for the Soqucoin SDK.
 
-This exists because the repository has shipped two classes of documentation defect
-that were mechanically detectable and caught by no test:
+Documentation drifts from code silently: no compiler reads a Markdown fence, so a
+snippet can name a function that no longer exists and every other CI job stays
+green. This closes three of those gaps mechanically.
 
-  1. Docs referencing an API that does not exist. The README described
-     `tx.Build(...)` as the build-and-sign call for three months. It never
-     existed. SECURITY.md documented nine identifiers, none of them real. An
-     exchange evaluating the SDK found both before we did.
+  1. API references. Every `pkg.Identifier` in a Go code block is resolved
+     against `go doc -all` for that package, so a renamed or removed export is
+     caught in the docs that call it.
 
-  2. Broken internal anchor links. A sweep that reworded headings silently
-     invalidated every link pointing at them, including in the guide an
-     integrator reads first.
+  2. Snippet compilation. Every self-contained `package main` block is built
+     against this checkout. Naming a real API is not the same as working: missing
+     imports and undeclared variables surface here.
 
-  3. Snippets that do not compile. Referencing a real API is not the same as
-     working. The Quick Start's send-a-transaction program was missing three
-     imports and used two variables it never declared, so the first thing an
-     integrator copies would not build.
+  3. Anchor links. Every internal `#anchor` is resolved against the target file's
+     headings, so rewording a heading cannot quietly break the links to it.
 
 Run from anywhere:  python3 scripts/check-docs.py
 Exits non-zero on any problem, so it can gate CI.

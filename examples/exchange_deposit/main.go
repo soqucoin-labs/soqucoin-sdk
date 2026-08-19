@@ -8,12 +8,11 @@
 //   - Applying a confirmation threshold anchored to Soqucoin's finality horizon
 //   - Not crediting the same deposit twice
 //
-// This example previously credited at 6 confirmations. That is a Bitcoin rule of
-// thumb and it is wrong here: Soqucoin targets 1-minute blocks and declares its
-// own finality at nMaxReorgDepth = 288 blocks, so 6 confirmations is roughly six
-// minutes inside a window in which nodes will still accept a reorganisation. It
-// also contradicted the threshold table in docs/EXCHANGE_INTEGRATION.md, which
-// this example now implements.
+// Confirmation thresholds follow the table in docs/EXCHANGE_INTEGRATION.md and are
+// anchored to Soqucoin's own finality horizon rather than to a threshold carried
+// over from another chain. Soqucoin targets 1-minute blocks and sets
+// nMaxReorgDepth = 288, so a Bitcoin-style 6 confirmations would credit about six
+// minutes into a window in which nodes still accept a reorganisation.
 //
 // Usage:
 //

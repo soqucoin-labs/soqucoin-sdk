@@ -2,6 +2,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+
+# Default to read for the workflow; the release job opts up to contents: write
+# because it publishes release artifacts.
+permissions:
+  contents: read
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -11,9 +17,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Read from go.mod, not a hardcoded pin. The pin said 1.22 while go.mod
-      # requires 1.25, which only worked because Go silently downloads a newer
-      # toolchain, so the release was not built with the declared version.
+      # Read from go.mod rather than a separate pin, so releases are built with
+      # the toolchain the module declares.
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

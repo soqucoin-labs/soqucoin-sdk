@@ -293,11 +293,11 @@ func NetworkOf(addr string) (types.Network, error) {
 // ScriptFor returns the scriptPubKey for an address, deriving the network from
 // the address itself.
 //
-// Prefer this over Decode+WitnessProgram. Those require the caller to supply the
-// HRP, and callers reliably hardcode it: every builder in this SDK passed "ssq"
-// unconditionally, which made mainnet transactions impossible to construct. The
-// script produced here is what BIP143 commits to as the scriptCode, so getting
-// the network wrong is a signing fault, not just a decoding one.
+// Prefer this over Decode plus WitnessProgram, which require the caller to supply
+// the HRP and so invite hardcoding one. The script produced here is what BIP143
+// commits to as the scriptCode, which makes a wrong network a signing fault
+// rather than merely a decoding one, so it should come from the address and not
+// from a constant at the call site.
 func ScriptFor(addr string) ([]byte, error) {
 	n, err := NetworkOf(addr)
 	if err != nil {

@@ -1,17 +1,16 @@
 // Copyright (c) 2026 Soqucoin Labs Inc.
 // Distributed under the MIT software license, see LICENSE.
 //
-// The security guide told integrators to "always use TLS when connecting to
-// ElectrumX servers" and showed an electrumx.Dial(..., WithTLS()) call. Neither
-// the function nor TLS support existed: the client had no reference to crypto/tls
-// at all, so the advice could not be followed. These tests cover the support that
-// closes that gap.
-//
 // An ElectrumX server sees every address a client tracks, so plaintext over an
 // untrusted path discloses the whole deposit set and lets an attacker alter the
-// balances the caller acts on. The properties worth pinning are therefore: TLS is
-// really negotiated, verification is really on by default, and a reconnect cannot
-// silently drop back to plaintext.
+// balances the caller acts on. Transport security here is an integrity property
+// and not only a privacy one.
+//
+// Three things are worth pinning, because each fails silently: TLS is really
+// negotiated rather than configured and ignored, certificate verification is
+// really on by default, and a reconnect cannot drop back to plaintext. That last
+// one matters most, since the client reconnects automatically after two failed
+// polls and after a panic in the polling goroutine.
 
 package electrumx
 

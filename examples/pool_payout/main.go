@@ -8,24 +8,11 @@
 //   - Webhook alerting for operational monitoring
 //   - Build, sign, broadcast and confirm, with the txid checked against the node
 //
-// # WHAT THIS EXAMPLE USED TO DO, AND WHY IT WAS DANGEROUS
-//
-// This program previously described itself as "production-grade" and as "the
-// same architecture that powers soqupool's live payouts" while building no
-// transaction at all. It assigned rawTxHex = "..." and never broadcast. That by
-// itself would only be misleading; what made it dangerous is that it then went on
-// to mutate state as though it had:
-//
-//   - It called spentSet.MarkBroadcast with the literal txid
-//     "simulated_txid_example", writing that fiction into a PERSISTENT file, so
-//     real UTXOs were recorded as spent against a transaction that did not exist.
-//   - It injected a change UTXO into the ElectrumX cache under the same fake txid.
-//   - It logged "Broadcast TX" and returned nil, so the circuit breaker recorded
-//     SUCCESS for every payout.
-//
-// Adapted for a real pool, that marks miners paid without paying them. The
-// program now performs the payout, and -dry-run stops before any state changes
-// rather than faking its way past them.
+// The ordering here is deliberate and worth copying: nothing is recorded as spent
+// and no change is injected until the node has ACCEPTED the transaction. Marking
+// inputs spent optimistically drops them from selection while they are still
+// spendable, and recording a payout that did not land is how a pool marks a miner
+// paid without paying them. -dry-run stops before any of those effects.
 //
 // Usage:
 //
@@ -123,9 +110,9 @@ func run(cfg runConfig) error {
 		return err
 	}
 
-	// Derive the network from the pool address rather than assuming one. Passing
-	// the wrong HRP is how this SDK ended up unable to build mainnet transactions
-	// at all, so nothing here hardcodes a prefix.
+	// Derive the network from the pool address rather than assuming one. Nothing
+	// here hardcodes a prefix: the script derived from an address is what BIP143
+	// commits to as the scriptCode, so the network has to come from the address.
 	network, err := address.NetworkOf(cfg.poolAddress)
 	if err != nil {
 		return fmt.Errorf("pool address: %w", err)
@@ -237,8 +224,7 @@ func run(cfg runConfig) error {
 //
 // State is mutated only after the node has accepted the transaction. That
 // ordering is the whole point: marking UTXOs spent before a successful broadcast
-// loses them from selection while they are still spendable, and the previous
-// version of this file did exactly that against a txid it invented.
+// loses them from selection while they are still spendable.
 func executePayout(
 	rpcClient *rpc.Client,
 	elxClient *electrumx.Client,

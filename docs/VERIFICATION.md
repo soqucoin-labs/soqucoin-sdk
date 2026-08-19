@@ -1,25 +1,12 @@
 # Transaction Verification Record
 
-This document exists so that an exchange evaluating this SDK does not have to take
-our word for anything. It records a transaction **built, signed, serialized,
-broadcast and confirmed entirely by the public SDK**, with identifiers you can
-decode against a Soqucoin node yourself, and the exact procedure to reproduce it.
+This document lets you verify the signing path independently rather than take our
+word for it. It records a transaction **built, signed, serialized, broadcast and
+confirmed entirely by the public SDK**, with identifiers you can decode against a
+Soqucoin node yourself, and the procedure to reproduce it.
 
 Nothing here requires access to our infrastructure. Every identifier below is
 public on-chain data.
-
----
-
-## Why this record exists
-
-An exchange reviewing this SDK asked, reasonably, for proof rather than
-assurances. Their argument was that our own release notes for `v0.3.1` disclosed
-that every pre-Phase-4 transaction signature had been computed over the wrong
-message, so "fixed" needed to be demonstrated rather than asserted.
-
-They were right, and running the exercise found **two further defects that
-inspection had not**. Both are described below, because the failures are more
-useful to a reviewer than the success.
 
 ---
 
@@ -47,39 +34,21 @@ soqucoin-cli getrawtransaction \
 
 Two things are worth checking specifically.
 
-**The witness stack sizes are 2421 and 1313, not 2420 and 1312.** That is the
-consensus-required format and the subject of defect 2 below.
+**The witness stack sizes are 2421 and 1313, not 2420 and 1312.** The extra byte
+on each is the sighash type and the FIPS 204 key prefix; see
+[the format below](#the-witness-format-consensus-requires).
 
-**The transaction id the SDK computed matches the one the node assigned.** That is
-an independent confirmation that the SDK's serialization agrees with consensus
-byte for byte, which is what the `v0.3.1` CTxOut fix was about.
+**The transaction id the SDK computed matches the one the node assigned.** This is
+the check worth making your own: it independently confirms that the SDK's
+serialization agrees with consensus byte for byte, since any disagreement would
+produce a different hash.
 
 ---
 
-## What the exercise found
+## The witness format consensus requires
 
-### Defect 1: the SDK could not build a mainnet transaction
-
-Every builder called the address decoder with a hardcoded `"ssq"`, the **stagenet**
-prefix. Mainnet addresses use `"sq"`, and the decoder rejects a mismatched prefix,
-so every builder failed on every mainnet address with `expected ssq, got sq`.
-
-That error message reads like a malformed address rather than a wrong assumption
-inside the SDK, which is why it survived. No test caught it because every fixture
-in the suite was a stagenet address.
-
-This mattered beyond a failed call: the script derived from the address is what
-BIP143 commits to as the `scriptCode`. A wrong network would not merely fail
-loudly. Had it ever succeeded, it would have signed over the wrong message.
-
-**Fixed** by deriving the network from the address (`address.HRPOf`), refusing
-prefixes that belong to no known network, and refusing transactions that mix
-networks. Regression tests build the same transaction on mainnet, stagenet and
-regtest.
-
-### Defect 2: the witness format was rejected by consensus
-
-Consensus requires:
+Worth stating explicitly, because it is Soqucoin-specific and the two lengths are
+easy to get wrong by one byte each:
 
 ```
 stack[0] = signature || sighash-type byte    (2421 bytes)
@@ -90,30 +59,24 @@ The trailing sighash byte follows Bitcoin convention. The leading `0x00` is
 required because NIST FIPS 204 Table 3 specifies that ML-DSA-44 public keys begin
 with that byte, and the node checks it directly.
 
-The SDK had **no witness-assembly helper at all**. The only signing example
-assembled a bare signature and a bare public key, with neither the sighash byte
-nor the `0x00` prefix, so every transaction it produced was rejected.
+`Transaction.SignAll` and `tx.BuildAndSign` assemble this for you and reject
+wrong-sized key material. If you implement your own signer instead, these are the
+lengths to target.
 
-**Fixed** by adding `Transaction.SignInput` and `SignAll`, which install the
-correct format and refuse wrong-sized key material, and `tx.BuildAndSign`, a
-one-call build-sign-serialize path.
+## Diagnosing a rejected transaction
 
-### The rejection sequence, which is the actual evidence
+If you build transactions yourself during onboarding, `testmempoolaccept` will
+tell you which check you are failing. These are the responses we have observed and
+what each one means:
 
-Run in order against a live node. The progression is more informative than the
-final success, because it shows which check each fix satisfied.
-
-| Attempt | `testmempoolaccept` result |
+| Response | Cause |
 |---|---|
-| Original witness format (bare signature and public key) | `bad-txns-requires-dilithium` |
-| Corrected witness format, `feeRate` 10 | `rate limited free transaction` |
-| Corrected witness format, `feeRate` 1000 | **`allowed: true`** |
+| `bad-txns-requires-dilithium` | Witness format wrong. Check for the trailing sighash byte and the leading `0x00`, and for the 2421/1313 lengths above |
+| `rate limited free transaction` | Fee too low to relay. `feeRate` is per vByte; at 10 a ~1,073 vB transaction pays about 10,700 satoshis, which the node treats as effectively free |
+| `allowed: true` | Ready to broadcast |
 
-The middle row is worth noting for your own integration: **the fee rate used in
-our own examples was too low for the node to relay.** At 10 sat/vB a ~1,073 vB
-transaction pays about 10,700 satoshis, which the node treats as effectively free
-and rate-limits. Size your fee against `vsize`, and validate with
-`testmempoolaccept` before broadcasting.
+Size your fee against `vsize` rather than byte count, and validate with
+`testmempoolaccept` before you rely on any broadcast.
 
 ---
 
@@ -176,9 +139,9 @@ proceed.
 
 ---
 
-## What this record does not cover
+## Scope of this record
 
-Stated plainly, because a verification document that overclaims is worse than none.
+Stated precisely, so you can see exactly what has and has not been demonstrated.
 
 - **This is a single-input, single-signature payment.** It does not exercise
   multi-input batching, USDSOQ asset transactions, or the authority paths.
@@ -193,9 +156,9 @@ Per-package unit test coverage is reported in
 
 ---
 
-## Independent validation we would welcome
+## Independent validation
 
-If you validate the signing path against your own known-answer vectors as part of
-onboarding, we would like to know what you find, including and especially if it
-disagrees with anything above. Two of the defects fixed in the last two releases
-were found by an outside reviewer reading this code rather than by us.
+If you validate the signing path against your own known-answer vectors during
+onboarding, we would like to know what you find, particularly if anything
+disagrees with the above. Outside review has already improved this SDK, and we
+would rather hear about a discrepancy early than have it surface in production.

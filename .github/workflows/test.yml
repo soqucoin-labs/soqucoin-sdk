@@ -4,15 +4,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Least privilege: this workflow only reads the repository. Without an explicit
+# block the job inherits the repository or organization default, which is
+# read-write on anything created before February 2023.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
-      # Read the version from go.mod rather than pinning it here. The pin said
-      # 1.22 while go.mod required 1.25, which only worked because Go silently
-      # downloads a newer toolchain — so CI was not testing the declared version.
+      # Read the version from go.mod rather than pinning it separately, so CI
+      # always builds with the toolchain the module declares.
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -41,10 +49,8 @@ jobs:
       - name: Coverage
         run: go test -cover ./...
 
-      # Documentation defects this repo has actually shipped, all of them
-      # invisible to the tests above: code blocks calling functions that never
-      # existed (tx.Build, and nine identifiers in SECURITY.md), snippets that do
-      # not compile, and anchor links broken by rewording the headings they point
-      # at. An exchange evaluating the SDK found the first class before we did.
+      # No compiler reads a Markdown fence, so documentation can drift from the
+      # code while every job above stays green. This compiles the snippets,
+      # resolves API references against the real packages, and checks anchors.
       - name: Documentation
         run: python3 scripts/check-docs.py

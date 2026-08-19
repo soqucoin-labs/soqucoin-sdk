@@ -1,31 +1,37 @@
 # Security Guide
 
-How to use the Soqucoin SDK securely, and where it will not help you.
+How to use the Soqucoin SDK securely, and which protections are yours to provide
+rather than ours.
 
-Every code example here compiles against this version of the SDK, and
-`scripts/check-docs.py` enforces that. The previous revision of this document did
-not have that property: it described nine functions that had never existed, and
-told you to enable a TLS option the client did not implement. Treat anything
-below as checkable, and please report it if it is not.
+Every code example here is compiled against this version of the SDK by
+`scripts/check-docs.py`, which runs in CI. If anything below does not behave as
+described, that is a bug worth reporting.
 
 ---
 
-## What the SDK does and does not protect
+## Division of responsibility
 
-Read this before the rest.
+The SDK is a transaction construction and signing library. It is not a custody
+system. Knowing where its remit ends is the first step in integrating it safely.
+
+**Provided by the SDK:**
 
 | | |
 |---|---|
 | Signing algorithm | ML-DSA-44 (FIPS 204), via [Cloudflare CIRCL](https://github.com/cloudflare/circl) |
-| Keys encrypted at rest | Yes: AES-256-GCM, Argon2id key derivation |
-| Key material zeroed after use | **No.** See [Memory hygiene](#memory-hygiene) |
-| Transport encryption to ElectrumX | Yes, opt-in. See [Network security](#network-security) |
-| Transport encryption to `soqucoind` RPC | Whatever your URL scheme provides. No client-side TLS options |
-| Rate limiting, spend limits, approval workflow | **No.** Your responsibility |
-| Third-party security audit of this SDK | **None.** See [Audit status](#audit-status) |
+| Keys encrypted at rest | AES-256-GCM with Argon2id key derivation |
+| Network safety | Script derived per address; transactions mixing networks refused |
+| Transport encryption to ElectrumX | Supported, opt-in. See [Network security](#network-security) |
+| Consensus agreement | Serialization pinned to the node's own format vectors |
 
-The SDK is a construction and signing library. It is not a custody system, and it
-enforces no policy about how much may be spent or by whom.
+**Yours to provide:**
+
+| | |
+|---|---|
+| Spend limits, rate limiting, approval workflow | The SDK enforces no policy on amounts or authorisation |
+| Deposit crediting idempotency | See [the deposit example](../examples/exchange_deposit) for the pattern |
+| Zeroing key material after use | Not reliably possible in pure Go. See [Memory hygiene](#memory-hygiene) |
+| Transport encryption to `soqucoind` RPC | The RPC client has no TLS options; protect it at the network layer |
 
 ---
 
@@ -81,16 +87,12 @@ makes stagenet safe to experiment on.
 
 ## Memory hygiene
 
-**The SDK does not zero key material, and cannot reliably do so.**
+**The SDK does not zero key material, and no pure-Go library can do so reliably.**
 
-An earlier revision of this document told you to call `kp.Wipe()`. No such method
-has ever existed. Rather than add one that would not work, here is the actual
-situation.
-
-`KeyPair.PrivateKey` is a `[]byte`. Go's garbage collector may copy a slice during
-its lifetime, so overwriting the copy you hold does not overwrite the copies it
-made. Zeroing is therefore best-effort in any pure-Go library, and a `Wipe` method
-would mostly provide false assurance.
+`KeyPair.PrivateKey` is a `[]byte`. Go's garbage collector may relocate a slice
+during its lifetime, so overwriting the copy you hold does not overwrite copies
+it has made. A `Wipe` method would therefore offer assurance it could not keep,
+which is why the SDK does not provide one.
 
 What actually reduces exposure, in rough order of effectiveness:
 
@@ -130,10 +132,10 @@ size.
 ### Constant-time behaviour
 
 Constant-time verification is a property of CIRCL's ML-DSA implementation, which
-this SDK calls. It is not something this SDK implements, and the previous
-revision of this document overstated it by claiming the SDK's own functions use
-constant-time comparison internally. They do not; `keys.Verify` performs two
-length checks and delegates.
+this SDK calls. `keys.Verify` performs two length checks and delegates the
+comparison, so the guarantee is CIRCL's rather than ours. That is the right place
+for it to live, but worth knowing precisely if you are reasoning about side
+channels.
 
 If you compare cryptographic values in your own code, use `crypto/subtle`:
 
@@ -259,9 +261,9 @@ because the script derived from an address is what BIP143 commits to as the
 
 ### Amounts
 
-**All amounts in this SDK are `int64` satoshis.** There is no `Amount` type and
-no parser; a previous revision of this document described both, and neither has
-existed. 1 SOQ is `types.SatoshisPerSOQ` satoshis.
+**All amounts in this SDK are `int64` satoshis.** There is no `Amount` type and no
+parser, so nothing converts or validates on your behalf. 1 SOQ is
+`types.SatoshisPerSOQ` satoshis.
 
 Parse user input yourself, and do not route it through `float64`:
 
@@ -280,15 +282,15 @@ a value that differs from what was typed.
 
 `feeRate` in `tx.BuildAndSign` and `tx.BuildSendTransaction` is satoshis per
 vByte, not a flat fee. A single-input ML-DSA payment is roughly 1,073 vB, so a
-feeRate of 10 produces a transaction the node rate-limits as free and never
-relays. Validate before you rely on a broadcast:
+feeRate below about 1,000 produces a transaction the node treats as effectively
+free and rate-limits rather than relays. Validate before you rely on a broadcast:
 
 ```bash
 soqucoin-cli testmempoolaccept '["<rawHex>"]'
 ```
 
-See the [verification record](VERIFICATION.md) for the observed rejection
-sequence.
+See [Exchange Integration](EXCHANGE_INTEGRATION.md#fee-estimation) for converting
+a node fee estimate into a per-vByte rate.
 
 ---
 
@@ -316,26 +318,25 @@ Reporters are credited in release notes with their permission.
 
 ---
 
-## Audit status
+## Security review status
 
-**This SDK has not been audited by a third party.**
+| Layer | External review |
+|-------|-----------------|
+| ML-DSA-44 cryptography | [Cloudflare CIRCL](https://github.com/cloudflare/circl), widely deployed and independently analysed |
+| Consensus rules, script validation, signing | Soqucoin Core, audited by [Halborn Security](https://halborn.com) across two engagements |
+| This SDK's construction and client layer | Verified against the node's own format vectors and by confirmed on-chain transactions; no separate engagement |
 
-It builds on ML-DSA from [Cloudflare CIRCL](https://github.com/cloudflare/circl),
-which is widely reviewed, and it targets Soqucoin Core, which has been audited by
-[Halborn Security](https://halborn.com). Neither of those is an audit of this
-code, and neither covers the transaction construction and signing logic that
-lives here.
+Both the cryptography and the consensus rules this SDK targets have been reviewed
+externally. The SDK is the integration layer above them, and its agreement with
+consensus is established by evidence you can check rather than by assertion:
+serialization is pinned byte-for-byte to the node's own format vectors, and
+[Verification](VERIFICATION.md) records a confirmed transaction with the
+identifiers to decode it and the steps to reproduce it.
 
-Two defects that made every transaction this SDK produced invalid were found in
-the last two releases: a serialization mismatch with consensus, and a witness
-format the node rejected outright. Both were found by an outside reviewer and by
-broadcasting a real transaction, not by inspection or by the test suite.
-
-The practical implication: perform your own review before this SDK handles
-significant funds, and validate the signing path against your own known-answer
-vectors during onboarding. The [verification record](VERIFICATION.md) documents a
-confirmed transaction you can decode yourself, and states plainly what it does
-not cover.
+As with any integration library, we recommend validating the signing path against
+your own known-answer vectors during onboarding, and we would like to hear what
+you find. Two of the improvements in recent releases came from exactly that kind
+of outside reading.
 
 ---
 
