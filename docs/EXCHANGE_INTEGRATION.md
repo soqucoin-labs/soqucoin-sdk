@@ -307,6 +307,29 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 
 ---
 
+## Verification: a real confirmed transaction
+
+Rather than asking you to trust that the signing path works, there is a
+[verification record](VERIFICATION.md) for a stagenet transaction **built, signed,
+serialized, broadcast and confirmed entirely by this SDK**:
+
+| | |
+|---|---|
+| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` |
+| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` |
+| Witness stack | `[2421, 1313]` bytes, the consensus-required format |
+
+The transaction id the SDK computed matches the one the node assigned, which
+independently confirms that serialization agrees with consensus byte for byte.
+
+That document also records the **two defects the exercise found that inspection had
+not**, the rejection sequence showing which check each fix satisfied, and the steps
+to reproduce it against your own node. It is worth reading before you scope the
+integration: one of the findings is that **the fee rate used in our own examples
+was too low for the node to relay.**
+
+---
+
 ## Test Coverage, current status
 
 Every package now carries unit tests. Measured with `go test -cover ./...`:

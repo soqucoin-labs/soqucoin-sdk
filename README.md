@@ -46,7 +46,7 @@ definition, so we publish a fork:
 
 Run your own instance (recommended: no dependency on our infrastructure) or connect to one we
 operate. See
-[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model--read-this-first) for both
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model-read-this-first) for both
 options and the full walkthrough.
 
 ## Features
@@ -152,13 +152,14 @@ The tests target invariants whose failure is *silent* rather than a coverage per
 order, per-input BIP143 sighash separation, USDSOQ never counted as native SOQ, stale UTXOs both
 dropped and evicted, and RPC errors never surfacing as usable zero values. Where coverage is thin
 it is stated plainly, with the reason, in
-[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage--current-status).
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage-current-status).
 
 ## Documentation
 
 - **[Quick Start](docs/QUICK_START.md)**: Generate an address, check balance, send SOQ in 5 minutes
 - **[Exchange Integration](docs/EXCHANGE_INTEGRATION.md)**: Step-by-step guide for listing SOQ on your exchange
 - **[Security](docs/SECURITY.md)**: Key storage, memory hygiene, vulnerability reporting
+- **[Verification](docs/VERIFICATION.md)**: a confirmed transaction built and signed by this SDK, with the identifiers to decode it yourself and the steps to reproduce it
 
 ## Post-Quantum Cryptography
 
