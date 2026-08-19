@@ -1,6 +1,6 @@
 # soqucoin-sdk
 
-**Go SDK for Soqucoin — integrate SOQ in hours, not weeks.**
+**Go SDK for Soqucoin: integrate SOQ in hours, not weeks.**
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/soqucoin-labs/soqucoin-sdk.svg)](https://pkg.go.dev/github.com/soqucoin-labs/soqucoin-sdk)
 [![CI](https://github.com/soqucoin-labs/soqucoin-sdk/actions/workflows/test.yml/badge.svg)](https://github.com/soqucoin-labs/soqucoin-sdk/actions/workflows/test.yml)
@@ -10,7 +10,7 @@
 
 ## What is Soqucoin?
 
-Soqucoin (SOQ) is the first NIST FIPS 204 (ML-DSA / Dilithium) post-quantum cryptocurrency. Every on-chain signature uses ML-DSA-44 — no classical elliptic-curve fallback. This SDK gives you everything you need to build wallets, exchanges, mining pools, and services on top of SOQ.
+Soqucoin (SOQ) is the first NIST FIPS 204 (ML-DSA / Dilithium) post-quantum cryptocurrency. Every on-chain signature uses ML-DSA-44, with no classical elliptic-curve fallback. This SDK gives you everything you need to build wallets, exchanges, mining pools, and services on top of SOQ.
 
 ## Install
 
@@ -24,14 +24,14 @@ Requires **Go 1.25+** (per the `go` directive in `go.mod`).
 
 **You run the node. You do not use the node's built-in wallet.** `soqucoind` ships with
 `disablewallet=1`, so wallet RPCs (`listunspent`, `getbalance`, `sendtoaddress`) are not part of the
-integration surface. You still perform wallet *functions* — address derivation, key custody,
-signing — but they run in your own infrastructure through this SDK. The node is a chain reader and
+integration surface. You still perform wallet *functions* (address derivation, key custody,
+signing), but they run in your own infrastructure through this SDK. The node is a chain reader and
 broadcaster; your key vault stays your key vault.
 
 | Component | What you use | SDK package |
 |-----------|--------------|-------------|
 | Address derivation | Your own key store | [`keys`](./keys), [`address`](./address) |
-| Chain watching | **ElectrumX indexer** (required — see note) | [`electrumx`](./electrumx) |
+| Chain watching | **ElectrumX indexer** (required, see note) | [`electrumx`](./electrumx) |
 | Signing | Your signing infrastructure | [`keys`](./keys), [`tx`](./tx) |
 | Broadcast + chain reads | Node JSON-RPC | [`rpc`](./rpc) |
 
@@ -42,9 +42,9 @@ confined to signature construction, which this SDK handles.
 deposit monitoring reads from an ElectrumX indexer. Upstream ElectrumX ships no Soqucoin coin
 definition, so we publish a fork:
 
-> **[soqucoin-labs/electrumx](https://github.com/soqucoin-labs/electrumx)** — branch `soqucoin`
+> **[soqucoin-labs/electrumx](https://github.com/soqucoin-labs/electrumx)**, branch `soqucoin`
 
-Run your own instance (recommended — no dependency on our infrastructure) or connect to one we
+Run your own instance (recommended: no dependency on our infrastructure) or connect to one we
 operate. See
 [Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model--read-this-first) for both
 options and the full walkthrough.
@@ -59,7 +59,7 @@ options and the full walkthrough.
 | **ElectrumX UTXO tracking** | Production-hardened TCP client with 4MB buffer, merge refresh, auto-reconnect |
 | **Node RPC client** | JSON-RPC client for `soqucoind` with Defense 11 (gettxout pre-verify) |
 | **UTXO coin selection** | Largest-first, smallest-first (consolidation), asset-type-aware, dust filtering |
-| **Persistent spent set** | Never re-spend a UTXO — survives process restarts via JSON persistence |
+| **Persistent spent set** | Never re-spend a UTXO, which survives process restarts via JSON persistence |
 | **Circuit breaker** | Halt operations after consecutive failures, probe, recover |
 | **Reconciliation** | Periodic UTXO balance verification to detect drift |
 | **Webhook alerting** | Slack-compatible notifications for circuit breaker transitions |
@@ -115,7 +115,7 @@ spentSet.MarkBroadcast(verified, txid)
 | [`tx`](./tx) | Transaction building, signing, serialization (wire format) |
 | [`types`](./types) | Shared types: UTXO, Network, asset type constants |
 | [`electrumx`](./electrumx) | Production-hardened ElectrumX TCP client (PF-018, F5, Defense 12) |
-| [`rpc`](./rpc) | JSON-RPC client for `soqucoind` — sendrawtransaction, gettxout, getblock |
+| [`rpc`](./rpc) | JSON-RPC client for `soqucoind` (sendrawtransaction, gettxout, getblock) |
 | [`utxo`](./utxo) | UTXO coin selection + persistent spent set tracking |
 | [`resilience`](./resilience) | Circuit breaker, reconciler, and Slack webhook alerter |
 | [`client`](./client) | High-level client combining RPC + ElectrumX for common flows |
@@ -126,13 +126,13 @@ This SDK was extracted from the canonical `soq-signer` service that has been run
 
 | Defense | What it prevents | Origin |
 |---------|-----------------|--------|
-| **Defense 11** | Stale UTXO signing — `gettxout` pre-verification | 2 weeks of failed payouts |
-| **Defense 12** | SpentPending flag loss — merge refresh instead of replace | Race condition during polling |
-| **Defense 13** | Change output delay — inject change immediately | Back-to-back payment failures |
-| **PF-018** | Bufio panic on large responses — 4MB read buffer | 18,000+ UTXO address |
-| **F5** | Broken pipe after idle — TCP keepalive 30s | NAT/firewall timeout |
-| **PF-018b** | TCP stream corruption — connection mutex | Concurrent broadcast+poll |
-| **Circuit Breaker** | Infinite retry loops — automatic backoff | Node outage cascade |
+| **Defense 11** | Stale UTXO signing, via `gettxout` pre-verification | 2 weeks of failed payouts |
+| **Defense 12** | SpentPending flag loss, via merge refresh instead of replace | Race condition during polling |
+| **Defense 13** | Change output delay, by injecting change immediately | Back-to-back payment failures |
+| **PF-018** | Bufio panic on large responses, via a 4MB read buffer | 18,000+ UTXO address |
+| **F5** | Broken pipe after idle, via TCP keepalive at 30s | NAT/firewall timeout |
+| **PF-018b** | TCP stream corruption, via a connection mutex | Concurrent broadcast+poll |
+| **Circuit Breaker** | Infinite retry loops, via automatic backoff | Node outage cascade |
 
 ## Test Coverage
 
@@ -156,9 +156,9 @@ it is stated plainly, with the reason, in
 
 ## Documentation
 
-- **[Quick Start](docs/QUICK_START.md)** — Generate an address, check balance, send SOQ in 5 minutes
-- **[Exchange Integration](docs/EXCHANGE_INTEGRATION.md)** — Step-by-step guide for listing SOQ on your exchange
-- **[Security](docs/SECURITY.md)** — Key storage, memory hygiene, vulnerability reporting
+- **[Quick Start](docs/QUICK_START.md)**: Generate an address, check balance, send SOQ in 5 minutes
+- **[Exchange Integration](docs/EXCHANGE_INTEGRATION.md)**: Step-by-step guide for listing SOQ on your exchange
+- **[Security](docs/SECURITY.md)**: Key storage, memory hygiene, vulnerability reporting
 
 ## Post-Quantum Cryptography
 
@@ -174,10 +174,10 @@ Key properties:
 
 See the [`examples/`](./examples) directory:
 
-- [`generate_address`](./examples/generate_address) — Create a new wallet address
-- [`send_transaction`](./examples/send_transaction) — Build and broadcast a transaction
-- [`exchange_deposit`](./examples/exchange_deposit) — Monitor incoming deposits (exchange flow)
-- [`pool_payout`](./examples/pool_payout) — Batch payouts with circuit breaker
+- [`generate_address`](./examples/generate_address): Create a new wallet address
+- [`send_transaction`](./examples/send_transaction): Build and broadcast a transaction
+- [`exchange_deposit`](./examples/exchange_deposit): Monitor incoming deposits (exchange flow)
+- [`pool_payout`](./examples/pool_payout): Batch payouts with circuit breaker
 
 ## Contributing
 
@@ -191,6 +191,6 @@ go test ./...
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
 
 Copyright © 2026 [Soqucoin Labs Inc.](https://soqucoin.com)

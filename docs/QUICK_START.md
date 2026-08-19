@@ -4,7 +4,7 @@ Get up and running with the Soqucoin SDK in five minutes.
 
 ## Prerequisites
 
-- **Go 1.22+** — [download](https://go.dev/dl/)
+- **Go 1.22+**: [download](https://go.dev/dl/)
 - A running `soqucoind` node or ElectrumX server (optional for address generation)
 
 ## Install
@@ -41,7 +41,7 @@ func main() {
 	fmt.Printf("PubKey:   %d bytes\n", len(kp.PublicKey))  // 1312 bytes
 	fmt.Printf("PrivKey:  %d bytes\n", len(kp.PrivateKey)) // 2560 bytes
 
-	// For mainnet, use types.Mainnet.HRP — produces sq1p... addresses
+	// For mainnet, use types.Mainnet.HRP, produces sq1p... addresses
 }
 ```
 
@@ -62,7 +62,7 @@ import (
 )
 
 func main() {
-	// Connect to ElectrumX (TCP, no TLS — standard for local/LAN)
+	// Connect to ElectrumX (TCP, no TLS, standard for local/LAN)
 	client := electrumx.NewClient("localhost:50001", 15*time.Second)
 	client.HRP = types.Stagenet.HRP // "ssq" for stagenet
 	if err := client.Connect(); err != nil {
@@ -88,7 +88,7 @@ func main() {
 	// List individual UTXOs
 	utxos := client.GetUTXOs(myAddr)
 	for _, u := range utxos {
-		fmt.Printf("  %s:%d — %d sat (height %d)\n", u.TxID[:12], u.Vout, u.Value, u.Height)
+		fmt.Printf("  %s:%d, %d sat (height %d)\n", u.TxID[:12], u.Vout, u.Value, u.Height)
 	}
 }
 ```
@@ -175,13 +175,13 @@ The SDK supports three networks. Use the `types` package constants:
 ```go
 import "github.com/soqucoin-labs/soqucoin-sdk/types"
 
-// Mainnet — production. Addresses start with "sq1p"
+// Mainnet, production. Addresses start with "sq1p"
 types.Mainnet.HRP  // "sq"
 
-// Stagenet — testing. Addresses start with "ssq1p"
+// Stagenet, testing. Addresses start with "ssq1p"
 types.Stagenet.HRP // "ssq"
 
-// Regtest — local development. Addresses start with "ssqrt1p"
+// Regtest, local development. Addresses start with "ssqrt1p"
 types.Regtest.HRP  // "ssqrt"
 ```
 
@@ -194,10 +194,10 @@ For production systems (exchanges, pools, services), add these layers:
 ```go
 import "github.com/soqucoin-labs/soqucoin-sdk/resilience"
 
-// Circuit breaker — halt after 3 failures, 15 min cooldown
+// Circuit breaker, halt after 3 failures, 15 min cooldown
 cb := resilience.NewCircuitBreaker(3, 15*time.Minute)
 
-// Webhook alerter — Slack notifications on CB state changes
+// Webhook alerter, Slack notifications on CB state changes
 alerter := resilience.NewAlerter(os.Getenv("ALERT_WEBHOOK_URL"))
 alerter.WireToCircuitBreaker(cb)
 
@@ -210,6 +210,6 @@ if err := cb.Allow(); err != nil {
 
 ## Next Steps
 
-- **[Exchange Integration Guide](EXCHANGE_INTEGRATION.md)** — Full walkthrough for listing SOQ
-- **[Security Guide](SECURITY.md)** — Key storage, memory hygiene, vulnerability reporting
-- **[API Reference](https://pkg.go.dev/github.com/soqucoin-labs/soqucoin-sdk)** — Full package documentation
+- **[Exchange Integration Guide](EXCHANGE_INTEGRATION.md)**: Full walkthrough for listing SOQ
+- **[Security Guide](SECURITY.md)**: Key storage, memory hygiene, vulnerability reporting
+- **[API Reference](https://pkg.go.dev/github.com/soqucoin-labs/soqucoin-sdk)**: Full package documentation
