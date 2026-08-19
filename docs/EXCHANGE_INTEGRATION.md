@@ -66,12 +66,26 @@ and we would rather you choose than discover it later:
 
 | Option | What it means | Trade-off |
 |--------|---------------|-----------|
-| **A. You run your own** | You operate an ElectrumX instance alongside your node, as you may already do for other UTXO coins | ✅ No dependency on our infrastructure, no shared point of failure. ⚠️ Requires the Soqucoin coin definition from us |
+| **A. You run your own** | You operate an ElectrumX instance alongside your node, as you may already do for other UTXO coins | ✅ No dependency on our infrastructure, no shared point of failure |
 | **B. You connect to ours** | You point the SDK at an ElectrumX endpoint we operate | ✅ Nothing extra to run. ⚠️ Creates a hard dependency on our availability for your deposit crediting, which most exchanges reasonably refuse |
 
-**We recommend Option A** and will provide the Soqucoin coin definition and configuration needed to
-run it. Upstream ElectrumX does not ship Soqucoin support, so this is something we supply rather
-than something you can pull from `spesmilo/electrumx` directly.
+**We recommend Option A, and the software is published:**
+
+> **https://github.com/soqucoin-labs/electrumx** — branch `soqucoin`
+
+Upstream ElectrumX ships no Soqucoin coin definition, so that fork is what you need. It is based on
+a pinned upstream commit rather than tracking `master`, so the entire Soqucoin delta is reviewable
+in one command:
+
+```bash
+git diff 24865dc..soqucoin -- src/
+```
+
+Roughly 183 lines across four files: the coin definitions (AuxPoW-aware headers), asset and
+visibility derivation from the witness version, UTXO records carrying that metadata, and one
+protocol extension (`get_multi_balance`) for per-asset balances. [`SOQUCOIN.md`](https://github.com/soqucoin-labs/electrumx/blob/soqucoin/SOQUCOIN.md)
+in that repository documents the configuration and the caveats, including the fact that the
+**mainnet genesis hash is a placeholder until genesis is mined**. Upstream `LICENCE` is unchanged.
 
 **So the question we need answered:** do you run your own indexer for UTXO-model coins, or would
 you expect to connect to one we operate? That answer changes both the integration effort and where

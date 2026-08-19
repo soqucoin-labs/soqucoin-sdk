@@ -39,9 +39,13 @@ The node behaves as an ordinary Bitcoin-style JSON-RPC daemon, and the post-quan
 confined to signature construction, which this SDK handles.
 
 ⚠️ **ElectrumX is required.** With the node wallet disabled there is no address index to query, so
-deposit monitoring reads from an ElectrumX indexer. Upstream ElectrumX does not ship Soqucoin
-support, so we supply the coin definition. You can run your own instance (recommended — no
-dependency on our infrastructure) or connect to one we operate. See
+deposit monitoring reads from an ElectrumX indexer. Upstream ElectrumX ships no Soqucoin coin
+definition, so we publish a fork:
+
+> **[soqucoin-labs/electrumx](https://github.com/soqucoin-labs/electrumx)** — branch `soqucoin`
+
+Run your own instance (recommended — no dependency on our infrastructure) or connect to one we
+operate. See
 [Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model--read-this-first) for both
 options and the full walkthrough.
 
