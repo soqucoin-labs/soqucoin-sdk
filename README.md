@@ -18,7 +18,26 @@ Soqucoin (SOQ) is the first NIST FIPS 204 (ML-DSA / Dilithium) post-quantum cryp
 go get github.com/soqucoin-labs/soqucoin-sdk
 ```
 
-Requires **Go 1.22+**.
+Requires **Go 1.25+** (per the `go` directive in `go.mod`).
+
+## Integration model
+
+**You do not run a Soqucoin wallet.** Nodes run as a pure blockchain interface with
+`disablewallet=1`, so wallet RPCs are not part of the integration surface. Key management stays in
+your own infrastructure.
+
+| Component | What you use | SDK package |
+|-----------|--------------|-------------|
+| Address derivation | Your own key store | [`keys`](./keys), [`address`](./address) |
+| Chain watching | ElectrumX indexer | [`electrumx`](./electrumx) |
+| Signing | Your signing infrastructure | [`keys`](./keys), [`tx`](./tx) |
+| Broadcast + chain reads | Node JSON-RPC | [`rpc`](./rpc) |
+
+This is the standard pattern for integrating a UTXO chain at scale, not a Soqucoin-specific
+arrangement — the node behaves as an ordinary Bitcoin-style JSON-RPC daemon, and the post-quantum
+specifics are confined to signature construction, which this SDK handles. See
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#integration-model--read-this-first) for the
+full walkthrough.
 
 ## Features
 
