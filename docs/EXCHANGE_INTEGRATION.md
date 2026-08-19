@@ -89,8 +89,12 @@ func StartDepositMonitor(depositAddresses []string) {
 					continue
 				}
 
+				// See "Step 4: Confirm Transactions" for thresholds. 288 is the
+				// chain's own finality horizon (nMaxReorgDepth); crediting below it
+				// accepts reorg risk the protocol does not consider settled.
+				const minConfirmations = 288
 				confirmations := tipHeight - u.Height + 1
-				if confirmations >= 6 {
+				if confirmations >= minConfirmations {
 					// Credit user — use txid:vout as idempotency key
 					log.Printf("Confirmed deposit: %s:%d — %.8f SOQ (%d conf)",
 						u.TxID[:12], u.Vout,
@@ -187,14 +191,71 @@ func ProcessWithdrawal(
 
 ## Step 4: Confirm Transactions
 
-SOQ uses a 1-minute block target. Recommended confirmation thresholds:
+SOQ uses a **1-minute block target**. Anchor your thresholds to two consensus parameters rather
+than to a rule of thumb carried over from another chain:
 
-| Use Case | Confirmations | Approximate Time |
-|----------|:-------------:|:----------------:|
-| Small deposits (<1,000 SOQ) | 6 | ~6 minutes |
-| Medium deposits (1K–100K SOQ) | 12 | ~12 minutes |
-| Large deposits (>100K SOQ) | 30 | ~30 minutes |
-| Withdrawal finality | 6 | ~6 minutes |
+| Parameter | Value | Meaning |
+|-----------|:-----:|---------|
+| `nMaxReorgDepth` | **288 blocks** (~4.8 h) | The chain's own finality horizon. Nodes reject reorganisations deeper than this |
+| `nCoinbaseMaturity` | **240 blocks** (~4 h) | Newly mined coins are unspendable until this depth, enforced by consensus |
+
+Recommended thresholds:
+
+| Use Case | Confirmations | Approximate Time | Rationale |
+|----------|:-------------:|:----------------:|-----------|
+| Zero-confirmation display | 0 | instant | Show as *pending only*. Never credit |
+| Small deposits | 30 | ~30 min | Bounded, recoverable loss if reorganised |
+| Medium deposits | 120 | ~2 h | Materially past any plausible reorg depth |
+| Large deposits | **288** | ~4.8 h | Matches the chain's own finality horizon |
+| Mining / coinbase payouts | **240 minimum** | ~4 h | Consensus-enforced; the output cannot be spent earlier regardless of policy |
+| Withdrawal release | 288 | ~4.8 h | Do not release outbound value against inbound funds the chain does not yet treat as final |
+
+**Set your own thresholds against value at risk. The table is a floor, not a ceiling.**
+
+### Why these are higher than a typical Bitcoin-style table
+
+Two reasons, both worth understanding before tuning them down:
+
+1. **The chain declares its own finality at 288 blocks.** Crediting a large deposit at 6
+   confirmations means accepting reorganisation risk the protocol itself does not consider settled.
+   Below 288 you are taking a position the chain has not taken.
+2. **Absolute hashrate matters more than block interval on a young chain.** Confirmation count is a
+   proxy for accumulated work. Early in a chain's life, and while hashrate is concentrated among a
+   small number of mining participants, producing a competing chain of N blocks costs far less than
+   the same N blocks would cost on a mature network. Prefer depth over speed until sustained
+   third-party hashrate exists.
+
+If low-latency credit matters to your product, credit small amounts quickly against your own risk
+budget and hold larger amounts to 288, rather than lowering the threshold uniformly.
+
+---
+
+## Test Coverage — current status
+
+We would rather state this plainly than have you find it during review.
+
+| Package | Coverage | Notes |
+|---------|:--------:|-------|
+| `address` | ✅ unit tested | Bech32m encoding and checksum validation |
+| `keys` | ✅ unit tested | Dilithium keypair generation and derivation |
+| `resilience` | ✅ unit tested | Circuit breaker state transitions |
+| `utxo` | ✅ unit tested | Coin selection and persistent spent set |
+| `tx` | ⏳ **in progress** | Transaction construction and signing |
+| `rpc` | ⏳ **in progress** | Node JSON-RPC client |
+| `electrumx` | ⏳ **in progress** | UTXO tracking client |
+| `client` | ⏳ **in progress** | soq-signer HTTP client |
+
+**Unit tests for the remaining packages are actively being written and will be published as soon
+as they are ready.** We will update this table as each lands.
+
+Context on the untested packages, offered as explanation rather than excuse: the transaction
+construction, RPC and signer-client code in this SDK is extracted from `soq-signer`, the payout
+service that has been running continuously in production against our live network. It is exercised
+daily by real traffic. That is operational evidence, not unit coverage, and we are not presenting
+it as equivalent — dedicated unit tests are the gap and they are being closed.
+
+If test coverage on a specific path is a gating requirement for your listing review, tell us which
+package matters most and we will prioritise it.
 
 ---
 

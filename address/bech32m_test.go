@@ -8,7 +8,7 @@ import (
 func TestDecodeValid(t *testing.T) {
 	// Known Soqucoin stagenet addresses (from wallet output)
 	tests := []struct {
-		addr   string
+		addr    string
 		wantVer byte
 		wantLen int
 	}{

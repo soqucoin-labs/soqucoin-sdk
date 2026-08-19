@@ -77,9 +77,9 @@ func main() {
 	// ── Step 3: Build payout list ──
 	// In production, this comes from your pool's balance database
 	payouts := []Payout{
-		{Address: "ssq1p...", Amount: 5000_00000000},  // 5000 SOQ to miner A
-		{Address: "ssq1p...", Amount: 2500_00000000},  // 2500 SOQ to miner B
-		{Address: "ssq1p...", Amount: 1200_00000000},  // 1200 SOQ to miner C
+		{Address: "ssq1p...", Amount: 5000_00000000}, // 5000 SOQ to miner A
+		{Address: "ssq1p...", Amount: 2500_00000000}, // 2500 SOQ to miner B
+		{Address: "ssq1p...", Amount: 1200_00000000}, // 1200 SOQ to miner C
 	}
 
 	// ── Step 4: Execute payouts with circuit breaker ──
@@ -145,8 +145,8 @@ func executePayout(
 	// Step 4: Defense 11 — verify each UTXO is still unspent on-chain
 	verified, err := rpcClient.VerifyAndFilterUTXOs(
 		selected,
-		elxClient.EvictUTXO,       // Remove stale UTXOs from cache
-		elxClient.SetAssetType,     // Stamp asset type from gettxout
+		elxClient.EvictUTXO,    // Remove stale UTXOs from cache
+		elxClient.SetAssetType, // Stamp asset type from gettxout
 	)
 	if err != nil {
 		return fmt.Errorf("UTXO verification: %w", err)

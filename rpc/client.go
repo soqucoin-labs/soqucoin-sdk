@@ -207,7 +207,7 @@ func (c *Client) EstimateSmartFee(confTarget int) (float64, error) {
 	}
 
 	var resp struct {
-		FeeRate float64 `json:"feerate"`
+		FeeRate float64  `json:"feerate"`
 		Errors  []string `json:"errors,omitempty"`
 	}
 	if err := json.Unmarshal(result, &resp); err != nil {

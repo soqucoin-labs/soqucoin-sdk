@@ -29,20 +29,20 @@ const (
 
 // KeyPair holds a Dilithium keypair.
 type KeyPair struct {
-	PrivateKey []byte `json:"-"`        // Never serialized in plain
+	PrivateKey []byte `json:"-"` // Never serialized in plain
 	PublicKey  []byte `json:"pubkey"`
-	Address    string `json:"address"`  // Bech32m ssq1p... address
-	Index      uint32 `json:"index"`    // Derivation index
+	Address    string `json:"address"` // Bech32m ssq1p... address
+	Index      uint32 `json:"index"`   // Derivation index
 }
 
 // Keystore holds encrypted key material on disk.
 type Keystore struct {
-	Version    int    `json:"version"`     // Format version (1)
-	KDF        string `json:"kdf"`         // "argon2id"
-	Salt       []byte `json:"salt"`        // 32-byte random salt
-	Nonce      []byte `json:"nonce"`       // 12-byte AES-GCM nonce
-	Ciphertext []byte `json:"ciphertext"`  // AES-256-GCM encrypted key material
-	PubKeys    []KeyPair `json:"pubkeys"`  // Public keys (unencrypted, for address tracking)
+	Version    int       `json:"version"`    // Format version (1)
+	KDF        string    `json:"kdf"`        // "argon2id"
+	Salt       []byte    `json:"salt"`       // 32-byte random salt
+	Nonce      []byte    `json:"nonce"`      // 12-byte AES-GCM nonce
+	Ciphertext []byte    `json:"ciphertext"` // AES-256-GCM encrypted key material
+	PubKeys    []KeyPair `json:"pubkeys"`    // Public keys (unencrypted, for address tracking)
 }
 
 // plaintextKeys is the decrypted inner structure.
@@ -57,11 +57,11 @@ type plaintextKeys struct {
 
 // Manager manages Dilithium keypairs with encrypted storage.
 type Manager struct {
-	mu       sync.RWMutex
-	keys     []KeyPair
-	keyFile  string
-	passwd   []byte
-	loaded   bool
+	mu      sync.RWMutex
+	keys    []KeyPair
+	keyFile string
+	passwd  []byte
+	loaded  bool
 }
 
 // NewManager creates a new key manager.

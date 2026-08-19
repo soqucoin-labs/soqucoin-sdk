@@ -16,7 +16,6 @@ import (
 	"strings"
 )
 
-
 var (
 	ErrInvalidChecksum = errors.New("bech32m: invalid checksum")
 	ErrInvalidLength   = errors.New("bech32m: invalid data length")
@@ -248,4 +247,3 @@ func Validate(hrp string, addr string) error {
 	_, _, err := Decode(hrp, addr)
 	return err
 }
-

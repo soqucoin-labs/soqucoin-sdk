@@ -20,7 +20,7 @@ import (
 
 // Config holds soq-signer connection settings.
 type Config struct {
-	URL      string `json:"url"`       // e.g. "http://64.23.129.28:8550"
+	URL      string `json:"url"`       // e.g. "http://signer.internal.example:8550"
 	APIToken string `json:"api_token"` // Bearer token for auth
 	FeeRate  int64  `json:"fee_rate"`  // sat/vB (default 10)
 }
@@ -133,7 +133,7 @@ func (c *Client) Send(address string, amountSat int64) (string, error) {
 // SendManyRequest is the request body for POST /api/v1/sendmany.
 type SendManyRequest struct {
 	Recipients map[string]int64 `json:"recipients"` // address → amount in satoshis
-	FeeRate    int64            `json:"fee_rate"`    // sat/vB (optional, default: 10)
+	FeeRate    int64            `json:"fee_rate"`   // sat/vB (optional, default: 10)
 }
 
 // SendMany sends SOQ to multiple recipients in ONE transaction.
