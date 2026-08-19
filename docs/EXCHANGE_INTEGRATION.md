@@ -246,14 +246,40 @@ func ProcessWithdrawal(
 		return "", err
 	}
 
-	// 5. Build, sign, broadcast (use tx package with your keystore)
-	// rawTx := tx.Build(verified, outputs, hotWalletAddr, fee, keystore)
-	// txid, err := rpcClient.SendRawTransaction(rawTx)
+	// 5. Build, sign and serialize. *keys.Manager satisfies tx.Signer.
+	//    feeRate is per vByte, not a flat fee: see the note below.
+	recipientSPK, err := address.ScriptFor(toAddr)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
+	changeSPK, err := address.ScriptFor(hotWalletAddr)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
+	rawTx, builtTxID, err := tx.BuildAndSign(
+		verified, recipientSPK, amount, changeSPK, feeRate, keystore)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
 
-	// 6. Mark spent (prevents re-selection)
+	// 6. Broadcast. The node's txid must equal the one BuildAndSign computed;
+	//    if it does not, serialization disagrees with consensus. Do not proceed.
+	txid, err := rpcClient.SendRawTransaction(rawTx)
+	if err != nil {
+		cb.RecordFailure(err)
+		return "", err
+	}
+	if txid != builtTxID {
+		return "", fmt.Errorf("txid mismatch: node %s, SDK %s", txid, builtTxID)
+	}
+
+	// 7. Mark spent (prevents re-selection)
 	spentSet.MarkBroadcast(verified, txid)
 
-	// 7. Inject change for immediate availability (Defense 13)
+	// 8. Inject change for immediate availability (Defense 13)
 	changeAmount := total - amount - fee
 	if changeAmount > 0 {
 		elxClient.AddChangeUTXO(txid, 1, changeAmount, hotWalletAddr)

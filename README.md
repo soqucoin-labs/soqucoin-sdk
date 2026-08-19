@@ -98,12 +98,18 @@ inputs, total, err := selector.SelectUTXOs(allUTXOs, amount+fee, 1, tipHeight, n
 // 2. Verify on-chain (Defense 11)
 verified, err := rpcClient.VerifyAndFilterUTXOs(inputs, elxClient.EvictUTXO, nil)
 
-// 3. Build, sign, broadcast
-rawTx := tx.Build(verified, outputs, changeAddr, fee, keystore)
-txid, err := rpcClient.SendRawTransaction(rawTx)
+// 3. Build, sign and serialize in one call. feeRate is per vByte; a
+//    Dilithium transaction is ~1,073 vB, so 10 is low enough that the node
+//    rate-limits it as free.
+recipientSPK, err := address.ScriptFor(recipientAddr)
+changeSPK, err := address.ScriptFor(changeAddr)
+rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, feeRate, keystore)
 
-// 4. Mark spent (Defense 12)
-spentSet.MarkBroadcast(verified, txid)
+// 4. Broadcast. The txid BuildAndSign computed must match the node's.
+sentTxID, err := rpcClient.SendRawTransaction(rawTx)
+
+// 5. Mark spent (Defense 12)
+spentSet.MarkBroadcast(verified, sentTxID)
 ```
 
 ## Packages

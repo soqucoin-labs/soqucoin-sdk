@@ -4,9 +4,11 @@ package address
 // Implements BIP-350 (bech32m for witness version >= 1).
 //
 // Usage:
-//   witVer, witProg, err := Decode("ssq", "ssq1p...")
-//   scriptPubKey := WitnessProgram(witVer, witProg)
+//   scriptPubKey, err := ScriptFor("ssq1p...")   // network derived from the address
 //   electrumHash := ScriptHash(scriptPubKey)
+//
+// Decode and WitnessProgram are the lower-level primitives behind ScriptFor and
+// require the caller to know the HRP in advance. Prefer ScriptFor.
 
 import (
 	"crypto/sha256"
@@ -14,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 var (
@@ -267,4 +271,41 @@ func HRPOf(addr string) (string, error) {
 		return "", ErrInvalidHRP
 	}
 	return a[:pos], nil
+}
+
+// NetworkOf returns the network an address belongs to, derived from its prefix.
+// A prefix that belongs to no supported network is refused, because a fabricated
+// prefix can otherwise carry a perfectly valid checksum.
+func NetworkOf(addr string) (types.Network, error) {
+	hrp, err := HRPOf(addr)
+	if err != nil {
+		return types.Network{}, err
+	}
+	for _, n := range []types.Network{types.Mainnet, types.Stagenet, types.Regtest} {
+		if hrp == n.HRP {
+			return n, nil
+		}
+	}
+	return types.Network{}, fmt.Errorf("%w: unknown network prefix %q in %s",
+		ErrInvalidHRP, hrp, addr)
+}
+
+// ScriptFor returns the scriptPubKey for an address, deriving the network from
+// the address itself.
+//
+// Prefer this over Decode+WitnessProgram. Those require the caller to supply the
+// HRP, and callers reliably hardcode it: every builder in this SDK passed "ssq"
+// unconditionally, which made mainnet transactions impossible to construct. The
+// script produced here is what BIP143 commits to as the scriptCode, so getting
+// the network wrong is a signing fault, not just a decoding one.
+func ScriptFor(addr string) ([]byte, error) {
+	n, err := NetworkOf(addr)
+	if err != nil {
+		return nil, err
+	}
+	witVer, witProg, err := Decode(n.HRP, addr)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", addr, err)
+	}
+	return WitnessProgram(witVer, witProg), nil
 }

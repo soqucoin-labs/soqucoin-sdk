@@ -13,6 +13,11 @@ that were mechanically detectable and caught by no test:
      invalidated every link pointing at them, including in the guide an
      integrator reads first.
 
+  3. Snippets that do not compile. Referencing a real API is not the same as
+     working. The Quick Start's send-a-transaction program was missing three
+     imports and used two variables it never declared, so the first thing an
+     integrator copies would not build.
+
 Run from anywhere:  python3 scripts/check-docs.py
 Exits non-zero on any problem, so it can gate CI.
 """
@@ -22,6 +27,20 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _gomod(key, default):
+    for line in (ROOT / "go.mod").read_text().splitlines():
+        if line.startswith(key + " "):
+            return line.split(None, 1)[1].strip()
+    return default
+
+
+MODULE = _gomod("module", "github.com/soqucoin-labs/soqucoin-sdk")
+
+
+def go_version():
+    return _gomod("go", "1.21")
 
 
 def md_files():
@@ -76,6 +95,52 @@ def check_api_references():
     return problems
 
 
+def check_snippets_compile():
+    """Every self-contained `package main` Go snippet must actually build.
+
+    Fragments cannot be compiled and are left to check_api_references. A snippet
+    opts in simply by being a whole program.
+    """
+    import shutil
+    import tempfile
+
+    problems = []
+    workdir = Path(tempfile.mkdtemp(prefix="soq-checkdocs-"))
+    try:
+        for f in md_files():
+            text = f.read_text()
+            for i, block in enumerate(re.finditer(r"```go\n(.*?)```", text, re.S)):
+                body = block.group(1)
+                if not body.lstrip().startswith("package main"):
+                    continue
+                line = text[: block.start()].count("\n") + 1
+                d = workdir / f"{f.stem}_{i}"
+                d.mkdir()
+                (d / "main.go").write_text(body)
+                # Build against THIS checkout, not a published tag, so the check
+                # fails on the commit that breaks a snippet rather than one release later.
+                (d / "go.mod").write_text(
+                    f"module docsnippet\n\ngo {go_version()}\n\n"
+                    f"require {MODULE} v0.0.0\n\nreplace {MODULE} => {ROOT}\n")
+                subprocess.run(["go", "mod", "tidy"], cwd=d,
+                               capture_output=True, text=True)
+                r = subprocess.run(["go", "build", "-o", "/dev/null", "./main.go"],
+                                   cwd=d, capture_output=True, text=True)
+                if r.returncode != 0:
+                    # go reports "./main.go:LINE:COL: msg"; remap to the doc line.
+                    for err in r.stderr.strip().splitlines():
+                        m = re.match(r"\./main\.go:(\d+):\d+:\s*(.*)", err.strip())
+                        if m:
+                            problems.append((f"{f.relative_to(ROOT)}:{line + int(m.group(1))}",
+                                             "snippet", m.group(2)))
+                        elif err.strip() and not err.startswith("#"):
+                            problems.append((f"{f.relative_to(ROOT)}:{line}",
+                                             "snippet", err.strip()))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return problems
+
+
 def slug(heading):
     """Approximate GitHub's heading-to-anchor transformation."""
     s = re.sub(r"[^\w\s-]", "", heading.strip().lower())
@@ -104,9 +169,9 @@ def check_anchors():
 
 
 def main():
-    problems = check_api_references() + check_anchors()
+    problems = check_api_references() + check_snippets_compile() + check_anchors()
     if not problems:
-        print("check-docs: OK (API references and anchor links all resolve)")
+        print("check-docs: OK (snippets compile, API references and anchors resolve)")
         return 0
     print(f"check-docs: {len(problems)} problem(s)\n")
     for where, what, why in problems:

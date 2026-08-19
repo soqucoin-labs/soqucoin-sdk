@@ -691,25 +691,12 @@ func BuildSendTransaction(
 // The scriptPubKey is what BIP143 commits to as the scriptCode, so getting the
 // network wrong here would not merely fail loudly: if it ever succeeded, it would
 // produce a signature over the wrong message.
+//
+// The derivation itself lives in soqaddr.ScriptFor so that this SDK has exactly
+// one implementation of "address to scriptCode". Two would be free to drift, and
+// this is the function whose drift produced the fault above.
 func inputScriptPubKey(addr string) ([]byte, error) {
-	hrp, err := soqaddr.HRPOf(addr)
-	if err != nil {
-		return nil, fmt.Errorf("address %s: %w", addr, err)
-	}
-	if !knownHRP(hrp) {
-		return nil, fmt.Errorf("address %s: unknown network prefix %q", addr, hrp)
-	}
-	witVer, witProg, err := soqaddr.Decode(hrp, addr)
-	if err != nil {
-		return nil, fmt.Errorf("decode address %s: %w", addr, err)
-	}
-	return soqaddr.WitnessProgram(witVer, witProg), nil
-}
-
-// knownHRP reports whether a prefix belongs to a network this SDK supports.
-// Without this check a fabricated prefix with a valid checksum would be accepted.
-func knownHRP(hrp string) bool {
-	return hrp == types.Mainnet.HRP || hrp == types.Stagenet.HRP || hrp == types.Regtest.HRP
+	return soqaddr.ScriptFor(addr)
 }
 
 // requireSameNetwork rejects a set of inputs that mix networks. Mixing them is

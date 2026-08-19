@@ -103,10 +103,14 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
+	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
+	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
@@ -120,8 +124,16 @@ func main() {
 
 	rpcClient := rpc.NewClient("http://127.0.0.1:19332", "rpcuser", "rpcpass")
 
-	// 2. Track your address and refresh UTXOs
-	myAddr := "ssq1p..."
+	// 2. Open the keystore holding the key for myAddr, and track the address.
+	//    *keys.Manager satisfies tx.Signer, so it can be passed to BuildAndSign.
+	keystore := keys.NewManager("keystore.enc", os.Getenv("SOQ_KEYSTORE_PASSPHRASE"))
+	if err := keystore.Load(); err != nil {
+		log.Fatal("Load keystore:", err)
+	}
+
+	myAddr := keystore.GetSignableAddresses()[0]
+	recipientAddr := "ssq1p..." // whoever you are paying
+
 	elx.TrackAddresses([]string{myAddr})
 	elx.RefreshAll()
 
@@ -133,9 +145,13 @@ func main() {
 	tipHeight, _ := rpcClient.GetBlockCount()
 	allUTXOs := elx.GetAllUTXOs()
 	paymentAmount := int64(1000_00000000) // 1000 SOQ
-	fee := int64(100_000)                  // 0.001 SOQ
 
-	selected, total, err := selector.SelectUTXOs(allUTXOs, paymentAmount+fee, 1, tipHeight, nil)
+	// feeRate is satoshis per vByte, not a flat fee. A single-input Dilithium
+	// payment is roughly 1,073 vB, so budget against vsize when selecting coins.
+	feeRate := int64(1000)
+	feeBudget := 1200 * feeRate
+
+	selected, total, err := selector.SelectUTXOs(allUTXOs, paymentAmount+feeBudget, 1, tipHeight, nil)
 	if err != nil {
 		log.Fatal("Coin selection failed:", err)
 	}
@@ -147,22 +163,55 @@ func main() {
 		log.Fatal("UTXO verification failed:", err)
 	}
 
-	// 6. Build, sign, and broadcast (use tx.Build() with your keystore)
-	// rawTxHex := tx.Build(verified, outputs, changeAddr, fee, keystore)
-	// txid, err := rpcClient.SendRawTransaction(rawTxHex)
-	_ = verified
-
-	// 7. Mark UTXOs as spent
-	txid := "your_txid_here"
-	spentSet.MarkBroadcast(verified, txid)
-
-	// 8. Inject change output for immediate availability (Defense 13)
-	changeAmount := total - paymentAmount - fee
-	if changeAmount > 0 {
-		elx.AddChangeUTXO(txid, 1, changeAmount, myAddr)
+	// 6. Build, sign and serialize in one call. At feeRate 10 the node
+	//    rate-limits the result as a free transaction, so 1000 is the floor
+	//    that actually relays. Validate with testmempoolaccept before you rely
+	//    on any of this.
+	recipientSPK, err := address.ScriptFor(recipientAddr)
+	if err != nil {
+		log.Fatal("recipient address:", err)
+	}
+	changeSPK, err := address.ScriptFor(myAddr)
+	if err != nil {
+		log.Fatal("change address:", err)
 	}
 
-	fmt.Println("Broadcast! TxID:", txid)
+	// tx.BuildAndSign does all three of the following in one call. They are
+	// spelled out here only because step 9 needs the change value, and the
+	// transaction is the only place that value actually exists: the fee is
+	// derived from feeRate and the final size, not from a flat number.
+	transaction, err := tx.BuildSendTransaction(
+		verified, recipientSPK, paymentAmount, changeSPK, feeRate)
+	if err != nil {
+		log.Fatal("Build failed:", err)
+	}
+	if err := transaction.SignAll(keystore); err != nil {
+		log.Fatal("Signing failed:", err)
+	}
+	rawTxHex, builtTxID := transaction.SerializeHex(), transaction.TxID()
+
+	// 7. Broadcast, then confirm the node agreed with our serialization
+	txid, err := rpcClient.SendRawTransaction(rawTxHex)
+	if err != nil {
+		log.Fatal("Broadcast failed:", err)
+	}
+	if txid != builtTxID {
+		log.Fatalf("txid mismatch: node %s, SDK %s", txid, builtTxID)
+	}
+
+	// 8. Mark UTXOs as spent
+	spentSet.MarkBroadcast(verified, txid)
+
+	// 9. Inject change for immediate availability (Defense 13). Read the value
+	//    off the transaction; BuildSendTransaction only adds a change output if
+	//    the remainder is worth more than it costs to spend.
+	if len(transaction.Outputs) > 1 {
+		change := transaction.Outputs[1]
+		elx.AddChangeUTXO(txid, 1, change.Value, myAddr)
+	}
+
+	fmt.Printf("Broadcast %s, spent %d sat of input to send %d sat\n",
+		txid, total, paymentAmount)
 }
 ```
 
