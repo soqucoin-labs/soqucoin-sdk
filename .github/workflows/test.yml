@@ -40,3 +40,11 @@ jobs:
 
       - name: Coverage
         run: go test -cover ./...
+
+      # Documentation defects this repo has actually shipped, all of them
+      # invisible to the tests above: code blocks calling functions that never
+      # existed (tx.Build, and nine identifiers in SECURITY.md), snippets that do
+      # not compile, and anchor links broken by rewording the headings they point
+      # at. An exchange evaluating the SDK found the first class before we did.
+      - name: Documentation
+        run: python3 scripts/check-docs.py

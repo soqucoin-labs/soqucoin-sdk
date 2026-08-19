@@ -403,22 +403,62 @@ prioritise it.
 
 SOQ transactions are larger than Bitcoin transactions due to Dilithium signatures:
 
+Sizes below are measured by building and signing with this SDK, not estimated.
+Each figure is for a payment plus a change output, which is what the builders
+produce whenever a remainder is left over.
+
 | Component | Size |
 |-----------|------|
-| Dilithium public key | 1,312 bytes |
-| Dilithium signature | 2,420 bytes |
-| Typical 1-in-1-out TX | ~4.8 KB |
-| Typical 2-in-1-out TX | ~8.5 KB |
-| Max inputs per TX | 80 (due to MAX_STANDARD_TX_WEIGHT) |
+| ML-DSA-44 public key | 1,312 bytes |
+| ML-DSA-44 signature | 2,420 bytes |
+| Witness stack per input | 3,734 bytes (2,421 + 1,313, including the sighash byte and the `0x00` key prefix) |
+| 1-in, 2-out | 3,880 bytes, 4,288 WU, ~1,072 vB |
+| 2-in, 2-out | 7,662 bytes, 8,184 WU, ~2,046 vB |
+| 10-in, 2-out | 37,918 bytes, 39,352 WU, ~9,838 vB |
+| 80-in, 2-out | 302,658 bytes, 312,072 WU, ~78,018 vB |
+| Max inputs per TX | 80, enforced by `utxo.MaxInputsPerTX` |
 
-### Fee Estimation
+Roughly 3,782 bytes per additional input, so estimate
+`3,880 + 3,782 x (inputs - 1)` bytes.
+
+**The 80-input cap is not the node's weight limit.** `MAX_STANDARD_TX_WEIGHT` is
+800,000 WU, and 80 inputs use 312,072 of it, about 39%. The cap is sized against
+the older 400,000 WU limit because not every production node runs the build that
+raised it. It was reverted from 200 to 80 in May 2026 after transactions were
+rejected in production for size. Treat it as an operational floor that will rise,
+not as a protocol constant.
+
+`SelectUTXOs` returns `ErrInputLimitReached` with a partial selection when it hits
+the cap before reaching the target. Handle that case: it means the payment needs
+consolidation first, and ignoring the error sends less than intended.
+
+### Fee estimation
+
+**`feeRate` is satoshis per vByte, not a flat fee.** This is worth stating twice,
+because the SDK's own examples got it wrong: at a feeRate of 10, a ~1,072 vB
+payment pays about 10,700 satoshis, which the node treats as effectively free and
+rate-limits rather than relays. The observed rejection is in the
+[verification record](VERIFICATION.md).
 
 ```go
-// Query the node for dynamic fee estimates
-feeRate, err := rpcClient.EstimateSmartFee(6) // target 6 blocks
+// Query the node for a dynamic estimate. It returns SOQ per kB.
+soqPerKB, err := rpcClient.EstimateSmartFee(6) // target: 6 blocks
+if err != nil {
+    return err
+}
+feeRate := int64(soqPerKB * float64(types.SatoshisPerSOQ) / 1000) // satoshis per vByte
+if feeRate < 1000 {
+    feeRate = 1000 // floor: below this the node rate-limits as free
+}
+```
 
-// Or use a generous fallback (typical for Soqucoin's low-fee environment)
-const defaultFee = 100_000 // 0.001 SOQ, covers most single-output TXs
+`EstimateSmartFee` falls back to 0.01 SOQ/kB when the node has no estimate, which
+is exactly 1,000 satoshis per vByte, so the floor above and the fallback agree.
+
+Always confirm before you rely on a broadcast:
+
+```bash
+soqucoin-cli testmempoolaccept '["<rawHex>"]'
 ```
 
 ### UTXO Consolidation
