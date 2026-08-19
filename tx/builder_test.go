@@ -276,29 +276,33 @@ func TestScriptBuildersPanicOnWrongHashLength(t *testing.T) {
 
 // ── Asset typing ───────────────────────────────────────────────────────────
 
-func TestOutputAssetTyping(t *testing.T) {
+// Asset type is carried by the WITNESS VERSION, not by an output field.
+//
+// This test previously asserted on TxOutput.AssetType and TxOutput.Visibility, and
+// it passed — because it was checking fields the SDK set and then serialized as two
+// extra bytes that consensus had already stopped reading. Asserting on a field the
+// chain does not see is how a self-consistently wrong format survives a green
+// suite. The assertions now look at the script, which is what consensus reads.
+func TestOutputAssetTypingFollowsWitnessVersion(t *testing.T) {
 	tr := NewTransaction()
-	tr.AddOutput(1_000, ScriptP2WPKH(hash32(0x01)))
-	tr.AddOutputUSDSOQ(2_000, ScriptP2WPKH(hash32(0x02)))
-	tr.AddOutputWitnessV5(hash32(0x03))
+	tr.AddOutput(1_000, ScriptP2WPKH(hash32(0x01)))                // native SOQ, v1
+	tr.AddOutputUSDSOQ(2_000, ScriptV7USDSOQHolding(hash32(0x02))) // USDSOQ, v7
+	tr.AddOutputWitnessV5(hash32(0x03))                            // authority marker, v5
 
-	if got := tr.Outputs[0].AssetType; got != 0x00 {
-		t.Errorf("AddOutput AssetType = %#x, want 0x00 (native SOQ)", got)
+	wantVersionByte := []byte{0x51, 0x57, 0x55} // OP_1, OP_7, OP_5
+	for i, want := range wantVersionByte {
+		spk := tr.Outputs[i].ScriptPubKey
+		if len(spk) != 34 {
+			t.Fatalf("output %d script length = %d, want 34", i, len(spk))
+		}
+		if spk[0] != want {
+			t.Errorf("output %d version byte = %#x, want %#x", i, spk[0], want)
+		}
 	}
-	if got := tr.Outputs[1].AssetType; got != 0x01 {
-		t.Errorf("AddOutputUSDSOQ AssetType = %#x, want 0x01", got)
-	}
-	// The authority marker is typed as SOQ and carries no value by design.
-	if got := tr.Outputs[2].AssetType; got != 0x00 {
-		t.Errorf("authority marker AssetType = %#x, want 0x00", got)
-	}
+
+	// The authority marker carries no value by design.
 	if got := tr.Outputs[2].Value; got != 0 {
 		t.Errorf("authority marker Value = %d, want 0", got)
-	}
-	for i, o := range tr.Outputs {
-		if o.Visibility != 0x00 {
-			t.Errorf("output %d Visibility = %#x, want 0x00 (transparent)", i, o.Visibility)
-		}
 	}
 }
 
