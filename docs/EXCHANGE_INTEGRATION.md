@@ -81,9 +81,23 @@ in one command:
 git diff 24865dc..soqucoin -- src/
 ```
 
-Roughly 183 lines across four files: the coin definitions (AuxPoW-aware headers), asset and
-visibility derivation from the witness version, UTXO records carrying that metadata, and one
-protocol extension (`get_multi_balance`) for per-asset balances. [`SOQUCOIN.md`](https://github.com/soqucoin-labs/electrumx/blob/soqucoin/SOQUCOIN.md)
+Roughly 242 lines across five files: the coin definitions (AuxPoW-aware headers), the AuxPoW
+transaction deserializer, asset and visibility derivation from the witness version, UTXO records
+carrying that metadata, and one protocol extension (`get_multi_balance`) for per-asset balances.
+
+You can confirm a clean checkout works before committing any effort to it:
+
+```bash
+git clone -b soqucoin https://github.com/soqucoin-labs/electrumx && cd electrumx
+pip install .
+cd /tmp && python -c "
+from electrumx.lib.coins import Coin
+print(Coin.lookup_coin_class('Soqucoin', 'stagenet').DESERIALIZER.__name__)
+"
+```
+
+CI runs that on every push, on Python 3.10 and 3.12, installing from a fresh checkout so only
+committed files can satisfy it. [`SOQUCOIN.md`](https://github.com/soqucoin-labs/electrumx/blob/soqucoin/SOQUCOIN.md)
 in that repository documents the configuration and the caveats, including the fact that the
 **mainnet genesis hash is a placeholder until genesis is mined**. Upstream `LICENCE` is unchanged.
 
