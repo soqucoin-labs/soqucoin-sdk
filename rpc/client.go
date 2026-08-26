@@ -39,7 +39,7 @@ type Client struct {
 // NewClient creates a new soqucoind RPC client.
 //
 // Parameters:
-//   - url: Full URL including port (e.g., "http://127.0.0.1:19332")
+//   - url: Full URL including port (e.g., "http://127.0.0.1:33389" on mainnet)
 //   - user: RPC username from soqucoin.conf
 //   - password: RPC password from soqucoin.conf
 func NewClient(url, user, password string) *Client {

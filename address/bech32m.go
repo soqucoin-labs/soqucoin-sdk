@@ -276,6 +276,9 @@ func HRPOf(addr string) (string, error) {
 // NetworkOf returns the network an address belongs to, derived from its prefix.
 // A prefix that belongs to no supported network is refused, because a fabricated
 // prefix can otherwise carry a perfectly valid checksum.
+// Note: regtest shares the mainnet HRP ("sq") in the node's chainparams, so a
+// regtest address resolves to Mainnet here — the address alone cannot tell
+// them apart. Only stagenet ("ssq") is distinguishable by prefix.
 func NetworkOf(addr string) (types.Network, error) {
 	hrp, err := HRPOf(addr)
 	if err != nil {
