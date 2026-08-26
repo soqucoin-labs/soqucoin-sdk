@@ -122,7 +122,7 @@ func main() {
 	elx.Connect()
 	defer elx.Stop()
 
-	rpcClient := rpc.NewClient("http://127.0.0.1:19332", "rpcuser", "rpcpass")
+	rpcClient := rpc.NewClient("http://127.0.0.1:28332", "rpcuser", "rpcpass")
 
 	// 2. Open the keystore holding the key for myAddr, and track the address.
 	//    *keys.Manager satisfies tx.Signer, so it can be passed to BuildAndSign.
@@ -230,8 +230,8 @@ types.Mainnet.HRP  // "sq"
 // Stagenet, testing. Addresses start with "ssq1p"
 types.Stagenet.HRP // "ssq"
 
-// Regtest, local development. Addresses start with "ssqrt1p"
-types.Regtest.HRP  // "ssqrt"
+// Regtest, local development. Shares the mainnet HRP: addresses start with "sq1p"
+types.Regtest.HRP  // "sq"
 ```
 
 > **Tip:** Always develop and test on stagenet before deploying to mainnet. Stagenet SOQ has no value and can be obtained from the faucet.

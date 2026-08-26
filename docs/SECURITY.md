@@ -213,7 +213,7 @@ default.
 ### soqucoind RPC
 
 ```go
-rpcClient := rpc.NewClient("http://127.0.0.1:19332", rpcUser, rpcPassword)
+rpcClient := rpc.NewClient("http://127.0.0.1:33389", rpcUser, rpcPassword)
 ```
 
 The client offers no TLS options. Protect the RPC transport at the network layer:

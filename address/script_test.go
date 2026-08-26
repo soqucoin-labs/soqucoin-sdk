@@ -90,14 +90,22 @@ func TestScriptForRejectsMalformed(t *testing.T) {
 }
 
 func TestNetworkOf(t *testing.T) {
-	for _, n := range []types.Network{types.Mainnet, types.Stagenet, types.Regtest} {
-		addr, _ := Encode(n.HRP, 1, progOf(0x02))
+	// Regtest shares the mainnet HRP, so its addresses resolve to mainnet.
+	for _, tc := range []struct {
+		encodeAs types.Network
+		want     string
+	}{
+		{types.Mainnet, types.Mainnet.Name},
+		{types.Stagenet, types.Stagenet.Name},
+		{types.Regtest, types.Mainnet.Name},
+	} {
+		addr, _ := Encode(tc.encodeAs.HRP, 1, progOf(0x02))
 		got, err := NetworkOf(addr)
 		if err != nil {
-			t.Fatalf("%s: %v", n.Name, err)
+			t.Fatalf("%s: %v", tc.encodeAs.Name, err)
 		}
-		if got.Name != n.Name {
-			t.Errorf("NetworkOf(%s) = %q, want %q", addr, got.Name, n.Name)
+		if got.Name != tc.want {
+			t.Errorf("NetworkOf(%s) = %q, want %q", addr, got.Name, tc.want)
 		}
 	}
 }
@@ -113,12 +121,14 @@ func TestNetworkOfDoesNotConfuseOverlappingPrefixes(t *testing.T) {
 	if n.Name != types.Stagenet.Name {
 		t.Errorf("stagenet address read as %q", n.Name)
 	}
+	// Regtest shares the mainnet HRP in the node's chainparams, so an address
+	// alone cannot distinguish the two: NetworkOf resolves "sq" to mainnet.
 	rt, _ := Encode(types.Regtest.HRP, 1, progOf(0x04))
 	n, err = NetworkOf(rt)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
-	if n.Name != types.Regtest.Name {
-		t.Errorf("regtest address read as %q", n.Name)
+	if n.Name != types.Mainnet.Name {
+		t.Errorf("regtest/mainnet-HRP address read as %q, want mainnet", n.Name)
 	}
 }

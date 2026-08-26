@@ -37,33 +37,35 @@ type Network struct {
 	RPCPort      int    // JSON-RPC port
 }
 
-// Pre-defined networks.
+// Pre-defined networks. Ports and HRPs mirror the node's chainparams.cpp /
+// chainparamsbase.cpp — if the node changes, these must change with it.
 var (
 	// Mainnet is the production Soqucoin network.
 	Mainnet = Network{
 		Name:         "mainnet",
 		HRP:          "sq",
-		DefaultPort:  19335,
+		DefaultPort:  33388,
 		ElectrumPort: 50001,
-		RPCPort:      19332,
+		RPCPort:      33389,
 	}
 
 	// Stagenet is the Soqucoin staging/test network.
 	Stagenet = Network{
 		Name:         "stagenet",
 		HRP:          "ssq",
-		DefaultPort:  19335,
+		DefaultPort:  28333,
 		ElectrumPort: 50001,
-		RPCPort:      19332,
+		RPCPort:      28332,
 	}
 
-	// Regtest is the local regression test network.
+	// Regtest is the local regression test network. Note: regtest shares the
+	// mainnet HRP ("sq") in the node's chainparams; only stagenet uses "ssq".
 	Regtest = Network{
 		Name:         "regtest",
-		HRP:          "ssqrt",
-		DefaultPort:  19444,
+		HRP:          "sq",
+		DefaultPort:  18444,
 		ElectrumPort: 50001,
-		RPCPort:      19443,
+		RPCPort:      18332,
 	}
 )
 

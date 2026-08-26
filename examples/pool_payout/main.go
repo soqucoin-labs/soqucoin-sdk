@@ -18,7 +18,7 @@
 //
 //	export SOQ_KEYSTORE_PASSPHRASE=...
 //	go run ./examples/pool_payout/ \
-//	  -rpc-url http://127.0.0.1:19332 \
+//	  -rpc-url http://127.0.0.1:28332 \
 //	  -rpc-user user -rpc-pass pass \
 //	  -electrumx localhost:50001 \
 //	  -keystore /var/lib/soq/keystore.enc \
@@ -53,7 +53,7 @@ type Payout struct {
 }
 
 func main() {
-	rpcURL := flag.String("rpc-url", "http://127.0.0.1:19332", "soqucoind RPC URL")
+	rpcURL := flag.String("rpc-url", "http://127.0.0.1:28332", "soqucoind RPC URL")
 	rpcUser := flag.String("rpc-user", "rpcuser", "RPC username")
 	rpcPass := flag.String("rpc-pass", "rpcpassword", "RPC password")
 	elxHost := flag.String("electrumx", "localhost:50001", "ElectrumX host:port")
