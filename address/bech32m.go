@@ -25,10 +25,47 @@ var (
 	ErrInvalidLength   = errors.New("bech32m: invalid data length")
 	ErrInvalidHRP      = errors.New("bech32m: invalid human-readable part")
 	ErrInvalidChar     = errors.New("bech32m: invalid character")
+
+	// ErrUnsupportedWitnessVersion is returned for an address whose witness
+	// version this chain does not spend. See supportedWitnessVersions.
+	ErrUnsupportedWitnessVersion = errors.New("bech32m: unsupported witness version for Soqucoin")
 )
 
 // bech32m constant
 const bech32mConst = 0x2bc830a3
+
+// supportedWitnessVersions is the allowlist of witness versions this SDK will
+// decode as a Soqucoin address and build a scriptPubKey for.
+//
+// ⛔ WHY AN ALLOWLIST AND NOT A LENGTH CHECK. Every Soqucoin witness version
+// shares the same HRP, so an HRP+length check alone accepts an address for a
+// version this chain does not spend. Witness versions without an active
+// consensus rule are anyone-can-spend under BIP-141, so building an output for
+// one is a loss-of-funds path: the payment confirms and any observer may then
+// sweep it. This is the same defence the mining pool already applies in
+// soqupool-server/bitcoin/soqucoin.go (bead gp9); it belongs in every consumer
+// that turns an address into a scriptPubKey, not just the pool.
+//
+//	v1 — Dilithium (ML-DSA-44) P2WPKH. The only universally spendable form.
+//	v5 — USDSOQ authority marker.   } supported by this SDK's builders; only
+//	v7 — USDSOQ holding.            } usable where the USDSOQ deployment is active.
+//
+// ⛔ Do NOT add a version here because it "exists" or because an opcode for it
+// is active. Add it only when its consensus rule makes outputs of that version
+// require a real authorization to spend. Notably v2 (PAT attestation) must NOT
+// be added: PAT commits to signatures rather than verifying them, so a v2
+// output authorizes nothing (bead pat-v2-anyone-can-spend-ae6u).
+var supportedWitnessVersions = map[byte]bool{
+	1: true,
+	5: true,
+	7: true,
+}
+
+// IsSupportedWitnessVersion reports whether this SDK will accept an address at
+// the given witness version as a payment destination.
+func IsSupportedWitnessVersion(witVer byte) bool {
+	return supportedWitnessVersions[witVer]
+}
 
 var charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
@@ -135,6 +172,15 @@ func Decode(hrp, addr string) (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("%w: witness program length %d", ErrInvalidLength, len(witProg))
 	}
 
+	// Reject witness versions this chain does not spend. A well-formed address
+	// at an unsupported version is NOT a valid Soqucoin address: paying it
+	// creates an anyone-can-spend output. Fail here, at parse time, so no
+	// caller can reach script construction with one.
+	if !supportedWitnessVersions[witVer] {
+		return 0, nil, fmt.Errorf("%w: v%d (supported: v1 Dilithium, v5/v7 USDSOQ)",
+			ErrUnsupportedWitnessVersion, witVer)
+	}
+
 	return witVer, witProg, nil
 }
 
@@ -201,6 +247,13 @@ func convertBits(data []int, fromBits, toBits uint, pad bool) ([]byte, error) {
 // Format: OP_witVer <push len> <witProg>
 // For witness v1+ (Dilithium), OP_1 is 0x51
 func WitnessProgram(witVer byte, witProg []byte) []byte {
+	// Defence in depth: Decode already rejects unsupported versions, but this
+	// is the function that actually mints the scriptPubKey, so it refuses too.
+	// A nil return is a hard failure the caller cannot mistake for a script.
+	if !supportedWitnessVersions[witVer] {
+		return nil
+	}
+
 	// OP_0 = 0x00, OP_1..OP_16 = 0x51..0x60
 	var verByte byte
 	if witVer == 0 {
