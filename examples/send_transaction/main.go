@@ -67,7 +67,7 @@ func main() {
 		recipientSPK,
 		5_000_000_00, // Send 5 SOQ
 		changeSPK,
-		10, // Fee rate: 10 sat/vB
+		types.RecommendedFeeRate, // 1000 sat/vB, the miner default floor
 	)
 	if err != nil {
 		log.Fatal("build transaction:", err)

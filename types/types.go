@@ -97,6 +97,18 @@ const (
 // SatoshisPerSOQ is the number of satoshis in one SOQ.
 const SatoshisPerSOQ int64 = 100_000_000
 
+// Fee rates in satoshis per virtual byte, from the node's policy:
+//
+//	RecommendedFeeRate is the miner's default block-inclusion floor
+//	(DEFAULT_BLOCK_MIN_TX_FEE = 0.01 SOQ/kB). Below it a transaction is
+//	relayed but not mined by a default node.
+//	MinRelayFeeRate is the mempool's relay floor (DEFAULT_MIN_RELAY_TX_FEE).
+//	Below it a transaction is not even relayed.
+const (
+	RecommendedFeeRate int64 = 1000
+	MinRelayFeeRate    int64 = 100
+)
+
 // CoinbaseMaturity is the number of confirmations a coinbase output needs
 // before it may be spent: consensus nCoinbaseMaturity of the tier active from
 // block 1 on mainnet and stagenet (chainparams.cpp). Regtest uses 60.

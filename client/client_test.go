@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 func init() { log.SetOutput(io.Discard) } // the package logs each queued payment
@@ -69,8 +71,8 @@ func okSend(txid string) reply {
 func TestNewClientDefaultsFeeRate(t *testing.T) {
 	for _, in := range []int64{0, -1, -1000} {
 		c := NewClient(Config{URL: "http://x", FeeRate: in})
-		if c.config.FeeRate != 10 {
-			t.Errorf("FeeRate %d became %d, want the 10 sat/vB default", in, c.config.FeeRate)
+		if c.config.FeeRate != types.RecommendedFeeRate {
+			t.Errorf("FeeRate %d became %d, want the %d sat/vB default", in, c.config.FeeRate, types.RecommendedFeeRate)
 		}
 	}
 	c := NewClient(Config{URL: "http://x", FeeRate: 25})
@@ -110,8 +112,8 @@ func TestSendSendsBearerTokenAndJSON(t *testing.T) {
 	if req.Amount != 150_000 {
 		t.Errorf("amount = %d, want 150000 satoshis passed through unchanged", req.Amount)
 	}
-	if req.FeeRate != 10 {
-		t.Errorf("fee_rate = %d, want the default 10", req.FeeRate)
+	if req.FeeRate != types.RecommendedFeeRate {
+		t.Errorf("fee_rate = %d, want the default %d", req.FeeRate, types.RecommendedFeeRate)
 	}
 }
 

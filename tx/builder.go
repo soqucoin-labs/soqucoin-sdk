@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	soqaddr "github.com/soqucoin-labs/soqucoin-sdk/address"
@@ -41,24 +42,122 @@ const (
 	// Dilithium public key size
 	DilithiumPubKeySize = 1312
 
-	// Estimated weight per input (witness v0/v1 Dilithium)
-	// witness: [sig(2420) + pubkey(1312)] = 3732 bytes witness data
-	// + 41 bytes non-witness (prevout:36 + scriptSig:1 + sequence:4)
-	EstimatedInputWeight = 41*4 + 3732 // 164 + 3732 = 3896 WU
+	// Weight of one signed input, for documentation and rough planning; the
+	// builder measures the real serialized form (see Weight). Non-witness:
+	// prevout 36 + scriptSig length 1 + sequence 4 = 41 bytes at 4 WU each.
+	// Witness: item count 1 + varint(2421) 3 + signature||hashtype 2421 +
+	// varint(1313) 3 + 0x00||pubkey 1313 = 3741 bytes at 1 WU each. The
+	// earlier value omitted the count and the two 3-byte varints, which
+	// underestimated vsize by about 2.25 vB per input, enough to fall below
+	// the miner's default fee floor at the documented rate (review, 2026-09-03).
+	EstimatedInputWeight = 41*4 + 3741 // 3905 WU
 
-	// Estimated weight per output (P2WPKH-Dilithium: OP_1 <32-byte hash>)
-	// 8 (value) + 1 (script len) + 34 (scriptPubKey) = 43 bytes
+	// Weight of one v1 output: value 8 + script length 1 + script 34 = 43 bytes.
 	EstimatedOutputWeight = 43 * 4 // 172 WU
 
-	// Transaction overhead: version(4) + marker(1) + flag(1) + input_count(1) + output_count(1) + locktime(4)
-	TxOverheadWeight = 12 * 4 // 48 WU (non-witness) + 2 (witness header)
+	// Fixed overhead: version 4 + input count 1 + output count 1 + locktime 4
+	// = 10 non-witness bytes, plus the 2 witness bytes (marker, flag).
+	TxOverheadWeight = 10*4 + 2 // 42 WU
 
-	// DustThreshold is the minimum output value (in satoshis) that soqucoind
-	// will accept. MUST match soqucoind's nHardDustLimit (policy.cpp L233):
-	//   DEFAULT_HARD_DUST_LIMIT = DEFAULT_DUST_LIMIT / 10 = 100,000 satoshis
-	// Reference: DL-PAYOUT-RELIABILITY.md, PF-005
-	DustThreshold int64 = 100000
+	// UTXOCostPerByte is the node's relay-policy floor on output value:
+	// IsStandardTx rejects any output worth less than this many satoshis per
+	// serialized output byte (src/policy/policy.cpp, UTXO_COST_PER_BYTE),
+	// independently of any deployment. A 34-byte v1 script serializes to 43
+	// bytes, so the floor for a normal output is 279,500 satoshis.
+	UTXOCostPerByte int64 = 6500
+
+	// DustThreshold is the relay floor for a standard v1 output (43 serialized
+	// bytes). Outputs below it are never emitted: change is folded into the
+	// fee and a recipient amount below it is refused. Use MinOutputValue for
+	// other script sizes.
+	DustThreshold int64 = UTXOCostPerByte * 43 // 279,500
+
+	// MaxMoney is the node's per-transaction ceiling on any amount
+	// (src/amount.h): 20e9 SOQ.
+	MaxMoney int64 = 20_000_000_000 * types.SatoshisPerSOQ
+
+	// FeeMarginVBytes is added to the measured vsize before the fee is
+	// computed, so a rounding difference against the node's own vsize can
+	// never put a transaction one satoshi under a fee floor.
+	FeeMarginVBytes int64 = 1
 )
+
+// Fee sanity limits. A fee above either is refused with ErrFeeTooHigh before
+// anything is signed. They are variables so an operator can tighten them; the
+// defaults are loose enough for any standard transaction at the recommended
+// rate (a maximal 80-input payout at 1000 sat/vB is about 0.75 SOQ) and tight
+// enough to stop a fee-rate typo from burning a hot wallet up to the node's
+// own 100 SOQ limit.
+var (
+	MaxFeeSat          int64 = 2 * types.SatoshisPerSOQ // 2 SOQ
+	MaxFeeRateSatPerVB int64 = 100_000                  // 100x the recommended rate
+)
+
+// Builder errors. All are permanent: the request itself is wrong.
+var (
+	ErrInvalidAmount     = errors.New("tx: amount must be positive and at most MaxMoney")
+	ErrBelowDust         = errors.New("tx: output below the node's relay floor (UTXOCostPerByte x serialized size)")
+	ErrFeeTooHigh        = errors.New("tx: fee exceeds the configured sanity limit")
+	ErrInsufficientFunds = errors.New("tx: insufficient funds")
+	ErrInputOverflow     = errors.New("tx: input values overflow")
+)
+
+// MinOutputValue is the node's relay floor for an output carrying this
+// scriptPubKey: UTXOCostPerByte times the serialized size (8 value bytes,
+// the script length varint, the script).
+func MinOutputValue(scriptPubKey []byte) int64 {
+	return UTXOCostPerByte * int64(8+varIntSize(uint64(len(scriptPubKey)))+len(scriptPubKey))
+}
+
+func varIntSize(v uint64) int {
+	switch {
+	case v < 0xfd:
+		return 1
+	case v <= 0xffff:
+		return 3
+	case v <= 0xffffffff:
+		return 5
+	default:
+		return 9
+	}
+}
+
+// checkAmount enforces the node's amount range on a single output value.
+func checkAmount(v int64) error {
+	if v <= 0 || v > MaxMoney {
+		return fmt.Errorf("%w: %d", ErrInvalidAmount, v)
+	}
+	return nil
+}
+
+// sumInputs adds input values with overflow detection.
+func sumInputs(inputs []types.UTXO) (int64, error) {
+	var total int64
+	for _, u := range inputs {
+		if err := checkAmount(u.Value); err != nil {
+			return 0, fmt.Errorf("input %s:%d: %w", u.TxID, u.Vout, err)
+		}
+		if total > MaxMoney-u.Value {
+			return 0, ErrInputOverflow
+		}
+		total += u.Value
+	}
+	return total, nil
+}
+
+// checkFee applies the fee sanity limits.
+func checkFee(fee, feeRate int64) error {
+	if feeRate <= 0 {
+		return fmt.Errorf("%w: fee rate %d sat/vB", ErrInvalidAmount, feeRate)
+	}
+	if feeRate > MaxFeeRateSatPerVB {
+		return fmt.Errorf("%w: fee rate %d sat/vB exceeds MaxFeeRateSatPerVB %d", ErrFeeTooHigh, feeRate, MaxFeeRateSatPerVB)
+	}
+	if fee > MaxFeeSat {
+		return fmt.Errorf("%w: fee %d sat exceeds MaxFeeSat %d", ErrFeeTooHigh, fee, MaxFeeSat)
+	}
+	return nil
+}
 
 // TxInput represents a transaction input.
 type TxInput struct {
@@ -136,17 +235,40 @@ func (tx *Transaction) AddOutput(value int64, scriptPubKey []byte) {
 	})
 }
 
-// EstimateWeight returns the estimated transaction weight in weight units.
+// EstimateWeight returns the transaction weight in weight units, measured on
+// the serialized form: 3 x the non-witness serialization plus the full
+// serialization (BIP 141). Inputs not yet signed are counted with the exact
+// witness this SDK emits (2421-byte signature||hashtype, 1313-byte 0x00||pk),
+// so the value is the node's own weight for the signed transaction, not an
+// approximation. Because every witness item has a fixed size, the estimate
+// before signing equals the measurement after.
 func (tx *Transaction) EstimateWeight() int {
-	return TxOverheadWeight +
-		len(tx.Inputs)*EstimatedInputWeight +
-		len(tx.Outputs)*EstimatedOutputWeight
+	base := len(tx.serializeNoWitness())
+	witness := 2 // marker + flag
+	for _, in := range tx.Inputs {
+		if len(in.WitnessData) > 0 {
+			witness += varIntSize(uint64(len(in.WitnessData)))
+			for _, item := range in.WitnessData {
+				witness += varIntSize(uint64(len(item))) + len(item)
+			}
+			continue
+		}
+		witness += 1 + varIntSize(DilithiumSigSize+1) + (DilithiumSigSize + 1) +
+			varIntSize(DilithiumPubKeySize+1) + (DilithiumPubKeySize + 1)
+	}
+	return base*4 + witness
 }
 
-// EstimateFee returns the estimated fee for this transaction given a fee rate (sat/vB).
+// VSize returns the virtual size in vbytes, weight divided by four rounded up,
+// as the node computes it for fee purposes.
+func (tx *Transaction) VSize() int64 {
+	return int64((tx.EstimateWeight() + 3) / 4)
+}
+
+// EstimateFee returns the fee for this transaction at feeRate (sat/vB):
+// (vsize + FeeMarginVBytes) x feeRate.
 func (tx *Transaction) EstimateFee(feeRate int64) int64 {
-	vsize := (tx.EstimateWeight() + 3) / 4 // Round up
-	return int64(vsize) * feeRate
+	return (tx.VSize() + FeeMarginVBytes) * feeRate
 }
 
 // ComputeSigHash computes the BIP143 sighash for a specific input.
@@ -282,6 +404,28 @@ func (tx *Transaction) Serialize() []byte {
 // SerializeHex returns the hex-encoded serialized transaction.
 func (tx *Transaction) SerializeHex() string {
 	return hex.EncodeToString(tx.Serialize())
+}
+
+// serializeNoWitness is the legacy (non-witness) serialization, which the
+// txid and the base weight are computed over.
+func (tx *Transaction) serializeNoWitness() []byte {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, tx.Version)
+	writeVarInt(&buf, uint64(len(tx.Inputs)))
+	for _, input := range tx.Inputs {
+		buf.Write(input.TxID[:])
+		binary.Write(&buf, binary.LittleEndian, input.Vout)
+		writeVarInt(&buf, 0)
+		binary.Write(&buf, binary.LittleEndian, input.Sequence)
+	}
+	writeVarInt(&buf, uint64(len(tx.Outputs)))
+	for _, output := range tx.Outputs {
+		binary.Write(&buf, binary.LittleEndian, output.Value)
+		writeVarInt(&buf, uint64(len(output.ScriptPubKey)))
+		buf.Write(output.ScriptPubKey)
+	}
+	binary.Write(&buf, binary.LittleEndian, tx.LockTime)
+	return buf.Bytes()
 }
 
 // TxID computes the transaction ID (double SHA-256 of the non-witness serialization).
@@ -523,10 +667,10 @@ func BuildMintUSDSOQTransaction(
 	tx.AddOutputWitnessV5(authorityPKHash)
 
 	// vout[2]: Native SOQ change output (witness v1, for fee change)
-	if change > DustThreshold {
+	if change >= MinOutputValue(changeScriptPubKey) {
 		tx.AddOutput(change, changeScriptPubKey)
 	} else {
-		// Below dust — donate to miners as additional fee
+		// Below the relay floor — left to miners as additional fee
 		fee += change
 	}
 
@@ -609,12 +753,12 @@ func BuildSendUSDSOQTransaction(
 
 	// vout[1]: USDSOQ change output (witness v7, if above dust)
 	usdsoqChange := totalUSDSOQ - amount
-	if usdsoqChange > DustThreshold {
+	if usdsoqChange >= MinOutputValue(usdsoqChangeScriptPubKey) {
 		tx.AddOutputUSDSOQ(usdsoqChange, usdsoqChangeScriptPubKey)
 	}
 
-	// vout[2]: native SOQ fee change output (witness v1, if above dust)
-	if soqChange > DustThreshold {
+	// vout[2]: native SOQ fee change output (witness v1, if at or above the relay floor)
+	if soqChange >= MinOutputValue(soqChangeScriptPubKey) {
 		tx.AddOutput(soqChange, soqChangeScriptPubKey)
 	}
 
@@ -633,10 +777,19 @@ func BuildSendTransaction(
 	if err := requireSameNetwork(inputs); err != nil {
 		return nil, err
 	}
+	if err := checkAmount(amount); err != nil {
+		return nil, err
+	}
+	if floor := MinOutputValue(recipientScriptPubKey); amount < floor {
+		return nil, fmt.Errorf("%w: %d sat to recipient, floor %d", ErrBelowDust, amount, floor)
+	}
+	totalInput, err := sumInputs(inputs)
+	if err != nil {
+		return nil, err
+	}
 	tx := NewTransaction()
 
 	// Add inputs
-	var totalInput int64
 	for _, u := range inputs {
 		// Derive the input's scriptPubKey from the UTXO's bech32m address.
 		// This is critical for BIP143 sighash computation — the scriptCode
@@ -649,30 +802,29 @@ func BuildSendTransaction(
 		if err := tx.AddInput(u, inputSPK); err != nil {
 			return nil, fmt.Errorf("add input: %w", err)
 		}
-		totalInput += u.Value
 	}
 
-	// Estimate fee (pessimistic: assume change output exists)
-	tx.Outputs = make([]TxOutput, 2) // temporary for weight estimation
+	// Fee for the two-output form (recipient + change), measured on the real
+	// serialization; if change is later folded away the fee only grows.
+	tx.AddOutput(amount, recipientScriptPubKey)
+	tx.AddOutput(0, changeScriptPubKey) // placeholder for measurement
 	fee := tx.EstimateFee(feeRate)
-	tx.Outputs = nil // reset
+	tx.Outputs = tx.Outputs[:1]
+	if err := checkFee(fee, feeRate); err != nil {
+		return nil, err
+	}
 
 	// Calculate change
 	change := totalInput - amount - fee
 	if change < 0 {
-		return nil, fmt.Errorf("insufficient funds: inputs=%d, amount=%d, fee=%d",
-			totalInput, amount, fee)
+		return nil, fmt.Errorf("%w: inputs=%d, amount=%d, fee=%d",
+			ErrInsufficientFunds, totalInput, amount, fee)
 	}
 
-	// Add recipient output
-	tx.AddOutput(amount, recipientScriptPubKey)
-
-	// Add change output (if above dust threshold)
-	if change > DustThreshold {
+	// Change output only above the relay floor for its script; otherwise it is
+	// left to the miner as fee (the node would reject the output as dust).
+	if change >= MinOutputValue(changeScriptPubKey) {
 		tx.AddOutput(change, changeScriptPubKey)
-	} else {
-		// Below dust — donate to miners as additional fee
-		fee += change
 	}
 
 	return tx, nil
