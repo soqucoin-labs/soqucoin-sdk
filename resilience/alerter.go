@@ -3,9 +3,11 @@ package resilience
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -86,7 +88,7 @@ func (a *Alerter) SendCircuitBreakerAlert(fromState, toState string, consecutive
 
 	text := fmt.Sprintf("%s *soqucoin-sdk*: %s → %s", emoji, fromState, toState)
 	if lastErr != "" {
-		text += fmt.Sprintf("\n> Last error: `%s`", lastErr)
+		text += fmt.Sprintf("\n> Last error: `%s`", clip(lastErr))
 	}
 	if consecutiveFailures > 0 {
 		text += fmt.Sprintf("\n> Consecutive failures: %d", consecutiveFailures)
@@ -120,7 +122,7 @@ func (a *Alerter) SendAlert(title, message, color string) {
 			{
 				Color:  color,
 				Title:  title,
-				Text:   message,
+				Text:   clip(message),
 				Footer: "soqucoin-sdk",
 				Ts:     time.Now().Unix(),
 			},
@@ -128,6 +130,27 @@ func (a *Alerter) SendAlert(title, message, color string) {
 	}
 
 	go a.send(payload)
+}
+
+// redactURLError strips the URL from a *url.Error so a webhook secret never
+// reaches the log; other errors pass through.
+func redactURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("%s webhook: %w", ue.Op, ue.Err)
+	}
+	return err
+}
+
+// maxAlertText bounds any free text placed in an alert, so a proxy's HTML
+// error page or an unbounded node reply is not posted to the channel.
+const maxAlertText = 500
+
+func clip(s string) string {
+	if len(s) <= maxAlertText {
+		return s
+	}
+	return s[:maxAlertText] + "…"
 }
 
 // send posts the payload to the webhook URL (fire-and-forget).
@@ -140,7 +163,9 @@ func (a *Alerter) send(payload slackPayload) {
 
 	resp, err := a.client.Post(a.webhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("[alerter] ERROR: webhook POST failed: %v", err)
+		// A Slack incoming-webhook URL is a bearer-equivalent secret and a
+		// *url.Error would print it whole. Log the cause without the URL.
+		log.Printf("[alerter] ERROR: webhook POST failed: %v", redactURLError(err))
 		return
 	}
 	defer resp.Body.Close()

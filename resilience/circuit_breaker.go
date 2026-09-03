@@ -22,10 +22,15 @@
 package resilience
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
+
+	soqaddr "github.com/soqucoin-labs/soqucoin-sdk/address"
+	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
+	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 )
 
 // CircuitBreakerState represents the circuit breaker's current state.
@@ -72,6 +77,7 @@ type CircuitBreaker struct {
 	consecutiveFailures int
 	maxFailures         int
 	cooldownDuration    time.Duration
+	probing             bool // HALF-OPEN: one probe is in flight
 
 	lastFailure time.Time
 	lastSuccess time.Time
@@ -82,8 +88,79 @@ type CircuitBreaker struct {
 
 	// OnStateChange is called whenever the CB transitions between states.
 	// Signature: func(fromState, toState string, consecutiveFailures int, lastErr string)
-	// May be nil. Used by the Alerter for webhook notifications.
+	// May be nil. Used by the Alerter for webhook notifications. It is invoked
+	// after the breaker's lock is released, so it may read the breaker.
 	OnStateChange func(from, to string, consecutiveFailures int, lastErr string)
+
+	// PerRequestErrors extends the set of errors that describe ONE request
+	// rather than the system, and so must never count as a failure. Address,
+	// amount and node-rejection errors from this SDK are always in the set.
+	PerRequestErrors []error
+}
+
+// perRequest reports whether err is about the request, not the system. A
+// malformed address, an amount below the floor, insufficient funds or a
+// node rejection of one transaction says nothing about whether the next
+// withdrawal can succeed; feeding such errors to the breaker lets an
+// unauthenticated user halt every withdrawal with three bad requests.
+func (cb *CircuitBreaker) perRequest(err error) bool {
+	if err == nil {
+		return false
+	}
+	builtin := []error{
+		rpc.ErrPermanent,
+		soqaddr.ErrInvalidChecksum, soqaddr.ErrInvalidLength, soqaddr.ErrInvalidHRP,
+		soqaddr.ErrInvalidChar, soqaddr.ErrUnsupportedWitnessVersion, soqaddr.ErrInvalidVersion,
+		tx.ErrInvalidAmount, tx.ErrBelowDust, tx.ErrFeeTooHigh, tx.ErrInsufficientFunds, tx.ErrInputOverflow,
+	}
+	for _, e := range append(builtin, cb.PerRequestErrors...) {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// RecordResult is the entry point callers should use. A nil error is a
+// success. A per-request error (see perRequest) is neither: the breaker is
+// untouched and false is returned. Anything else (transport failures,
+// transient node states, unknown outcomes, unclassified errors) counts as a
+// failure. Returns true when the result changed the breaker's counters.
+func (cb *CircuitBreaker) RecordResult(err error) bool {
+	switch {
+	case err == nil:
+		cb.RecordSuccess()
+		return true
+	case cb.perRequest(err):
+		cb.mu.Lock()
+		if cb.state == CircuitHalfOpen {
+			cb.probing = false // the probe completed; it just told us nothing about the system
+		}
+		cb.mu.Unlock()
+		return false
+	default:
+		cb.RecordFailure(err)
+		return true
+	}
+}
+
+// Trip forces the breaker OPEN regardless of the failure count, for callers
+// that have found a reason to halt outright (the reconciler on a mismatch).
+func (cb *CircuitBreaker) Trip(err error) {
+	cb.mu.Lock()
+	prev := cb.state
+	cb.state = CircuitOpen
+	cb.probing = false
+	cb.lastFailure = time.Now()
+	if cb.consecutiveFailures < cb.maxFailures {
+		cb.consecutiveFailures = cb.maxFailures
+	}
+	n := cb.consecutiveFailures
+	cb.mu.Unlock()
+	log.Printf("[circuit-breaker] %s → OPEN (tripped: %v)", prev, err)
+	if prev != CircuitOpen && cb.OnStateChange != nil {
+		cb.OnStateChange(prev.String(), "OPEN", n, err.Error())
+	}
 }
 
 // NewCircuitBreaker creates a new circuit breaker.
@@ -112,7 +189,8 @@ func (cb *CircuitBreaker) Allow() error {
 	case CircuitOpen:
 		if time.Since(cb.lastFailure) >= cb.cooldownDuration {
 			cb.state = CircuitHalfOpen
-			log.Printf("[circuit-breaker] Transitioning OPEN → HALF-OPEN (cooldown elapsed, allowing probe)")
+			cb.probing = true
+			log.Printf("[circuit-breaker] Transitioning OPEN → HALF-OPEN (cooldown elapsed, allowing ONE probe)")
 			return nil
 		}
 		remaining := cb.cooldownDuration - time.Since(cb.lastFailure)
@@ -120,6 +198,12 @@ func (cb *CircuitBreaker) Allow() error {
 			cb.consecutiveFailures, remaining.Round(time.Second))
 
 	case CircuitHalfOpen:
+		// Exactly one probe at a time. Admitting everyone while half-open lets
+		// a burst of doomed operations through before the probe has answered.
+		if cb.probing {
+			return errors.New("circuit breaker HALF-OPEN: a probe is already in flight")
+		}
+		cb.probing = true
 		return nil
 
 	default:
@@ -130,13 +214,13 @@ func (cb *CircuitBreaker) Allow() error {
 // RecordSuccess records a successful operation. Resets failure count and closes the circuit.
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
 	previousState := cb.state
 	cb.consecutiveFailures = 0
 	cb.lastSuccess = time.Now()
 	cb.TotalSuccesses++
 	cb.state = CircuitClosed
+	cb.probing = false
+	cb.mu.Unlock()
 
 	if previousState != CircuitClosed {
 		log.Printf("[circuit-breaker] %s → CLOSED (operation succeeded)", previousState)
@@ -147,34 +231,37 @@ func (cb *CircuitBreaker) RecordSuccess() {
 }
 
 // RecordFailure records an operation failure. May trip the circuit open.
+//
+// Prefer RecordResult, which refuses to count per-request errors.
 func (cb *CircuitBreaker) RecordFailure(err error) {
+	if err == nil {
+		err = errors.New("unspecified failure")
+	}
 	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
 	cb.consecutiveFailures++
 	cb.lastFailure = time.Now()
 	cb.TotalFailures++
-
-	if cb.state == CircuitHalfOpen {
+	n := cb.consecutiveFailures
+	var from string
+	tripped := false
+	switch {
+	case cb.state == CircuitHalfOpen:
 		cb.state = CircuitOpen
-		log.Printf("[circuit-breaker] HALF-OPEN → OPEN (probe failed: %v, cooling down %v)",
-			err, cb.cooldownDuration)
-		if cb.OnStateChange != nil {
-			cb.OnStateChange("HALF-OPEN", "OPEN", cb.consecutiveFailures, err.Error())
-		}
+		cb.probing = false
+		from, tripped = "HALF-OPEN", true
+	case cb.consecutiveFailures >= cb.maxFailures && cb.state != CircuitOpen:
+		cb.state = CircuitOpen
+		from, tripped = "CLOSED", true
+	}
+	cb.mu.Unlock()
+
+	if !tripped {
+		log.Printf("[circuit-breaker] Failure %d/%d: %v", n, cb.maxFailures, err)
 		return
 	}
-
-	if cb.consecutiveFailures >= cb.maxFailures {
-		cb.state = CircuitOpen
-		log.Printf("[circuit-breaker] CLOSED → OPEN (%d consecutive failures, cooling down %v)",
-			cb.consecutiveFailures, cb.cooldownDuration)
-		if cb.OnStateChange != nil {
-			cb.OnStateChange("CLOSED", "OPEN", cb.consecutiveFailures, err.Error())
-		}
-	} else {
-		log.Printf("[circuit-breaker] Failure %d/%d: %v",
-			cb.consecutiveFailures, cb.maxFailures, err)
+	log.Printf("[circuit-breaker] %s → OPEN (%d consecutive failures: %v, cooling down %v)", from, n, err, cb.cooldownDuration)
+	if cb.OnStateChange != nil {
+		cb.OnStateChange(from, "OPEN", n, err.Error())
 	}
 }
 
@@ -191,5 +278,6 @@ func (cb *CircuitBreaker) Reset() {
 	defer cb.mu.Unlock()
 	cb.state = CircuitClosed
 	cb.consecutiveFailures = 0
+	cb.probing = false
 	log.Printf("[circuit-breaker] Manually reset to CLOSED")
 }
