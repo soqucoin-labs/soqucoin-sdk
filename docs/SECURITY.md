@@ -151,12 +151,12 @@ ML-DSA signatures are not malleable in the ECDSA sense, so the classic txid
 mutation does not apply. The property you should still enforce is agreement:
 
 ```go
-txid, err := rpcClient.SendRawTransaction(rawHex)
+// Broadcast refuses a node txid that differs from the one the SDK computed,
+// resolves a lost reply against the node, and reports "already in chain" as
+// success. rpc.ErrUnknownOutcome means retry these bytes, never rebuild.
+txid, err := rpcClient.Broadcast(rawHex, builtTxID)
 if err != nil {
     return err
-}
-if txid != builtTxID {
-    return fmt.Errorf("node txid %s != SDK txid %s", txid, builtTxID)
 }
 ```
 
@@ -230,7 +230,10 @@ The client offers no TLS options. Protect the RPC transport at the network layer
 ### Addresses
 
 Validate before you build anything. `Validate` takes the expected HRP, so it
-checks the network at the same time as the checksum:
+checks the network at the same time as the checksum. It accepts exactly what the
+node's own `DecodeDestination` accepts as a payment destination: witness version 1
+with a 32-byte program. Versions 5 and 7 are USDSOQ script forms, not addresses;
+v0.3.3 and earlier accepted them, and paying one is a loss of funds.
 
 ```go
 if err := address.Validate(types.Mainnet.HRP, userProvidedAddress); err != nil {
@@ -265,11 +268,15 @@ because the script derived from an address is what BIP143 commits to as the
 parser, so nothing converts or validates on your behalf. 1 SOQ is
 `types.ShorsPerSOQ` shors.
 
-Parse user input yourself, and do not route it through `float64`:
+Parse user input yourself, and do not route it through `float64`. The builders
+refuse amounts outside `0 < v <= tx.MaxMoney` (`tx.ErrInvalidAmount`), recipient
+amounts below the node's relay floor (`tx.MinOutputValue`, `tx.ErrBelowDust`), and
+input sums that would overflow; treat all of those as per-request errors, not as
+system failures:
 
 ```go
 // Reject anything non-positive before it reaches a builder.
-if amountSats <= 0 {
+if amountShors <= 0 {
     return errors.New("amount must be positive")
 }
 ```
@@ -281,9 +288,11 @@ a value that differs from what was typed.
 ### Fee rate is per vByte
 
 `feeRate` in `tx.BuildAndSign` and `tx.BuildSendTransaction` is shors per
-vByte, not a flat fee. A single-input ML-DSA payment is roughly 1,073 vB, so a
-feeRate below about 1,000 produces a transaction the node treats as effectively
-free and rate-limits rather than relays. Validate before you rely on a broadcast:
+vByte, not a flat fee. A single-input ML-DSA payment is 1,073 vB. Use
+`types.RecommendedFeeRate` (1,000); below it a default miner does not include the
+transaction. The builders cap the fee at `tx.MaxFeeShors` and the rate at
+`tx.MaxFeeRateShorsPerVB`, both adjustable, so a typo cannot burn the hot wallet.
+Validate before you rely on a broadcast:
 
 ```bash
 soqucoin-cli testmempoolaccept '["<rawHex>"]'
@@ -300,7 +309,9 @@ Please do not open a public issue for a security defect.
 
 Email **[security@soqucoin.com](mailto:security@soqucoin.com)** with a
 description, reproduction steps, and your assessment of the impact. Include a
-suggested fix if you have one.
+suggested fix if you have one. If you have not received an acknowledgement within
+two business days, open a private vulnerability report on the GitHub repository
+so the report is not lost to a mail problem.
 
 We will acknowledge receipt and give you an initial assessment, and we will agree
 a disclosure timeline with you rather than imposing one. We are a small team and
@@ -324,7 +335,8 @@ Reporters are credited in release notes with their permission.
 |-------|-----------------|
 | ML-DSA-44 cryptography | [Cloudflare CIRCL](https://github.com/cloudflare/circl), widely deployed and independently analysed |
 | Consensus rules, script validation, signing | Soqucoin Core, audited by [Halborn Security](https://halborn.com) across two engagements |
-| This SDK's construction and client layer | Verified against the node's own format vectors and by confirmed on-chain transactions; no separate engagement |
+| This SDK's construction and client layer | Verified against the node's own format vectors, against addresses produced by the node's own encoder, and by confirmed on-chain transactions; an internal adversarial review in September 2026 found and fixed defects in every package (see the release notes); no separate external engagement |
+| ML-DSA-44 implementation used here | [Cloudflare CIRCL](https://github.com/cloudflare/circl). The node verifies with the pq-crystals reference C implementation, so two independent implementations meet on every signature; their agreement is pinned by signatures verified across the pair and by the confirmed transaction |
 
 Both the cryptography and the consensus rules this SDK targets have been reviewed
 externally. The SDK is the integration layer above them, and its agreement with

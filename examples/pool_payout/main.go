@@ -201,7 +201,7 @@ func run(cfg runConfig) error {
 			payout, cfg.poolAddress, cfg.feeRate, cfg.dryRun)
 		if err != nil {
 			log.Printf("  FAILED: %v", err)
-			cb.RecordFailure(err)
+			cb.RecordResult(err)
 			failed++
 			continue
 		}
@@ -303,14 +303,15 @@ func executePayout(
 		return builtTxID, nil
 	}
 
-	txid, err := rpcClient.SendRawTransaction(rawTxHex)
+	// Broadcast with a known outcome: a lost reply is resolved against the
+	// node, "already in chain" is success, and a node txid that differs from
+	// the one we computed is refused (serialization would disagree with
+	// consensus). rpc.ErrUnknownOutcome means the transaction MAY be out: retry
+	// these same bytes later, never rebuild. withdraw.Engine does that
+	// durably; this example keeps the single-shot shape for readability.
+	txid, err := rpcClient.Broadcast(rawTxHex, builtTxID)
 	if err != nil {
 		return "", fmt.Errorf("broadcast: %w", err)
-	}
-	// If the node computed a different txid, our serialization disagrees with
-	// consensus. Do not record anything against it and do not retry.
-	if txid != builtTxID {
-		return "", fmt.Errorf("txid mismatch: node %s, SDK %s", txid, builtTxID)
 	}
 
 	// Only now, with the transaction accepted, record the effects.

@@ -146,8 +146,9 @@ Stated precisely, so you can see exactly what has and has not been demonstrated.
 - **This is a single-input, single-signature payment.** It does not exercise
   multi-input batching, USDSOQ asset transactions, or the authority paths.
 - **It was performed on stagenet.** Mainnet construction is covered by unit tests
-  across all three networks, but no mainnet transaction has been broadcast,
-  because mainnet does not yet exist.
+  across all three networks and by address vectors produced by the node's own
+  encoder, but no mainnet transaction has been broadcast: the mainnet genesis
+  exists (2026-09-02) and the network launches later.
 - **It proves the signing and serialization path, not the whole SDK.** The
   deposit-monitoring path depends on an indexer and is not covered here.
 

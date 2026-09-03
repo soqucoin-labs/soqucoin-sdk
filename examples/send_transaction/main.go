@@ -2,7 +2,8 @@
 // a Soqucoin transaction using the SDK.
 //
 // This example builds a transaction offline — it does NOT broadcast.
-// For broadcasting, use rpc.Client.SendRawTransaction() with a live node.
+// For broadcasting, use rpc.Client.Broadcast(rawTx, txid) with a live node; for
+// real withdrawals use withdraw.Engine, which persists before it broadcasts.
 //
 // Usage:
 //
@@ -119,5 +120,5 @@ func main() {
 	}
 	fmt.Printf("Signature verification: %v\n", sigValid)
 	fmt.Println()
-	fmt.Println("In production, broadcast via: rpc.Client.SendRawTransaction(rawTx)")
+	fmt.Println("In production, broadcast via: rpc.Client.Broadcast(rawTx, txid)")
 }

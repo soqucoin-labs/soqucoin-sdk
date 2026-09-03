@@ -59,9 +59,11 @@ options and the full walkthrough.
 | **ElectrumX UTXO tracking** | Production-hardened TCP client with 4MB buffer, merge refresh, auto-reconnect |
 | **Node RPC client** | JSON-RPC client for `soqucoind` with Defense 11 (gettxout pre-verify) |
 | **UTXO coin selection** | Largest-first, smallest-first (consolidation), asset-type-aware, dust filtering |
-| **Persistent spent set** | Never re-spend a UTXO, which survives process restarts via JSON persistence |
-| **Circuit breaker** | Halt operations after consecutive failures, probe, recover |
-| **Reconciliation** | Periodic UTXO balance verification to detect drift |
+| **Persistent spent set** | Never re-spend a UTXO: inputs reserved at build time, unconfirmed spends survive restarts |
+| **Withdrawal state machine** | `withdraw.Engine`: idempotency keys, persist-before-broadcast, same-bytes retry on a lost reply, recovery without rebuilding |
+| **Deposit crediting** | `deposit.Monitor`: credits only what your own node confirms; pauses while syncing or stale; alarms on a vanished credit |
+| **Circuit breaker** | Halt on systemic failures only (per-request errors never count), one probe, recover |
+| **Reconciliation** | Verifies the indexer cache against the node outpoint by outpoint; halts withdrawals on a mismatch |
 | **Webhook alerting** | Slack-compatible notifications for circuit breaker transitions |
 
 ## Quick Example
@@ -79,13 +81,20 @@ fmt.Println("Address:", kp.Address)
 Monitor deposits via ElectrumX:
 
 ```go
-client := electrumx.NewClient("electrumx.example.com:50001", 15*time.Second)
-client.Connect()
-client.TrackAddresses([]string{depositAddr})
+client := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second)
+client.UseTLS()
+if err := client.TrackAddresses([]string{depositAddr}); err != nil { // network inferred, mixed refused
+    log.Fatal(err)
+}
+if err := client.Connect(); err != nil { // verifies the server's genesis hash
+    log.Fatal(err)
+}
 client.StartPolling()
 
-// Check balance periodically
-confirmed, _ := client.GetBalance(6, tipHeight)
+// Credit through deposit.Monitor, which checks every candidate against your
+// own node before crediting; see docs/EXCHANGE_INTEGRATION.md Step 2. The
+// confirmation table starts at 30 for small amounts, never 6.
+confirmed, _ := client.GetBalance(30, tipHeight)
 ```
 
 Build and broadcast a payment:
@@ -98,15 +107,18 @@ inputs, total, err := selector.SelectUTXOs(allUTXOs, amount+fee, 1, tipHeight, n
 // 2. Verify on-chain (Defense 11)
 verified, err := rpcClient.VerifyAndFilterUTXOs(inputs, elxClient.EvictUTXO, nil)
 
-// 3. Build, sign and serialize in one call. feeRate is per vByte; a
-//    Dilithium transaction is ~1,073 vB, so 10 is low enough that the node
-//    rate-limits it as free.
+// 3. Build, sign and serialize in one call. feeRate is shors per vByte; use
+//    types.RecommendedFeeRate (1000). The builder measures the real weight,
+//    enforces the node's output floor and caps the fee.
 recipientSPK, err := address.ScriptFor(recipientAddr)
 changeSPK, err := address.ScriptFor(changeAddr)
-rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, feeRate, keystore)
+rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, types.RecommendedFeeRate, keystore)
 
-// 4. Broadcast. The txid BuildAndSign computed must match the node's.
-sentTxID, err := rpcClient.SendRawTransaction(rawTx)
+// 4. Broadcast with a known outcome: a lost reply is resolved against the
+//    node, "already in chain" is success, and rpc.ErrUnknownOutcome means
+//    retry THESE bytes, never rebuild. withdraw.Engine does all of this
+//    durably; use it for real withdrawals (Step 3 of the exchange guide).
+sentTxID, err := rpcClient.Broadcast(rawTx, txid)
 
 // 5. Mark spent (Defense 12)
 spentSet.MarkBroadcast(verified, sentTxID)
@@ -123,8 +135,10 @@ spentSet.MarkBroadcast(verified, sentTxID)
 | [`electrumx`](./electrumx) | Production-hardened ElectrumX TCP client (PF-018, F5, Defense 12) |
 | [`rpc`](./rpc) | JSON-RPC client for `soqucoind` (sendrawtransaction, gettxout, getblock) |
 | [`utxo`](./utxo) | UTXO coin selection + persistent spent set tracking |
-| [`resilience`](./resilience) | Circuit breaker, reconciler, and Slack webhook alerter |
-| [`client`](./client) | High-level client combining RPC + ElectrumX for common flows |
+| [`withdraw`](./withdraw) | Durable withdrawal state machine: idempotency, reservation, same-bytes retry, recovery |
+| [`deposit`](./deposit) | Deposit crediting verified against your own node |
+| [`resilience`](./resilience) | Circuit breaker, reconciler against the node, Slack webhook alerter |
+| [`client`](./client) | HTTP client for the internal soq-signer REST service; exchanges do not need it |
 
 ## Provenance
 
@@ -160,9 +174,9 @@ can check rather than provenance you have to trust.
 
 Every package carries unit tests, and the suite passes under the race detector.
 
-| `address` | `client` | `utxo` | `tx` | `keys` | `rpc` | `electrumx` | `resilience` |
-|:---------:|:--------:|:------:|:----:|:------:|:-----:|:-----------:|:------------:|
-| 91.1% | 86.8% | 83.9% | 70.5% | 67.3% | 64.8% | 51.3% | 33.8% |
+| `address` | `utxo` | `client` | `rpc` | `deposit` | `electrumx` | `tx` | `keys` | `withdraw` | `resilience` |
+|:---------:|:------:|:--------:|:-----:|:---------:|:-----------:|:----:|:------:|:----------:|:------------:|
+| 92.4% | 88.1% | 86.8% | 78.3% | 77.3% | 76.2% | 76.1% | 75.3% | 73.1% | 62.1% |
 
 ```bash
 go test ./...
@@ -198,8 +212,8 @@ Key properties:
 See the [`examples/`](./examples) directory:
 
 - [`generate_address`](./examples/generate_address): Create a new wallet address
-- [`send_transaction`](./examples/send_transaction): Build and broadcast a transaction
-- [`exchange_deposit`](./examples/exchange_deposit): Monitor incoming deposits (exchange flow)
+- [`send_transaction`](./examples/send_transaction): Build and sign a transaction (does not broadcast)
+- [`exchange_deposit`](./examples/exchange_deposit): Credit deposits verified against your own node (exchange flow)
 - [`pool_payout`](./examples/pool_payout): Batch payouts with circuit breaker
 
 ## Contributing
