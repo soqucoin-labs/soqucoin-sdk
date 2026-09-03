@@ -96,7 +96,9 @@ func main() {
 		"ssq1p...", // User 1's deposit address
 		"ssq1p...", // User 2's deposit address
 	}
-	client.TrackAddresses(depositAddresses)
+	if err := client.TrackAddresses(depositAddresses); err != nil {
+		log.Fatalf("track deposit addresses: %v", err)
+	}
 	log.Printf("Tracking %d deposit addresses", len(depositAddresses))
 
 	// ── Step 4: Start polling ──

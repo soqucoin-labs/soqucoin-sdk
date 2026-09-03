@@ -31,9 +31,11 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,16 +53,24 @@ type Client struct {
 	mu           sync.RWMutex
 	utxos        map[string][]types.UTXO // address -> UTXOs
 	host         string
-	conn         net.Conn
-	reader       *bufio.Reader
-	connMu       sync.Mutex // PF-018b: Serializes all TCP I/O
+	conn         net.Conn      // guarded by connMu
+	reader       *bufio.Reader // guarded by connMu
+	connMu       sync.Mutex    // PF-018b: Serializes all TCP I/O and connection replacement
 	reqID        atomic.Int64
+	lastTip      atomic.Int64 // latest height seen in a headers.subscribe reply or notification
 	addresses    []string
 	pollInterval time.Duration
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 
-	// Network HRP for address-to-script-hash conversion.
-	// Defaults to "ssq" (stagenet). Set to "sq" for mainnet.
+	lastRefreshAt  time.Time // guarded by mu: last time EVERY tracked address refreshed
+	lastRefreshErr error     // guarded by mu: error of the last RefreshAll, nil on success
+
+	// HRP is the network prefix the tracked addresses must carry. Leave it
+	// empty and TrackAddresses infers it from the addresses themselves; set it
+	// explicitly ("sq" mainnet, "ssq" stagenet) to have TrackAddresses reject
+	// any address on another network. There is deliberately no default: a
+	// silent stagenet default on a mainnet deployment refreshed nothing, ever.
 	HRP string
 
 	// OnRefresh is called after each successful UTXO refresh with the address
@@ -110,6 +120,33 @@ type response struct {
 	Error  json.RawMessage `json:"error,omitempty"`
 }
 
+// incoming is any line the server sends: a reply (id set) or a notification
+// (method set, no id). ElectrumX pushes blockchain.headers.subscribe
+// notifications on the same connection once GetTip has subscribed, so a reader
+// that takes "the next line" as "the reply" goes off by one at every new block.
+type incoming struct {
+	ID     *int64          `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+	Result json.RawMessage `json:"result"`
+	Error  json.RawMessage `json:"error,omitempty"`
+}
+
+var (
+	// ErrNotConnected is returned by every call made before Connect or after Stop.
+	ErrNotConnected = errors.New("electrumx: not connected")
+	// ErrNetworkMismatch is returned when a tracked address is on a different
+	// network than the client's HRP, or when addresses in one call disagree.
+	ErrNetworkMismatch = errors.New("electrumx: address network does not match the client's")
+	// ErrGenesisMismatch is returned by Connect when the server's reported
+	// genesis hash is not one of the chains the client's HRP belongs to.
+	ErrGenesisMismatch = errors.New("electrumx: server is indexing a different chain")
+)
+
+// maxSkippedLines bounds how many notifications or stale replies one call will
+// read past before giving up; the read deadline bounds it in time as well.
+const maxSkippedLines = 64
+
 // NewClient creates a new ElectrumX client.
 //
 // Parameters:
@@ -121,7 +158,6 @@ func NewClient(host string, pollInterval time.Duration) *Client {
 		host:         host,
 		pollInterval: pollInterval,
 		stopCh:       make(chan struct{}),
-		HRP:          "ssq", // Default to stagenet
 	}
 }
 
@@ -180,12 +216,24 @@ func (c *Client) dial() (net.Conn, error) {
 // Production lesson (F5): ElectrumX connections sit idle between poll intervals.
 // NAT/firewall timeouts silently kill the connection after ~4h on DigitalOcean
 // droplets. TCP keepalive at 30s prevents this.
+//
+// The connection is replaced under connMu, the same lock every call holds, so
+// a Reconnect from the polling goroutine can never race a caller mid-request.
+// After the version handshake the server's genesis hash is checked against the
+// chains the client's HRP belongs to (see verifyGenesisLocked): an indexer for
+// the wrong chain would otherwise report "no deposits" forever.
 func (c *Client) Connect() error {
 	conn, err := c.dial()
 	if err != nil {
 		return err
 	}
 
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
+	if c.conn != nil {
+		c.conn.Close()
+	}
 	c.conn = conn
 	// PF-018 FIX: Use 4MB buffer instead of default 4KB.
 	// ElectrumX responses for addresses with 18,000+ UTXOs can exceed
@@ -199,22 +247,58 @@ func (c *Client) Connect() error {
 		log.Printf("[electrumx] Connected to ElectrumX at %s in plaintext", c.host)
 	}
 
+	fail := func(err error) error {
+		conn.Close()
+		c.conn = nil
+		c.reader = nil
+		return err
+	}
+
 	// Server version handshake
-	resp, err := c.call("server.version", []interface{}{"soqucoin-sdk/1.0", "1.4"})
+	resp, err := c.callLocked("server.version", []interface{}{"soqucoin-sdk/1.0", "1.4"})
 	if err != nil {
-		c.conn.Close()
-		return fmt.Errorf("electrumx handshake: %w", err)
+		return fail(fmt.Errorf("electrumx handshake: %w", err))
 	}
 	log.Printf("[electrumx] Server version: %s", string(resp))
 
+	if err := c.verifyGenesisLocked(); err != nil {
+		return fail(err)
+	}
 	return nil
+}
+
+// verifyGenesisLocked refuses a server that indexes a chain other than the one
+// the client's addresses belong to. Skipped only while the HRP is still unknown
+// (before TrackAddresses), in which case TrackAddresses is the gate.
+func (c *Client) verifyGenesisLocked() error {
+	if c.HRP == "" {
+		return nil
+	}
+	want := types.GenesisHashesForHRP(c.HRP)
+	if len(want) == 0 {
+		return fmt.Errorf("%w: no known chain uses HRP %q", ErrNetworkMismatch, c.HRP)
+	}
+	raw, err := c.callLocked("server.features", []interface{}{})
+	if err != nil {
+		return fmt.Errorf("electrumx server.features: %w", err)
+	}
+	var features struct {
+		Genesis string `json:"genesis_hash"`
+	}
+	if err := json.Unmarshal(raw, &features); err != nil {
+		return fmt.Errorf("electrumx server.features: parse: %w", err)
+	}
+	got := strings.ToLower(strings.TrimPrefix(features.Genesis, "0x"))
+	for _, w := range want {
+		if got == w {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: server genesis %q, client HRP %q expects one of %v", ErrGenesisMismatch, got, c.HRP, want)
 }
 
 // Reconnect closes the existing connection and re-establishes it.
 func (c *Client) Reconnect() error {
-	if c.conn != nil {
-		c.conn.Close()
-	}
 	log.Printf("[electrumx] Reconnecting to ElectrumX at %s...", c.host)
 	if err := c.Connect(); err != nil {
 		return fmt.Errorf("reconnect failed: %w", err)
@@ -235,6 +319,24 @@ func (c *Client) Call(method string, params interface{}) (json.RawMessage, error
 }
 
 func (c *Client) call(method string, params interface{}) (json.RawMessage, error) {
+	// PF-018b FIX: Serialize TCP I/O.
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	return c.callLocked(method, params)
+}
+
+// callLocked performs one request/reply exchange. Caller holds connMu.
+//
+// The reply is identified by id, never by position. Lines carrying a method
+// are server notifications (headers.subscribe pushes one at every new block)
+// and are consumed here; lines carrying another id are replies to an earlier
+// request that timed out and are discarded. Before this, a notification was
+// returned as the reply to whatever call happened to read it, and every later
+// reply was off by one: listunspent for address A stored under address B.
+func (c *Client) callLocked(method string, params interface{}) (json.RawMessage, error) {
+	if c.conn == nil {
+		return nil, ErrNotConnected
+	}
 	id := c.reqID.Add(1)
 	req := request{
 		ID:     id,
@@ -247,9 +349,11 @@ func (c *Client) call(method string, params interface{}) (json.RawMessage, error
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	// PF-018b FIX: Serialize TCP I/O.
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	// One deadline covers the write and the read: a stalled peer must not be
+	// able to hold connMu, and every other caller behind it, forever.
+	if err := c.conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
+	}
 
 	// ElectrumX uses newline-delimited JSON
 	data = append(data, '\n')
@@ -257,45 +361,133 @@ func (c *Client) call(method string, params interface{}) (json.RawMessage, error
 		return nil, fmt.Errorf("write request: %w", err)
 	}
 
-	// Read response
-	c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	line, err := c.reader.ReadBytes('\n')
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+	for skipped := 0; skipped < maxSkippedLines; skipped++ {
+		line, err := c.reader.ReadBytes('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+		var in incoming
+		if err := json.Unmarshal(line, &in); err != nil {
+			return nil, fmt.Errorf("parse response: %w", err)
+		}
+		if in.Method != "" {
+			c.handleNotification(in)
+			continue
+		}
+		if in.ID == nil {
+			log.Printf("[electrumx] discarding line with neither id nor method")
+			continue
+		}
+		if *in.ID != id {
+			log.Printf("[electrumx] discarding stale reply id=%d while waiting for id=%d", *in.ID, id)
+			continue
+		}
+		if len(in.Error) > 0 && string(in.Error) != "null" {
+			return nil, fmt.Errorf("electrumx error: %s", string(in.Error))
+		}
+		if method == "blockchain.headers.subscribe" {
+			c.recordTip(in.Result)
+		}
+		return in.Result, nil
 	}
-
-	var resp response
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
-	}
-
-	if len(resp.Error) > 0 && string(resp.Error) != "null" {
-		return nil, fmt.Errorf("electrumx error: %s", string(resp.Error))
-	}
-
-	return resp.Result, nil
+	return nil, fmt.Errorf("electrumx: no reply to request %d within %d lines", id, maxSkippedLines)
 }
 
+// handleNotification consumes a server push. Only the headers subscription is
+// meaningful to this client; its height is recorded so LastTip stays current
+// between GetTip calls.
+func (c *Client) handleNotification(in incoming) {
+	if in.Method != "blockchain.headers.subscribe" {
+		return
+	}
+	var params []json.RawMessage
+	if err := json.Unmarshal(in.Params, &params); err != nil || len(params) == 0 {
+		return
+	}
+	c.recordTip(params[0])
+}
+
+func (c *Client) recordTip(header json.RawMessage) {
+	var h struct {
+		Height int64 `json:"height"`
+	}
+	if err := json.Unmarshal(header, &h); err == nil && h.Height > 0 {
+		c.lastTip.Store(h.Height)
+	}
+}
+
+// LastTip returns the most recent chain height this connection has seen, from
+// a GetTip reply or a server notification. Zero until the first GetTip.
+func (c *Client) LastTip() int64 { return c.lastTip.Load() }
+
 // TrackAddresses registers addresses for UTXO tracking.
-func (c *Client) TrackAddresses(addresses []string) {
+//
+// Every address must decode on one network. If HRP is unset it is inferred
+// from the first address; if it is set, an address on another network is an
+// error (ErrNetworkMismatch). Nothing is registered when any address fails, so
+// a mainnet deployment that forgets to set HRP gets an error at startup rather
+// than a cache that refreshes nothing for the life of the process.
+func (c *Client) TrackAddresses(addresses []string) error {
+	hrp := c.HRP
+	for _, a := range addresses {
+		n, err := address.NetworkOf(a)
+		if err != nil {
+			return fmt.Errorf("track %s: %w", a, err)
+		}
+		if hrp == "" {
+			hrp = n.HRP
+		} else if n.HRP != hrp {
+			return fmt.Errorf("%w: %s is %s, client is %s", ErrNetworkMismatch, a, n.HRP, hrp)
+		}
+		if _, _, err := address.Decode(hrp, a); err != nil {
+			return fmt.Errorf("track %s: %w", a, err)
+		}
+	}
 	c.mu.Lock()
-	c.addresses = addresses
+	c.HRP = hrp
+	c.addresses = append([]string(nil), addresses...)
 	c.mu.Unlock()
+	return nil
 }
 
 // RefreshAll fetches UTXOs for all tracked addresses.
+//
+// One failing address does not stop the others: every address is attempted
+// and the returned error joins the failures, naming each address. The result
+// is recorded for LastRefresh, which callers must consult before treating an
+// empty UTXO set as "no deposits".
 func (c *Client) RefreshAll() error {
 	c.mu.RLock()
 	addrs := make([]string, len(c.addresses))
 	copy(addrs, c.addresses)
 	c.mu.RUnlock()
 
+	var errs []error
 	for _, addr := range addrs {
 		if err := c.refreshAddress(addr); err != nil {
-			return fmt.Errorf("refresh %s: %w", addr, err)
+			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
 		}
 	}
-	return nil
+	err := errors.Join(errs...)
+
+	c.mu.Lock()
+	c.lastRefreshErr = err
+	if err == nil {
+		c.lastRefreshAt = time.Now()
+	}
+	c.mu.Unlock()
+	return err
+}
+
+// LastRefresh reports when every tracked address last refreshed successfully
+// and the error of the most recent RefreshAll (nil on success). A zero time or
+// a non-nil error means the cache may be stale: GetUTXOs and GetBalance answer
+// from the cache regardless, so this is how an indexer outage is told apart
+// from "no deposits".
+func (c *Client) LastRefresh() (time.Time, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastRefreshAt, c.lastRefreshErr
 }
 
 // refreshAddress fetches UTXOs for a single address via ElectrumX.
@@ -347,10 +539,18 @@ func (c *Client) refreshAddress(addr string) error {
 	for _, u := range existing {
 		key := utxoKey{u.TxID, u.Vout}
 		if fresh, stillExists := freshSet[key]; stillExists {
-			// Preserve our copy (SpentPending, AssetType) but update height
-			if u.Height == 0 && fresh.Height > 0 {
-				u.Height = fresh.Height
+			// Preserve our flags (SpentPending, AssetType) but take the server's
+			// height and value on every pass. Height must be allowed to fall
+			// back to 0 (a reorg returned the tx to the mempool) or move (it
+			// was re-mined elsewhere); value must be allowed to correct a
+			// wrongly injected change output, because the amount is committed
+			// into the sighash and a stale one makes every spend fail.
+			if u.Height > 0 && fresh.Height == 0 {
+				log.Printf("[electrumx] REORG: %s:%d left height %d and is back in the mempool",
+					shortID(u.TxID, 12), u.Vout, u.Height)
 			}
+			u.Height = fresh.Height
+			u.Value = fresh.Value
 			merged = append(merged, u)
 			kept[key] = true
 		}
@@ -432,11 +632,16 @@ func (c *Client) StartPolling() {
 	}()
 }
 
-// Stop halts the polling goroutine and closes the connection.
+// Stop halts the polling goroutine and closes the connection. Safe to call
+// more than once; calls after Stop return ErrNotConnected.
 func (c *Client) Stop() {
-	close(c.stopCh)
+	c.stopOnce.Do(func() { close(c.stopCh) })
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
+		c.reader = nil
 	}
 }
 
