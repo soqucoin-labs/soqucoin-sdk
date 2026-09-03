@@ -17,11 +17,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Read the version from go.mod rather than pinning it separately, so CI
       # always builds with the toolchain the module declares.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
@@ -54,3 +54,25 @@ jobs:
       # resolves API references against the real packages, and checks anchors.
       - name: Documentation
         run: python3 scripts/check-docs.py
+
+      # Known-vulnerability scan against the Go vulnerability database, on the
+      # symbols this module actually calls, not just the module graph.
+      - name: Vulnerability scan
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-version-file: go.mod
+          go-package: ./...
+
+  secrets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # Scans the full history for committed credentials. An exchange's own
+      # scanner will run this against us; better that it finds nothing new.
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

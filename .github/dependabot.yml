@@ -1,0 +1,14 @@
+# Keep the two direct dependencies and the pinned actions current. Every bump
+# arrives as a pull request that runs the full test, race, docs, vulnerability
+# and secret-scan jobs before anyone merges it.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

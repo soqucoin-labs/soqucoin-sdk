@@ -318,6 +318,31 @@ Reporters are credited in release notes with their permission.
 
 ---
 
+## Releases and supply chain
+
+- **Dependencies.** Two direct: [Cloudflare CIRCL](https://github.com/cloudflare/circl) for
+  ML-DSA-44 and `golang.org/x/crypto` for the keystore's Argon2id. No `replace` directives, no
+  vendored code; `go mod verify` is clean. CI runs `govulncheck` on the symbols this module calls and
+  `gitleaks` over the full history on every push, and Dependabot proposes updates weekly. GitHub
+  Actions are pinned by commit, not by tag.
+- **Signed tags.** Release tags are signed with OpenPGP key
+  `5C30 55F9 F986 6B23 7D69 A247 32ED 260F 83A0 BA88`. Verify before you depend on a tag:
+
+  ```bash
+  gpg --recv-keys 5C3055F9F9866B237D69A24732ED260F83A0BA88
+  git tag -v v0.3.4
+  ```
+
+- **Reproducibility.** The module is pure Go with no cgo and no code generation, so a build from a
+  tag is reproducible with the toolchain declared in `go.mod`. To list exactly what went into a
+  binary you built: `go version -m ./your-binary`. To produce a CycloneDX SBOM of the module:
+
+  ```bash
+  go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest mod -json -output sbom.json
+  ```
+
+---
+
 ## Security review status
 
 | Layer | External review |
