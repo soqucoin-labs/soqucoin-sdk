@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -65,6 +66,93 @@ type Manager struct {
 }
 
 // NewManager creates a new key manager.
+var (
+	// ErrInvalidPublicKey marks an ML-DSA-44 public key whose first byte is
+	// 0xFF. The node's CPubKey uses that byte as its invalid-key sentinel
+	// (src/pubkey.h GetLen), CheckSig fails on it, and the node's own key
+	// generator regenerates when it appears (src/key.cpp). Roughly 1 key in 256
+	// from a plain generator is such a key: its address still receives (the
+	// witness program is SHA-256 of the raw key) but nothing can ever spend.
+	ErrInvalidPublicKey = errors.New("keys: public key first byte 0xFF is the node's invalid-key marker; its address is unspendable")
+
+	// ErrKeyMismatch marks a key record whose private key, public key and
+	// address do not belong together. A manager that holds such a record would
+	// hand out a deposit address it cannot sign for.
+	ErrKeyMismatch = errors.New("keys: private key, public key and address do not match")
+)
+
+// maxKeygenAttempts bounds the regeneration loop in GenerateKeyForNetwork. The
+// probability of exhausting it with a sound RNG is 256^-32.
+const maxKeygenAttempts = 32
+
+// checkPublicKey enforces size and the node's invalid-key sentinel.
+func checkPublicKey(pubKey []byte) error {
+	if len(pubKey) != PublicKeySize {
+		return fmt.Errorf("invalid public key size: got %d, want %d", len(pubKey), PublicKeySize)
+	}
+	if pubKey[0] == 0xFF {
+		return ErrInvalidPublicKey
+	}
+	return nil
+}
+
+// publicKeyOf derives the public key from a packed private key.
+func publicKeyOf(privKey []byte) ([]byte, error) {
+	if len(privKey) != PrivateKeySize {
+		return nil, fmt.Errorf("invalid private key size: got %d, want %d", len(privKey), PrivateKeySize)
+	}
+	var skArr [PrivateKeySize]byte
+	copy(skArr[:], privKey)
+	var sk mldsa44.PrivateKey
+	sk.Unpack(&skArr)
+	for i := range skArr {
+		skArr[i] = 0
+	}
+	pk, ok := sk.Public().(*mldsa44.PublicKey)
+	if !ok {
+		return nil, errors.New("keys: unexpected public key type")
+	}
+	return pk.Bytes(), nil
+}
+
+// AddressFor derives the bech32m v1 address of a public key for an HRP, the
+// same way the node does (SHA-256 of the raw 1312-byte key, witness version 1).
+func AddressFor(hrp string, pubKey []byte) (string, error) {
+	if err := checkPublicKey(pubKey); err != nil {
+		return "", err
+	}
+	pkHash := sha256.Sum256(pubKey)
+	return soqaddr.Encode(hrp, 1, pkHash[:])
+}
+
+// checkKeyRecord verifies that a record's private key derives its public key,
+// that the public key is acceptable to the node, and that the stored address
+// is the one that key derives on the address's own network.
+func checkKeyRecord(privKey, pubKey []byte, address string) error {
+	if err := checkPublicKey(pubKey); err != nil {
+		return fmt.Errorf("%s: %w", address, err)
+	}
+	derivedPK, err := publicKeyOf(privKey)
+	if err != nil {
+		return fmt.Errorf("%s: %w", address, err)
+	}
+	if string(derivedPK) != string(pubKey) {
+		return fmt.Errorf("%s: %w (public key is not derived from the private key)", address, ErrKeyMismatch)
+	}
+	n, err := soqaddr.NetworkOf(address)
+	if err != nil {
+		return fmt.Errorf("%s: %w", address, err)
+	}
+	want, err := AddressFor(n.HRP, pubKey)
+	if err != nil {
+		return fmt.Errorf("%s: %w", address, err)
+	}
+	if want != address {
+		return fmt.Errorf("%s: %w (key derives %s)", address, ErrKeyMismatch, want)
+	}
+	return nil
+}
+
 func NewManager(keyFile string, passwd string) *Manager {
 	return &Manager{
 		keyFile: keyFile,
@@ -123,6 +211,15 @@ func (m *Manager) Load() error {
 	// Wipe plaintext from memory after parsing
 	for i := range plaintext {
 		plaintext[i] = 0
+	}
+
+	// Refuse to serve a record the node could not spend or that this manager
+	// could not sign for: a wrong or 0xFF public key here means a deposit
+	// address that silently loses funds. Fail loudly, naming the address.
+	for _, k := range pk.Keys {
+		if err := checkKeyRecord(k.PrivateKey, k.PublicKey, k.Address); err != nil {
+			return fmt.Errorf("keystore record rejected: %w", err)
+		}
 	}
 
 	m.keys = make([]KeyPair, len(pk.Keys))
@@ -235,11 +332,8 @@ func (m *Manager) ImportPrivateKey(privKey []byte, pubKey []byte, address string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if len(privKey) != PrivateKeySize {
-		return fmt.Errorf("invalid private key size: got %d, want %d", len(privKey), PrivateKeySize)
-	}
-	if len(pubKey) != PublicKeySize {
-		return fmt.Errorf("invalid public key size: got %d, want %d", len(pubKey), PublicKeySize)
+	if err := checkKeyRecord(privKey, pubKey, address); err != nil {
+		return err
 	}
 
 	// Check for duplicate
@@ -339,8 +433,19 @@ func (m *Manager) Sign(address string, digest []byte) ([]byte, error) {
 
 // Verify verifies a Dilithium signature against a public key and message digest.
 func Verify(pubKey []byte, digest []byte, signature []byte) (bool, error) {
-	if len(pubKey) != PublicKeySize {
-		return false, fmt.Errorf("invalid public key size: %d", len(pubKey))
+	// Accept the witness forms as well as the raw ones: consensus requires the
+	// public key to be pushed as 0x00||pk (1313 bytes) and the signature to
+	// carry a trailing hashtype byte (2421); the interpreter strips both before
+	// verifying (src/script/interpreter.cpp). A verifier that rejects the form
+	// the SDK itself emits is not usable on the withdrawal path.
+	if len(pubKey) == PublicKeySize+1 && pubKey[0] == 0x00 {
+		pubKey = pubKey[1:]
+	}
+	if len(signature) == SignatureSize+1 {
+		signature = signature[:SignatureSize]
+	}
+	if err := checkPublicKey(pubKey); err != nil {
+		return false, err
 	}
 	if len(signature) != SignatureSize {
 		return false, fmt.Errorf("invalid signature size: %d", len(signature))
@@ -356,33 +461,46 @@ func Verify(pubKey []byte, digest []byte, signature []byte) (bool, error) {
 
 // GenerateKeyForNetwork generates a new ML-DSA-44 keypair and derives the bech32m
 // address for the specified network HRP (e.g., "ssq" for stagenet, "sq" for mainnet).
+//
+// A key whose public key begins with 0xFF is regenerated, exactly as the node's
+// own CKey::MakeNewKey does (src/key.cpp): the node treats that byte as its
+// invalid-key sentinel and can never spend from such a key (ErrInvalidPublicKey).
 func GenerateKeyForNetwork(hrp string) (*KeyPair, error) {
-	pk, sk, err := mldsa44.GenerateKey(nil)
-	if err != nil {
-		return nil, fmt.Errorf("generate ML-DSA-44 key: %w", err)
+	for attempt := 0; attempt < maxKeygenAttempts; attempt++ {
+		pk, sk, err := mldsa44.GenerateKey(nil)
+		if err != nil {
+			return nil, fmt.Errorf("generate ML-DSA-44 key: %w", err)
+		}
+		pkBytes := pk.Bytes()
+		if pkBytes[0] == 0xFF {
+			skBytes := sk.Bytes()
+			for i := range skBytes {
+				skBytes[i] = 0
+			}
+			continue
+		}
+		skBytes := sk.Bytes()
+
+		// Encode as bech32m: witness version 1 (Dilithium), 32-byte program =
+		// SHA-256 of the raw public key.
+		addr, err := AddressFor(hrp, pkBytes)
+		if err != nil {
+			return nil, fmt.Errorf("encode bech32m address: %w", err)
+		}
+
+		return &KeyPair{
+			PrivateKey: skBytes,
+			PublicKey:  pkBytes,
+			Address:    addr,
+		}, nil
 	}
-
-	pkBytes := pk.Bytes()
-	skBytes := sk.Bytes()
-
-	// Derive witness program: SHA-256 of public key (32 bytes)
-	pkHash := sha256.Sum256(pkBytes)
-
-	// Encode as bech32m: witness version 1 (Dilithium), 32-byte program
-	addr, err := soqaddr.Encode(hrp, 1, pkHash[:])
-	if err != nil {
-		return nil, fmt.Errorf("encode bech32m address: %w", err)
-	}
-
-	return &KeyPair{
-		PrivateKey: skBytes,
-		PublicKey:  pkBytes,
-		Address:    addr,
-	}, nil
+	return nil, errors.New("keys: key generation produced only invalid-marker keys; the random source is broken")
 }
 
 // GenerateKey generates a new ML-DSA-44 keypair with a stagenet address (ssq1p...).
-// For mainnet addresses, use GenerateKeyForNetwork("sq") instead.
+//
+// Deprecated: the network default is a trap for mainnet integrators. Use
+// GenerateKeyForNetwork(types.Mainnet.HRP) or GenerateKeyForNetwork("ssq").
 func GenerateKey() (*KeyPair, error) {
 	return GenerateKeyForNetwork("ssq")
 }
