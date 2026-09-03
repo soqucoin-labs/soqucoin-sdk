@@ -4,7 +4,7 @@ Get up and running with the Soqucoin SDK in five minutes.
 
 ## Prerequisites
 
-- **Go 1.22+**: [download](https://go.dev/dl/)
+- **Go 1.25+**: [download](https://go.dev/dl/)
 - A running `soqucoind` node or ElectrumX server (optional for address generation)
 
 ## Install
@@ -62,33 +62,38 @@ import (
 )
 
 func main() {
-	// Connect to ElectrumX (TCP, no TLS, standard for local/LAN)
+	// Connect to ElectrumX (plaintext is acceptable only on localhost or a
+	// private network; call client.UseTLS() otherwise). The network is
+	// inferred from the addresses you track.
 	client := electrumx.NewClient("localhost:50001", 15*time.Second)
-	client.HRP = types.Stagenet.HRP // "ssq" for stagenet
+	myAddr := "ssq1p..."
+	if err := client.TrackAddresses([]string{myAddr}); err != nil {
+		log.Fatal(err)
+	}
 	if err := client.Connect(); err != nil {
 		log.Fatal(err)
 	}
 	defer client.Stop()
-
-	// Track your address
-	myAddr := "ssq1p..."
-	client.TrackAddresses([]string{myAddr})
 
 	// Fetch UTXOs
 	if err := client.RefreshAll(); err != nil {
 		log.Fatal(err)
 	}
 
-	// Get balance (6 confirmations minimum)
-	tipHeight, _ := client.GetTip()
-	confirmed, unconfirmed := client.GetBalance(6, tipHeight)
+	// Balance at 30 confirmations, the floor for small amounts in the
+	// confirmation table (docs/EXCHANGE_INTEGRATION.md, Step 4). An error here
+	// decides the money question, so it is not discarded.
+	tipHeight, err := client.GetTip()
+	if err != nil {
+		log.Fatal(err)
+	}
+	confirmed, unconfirmed := client.GetBalance(30, tipHeight)
 	fmt.Printf("Confirmed:   %.8f SOQ\n", float64(confirmed)/float64(types.ShorsPerSOQ))
 	fmt.Printf("Unconfirmed: %.8f SOQ\n", float64(unconfirmed)/float64(types.ShorsPerSOQ))
 
 	// List individual UTXOs
-	utxos := client.GetUTXOs(myAddr)
-	for _, u := range utxos {
-		fmt.Printf("  %s:%d, %d sat (height %d)\n", u.TxID[:12], u.Vout, u.Value, u.Height)
+	for _, u := range client.GetUTXOs(myAddr) {
+		fmt.Printf("  %s:%d, %d shors (height %d)\n", u.TxID, u.Vout, u.Value, u.Height)
 	}
 }
 ```
@@ -118,8 +123,6 @@ import (
 func main() {
 	// 1. Connect to ElectrumX and soqucoind RPC
 	elx := electrumx.NewClient("localhost:50001", 15*time.Second)
-	elx.HRP = types.Stagenet.HRP
-	elx.Connect()
 	defer elx.Stop()
 
 	rpcClient := rpc.NewClient("http://127.0.0.1:28332", "rpcuser", "rpcpass")
@@ -134,21 +137,31 @@ func main() {
 	myAddr := keystore.GetSignableAddresses()[0]
 	recipientAddr := "ssq1p..." // whoever you are paying
 
-	elx.TrackAddresses([]string{myAddr})
-	elx.RefreshAll()
+	if err := elx.TrackAddresses([]string{myAddr}); err != nil {
+		log.Fatal("track:", err)
+	}
+	if err := elx.Connect(); err != nil {
+		log.Fatal("connect:", err)
+	}
+	if err := elx.RefreshAll(); err != nil {
+		log.Fatal("refresh:", err)
+	}
 
 	// 3. Create a persistent spent set (prevents UTXO re-selection across restarts)
 	spentSet := utxo.NewSpentSet("/tmp/my_wallet_spent_set.json")
 	selector := utxo.NewCoinSelector(spentSet)
 
 	// 4. Select UTXOs for the payment
-	tipHeight, _ := rpcClient.GetBlockCount()
+	tipHeight, err := rpcClient.GetBlockCount()
+	if err != nil {
+		log.Fatal("tip:", err)
+	}
 	allUTXOs := elx.GetAllUTXOs()
 	paymentAmount := int64(1000_00000000) // 1000 SOQ
 
 	// feeRate is shors per vByte, not a flat fee. A single-input Dilithium
 	// payment is roughly 1,073 vB, so budget against vsize when selecting coins.
-	feeRate := int64(1000)
+	feeRate := types.RecommendedFeeRate
 	feeBudget := 1200 * feeRate
 
 	selected, total, err := selector.SelectUTXOs(allUTXOs, paymentAmount+feeBudget, 1, tipHeight, nil)
@@ -190,13 +203,14 @@ func main() {
 	}
 	rawTxHex, builtTxID := transaction.SerializeHex(), transaction.TxID()
 
-	// 7. Broadcast, then confirm the node agreed with our serialization
-	txid, err := rpcClient.SendRawTransaction(rawTxHex)
+	// 7. Broadcast with a known outcome. A lost reply is resolved against the
+	//    node, "already in chain" is success, and a node txid that differs from
+	//    ours is refused. rpc.ErrUnknownOutcome means the transaction MAY be
+	//    out: retry these same bytes, never rebuild (withdraw.Engine does this
+	//    durably for real withdrawals).
+	txid, err := rpcClient.Broadcast(rawTxHex, builtTxID)
 	if err != nil {
 		log.Fatal("Broadcast failed:", err)
-	}
-	if txid != builtTxID {
-		log.Fatalf("txid mismatch: node %s, SDK %s", txid, builtTxID)
 	}
 
 	// 8. Mark UTXOs as spent
@@ -210,7 +224,7 @@ func main() {
 		elx.AddChangeUTXO(txid, 1, change.Value, myAddr)
 	}
 
-	fmt.Printf("Broadcast %s, spent %d sat of input to send %d sat\n",
+	fmt.Printf("Broadcast %s, spent %d shors of input to send %d shors\n",
 		txid, total, paymentAmount)
 }
 ```
