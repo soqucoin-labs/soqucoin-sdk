@@ -340,7 +340,7 @@ func TestEstimateFeeRoundsVsizeUp(t *testing.T) {
 	if err := tr.AddInput(testUTXO(displayTxID, 0, 1), nil); err != nil {
 		t.Fatalf("AddInput: %v", err)
 	}
-	vsize := int64((tr.EstimateWeight() + 3) / 4)
+	vsize := int64((tr.EstimateWeight()+3)/4) + FeeMarginVBytes
 
 	if got := tr.EstimateFee(1); got != vsize {
 		t.Errorf("fee at 1 sat/vB = %d, want %d", got, vsize)

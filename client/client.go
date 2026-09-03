@@ -2,7 +2,7 @@
 // soq-signer is the out-of-process Dilithium signing service used for SOQ payouts
 // because soqucoind runs with disablewallet=1 (PQ keys cannot be in-daemon).
 //
-// API: POST /api/v1/send {"address": "ssq1...", "amount": <satoshis>, "fee_rate": 10}
+// API: POST /api/v1/send {"address": "ssq1...", "amount": <satoshis>, "fee_rate": 1000}
 // Auth: Bearer token in Authorization header (constant-time comparison server-side)
 // Amounts: int64 satoshis (1 SOQ = 100,000,000 satoshis)
 package client
@@ -17,13 +17,15 @@ import (
 	"math"
 	"net/http"
 	"time"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 // Config holds soq-signer connection settings.
 type Config struct {
 	URL      string `json:"url"`       // e.g. "http://signer.internal.example:8550"
 	APIToken string `json:"api_token"` // Bearer token for auth
-	FeeRate  int64  `json:"fee_rate"`  // sat/vB (default 10)
+	FeeRate  int64  `json:"fee_rate"`  // sat/vB (default types.RecommendedFeeRate)
 }
 
 // Client is the HTTP client for soq-signer.
@@ -59,7 +61,7 @@ type ErrorResponse struct {
 // NewClient creates a new soq-signer HTTP client.
 func NewClient(cfg Config) *Client {
 	if cfg.FeeRate <= 0 {
-		cfg.FeeRate = 10 // default 10 sat/vB
+		cfg.FeeRate = types.RecommendedFeeRate // the miner's default floor; 10 sat/vB was below relay
 	}
 	return &Client{
 		config: cfg,
