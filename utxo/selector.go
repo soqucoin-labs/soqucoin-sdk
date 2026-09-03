@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
+	"strings"
 )
 
 // MaxInputsPerTX is the hard cap on UTXO inputs per transaction.
@@ -62,9 +63,32 @@ type SpentKey struct {
 type SpentEntry struct {
 	TxID      string    `json:"txid"`        // The UTXO's transaction ID
 	Vout      uint32    `json:"vout"`        // The UTXO's output index
-	SpentInTx string    `json:"spent_in_tx"` // TX that consumed this UTXO
-	SpentAt   time.Time `json:"spent_at"`    // When we broadcast
+	SpentInTx string    `json:"spent_in_tx"` // TX that consumed this UTXO, or "reserved:<intent>"
+	SpentAt   time.Time `json:"spent_at"`    // When we broadcast (or reserved)
 	Confirmed bool      `json:"confirmed"`   // True once absent from ElectrumX
+	// ExpiresAt is set only on reservations: an input held for a withdrawal
+	// that has not been broadcast yet. A reservation past this time is treated
+	// as free. Broadcast entries never expire by the clock; they leave the set
+	// when the spend is confirmed (ConfirmSpent then Prune).
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	// IntentID names the withdrawal that reserved or spent this input, so a
+	// failed or abandoned withdrawal can release exactly its own inputs.
+	IntentID string `json:"intent_id,omitempty"`
+}
+
+// ErrAlreadyReserved is returned by Reserve when any requested input is already
+// reserved by another withdrawal or already spent. Nothing is reserved in that
+// case: reservation is all-or-nothing.
+var ErrAlreadyReserved = errors.New("utxo: input already reserved or spent")
+
+// ReservedPrefix marks reservation entries in SpentInTx.
+const ReservedPrefix = "reserved:"
+
+func (e SpentEntry) reserved() bool {
+	return !e.ExpiresAt.IsZero() && strings.HasPrefix(e.SpentInTx, ReservedPrefix)
+}
+func (e SpentEntry) expired(now time.Time) bool {
+	return e.reserved() && now.After(e.ExpiresAt)
 }
 
 // spentSetFile is the JSON structure persisted to disk.
@@ -100,9 +124,70 @@ func NewSpentSet(filePath string) *SpentSet {
 	return ss
 }
 
+// Reserve holds the given inputs for a withdrawal that is about to be built,
+// so a concurrent withdrawal cannot select them. All-or-nothing: if any input
+// is already reserved (and not expired) or spent, nothing is reserved and
+// ErrAlreadyReserved names the input. The reservation lasts ttl; MarkBroadcast
+// converts it into a permanent spent entry, Release drops it.
+func (ss *SpentSet) Reserve(inputs []types.UTXO, intentID string, ttl time.Duration) error {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	now := time.Now()
+	for _, u := range inputs {
+		key := SpentKey{u.TxID, u.Vout}
+		if e, exists := ss.entries[key]; exists && !e.expired(now) {
+			if e.IntentID == intentID && e.reserved() {
+				continue // re-reserving our own inputs is fine (retry after a crash)
+			}
+			return fmt.Errorf("%w: %s:%d (%s)", ErrAlreadyReserved, u.TxID, u.Vout, e.SpentInTx)
+		}
+	}
+	for _, u := range inputs {
+		ss.entries[SpentKey{u.TxID, u.Vout}] = SpentEntry{
+			TxID:      u.TxID,
+			Vout:      u.Vout,
+			SpentInTx: ReservedPrefix + intentID,
+			SpentAt:   now,
+			ExpiresAt: now.Add(ttl),
+			IntentID:  intentID,
+		}
+	}
+	ss.persist()
+	return nil
+}
+
+// Release drops the reservations held by intentID. Broadcast entries are
+// never released here: once a transaction is out, its inputs are spent until
+// the chain says otherwise.
+func (ss *SpentSet) Release(intentID string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	released := 0
+	for key, e := range ss.entries {
+		if e.reserved() && e.IntentID == intentID {
+			delete(ss.entries, key)
+			released++
+		}
+	}
+	if released > 0 {
+		ss.persist()
+	}
+}
+
 // MarkBroadcast records that the given UTXOs were spent in a broadcast TX.
-// This is the PRIMARY defense against stale UTXO re-selection.
+// This is the PRIMARY defense against stale UTXO re-selection. Reservations
+// on these inputs become permanent spent entries.
 func (ss *SpentSet) MarkBroadcast(inputs []types.UTXO, broadcastTxID string) {
+	ss.markBroadcast(inputs, broadcastTxID, "")
+}
+
+// MarkBroadcastFor is MarkBroadcast that also records the withdrawal id.
+func (ss *SpentSet) MarkBroadcastFor(inputs []types.UTXO, broadcastTxID, intentID string) {
+	ss.markBroadcast(inputs, broadcastTxID, intentID)
+}
+
+func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID string) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
@@ -115,6 +200,7 @@ func (ss *SpentSet) MarkBroadcast(inputs []types.UTXO, broadcastTxID string) {
 			SpentInTx: broadcastTxID,
 			SpentAt:   now,
 			Confirmed: false,
+			IntentID:  intentID,
 		}
 	}
 
@@ -130,8 +216,15 @@ func (ss *SpentSet) MarkBroadcast(inputs []types.UTXO, broadcastTxID string) {
 func (ss *SpentSet) IsSpent(txid string, vout uint32) bool {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
-	_, exists := ss.entries[SpentKey{txid, vout}]
-	return exists
+	e, exists := ss.entries[SpentKey{txid, vout}]
+	if !exists {
+		return false
+	}
+	if e.expired(time.Now()) {
+		delete(ss.entries, SpentKey{txid, vout})
+		return false
+	}
+	return true
 }
 
 // ConfirmSpent marks a spent entry as confirmed (UTXO disappeared from ElectrumX).
@@ -146,16 +239,20 @@ func (ss *SpentSet) ConfirmSpent(txid string, vout uint32) {
 	}
 }
 
-// Prune removes confirmed entries older than 1 hour.
+// Prune removes confirmed entries older than 1 hour and expired
+// reservations. Unconfirmed broadcast entries are never pruned by the clock:
+// the transaction that spends them is still in flight until the chain
+// confirms it, however long that takes.
 // Should be called periodically (e.g., after each UTXO refresh).
 func (ss *SpentSet) Prune() {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
-	cutoff := time.Now().Add(-1 * time.Hour)
+	now := time.Now()
+	cutoff := now.Add(-1 * time.Hour)
 	pruned := 0
 	for key, entry := range ss.entries {
-		if entry.Confirmed && entry.SpentAt.Before(cutoff) {
+		if (entry.Confirmed && entry.SpentAt.Before(cutoff)) || entry.expired(now) {
 			delete(ss.entries, key)
 			pruned++
 		}
@@ -211,7 +308,12 @@ func (ss *SpentSet) persist() {
 }
 
 // load reads the spent set from disk on startup.
-// Entries older than 2 hours are discarded.
+//
+// Confirmed entries older than 2 hours and expired reservations are
+// discarded. Unconfirmed broadcast entries are kept whatever their age: an
+// earlier version dropped them after 2 hours, so a restart after a slow
+// confirmation re-exposed the inputs of a transaction that was still in the
+// mempool, and the next withdrawal double-spent them.
 func (ss *SpentSet) load() {
 	// Ensure directory exists
 	dir := filepath.Dir(ss.filePath)
@@ -236,12 +338,13 @@ func (ss *SpentSet) load() {
 		return
 	}
 
-	cutoff := time.Now().Add(-2 * time.Hour)
+	now := time.Now()
+	cutoff := now.Add(-2 * time.Hour)
 	loaded := 0
 	expired := 0
 
 	for _, entry := range file.Entries {
-		if entry.SpentAt.Before(cutoff) {
+		if (entry.Confirmed && entry.SpentAt.Before(cutoff)) || entry.expired(now) {
 			expired++
 			continue
 		}
