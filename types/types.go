@@ -108,6 +108,7 @@ const (
 	RecommendedFeeRate int64 = 1000
 	MinRelayFeeRate    int64 = 100
 )
+
 // CoinbaseMaturity is the number of confirmations a coinbase output needs
 // before it may be spent: consensus nCoinbaseMaturity of the tier active from
 // block 1 on mainnet and stagenet (chainparams.cpp). Regtest uses 60.
