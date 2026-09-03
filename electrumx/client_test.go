@@ -308,7 +308,12 @@ func TestGetAllUTXOsSpansAddresses(t *testing.T) {
 
 func TestTrackAddressesRegistersForPolling(t *testing.T) {
 	c := newTestClient(nil)
-	c.TrackAddresses([]string{adr, "ssq1psecond"})
+	// adr is a placeholder with an invalid checksum: TrackAddresses now
+	// validates every address, so registration must be refused loudly rather
+	// than accepted and never refreshed.
+	if err := c.TrackAddresses([]string{adr, "ssq1psecond"}); err == nil {
+		t.Error("undecodable addresses were accepted for tracking")
+	}
 	// Tracking alone must not invent UTXOs.
 	if n := len(c.GetAllUTXOs()); n != 0 {
 		t.Errorf("tracking created %d phantom UTXOs", n)

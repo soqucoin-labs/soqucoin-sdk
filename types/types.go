@@ -35,6 +35,21 @@ type Network struct {
 	DefaultPort  int    // P2P port
 	ElectrumPort int    // ElectrumX TCP port
 	RPCPort      int    // JSON-RPC port
+	GenesisHash  string // Block 0 hash, lowercase hex, as the node's chainparams.cpp asserts it
+}
+
+// GenesisHashesForHRP returns the genesis hashes a server serving addresses
+// with this HRP may legitimately report. Mainnet and regtest share the HRP
+// "sq", so both are acceptable for it; an indexer on any other chain is a
+// mis-pointed backend and must be refused.
+func GenesisHashesForHRP(hrp string) []string {
+	var out []string
+	for _, n := range []Network{Mainnet, Stagenet, Regtest} {
+		if n.HRP == hrp {
+			out = append(out, n.GenesisHash)
+		}
+	}
+	return out
 }
 
 // Pre-defined networks. Ports and HRPs mirror the node's chainparams.cpp /
@@ -43,6 +58,7 @@ var (
 	// Mainnet is the production Soqucoin network.
 	Mainnet = Network{
 		Name:         "mainnet",
+		GenesisHash:  "0d828600816cbd7c23789660b53f90cb6ec7ff85540698e13845eb2d2f0486a8",
 		HRP:          "sq",
 		DefaultPort:  33388,
 		ElectrumPort: 50001,
@@ -52,6 +68,7 @@ var (
 	// Stagenet is the Soqucoin staging/test network.
 	Stagenet = Network{
 		Name:         "stagenet",
+		GenesisHash:  "97df3ae79eaf5623c0feecfa1079439f8acdfea06a0f2acb4ef63c6b9ad91bb0",
 		HRP:          "ssq",
 		DefaultPort:  28333,
 		ElectrumPort: 50001,
@@ -62,6 +79,7 @@ var (
 	// mainnet HRP ("sq") in the node's chainparams; only stagenet uses "ssq".
 	Regtest = Network{
 		Name:         "regtest",
+		GenesisHash:  "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5",
 		HRP:          "sq",
 		DefaultPort:  18444,
 		ElectrumPort: 50001,
@@ -90,3 +108,7 @@ const (
 	RecommendedFeeRate int64 = 1000
 	MinRelayFeeRate    int64 = 100
 )
+// CoinbaseMaturity is the number of confirmations a coinbase output needs
+// before it may be spent: consensus nCoinbaseMaturity of the tier active from
+// block 1 on mainnet and stagenet (chainparams.cpp). Regtest uses 60.
+const CoinbaseMaturity int64 = 240

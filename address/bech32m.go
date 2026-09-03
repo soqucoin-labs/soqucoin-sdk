@@ -25,6 +25,7 @@ var (
 	ErrInvalidLength   = errors.New("bech32m: invalid data length")
 	ErrInvalidHRP      = errors.New("bech32m: invalid human-readable part")
 	ErrInvalidChar     = errors.New("bech32m: invalid character")
+	ErrInvalidVersion  = errors.New("bech32m: witness version out of range")
 
 	// ErrUnsupportedWitnessVersion is returned for an address whose witness
 	// version this chain does not spend. See supportedWitnessVersions.
@@ -33,6 +34,17 @@ var (
 
 // bech32m constant
 const bech32mConst = 0x2bc830a3
+
+// WitnessProgramSize is the only witness-program length the node accepts as a
+// destination: every Soqucoin witness version is OP_N <32 bytes>, and the
+// node's DecodeDestination (src/utiladdress.cpp) refuses anything else. An
+// address at another length is therefore not a Soqucoin address at all, even
+// though BIP-141 would allow 2..40 bytes; paying one produces a non-standard
+// output that relay rejects and a miner accepting it would burn.
+const WitnessProgramSize = 32
+
+// MaxAddressLength matches the node's bech32 decoder limit (src/bech32.cpp).
+const MaxAddressLength = 90
 
 // supportedWitnessVersions is the allowlist of witness versions this SDK will
 // decode as a Soqucoin address and build a scriptPubKey for.
@@ -46,19 +58,26 @@ const bech32mConst = 0x2bc830a3
 // soqupool-server/bitcoin/soqucoin.go (bead gp9); it belongs in every consumer
 // that turns an address into a scriptPubKey, not just the pool.
 //
-//	v1 — Dilithium (ML-DSA-44) P2WPKH. The only universally spendable form.
-//	v5 — USDSOQ authority marker.   } supported by this SDK's builders; only
-//	v7 — USDSOQ holding.            } usable where the USDSOQ deployment is active.
+//	v1 — Dilithium (ML-DSA-44) P2WPKH. The only form the node accepts as an
+//	     address (src/utiladdress.cpp DecodeDestination: data[0]==1, 32 bytes).
+//
+// v5 (USDSOQ authority marker) and v7 (USDSOQ holding) are NOT payment
+// destinations and are not in this set. The node does not decode them as
+// addresses; on mainnet creating such an output is consensus-rejected while
+// the USDSOQ deployment is not scheduled, and where it is active a v5 witness
+// is anyone-can-spend until the rule applies and a v7 output's value is USDSOQ,
+// so paying SOQ into it fails conservation. Consumers that build USDSOQ scripts
+// use tx.ScriptWitnessV5 / tx.ScriptV7USDSOQHolding explicitly; nothing that
+// starts from a user-supplied address may reach them (2026-09-03 review).
 //
 // ⛔ Do NOT add a version here because it "exists" or because an opcode for it
-// is active. Add it only when its consensus rule makes outputs of that version
-// require a real authorization to spend. Notably v2 (PAT attestation) must NOT
-// be added: PAT commits to signatures rather than verifying them, so a v2
-// output authorizes nothing (bead pat-v2-anyone-can-spend-ae6u).
+// is active. Add it only when the node's DecodeDestination accepts it AND its
+// consensus rule makes outputs of that version require a real authorization to
+// spend. Notably v2 (PAT attestation) must NOT be added: PAT commits to
+// signatures rather than verifying them, so a v2 output authorizes nothing
+// (bead pat-v2-anyone-can-spend-ae6u).
 var supportedWitnessVersions = map[byte]bool{
 	1: true,
-	5: true,
-	7: true,
 }
 
 // IsSupportedWitnessVersion reports whether this SDK will accept an address at
@@ -126,6 +145,9 @@ func createChecksum(hrp string, data []int) []int {
 // Decode decodes a bech32m address string.
 // Returns witness version (0-16) and witness program bytes.
 func Decode(hrp, addr string) (byte, []byte, error) {
+	if len(addr) > MaxAddressLength {
+		return 0, nil, fmt.Errorf("%w: %d characters, limit %d", ErrInvalidLength, len(addr), MaxAddressLength)
+	}
 	addrLower := strings.ToLower(addr)
 	if addrLower != addr && strings.ToUpper(addr) != addr {
 		return 0, nil, ErrInvalidChar
@@ -167,18 +189,20 @@ func Decode(hrp, addr string) (byte, []byte, error) {
 		return 0, nil, err
 	}
 
-	// BIP-141 witness program length constraints
-	if len(witProg) < 2 || len(witProg) > 40 {
-		return 0, nil, fmt.Errorf("%w: witness program length %d", ErrInvalidLength, len(witProg))
-	}
-
 	// Reject witness versions this chain does not spend. A well-formed address
 	// at an unsupported version is NOT a valid Soqucoin address: paying it
-	// creates an anyone-can-spend output. Fail here, at parse time, so no
-	// caller can reach script construction with one.
+	// creates an anyone-can-spend or unspendable output. Fail here, at parse
+	// time, so no caller can reach script construction with one.
 	if !supportedWitnessVersions[witVer] {
-		return 0, nil, fmt.Errorf("%w: v%d (supported: v1 Dilithium, v5/v7 USDSOQ)",
+		return 0, nil, fmt.Errorf("%w: v%d (only v1 Dilithium addresses are payment destinations)",
 			ErrUnsupportedWitnessVersion, witVer)
+	}
+
+	// The node accepts exactly 32-byte programs (see WitnessProgramSize); the
+	// BIP-141 2..40 range is wider than what this chain decodes as an address.
+	if len(witProg) != WitnessProgramSize {
+		return 0, nil, fmt.Errorf("%w: witness program length %d, want %d",
+			ErrInvalidLength, len(witProg), WitnessProgramSize)
 	}
 
 	return witVer, witProg, nil
@@ -186,6 +210,13 @@ func Decode(hrp, addr string) (byte, []byte, error) {
 
 // Encode encodes a witness version and program to a bech32m string.
 func Encode(hrp string, witVer byte, witProg []byte) (string, error) {
+	if witVer > 16 {
+		return "", fmt.Errorf("%w: v%d (max 16)", ErrInvalidVersion, witVer)
+	}
+	// The checksum is defined over the lowercase HRP and Decode (like the node)
+	// rejects mixed case, so an upper-case HRP would encode an undecodable
+	// string. Normalise instead of emitting one.
+	hrp = strings.ToLower(hrp)
 	// Convert []byte to []int for convertBits
 	progInts := make([]int, len(witProg))
 	for i, b := range witProg {
@@ -250,7 +281,7 @@ func WitnessProgram(witVer byte, witProg []byte) []byte {
 	// Defence in depth: Decode already rejects unsupported versions, but this
 	// is the function that actually mints the scriptPubKey, so it refuses too.
 	// A nil return is a hard failure the caller cannot mistake for a script.
-	if !supportedWitnessVersions[witVer] {
+	if !supportedWitnessVersions[witVer] || len(witProg) != WitnessProgramSize {
 		return nil
 	}
 
