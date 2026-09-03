@@ -173,7 +173,9 @@ func run(cfg runConfig) error {
 	}
 	defer elxClient.Stop()
 
-	elxClient.TrackAddresses([]string{cfg.poolAddress})
+	if err := elxClient.TrackAddresses([]string{cfg.poolAddress}); err != nil {
+		log.Fatalf("track pool address: %v", err)
+	}
 	if err := elxClient.RefreshAll(); err != nil {
 		return fmt.Errorf("initial UTXO refresh: %w", err)
 	}
