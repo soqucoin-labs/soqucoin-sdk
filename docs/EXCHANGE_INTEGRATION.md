@@ -112,6 +112,26 @@ something that does not fit your operations.
 
 ---
 
+## Before you write code: run the harness
+
+Fifteen minutes, one command, and you have seen every flow in this guide work against a real node:
+
+```bash
+git clone https://github.com/soqucoin-labs/soqucoin-sdk && cd soqucoin-sdk
+SOQUCOIND=/path/to/soqucoind make integration   # a soqucoind build, v2.3.0 or later
+```
+
+The harness starts a throwaway regtest node, mines to SDK-generated addresses, and drives the same
+`deposit` and `withdraw` packages this guide uses through six scenarios: a deposit credited only
+after the node confirms it, a withdrawal built, signed, broadcast, mined and confirmed, a lost
+broadcast reply survived with exactly one payment, two withdrawals that cannot share an input,
+refused inputs (a USDSOQ-form destination, an amount below the relay floor, a fee-rate typo) that
+never reach the node, and a reorganisation that removes a credited deposit and raises the alarm.
+The indexer role is played by an in-test block scanner, so the harness needs no ElectrumX; the
+ElectrumX client is exercised by its own protocol tests against a scripted server.
+
+---
+
 ## Step 1: Generate Deposit Addresses
 
 Create a unique deposit address for each user. Store the keypair securely, you'll need it to sweep funds.

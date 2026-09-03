@@ -190,6 +190,16 @@ dropped and evicted, and RPC errors never surfacing as usable zero values. Where
 it is stated plainly, with the reason, in
 [Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage-current-status).
 
+## Integration harness
+
+```bash
+SOQUCOIND=/path/to/soqucoind make integration
+```
+
+A throwaway regtest node, the real `deposit` and `withdraw` packages, six end-to-end scenarios,
+about thirty seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
+each scenario proves.
+
 ## Documentation
 
 - **[Quick Start](docs/QUICK_START.md)**: Generate an address, check balance, send SOQ in 5 minutes
