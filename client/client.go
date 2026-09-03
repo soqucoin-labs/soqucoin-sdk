@@ -2,9 +2,9 @@
 // soq-signer is the out-of-process Dilithium signing service used for SOQ payouts
 // because soqucoind runs with disablewallet=1 (PQ keys cannot be in-daemon).
 //
-// API: POST /api/v1/send {"address": "ssq1...", "amount": <satoshis>, "fee_rate": 1000}
+// API: POST /api/v1/send {"address": "ssq1...", "amount": <shors>, "fee_rate": 1000}
 // Auth: Bearer token in Authorization header (constant-time comparison server-side)
-// Amounts: int64 satoshis (1 SOQ = 100,000,000 satoshis)
+// Amounts: int64 shors (1 SOQ = 100,000,000 shors)
 package client
 
 import (
@@ -25,7 +25,7 @@ import (
 type Config struct {
 	URL      string `json:"url"`       // e.g. "http://signer.internal.example:8550"
 	APIToken string `json:"api_token"` // Bearer token for auth
-	FeeRate  int64  `json:"fee_rate"`  // sat/vB (default types.RecommendedFeeRate)
+	FeeRate  int64  `json:"fee_rate"`  // shors/vB (default types.RecommendedFeeRate)
 }
 
 // Client is the HTTP client for soq-signer.
@@ -61,7 +61,7 @@ type ErrorResponse struct {
 // NewClient creates a new soq-signer HTTP client.
 func NewClient(cfg Config) *Client {
 	if cfg.FeeRate <= 0 {
-		cfg.FeeRate = types.RecommendedFeeRate // the miner's default floor; 10 sat/vB was below relay
+		cfg.FeeRate = types.RecommendedFeeRate // the miner's default floor; 10 shors/vB was below relay
 	}
 	return &Client{
 		config: cfg,
@@ -86,7 +86,7 @@ func (c *Client) HealthCheck() error {
 }
 
 // Send sends SOQ to a single recipient address.
-// amount is in satoshis (1 SOQ = 100,000,000 sat).
+// amount is in shors (1 SOQ = 100,000,000 shors).
 func (c *Client) Send(address string, amountSat int64) (string, error) {
 	req := SendRequest{
 		Address: address,
@@ -135,8 +135,8 @@ func (c *Client) Send(address string, amountSat int64) (string, error) {
 
 // SendManyRequest is the request body for POST /api/v1/sendmany.
 type SendManyRequest struct {
-	Recipients map[string]int64 `json:"recipients"` // address → amount in satoshis
-	FeeRate    int64            `json:"fee_rate"`   // sat/vB (optional, default: 10)
+	Recipients map[string]int64 `json:"recipients"` // address → amount in shors
+	FeeRate    int64            `json:"fee_rate"`   // shors/vB (optional, default: 10)
 }
 
 // SendMany sends SOQ to multiple recipients in ONE transaction.
@@ -152,16 +152,16 @@ func (c *Client) SendMany(transactions map[string]float64) (string, error) {
 		return "", fmt.Errorf("pre-flight health check: %w", err)
 	}
 
-	// Convert float64 SOQ amounts to int64 satoshis.
+	// Convert float64 SOQ amounts to int64 shors.
 	//
 	// math.Round, not a plain int64 conversion. A truncating conversion is
 	// systematically short because binary floating point cannot represent most
 	// decimal SOQ amounts exactly: 0.29 SOQ evaluates to 28999999.999999996 and
-	// truncates to 28,999,999, one satoshi less than owed. It is always short and
+	// truncates to 28,999,999, one shor less than owed. It is always short and
 	// never over, so across a payout run the shortfall accumulates as unexplained
 	// dust in the hot wallet and the payout ledger stops reconciling exactly.
 	//
-	// Prefer Send, which takes int64 satoshis directly, when the caller already
+	// Prefer Send, which takes int64 shors directly, when the caller already
 	// has an integer amount. Float is lossy at this API boundary by construction.
 	recipients := make(map[string]int64, len(transactions))
 	for address, amountSOQ := range transactions {

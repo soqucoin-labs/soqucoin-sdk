@@ -72,7 +72,7 @@ what each one means:
 | Response | Cause |
 |---|---|
 | `bad-txns-requires-dilithium` | Witness format wrong. Check for the trailing sighash byte and the leading `0x00`, and for the 2421/1313 lengths above |
-| `rate limited free transaction` | Fee too low to relay. `feeRate` is per vByte; at 10 a ~1,073 vB transaction pays about 10,700 satoshis, which the node treats as effectively free |
+| `rate limited free transaction` | Fee too low to relay. `feeRate` is per vByte; at 10 a ~1,073 vB transaction pays about 10,700 shors, which the node treats as effectively free |
 | `allowed: true` | Ready to broadcast |
 
 Size your fee against `vsize` rather than byte count, and validate with
@@ -110,7 +110,7 @@ spk := address.WitnessProgram(witVer, witProg)
 in := []types.UTXO{{
     TxID:    fundingTxID,
     Vout:    fundingVout,
-    Value:   fundingValueSats,
+    Value:   fundingValueShorss,
     Address: kp.Address,
 }}
 

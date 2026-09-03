@@ -316,11 +316,11 @@ type TxOut struct {
 	AssetType     uint8        `json:"assettype"` // RC7+: 0=SOQ, 1=USDSOQ
 }
 
-// ValueSat returns the output value in satoshis. The node reports SOQ as a
-// JSON number; rounding to the nearest satoshi is exact for every value the
+// ValueShors returns the output value in shors. The node reports SOQ as a
+// JSON number; rounding to the nearest shor is exact for every value the
 // node can produce.
-func (o *TxOut) ValueSat() int64 {
-	return int64(math.Round(o.Value * float64(types.SatoshisPerSOQ)))
+func (o *TxOut) ValueShors() int64 {
+	return int64(math.Round(o.Value * float64(types.ShorsPerSOQ)))
 }
 
 // ScriptPubKey contains the output script details.

@@ -343,13 +343,13 @@ func TestEstimateFeeRoundsVsizeUp(t *testing.T) {
 	vsize := int64((tr.EstimateWeight()+3)/4) + FeeMarginVBytes
 
 	if got := tr.EstimateFee(1); got != vsize {
-		t.Errorf("fee at 1 sat/vB = %d, want %d", got, vsize)
+		t.Errorf("fee at 1 shors/vB = %d, want %d", got, vsize)
 	}
 	if got := tr.EstimateFee(10); got != vsize*10 {
-		t.Errorf("fee at 10 sat/vB = %d, want %d", got, vsize*10)
+		t.Errorf("fee at 10 shors/vB = %d, want %d", got, vsize*10)
 	}
 	if got := tr.EstimateFee(0); got != 0 {
-		t.Errorf("fee at 0 sat/vB = %d, want 0", got)
+		t.Errorf("fee at 0 shors/vB = %d, want 0", got)
 	}
 }
 
