@@ -116,6 +116,15 @@ const (
 	MinRelayFeeRate    int64 = 100
 )
 
+// MaxReorgDepth is the consensus finality horizon (chainparams nMaxReorgDepth):
+// a header building on a fork deeper than this is refused, so a block buried
+// by more than MaxReorgDepth blocks cannot be reorganised away by any amount
+// of hashrate. It is enforced when headers are accepted and not during a
+// node's initial block download, so it holds only for a node that has caught
+// up; deposit crediting must check that (rpc.RequireSynced). A deposit at
+// MaxReorgDepth + 1 confirmations is final in the consensus sense.
+const MaxReorgDepth int64 = 288
+
 // CoinbaseMaturity is the number of confirmations a coinbase output needs
 // before it may be spent: consensus nCoinbaseMaturity of the tier active from
 // block 1 on mainnet and stagenet (chainparams.cpp). Regtest uses 60.
