@@ -189,7 +189,7 @@ func StartDepositMonitor(depositAddresses []string) {
 					// Credit user, use txid:vout as idempotency key
 					log.Printf("Confirmed deposit: %s:%d, %.8f SOQ (%d conf)",
 						u.TxID[:12], u.Vout,
-						float64(u.Value)/float64(types.SatoshisPerSOQ),
+						float64(u.Value)/float64(types.ShorsPerSOQ),
 						confirmations)
 				}
 			}
@@ -225,7 +225,7 @@ func ProcessWithdrawal(
 	elxClient  *electrumx.Client,
 	rpcClient  *rpc.Client,
 	toAddress  string,
-	amount     int64,  // in satoshis
+	amount     int64,  // in shors
 	hotWalletAddr string,
 ) (txid string, err error) {
 	// 1. Check circuit breaker
@@ -376,7 +376,7 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
 | `address` | **91.1%** | Bech32m encoding, checksum validation, script derivation, network detection |
-| `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-satoshi conversion |
+| `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
 | `utxo` | **83.9%** | Coin selection, persistent spent set |
 | `tx` | **70.5%** | Txid byte order, BIP143 sighash, witness format, consensus format vectors, all three networks |
 | `keys` | **67.3%** | Dilithium keypair generation, keystore encryption |
@@ -449,9 +449,9 @@ consolidation first, and ignoring the error sends less than intended.
 
 ### Fee estimation
 
-**`feeRate` is satoshis per vByte, not a flat fee.** This trips people up because
+**`feeRate` is shors per vByte, not a flat fee.** This trips people up because
 the numbers are small: at a feeRate of 10, a ~1,072 vB payment pays about 10,700
-satoshis, which the node treats as effectively free and rate-limits rather than
+shors, which the node treats as effectively free and rate-limits rather than
 relays. Start at 1,000. The [verification record](VERIFICATION.md) maps the
 rejection you get if you go lower.
 
@@ -461,14 +461,14 @@ soqPerKB, err := rpcClient.EstimateSmartFee(6) // target: 6 blocks
 if err != nil {
     return err
 }
-feeRate := int64(soqPerKB * float64(types.SatoshisPerSOQ) / 1000) // satoshis per vByte
+feeRate := int64(soqPerKB * float64(types.ShorsPerSOQ) / 1000) // shors per vByte
 if feeRate < 1000 {
     feeRate = 1000 // floor: below this the node rate-limits as free
 }
 ```
 
 `EstimateSmartFee` falls back to 0.01 SOQ/kB when the node has no estimate, which
-is exactly 1,000 satoshis per vByte, so the floor above and the fallback agree.
+is exactly 1,000 shors per vByte, so the floor above and the fallback agree.
 
 Always confirm before you rely on a broadcast:
 

@@ -261,9 +261,9 @@ because the script derived from an address is what BIP143 commits to as the
 
 ### Amounts
 
-**All amounts in this SDK are `int64` satoshis.** There is no `Amount` type and no
+**All amounts in this SDK are `int64` shors.** There is no `Amount` type and no
 parser, so nothing converts or validates on your behalf. 1 SOQ is
-`types.SatoshisPerSOQ` satoshis.
+`types.ShorsPerSOQ` shors.
 
 Parse user input yourself, and do not route it through `float64`:
 
@@ -274,13 +274,13 @@ if amountSats <= 0 {
 }
 ```
 
-A `float64` holds 53 bits of mantissa. Large SOQ amounts in satoshis exceed that
+A `float64` holds 53 bits of mantissa. Large SOQ amounts in shors exceed that
 and round silently, so `strconv.ParseFloat` on a user-supplied amount can produce
 a value that differs from what was typed.
 
 ### Fee rate is per vByte
 
-`feeRate` in `tx.BuildAndSign` and `tx.BuildSendTransaction` is satoshis per
+`feeRate` in `tx.BuildAndSign` and `tx.BuildSendTransaction` is shors per
 vByte, not a flat fee. A single-input ML-DSA payment is roughly 1,073 vB, so a
 feeRate below about 1,000 produces a transaction the node treats as effectively
 free and rate-limits rather than relays. Validate before you rely on a broadcast:

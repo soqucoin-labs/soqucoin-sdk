@@ -766,7 +766,7 @@ func (c *Client) AddChangeUTXO(txid string, vout uint32, value int64, addr strin
 	// Previously this whole log was skipped when either identifier was short,
 	// which silently dropped the diagnostic for exactly the inputs most likely to
 	// be wrong. shortID keeps the line and truncates safely instead.
-	log.Printf("[electrumx] Added change UTXO %s:%d (%d sat) for %s...",
+	log.Printf("[electrumx] Added change UTXO %s:%d (%d shors) for %s...",
 		shortID(txid, 12), vout, value, shortID(addr, 20))
 }
 

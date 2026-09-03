@@ -232,13 +232,13 @@ func TestVerifyAndFilterSkipsImmatureCoinbaseWithoutEvicting(t *testing.T) {
 	}
 }
 
-func TestTxOutValueSat(t *testing.T) {
+func TestTxOutValueShors(t *testing.T) {
 	for _, tc := range []struct {
-		soq float64
-		sat int64
+		soq   float64
+		shors int64
 	}{{1.5, 150_000_000}, {0.00000001, 1}, {88, 8_800_000_000}, {12345.67891234, 1_234_567_891_234}} {
-		if got := (&TxOut{Value: tc.soq}).ValueSat(); got != tc.sat {
-			t.Errorf("%v SOQ -> %d sat, want %d", tc.soq, got, tc.sat)
+		if got := (&TxOut{Value: tc.soq}).ValueShors(); got != tc.shors {
+			t.Errorf("%v SOQ -> %d shors, want %d", tc.soq, got, tc.shors)
 		}
 	}
 }

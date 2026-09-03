@@ -98,7 +98,7 @@ func TestBuildSendRefusesRecipientBelowRelayFloor(t *testing.T) {
 
 func TestBuildSendFoldsSubFloorChangeIntoFee(t *testing.T) {
 	spk := ScriptP2WPKH(hash32(0x02))
-	// Fee for 1 input, 2 outputs at 1000 sat/vB is (1073+1)*1000.
+	// Fee for 1 input, 2 outputs at 1000 shors/vB is (1073+1)*1000.
 	fee := int64(1074) * types.RecommendedFeeRate
 	amount := int64(1_000_000_000)
 	for _, change := range []int64{0, 100_000, 279_499} {
@@ -145,8 +145,8 @@ func TestBuildSendRefusesBadAmounts(t *testing.T) {
 
 func TestBuildSendCapsFees(t *testing.T) {
 	spk := ScriptP2WPKH(hash32(0x02))
-	in := []types.UTXO{realUTXO(t, 0x10, 0, 100*types.SatoshisPerSOQ)}
-	// A fee-rate typo: 9,000,000 sat/vB would burn ~96 SOQ of a 100 SOQ input.
+	in := []types.UTXO{realUTXO(t, 0x10, 0, 100*types.ShorsPerSOQ)}
+	// A fee-rate typo: 9,000,000 shors/vB would burn ~96 SOQ of a 100 SOQ input.
 	if _, err := BuildSendTransaction(in, spk, 1_000_000_000, spk, 9_000_000); !errors.Is(err, ErrFeeTooHigh) {
 		t.Errorf("fee-rate typo accepted: %v", err)
 	}
@@ -158,8 +158,8 @@ func TestBuildSendCapsFees(t *testing.T) {
 	for i := 0; i < 80; i++ {
 		many = append(many, realUTXO(t, 0x10, uint32(i), 1_000_000_000))
 	}
-	if _, err := BuildSendTransaction(many, spk, 1_000_000_000, spk, MaxFeeRateSatPerVB); !errors.Is(err, ErrFeeTooHigh) {
-		t.Errorf("fee above MaxFeeSat accepted: %v", err)
+	if _, err := BuildSendTransaction(many, spk, 1_000_000_000, spk, MaxFeeRateShorsPerVB); !errors.Is(err, ErrFeeTooHigh) {
+		t.Errorf("fee above MaxFeeShors accepted: %v", err)
 	}
 	// A maximal standard payout at the recommended rate is fine.
 	tr, err := BuildSendTransaction(many, spk, 1_000_000_000, spk, types.RecommendedFeeRate)
@@ -167,8 +167,8 @@ func TestBuildSendCapsFees(t *testing.T) {
 		t.Fatalf("80-input payout at the recommended rate refused: %v", err)
 	}
 	fee := int64(80)*1_000_000_000 - tr.Outputs[0].Value - tr.Outputs[1].Value
-	if fee > MaxFeeSat {
+	if fee > MaxFeeShors {
 		t.Errorf("fee %d exceeds the cap the builder should have enforced", fee)
 	}
-	t.Log(fmt.Sprintf("80-input fee at %d sat/vB: %d sat", types.RecommendedFeeRate, fee))
+	t.Log(fmt.Sprintf("80-input fee at %d shors/vB: %d sat", types.RecommendedFeeRate, fee))
 }

@@ -82,8 +82,8 @@ func main() {
 	// Get balance (6 confirmations minimum)
 	tipHeight, _ := client.GetTip()
 	confirmed, unconfirmed := client.GetBalance(6, tipHeight)
-	fmt.Printf("Confirmed:   %.8f SOQ\n", float64(confirmed)/float64(types.SatoshisPerSOQ))
-	fmt.Printf("Unconfirmed: %.8f SOQ\n", float64(unconfirmed)/float64(types.SatoshisPerSOQ))
+	fmt.Printf("Confirmed:   %.8f SOQ\n", float64(confirmed)/float64(types.ShorsPerSOQ))
+	fmt.Printf("Unconfirmed: %.8f SOQ\n", float64(unconfirmed)/float64(types.ShorsPerSOQ))
 
 	// List individual UTXOs
 	utxos := client.GetUTXOs(myAddr)
@@ -146,7 +146,7 @@ func main() {
 	allUTXOs := elx.GetAllUTXOs()
 	paymentAmount := int64(1000_00000000) // 1000 SOQ
 
-	// feeRate is satoshis per vByte, not a flat fee. A single-input Dilithium
+	// feeRate is shors per vByte, not a flat fee. A single-input Dilithium
 	// payment is roughly 1,073 vB, so budget against vsize when selecting coins.
 	feeRate := int64(1000)
 	feeBudget := 1200 * feeRate

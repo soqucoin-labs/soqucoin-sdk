@@ -41,10 +41,10 @@ const (
 	mediumDepth   = 120 // ~2 h
 	smallDepth    = 30  // ~30 min
 
-	// Value boundaries between those tiers, in satoshis. These are illustrative.
+	// Value boundaries between those tiers, in shors. These are illustrative.
 	// Set them against your own value at risk; the table is a floor, not a ceiling.
-	smallMax  = 1_000 * types.SatoshisPerSOQ
-	mediumMax = 50_000 * types.SatoshisPerSOQ
+	smallMax  = 1_000 * types.ShorsPerSOQ
+	mediumMax = 50_000 * types.ShorsPerSOQ
 )
 
 const (
@@ -170,7 +170,7 @@ func checkDeposits(client *electrumx.Client, addresses []string) {
 
 			fmt.Printf("CREDIT %s:%d, %.8f SOQ (%d confirmations, %d required)\n",
 				shortID(u.TxID, 12), u.Vout,
-				float64(u.Value)/float64(types.SatoshisPerSOQ),
+				float64(u.Value)/float64(types.ShorsPerSOQ),
 				confirmations, required)
 		}
 	}

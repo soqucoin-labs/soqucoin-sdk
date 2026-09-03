@@ -10,8 +10,8 @@ import (
 type ReconciliationConfig struct {
 	// Interval between reconciliation runs (default: 24h).
 	Interval time.Duration
-	// DeltaThreshold is the max allowed balance difference in satoshis
-	// before an alert is fired. Default: 100,000 sat (1 SOQ dust threshold).
+	// DeltaThreshold is the max allowed balance difference in shors
+	// before an alert is fired. Default: 100,000 shors (1 SOQ dust threshold).
 	DeltaThreshold int64
 }
 
@@ -65,7 +65,7 @@ func NewReconciler(source BalanceSource, cb *CircuitBreaker, cfg ReconciliationC
 
 // Start launches the reconciliation background goroutine.
 func (r *Reconciler) Start() {
-	log.Printf("[reconciler] Starting reconciliation (interval=%v, threshold=%d sat)",
+	log.Printf("[reconciler] Starting reconciliation (interval=%v, threshold=%d shors)",
 		r.cfg.Interval, r.cfg.DeltaThreshold)
 
 	go func() {

@@ -60,10 +60,10 @@ const (
 	TxOverheadWeight = 10*4 + 2 // 42 WU
 
 	// UTXOCostPerByte is the node's relay-policy floor on output value:
-	// IsStandardTx rejects any output worth less than this many satoshis per
+	// IsStandardTx rejects any output worth less than this many shors per
 	// serialized output byte (src/policy/policy.cpp, UTXO_COST_PER_BYTE),
 	// independently of any deployment. A 34-byte v1 script serializes to 43
-	// bytes, so the floor for a normal output is 279,500 satoshis.
+	// bytes, so the floor for a normal output is 279,500 shors.
 	UTXOCostPerByte int64 = 6500
 
 	// DustThreshold is the relay floor for a standard v1 output (43 serialized
@@ -74,23 +74,23 @@ const (
 
 	// MaxMoney is the node's per-transaction ceiling on any amount
 	// (src/amount.h): 20e9 SOQ.
-	MaxMoney int64 = 20_000_000_000 * types.SatoshisPerSOQ
+	MaxMoney int64 = 20_000_000_000 * types.ShorsPerSOQ
 
 	// FeeMarginVBytes is added to the measured vsize before the fee is
 	// computed, so a rounding difference against the node's own vsize can
-	// never put a transaction one satoshi under a fee floor.
+	// never put a transaction one shor under a fee floor.
 	FeeMarginVBytes int64 = 1
 )
 
 // Fee sanity limits. A fee above either is refused with ErrFeeTooHigh before
 // anything is signed. They are variables so an operator can tighten them; the
 // defaults are loose enough for any standard transaction at the recommended
-// rate (a maximal 80-input payout at 1000 sat/vB is about 0.75 SOQ) and tight
+// rate (a maximal 80-input payout at 1000 shors/vB is about 0.75 SOQ) and tight
 // enough to stop a fee-rate typo from burning a hot wallet up to the node's
 // own 100 SOQ limit.
 var (
-	MaxFeeSat          int64 = 2 * types.SatoshisPerSOQ // 2 SOQ
-	MaxFeeRateSatPerVB int64 = 100_000                  // 100x the recommended rate
+	MaxFeeShors          int64 = 2 * types.ShorsPerSOQ // 2 SOQ
+	MaxFeeRateShorsPerVB int64 = 100_000               // 100x the recommended rate
 )
 
 // Builder errors. All are permanent: the request itself is wrong.
@@ -148,13 +148,13 @@ func sumInputs(inputs []types.UTXO) (int64, error) {
 // checkFee applies the fee sanity limits.
 func checkFee(fee, feeRate int64) error {
 	if feeRate <= 0 {
-		return fmt.Errorf("%w: fee rate %d sat/vB", ErrInvalidAmount, feeRate)
+		return fmt.Errorf("%w: fee rate %d shors/vB", ErrInvalidAmount, feeRate)
 	}
-	if feeRate > MaxFeeRateSatPerVB {
-		return fmt.Errorf("%w: fee rate %d sat/vB exceeds MaxFeeRateSatPerVB %d", ErrFeeTooHigh, feeRate, MaxFeeRateSatPerVB)
+	if feeRate > MaxFeeRateShorsPerVB {
+		return fmt.Errorf("%w: fee rate %d shors/vB exceeds MaxFeeRateShorsPerVB %d", ErrFeeTooHigh, feeRate, MaxFeeRateShorsPerVB)
 	}
-	if fee > MaxFeeSat {
-		return fmt.Errorf("%w: fee %d sat exceeds MaxFeeSat %d", ErrFeeTooHigh, fee, MaxFeeSat)
+	if fee > MaxFeeShors {
+		return fmt.Errorf("%w: fee %d sat exceeds MaxFeeShors %d", ErrFeeTooHigh, fee, MaxFeeShors)
 	}
 	return nil
 }
@@ -180,7 +180,7 @@ type TxInput struct {
 // This mirrors soq-signer/internal/txbuilder, the production reference, and is
 // pinned byte-identically to the node by the golden vector in the tests.
 type TxOutput struct {
-	Value        int64  // Output value in satoshis
+	Value        int64  // Output value in shors
 	ScriptPubKey []byte // Output script
 }
 
@@ -265,7 +265,7 @@ func (tx *Transaction) VSize() int64 {
 	return int64((tx.EstimateWeight() + 3) / 4)
 }
 
-// EstimateFee returns the fee for this transaction at feeRate (sat/vB):
+// EstimateFee returns the fee for this transaction at feeRate (shors/vB):
 // (vsize + FeeMarginVBytes) x feeRate.
 func (tx *Transaction) EstimateFee(feeRate int64) int64 {
 	return (tx.VSize() + FeeMarginVBytes) * feeRate

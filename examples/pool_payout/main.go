@@ -46,7 +46,7 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
 
-// Payout is a single payment to a miner. Amount is in satoshis.
+// Payout is a single payment to a miner. Amount is in shors.
 type Payout struct {
 	Address string `json:"address"`
 	Amount  int64  `json:"amount"`
@@ -61,7 +61,7 @@ func main() {
 	keystorePath := flag.String("keystore", "", "Path to the encrypted keystore (required)")
 	poolAddress := flag.String("pool-address", "", "Pool payout address, also receives change (required)")
 	payoutsPath := flag.String("payouts", "", "JSON file: [{\"address\":\"...\",\"amount\":123}] (required)")
-	feeRate := flag.Int64("fee-rate", 1000, "Fee rate in satoshis per vByte")
+	feeRate := flag.Int64("fee-rate", 1000, "Fee rate in shors per vByte")
 	spentSetPath := flag.String("spent-set", "pool_payout_spent_set.json", "Persistent spent-set path")
 	webhookURL := flag.String("webhook", "", "Slack webhook URL for alerts (optional)")
 	dryRun := flag.Bool("dry-run", false, "Build and sign but do not broadcast or record anything")
@@ -339,7 +339,7 @@ func loadPayouts(path string) ([]Payout, error) {
 }
 
 func soq(sats int64) float64 {
-	return float64(sats) / float64(types.SatoshisPerSOQ)
+	return float64(sats) / float64(types.ShorsPerSOQ)
 }
 
 // shortID truncates an identifier for display without panicking on short input.

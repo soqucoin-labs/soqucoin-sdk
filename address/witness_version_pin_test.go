@@ -77,7 +77,7 @@ func TestDecodeRejectsAllUnsupportedVersions(t *testing.T) {
 
 // The supported set is exactly v1. This is a drift detector: adding a version
 // here without the node decoding it as an address AND a consensus rule that
-// requires real authorization is how the v2 hazard got created, and v5/v7 sat
+// requires real authorization is how the v2 hazard got created, and v5/v7 shors
 // here until the 2026-09-03 review showed the node's DecodeDestination accepts
 // only v1 (a v5 destination is anyone-can-spend where USDSOQ is unscheduled).
 func TestSupportedSetIsExactlyV1(t *testing.T) {

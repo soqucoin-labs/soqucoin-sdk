@@ -72,7 +72,7 @@ func TestNewClientDefaultsFeeRate(t *testing.T) {
 	for _, in := range []int64{0, -1, -1000} {
 		c := NewClient(Config{URL: "http://x", FeeRate: in})
 		if c.config.FeeRate != types.RecommendedFeeRate {
-			t.Errorf("FeeRate %d became %d, want the %d sat/vB default", in, c.config.FeeRate, types.RecommendedFeeRate)
+			t.Errorf("FeeRate %d became %d, want the %d shors/vB default", in, c.config.FeeRate, types.RecommendedFeeRate)
 		}
 	}
 	c := NewClient(Config{URL: "http://x", FeeRate: 25})
@@ -110,7 +110,7 @@ func TestSendSendsBearerTokenAndJSON(t *testing.T) {
 		t.Errorf("address = %q", req.Address)
 	}
 	if req.Amount != 150_000 {
-		t.Errorf("amount = %d, want 150000 satoshis passed through unchanged", req.Amount)
+		t.Errorf("amount = %d, want 150000 shors passed through unchanged", req.Amount)
 	}
 	if req.FeeRate != types.RecommendedFeeRate {
 		t.Errorf("fee_rate = %d, want the default %d", req.FeeRate, types.RecommendedFeeRate)
@@ -185,12 +185,12 @@ func TestHealthCheck(t *testing.T) {
 	})
 }
 
-// ── SendMany: the SOQ-to-satoshi conversion ────────────────────────────────
+// ── SendMany: the SOQ-to-shor conversion ────────────────────────────────
 
 // Regression. int64(soq * 1e8) truncates, and binary floating point cannot hold
 // most decimal SOQ amounts exactly, so the truncation is systematically SHORT and
 // never over: 0.29 SOQ evaluates to 28999999.999999996 and truncated to
-// 28,999,999 — one satoshi less than owed, silently, on every payout run.
+// 28,999,999 — one shor less than owed, silently, on every payout run.
 func TestSendManyRoundsRatherThanTruncates(t *testing.T) {
 	cases := map[float64]int64{
 		0.29:       29_000_000,  // truncation gave 28999999
@@ -200,7 +200,7 @@ func TestSendManyRoundsRatherThanTruncates(t *testing.T) {
 		1.1:        110_000_000,
 		1234.56:    123_456_000_000,
 		1:          100_000_000,
-		0.00000001: 1, // one satoshi
+		0.00000001: 1, // one shor
 	}
 	for soq, wantSat := range cases {
 		c, seen := signerServer(t, 200, map[string]reply{"/api/v1/sendmany": okSend(fakeTxID)})
@@ -264,7 +264,7 @@ func TestSendManyFiltersNonPositiveAmounts(t *testing.T) {
 			"ssq1pgood": 2.5,
 			"ssq1pzero": 0,
 			"ssq1pneg":  -1.25,
-			"ssq1pdust": 0.000000001, // rounds to 0 satoshis
+			"ssq1pdust": 0.000000001, // rounds to 0 shors
 		})
 		if err != nil {
 			t.Fatalf("SendMany: %v", err)

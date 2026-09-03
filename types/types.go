@@ -8,7 +8,7 @@ package types
 type UTXO struct {
 	TxID         string `json:"tx_hash"`
 	Vout         uint32 `json:"tx_pos"`
-	Value        int64  `json:"value"`  // Satoshis
+	Value        int64  `json:"value"`  // Shors
 	Height       int64  `json:"height"` // Block height (0 = unconfirmed)
 	ScriptPubKey []byte `json:"-"`      // Populated on demand
 	Address      string `json:"-"`      // Which address owns this UTXO
@@ -94,10 +94,17 @@ const (
 	SignatureSize  = 2420 // ML-DSA-44 signature bytes
 )
 
-// SatoshisPerSOQ is the number of satoshis in one SOQ.
-const SatoshisPerSOQ int64 = 100_000_000
+// ShorsPerSOQ is the number of shors in one SOQ. The shor is the base unit
+// of Soqucoin (the node's amount.h counts in shors); every int64 amount in
+// this SDK is a count of shors.
+const ShorsPerSOQ int64 = 100_000_000
 
-// Fee rates in satoshis per virtual byte, from the node's policy:
+// SatoshisPerSOQ is the former name of ShorsPerSOQ.
+//
+// Deprecated: use ShorsPerSOQ. The base unit is called the shor.
+const SatoshisPerSOQ = ShorsPerSOQ
+
+// Fee rates in shors per virtual byte, from the node's policy:
 //
 //	RecommendedFeeRate is the miner's default block-inclusion floor
 //	(DEFAULT_BLOCK_MIN_TX_FEE = 0.01 SOQ/kB). Below it a transaction is

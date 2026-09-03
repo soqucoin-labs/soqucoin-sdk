@@ -42,7 +42,7 @@ func main() {
 	mockUTXO := types.UTXO{
 		TxID:    "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		Vout:    0,
-		Value:   10_000_000_00, // 10 SOQ in satoshis
+		Value:   10_000_000_00, // 10 SOQ in shors
 		Height:  1000,
 		Address: sender.Address,
 	}
@@ -67,7 +67,7 @@ func main() {
 		recipientSPK,
 		5_000_000_00, // Send 5 SOQ
 		changeSPK,
-		types.RecommendedFeeRate, // 1000 sat/vB, the miner default floor
+		types.RecommendedFeeRate, // 1000 shors/vB, the miner default floor
 	)
 	if err != nil {
 		log.Fatal("build transaction:", err)
@@ -75,7 +75,7 @@ func main() {
 
 	fmt.Printf("Transaction built: %d inputs, %d outputs\n", len(unsignedTx.Inputs), len(unsignedTx.Outputs))
 	fmt.Printf("Estimated weight: %d WU (%d vB)\n", unsignedTx.EstimateWeight(), (unsignedTx.EstimateWeight()+3)/4)
-	fmt.Printf("Estimated fee: %d satoshis\n", unsignedTx.EstimateFee(10))
+	fmt.Printf("Estimated fee: %d shors\n", unsignedTx.EstimateFee(10))
 	fmt.Println()
 
 	// 6. Sign every input.
