@@ -78,3 +78,8 @@ const (
 
 // SatoshisPerSOQ is the number of satoshis in one SOQ.
 const SatoshisPerSOQ int64 = 100_000_000
+
+// CoinbaseMaturity is the number of confirmations a coinbase output needs
+// before it may be spent: consensus nCoinbaseMaturity of the tier active from
+// block 1 on mainnet and stagenet (chainparams.cpp). Regtest uses 60.
+const CoinbaseMaturity int64 = 240

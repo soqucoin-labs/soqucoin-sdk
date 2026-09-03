@@ -20,8 +20,11 @@ package rpc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"net/http"
 	"time"
 
@@ -64,19 +67,83 @@ type rpcRequest struct {
 // rpcResponse is a JSON-RPC 1.0 response.
 type rpcResponse struct {
 	Result json.RawMessage `json:"result"`
-	Error  *rpcError       `json:"error"`
+	Error  *Error          `json:"error"`
 	ID     int             `json:"id"`
 }
 
-// rpcError is a JSON-RPC error.
-type rpcError struct {
+// Error kinds. Every error this package returns wraps exactly one of these,
+// so a caller decides what to do with errors.Is and never by string matching:
+//
+//	ErrTransient      retry later; the node was unreachable, warming up, or
+//	                  still syncing. Nothing about the request was wrong.
+//	ErrPermanent      do not retry; the request was rejected (bad parameter,
+//	                  transaction refused by consensus or policy).
+//	ErrUnknownOutcome the request MAY have taken effect. Only broadcast can
+//	                  produce this: the transaction was written to the node
+//	                  and the reply was lost. A caller that treats this as
+//	                  "failed" and rebuilds pays twice.
+//	ErrAlreadyInChain the transaction is already mined. For a broadcast that
+//	                  is success, not failure.
+var (
+	ErrTransient      = errors.New("rpc: transient failure, retry later")
+	ErrPermanent      = errors.New("rpc: request rejected")
+	ErrUnknownOutcome = errors.New("rpc: outcome unknown, the request may have taken effect")
+	ErrAlreadyInChain = errors.New("rpc: transaction already in chain")
+	ErrNodeSyncing    = fmt.Errorf("%w: node is in initial block download or behind its headers", ErrTransient)
+)
+
+// Node error codes this package interprets (src/rpc/protocol.h in the node).
+const (
+	CodeInvalidAddressOrKey       = -5
+	CodeInvalidParameter          = -8
+	CodeClientInInitialDownload   = -10
+	CodeVerifyError               = -25
+	CodeVerifyRejected            = -26
+	CodeTransactionAlreadyInChain = -27
+	CodeInWarmup                  = -28
+)
+
+// Error is a JSON-RPC error returned by the node, exported so callers can
+// read the code with errors.As. It also reports the kind it belongs to
+// through errors.Is (see the kinds above).
+type Error struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-func (e *rpcError) Error() string {
+func (e *Error) Error() string {
 	return fmt.Sprintf("RPC error %d: %s", e.Code, e.Message)
 }
+
+// Is classifies the node's error code into a kind.
+func (e *Error) Is(target error) bool {
+	switch target {
+	case ErrTransient:
+		return e.Code == CodeInWarmup || e.Code == CodeClientInInitialDownload
+	case ErrAlreadyInChain:
+		return e.Code == CodeTransactionAlreadyInChain
+	case ErrPermanent:
+		return e.Code != CodeInWarmup && e.Code != CodeClientInInitialDownload &&
+			e.Code != CodeTransactionAlreadyInChain
+	}
+	return false
+}
+
+// transportError is a failure to complete the HTTP exchange. Before the
+// request was written it is transient; a broadcast whose reply was lost is
+// reported by Broadcast as ErrUnknownOutcome instead.
+type transportError struct {
+	err error
+}
+
+func (e *transportError) Error() string { return e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+func (e *transportError) Is(target error) bool {
+	return target == ErrTransient
+}
+
+// SetTimeout replaces the per-request HTTP timeout (default 30 s).
+func (c *Client) SetTimeout(d time.Duration) { c.client.Timeout = d }
 
 // Call sends a JSON-RPC request and returns the raw result.
 func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, error) {
@@ -106,18 +173,20 @@ func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, er
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
+		return nil, &transportError{err: fmt.Errorf("send request: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, &transportError{err: fmt.Errorf("read response: %w", err)}
 	}
 
 	var rpcResp rpcResponse
 	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
-		return nil, fmt.Errorf("parse response (status %d): %w\nbody: %s", resp.StatusCode, err, string(respBody))
+		// A body that is not JSON-RPC is a proxy or auth page, not the node.
+		// Keep it short: this string travels into logs and alerts.
+		return nil, &transportError{err: fmt.Errorf("parse response (status %d): %w; body: %.200s", resp.StatusCode, err, string(respBody))}
 	}
 
 	if rpcResp.Error != nil {
@@ -129,9 +198,19 @@ func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, er
 
 // SendRawTransaction broadcasts a signed transaction to the network.
 // Returns the transaction ID on success.
+//
+// A transport failure here is reported as ErrUnknownOutcome, not as a
+// rejection: the node may have accepted and relayed the transaction before
+// the reply was lost, and a caller that rebuilds with other inputs pays the
+// recipient twice. Prefer Broadcast, which resolves that case against the
+// node using the transaction id the builder already knows.
 func (c *Client) SendRawTransaction(rawTxHex string) (string, error) {
 	result, err := c.Call("sendrawtransaction", rawTxHex)
 	if err != nil {
+		var te *transportError
+		if errors.As(err, &te) {
+			return "", fmt.Errorf("sendrawtransaction: %w: %v", ErrUnknownOutcome, err)
+		}
 		return "", fmt.Errorf("sendrawtransaction: %w", err)
 	}
 
@@ -142,12 +221,73 @@ func (c *Client) SendRawTransaction(rawTxHex string) (string, error) {
 	return txid, nil
 }
 
+// Broadcast sends a signed transaction whose id the caller has already
+// computed (tx.Transaction.TxID) and returns only once the outcome is known.
+//
+//   - Accepted, or already in the mempool: returns txid, nil.
+//   - Already mined (node code -27): returns txid, nil. Re-sending the same
+//     bytes is idempotent; this is the normal reply to a retried broadcast.
+//   - Rejected by the node: returns the node's error (ErrPermanent).
+//   - Reply lost: the node is asked whether it knows txid (getrawtransaction,
+//     then gettxout on output 0). Found means accepted. Not found is still
+//     not proof of rejection, so ErrUnknownOutcome is returned and the caller
+//     must retry THIS transaction, never build another one for the same
+//     withdrawal.
+//
+// The txid must match the transaction; a mismatch is refused before sending.
+func (c *Client) Broadcast(rawTxHex, txid string) (string, error) {
+	if txid == "" {
+		return "", fmt.Errorf("broadcast: %w: txid is required", ErrPermanent)
+	}
+	result, err := c.Call("sendrawtransaction", rawTxHex)
+	if err == nil {
+		var got string
+		if err := json.Unmarshal(result, &got); err != nil {
+			return "", fmt.Errorf("broadcast: parse txid: %w", err)
+		}
+		if got != txid {
+			return got, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", ErrPermanent, got, txid)
+		}
+		return txid, nil
+	}
+	if errors.Is(err, ErrAlreadyInChain) {
+		return txid, nil
+	}
+	var te *transportError
+	if !errors.As(err, &te) {
+		return "", fmt.Errorf("broadcast: %w", err)
+	}
+	// Reply lost. Resolve against the node before reporting anything.
+	known, lookupErr := c.knowsTransaction(txid)
+	if lookupErr == nil && known {
+		return txid, nil
+	}
+	return "", fmt.Errorf("broadcast of %s: %w: %v", txid, ErrUnknownOutcome, err)
+}
+
+// knowsTransaction reports whether the node has txid in its mempool or chain.
+func (c *Client) knowsTransaction(txid string) (bool, error) {
+	if _, err := c.Call("getrawtransaction", txid); err == nil {
+		return true, nil
+	} else if errors.Is(err, ErrTransient) {
+		return false, err
+	}
+	// Without -txindex a mined transaction is not served by getrawtransaction;
+	// its own first output is, unless already spent.
+	out, err := c.GetTxOut(txid, 0, true)
+	if err != nil {
+		return false, err
+	}
+	return out != nil, nil
+}
+
 // GetTxOut queries the UTXO set for a specific output.
-// Returns nil if the output has been spent.
+// Returns nil if the output is not in the node's UTXO set.
 //
 // This is Defense 11: gettxout pre-verification catches stale UTXOs
-// BEFORE signing. If gettxout returns nil, the UTXO was already spent
-// on-chain even though ElectrumX may still report it.
+// BEFORE signing. A nil result means "spent" ONLY on a node that has caught
+// up; a node in initial block download or behind its headers has not seen
+// recent outputs yet. Call RequireSynced first, as VerifyAndFilterUTXOs does.
 func (c *Client) GetTxOut(txid string, vout uint32, includeMempool bool) (*TxOut, error) {
 	result, err := c.Call("gettxout", txid, vout, includeMempool)
 	if err != nil {
@@ -174,6 +314,13 @@ type TxOut struct {
 	ScriptPubKey  ScriptPubKey `json:"scriptPubKey"`
 	Coinbase      bool         `json:"coinbase"`
 	AssetType     uint8        `json:"assettype"` // RC7+: 0=SOQ, 1=USDSOQ
+}
+
+// ValueSat returns the output value in satoshis. The node reports SOQ as a
+// JSON number; rounding to the nearest satoshi is exact for every value the
+// node can produce.
+func (o *TxOut) ValueSat() int64 {
+	return int64(math.Round(o.Value * float64(types.SatoshisPerSOQ)))
 }
 
 // ScriptPubKey contains the output script details.
@@ -279,6 +426,22 @@ type BlockchainInfo struct {
 	InitialSync   bool    `json:"initialblockdownload"`
 }
 
+// RequireSynced returns ErrNodeSyncing (a transient error) unless the node
+// is out of initial block download and its block height has caught up with
+// its header height. Until then the node's UTXO set is incomplete and a nil
+// gettxout is not evidence of a spend.
+func (c *Client) RequireSynced() error {
+	info, err := c.GetBlockchainInfo()
+	if err != nil {
+		return err
+	}
+	if info.InitialSync || info.Headers > info.Blocks {
+		return fmt.Errorf("%w (blocks %d, headers %d, initialblockdownload %v)",
+			ErrNodeSyncing, info.Blocks, info.Headers, info.InitialSync)
+	}
+	return nil
+}
+
 // VerifyUTXO checks if a UTXO exists on-chain using gettxout (Defense 11).
 // Returns (exists, assetType, error). If exists is false, the UTXO is stale.
 //
@@ -308,28 +471,44 @@ func (c *Client) VerifyAndFilterUTXOs(
 	evictFn func(txid string, vout uint32),
 	setAssetTypeFn func(txid string, vout uint32, assetType uint8),
 ) ([]types.UTXO, error) {
+	if len(utxos) == 0 {
+		return nil, nil
+	}
+	// Eviction is only sound on a node that has caught up: on a syncing node a
+	// nil gettxout means "not seen yet", and evicting on it would drain the
+	// cache of live outputs and stall withdrawals with "no spendable UTXOs".
+	if err := c.RequireSynced(); err != nil {
+		return nil, err
+	}
+
 	var verified []types.UTXO
 
 	for _, u := range utxos {
-		exists, assetType, err := c.VerifyUTXO(u.TxID, u.Vout)
+		txout, err := c.GetTxOut(u.TxID, u.Vout, true)
 		if err != nil {
 			return nil, fmt.Errorf("verify UTXO %s:%d: %w", shortID(u.TxID, 12), u.Vout, err)
 		}
-		if !exists {
-			if len(u.TxID) >= 12 {
-				fmt.Printf("[rpc] Defense 11: UTXO %s:%d is STALE (gettxout=null), skipping\n", shortID(u.TxID, 12), u.Vout)
-			}
+		if txout == nil {
+			log.Printf("[rpc] Defense 11: UTXO %s:%d is STALE (gettxout=null), skipping", shortID(u.TxID, 12), u.Vout)
 			if evictFn != nil {
 				evictFn(u.TxID, u.Vout)
 			}
 			continue
 		}
+		// An immature coinbase output is real but not yet spendable
+		// (consensus: nCoinbaseMaturity). Keep it in the cache, leave it out
+		// of this selection.
+		if txout.Coinbase && txout.Confirmations < types.CoinbaseMaturity {
+			log.Printf("[rpc] UTXO %s:%d is an immature coinbase (%d of %d confirmations), skipping",
+				shortID(u.TxID, 12), u.Vout, txout.Confirmations, types.CoinbaseMaturity)
+			continue
+		}
 
 		// Stamp asset type from gettxout response
 		if setAssetTypeFn != nil {
-			setAssetTypeFn(u.TxID, u.Vout, assetType)
+			setAssetTypeFn(u.TxID, u.Vout, txout.AssetType)
 		}
-		u.AssetType = assetType
+		u.AssetType = txout.AssetType
 
 		verified = append(verified, u)
 	}
