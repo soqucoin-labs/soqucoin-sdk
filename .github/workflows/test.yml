@@ -73,6 +73,9 @@ jobs:
           fetch-depth: 0
       # Scans the full history for committed credentials. An exchange's own
       # scanner will run this against us; better that it finds nothing new.
-      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The gitleaks GitHub Action requires a paid license for organisation
+      # repositories; the gitleaks CLI itself is MIT-licensed, so run that.
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --redact --exit-code 1 --verbose
