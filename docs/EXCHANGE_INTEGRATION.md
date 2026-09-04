@@ -671,4 +671,4 @@ Full API documentation is available at:
 - **Security issues:** [security@soqu.org](mailto:security@soqu.org), or a private
   vulnerability report on the GitHub repository if you do not receive an acknowledgement within two
   business days
-- **Exchange listing inquiries:** [listings@soqucoin.com](mailto:listings@soqucoin.com)
+- **Exchange listing inquiries:** [dev@soqu.org](mailto:dev@soqu.org)
