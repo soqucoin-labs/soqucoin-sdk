@@ -668,7 +668,7 @@ Full API documentation is available at:
 ## Support
 
 - **Technical questions:** Open an issue on [GitHub](https://github.com/soqucoin-labs/soqucoin-sdk/issues)
-- **Security issues:** [security@soqucoin.com](mailto:security@soqucoin.com), or a private
+- **Security issues:** [security@soqu.org](mailto:security@soqu.org), or a private
   vulnerability report on the GitHub repository if you do not receive an acknowledgement within two
   business days
 - **Exchange listing inquiries:** [listings@soqucoin.com](mailto:listings@soqucoin.com)

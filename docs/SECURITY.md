@@ -307,11 +307,13 @@ a node fee estimate into a per-vByte rate.
 
 Please do not open a public issue for a security defect.
 
-Email **[security@soqucoin.com](mailto:security@soqucoin.com)** with a
+Email **[security@soqu.org](mailto:security@soqu.org)** with a
 description, reproduction steps, and your assessment of the impact. Include a
-suggested fix if you have one. If you have not received an acknowledgement within
-two business days, open a private vulnerability report on the GitHub repository
-so the report is not lost to a mail problem.
+suggested fix if you have one. The mailbox is monitored and was confirmed
+receiving on 2026-09-03; `https://soqu.org/.well-known/security.txt` carries the
+same contact. If you have not received an acknowledgement within two business
+days, open a private vulnerability report on the GitHub repository so the report
+is not lost to a mail problem.
 
 We will acknowledge receipt and give you an initial assessment, and we will agree
 a disclosure timeline with you rather than imposing one. We are a small team and
