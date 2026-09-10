@@ -461,7 +461,7 @@ than to a rule of thumb carried over from another chain:
 | Parameter | Value | Meaning |
 |-----------|:-----:|---------|
 | `nMaxReorgDepth` | **288 blocks** (~4.8 h) | The chain's own finality horizon, exposed as `types.MaxReorgDepth`. Nodes reject headers building on a fork deeper than this, once they have finished initial download |
-| `nCoinbaseMaturity` | **240 blocks** (~4 h) | Newly mined coins are unspendable until this depth, enforced by consensus |
+| `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus |
 
 Recommended thresholds:
 
@@ -471,7 +471,7 @@ Recommended thresholds:
 | Small deposits | 30 | ~30 min | Bounded, recoverable loss if reorganised |
 | Medium deposits | 120 | ~2 h | Materially past any plausible reorg depth |
 | Large deposits | **288** | ~4.8 h | Matches the chain's own finality horizon |
-| Mining / coinbase payouts | **240 minimum** | ~4 h | Consensus-enforced; the output cannot be spent earlier regardless of policy |
+| Mining / coinbase payouts | **288 minimum** | ~4.8 h | Consensus-enforced; the output cannot be spent earlier regardless of policy |
 | Withdrawal release | 288 | ~4.8 h | Do not release outbound value against inbound funds the chain does not yet treat as final |
 
 **Set your own thresholds against value at risk. The table is a floor, not a ceiling.**
