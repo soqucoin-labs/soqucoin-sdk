@@ -945,13 +945,37 @@ func (tx *Transaction) SignAll(signer Signer) error {
 	return nil
 }
 
-// BuildAndSign builds, signs and serializes a simple send in one call, returning
-// the raw hex ready for sendrawtransaction and the transaction id.
+// BuildSignedTransaction builds and signs a simple send in one call and
+// returns the transaction, for callers that need more than the bytes: the
+// change output (Outputs[1], present only when the remainder is worth more
+// than it costs to spend), the weight, the inputs as committed. SerializeHex
+// and TxID give the bytes and id for the node.
 //
-// Prefer this over hand-wiring build, sighash, sign, witness assembly and
-// serialize: the witness format is Soqucoin-specific and easy to get wrong by a
-// byte at each end. Use BuildSendTransaction plus SignAll directly only when you
-// need the transaction itself, for example to read the change output's value.
+// Prefer this or BuildAndSign over hand-wiring build, sighash, sign, witness
+// assembly and serialize: the witness format is Soqucoin-specific and easy to
+// get wrong by a byte at each end.
+func BuildSignedTransaction(
+	inputs []types.UTXO,
+	recipientScriptPubKey []byte,
+	amount int64,
+	changeScriptPubKey []byte,
+	feeRate int64,
+	signer Signer,
+) (*Transaction, error) {
+	t, err := BuildSendTransaction(inputs, recipientScriptPubKey, amount,
+		changeScriptPubKey, feeRate)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.SignAll(signer); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// BuildAndSign builds, signs and serializes a simple send in one call, returning
+// the raw hex ready for sendrawtransaction and the transaction id. It is
+// BuildSignedTransaction followed by SerializeHex and TxID.
 func BuildAndSign(
 	inputs []types.UTXO,
 	recipientScriptPubKey []byte,
@@ -960,12 +984,9 @@ func BuildAndSign(
 	feeRate int64,
 	signer Signer,
 ) (rawHex string, txid string, err error) {
-	t, err := BuildSendTransaction(inputs, recipientScriptPubKey, amount,
-		changeScriptPubKey, feeRate)
+	t, err := BuildSignedTransaction(inputs, recipientScriptPubKey, amount,
+		changeScriptPubKey, feeRate, signer)
 	if err != nil {
-		return "", "", err
-	}
-	if err := t.SignAll(signer); err != nil {
 		return "", "", err
 	}
 	return t.SerializeHex(), t.TxID(), nil

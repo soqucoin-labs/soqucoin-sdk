@@ -192,3 +192,35 @@ func TestSignUnknownAddress(t *testing.T) {
 		t.Error("Sign with unknown address should fail")
 	}
 }
+
+// Signing is hedged: two signatures of one digest differ and both verify.
+// The txid does not depend on the witness, so this changes no transaction id.
+func TestSigningIsHedged(t *testing.T) {
+	kp, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager("/dev/null", "test-passwd")
+	mgr.keys = []KeyPair{*kp}
+	mgr.loaded = true
+	digest := make([]byte, 32)
+	for i := range digest {
+		digest[i] = byte(i)
+	}
+	sig1, err := mgr.Sign(kp.Address, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig2, err := mgr.Sign(kp.Address, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(sig1) == string(sig2) {
+		t.Fatal("two signatures of one digest are identical; signing is not hedged")
+	}
+	for i, sig := range [][]byte{sig1, sig2} {
+		if ok, err := Verify(kp.PublicKey, digest, sig); err != nil || !ok {
+			t.Fatalf("signature %d does not verify: %v %v", i, ok, err)
+		}
+	}
+}

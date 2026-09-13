@@ -149,7 +149,10 @@ func main() {
 	}
 
 	// 3. Create a persistent spent set (prevents UTXO re-selection across restarts)
-	spentSet := utxo.NewSpentSet("/tmp/my_wallet_spent_set.json")
+	spentSet, err := utxo.OpenSpentSet("/tmp/my_wallet_spent_set.json")
+	if err != nil {
+		log.Fatal("spent set:", err) // a file that exists but cannot be read must not start empty
+	}
 	selector := utxo.NewCoinSelector(spentSet)
 
 	// 4. Select UTXOs for the payment
@@ -190,17 +193,14 @@ func main() {
 		log.Fatal("change address:", err)
 	}
 
-	// tx.BuildAndSign does all three of the following in one call. They are
-	// spelled out here only because step 9 needs the change value, and the
-	// transaction is the only place that value actually exists: the fee is
-	// derived from feeRate and the final size, not from a flat number.
-	transaction, err := tx.BuildSendTransaction(
-		verified, recipientSPK, paymentAmount, changeSPK, feeRate)
+	// Build and sign in one call. The transaction itself is returned because
+	// step 9 needs the change value, and the transaction is the only place
+	// that value exists: the fee is derived from feeRate and the final size,
+	// not from a flat number. tx.BuildAndSign returns just the hex and txid.
+	transaction, err := tx.BuildSignedTransaction(
+		verified, recipientSPK, paymentAmount, changeSPK, feeRate, keystore)
 	if err != nil {
-		log.Fatal("Build failed:", err)
-	}
-	if err := transaction.SignAll(keystore); err != nil {
-		log.Fatal("Signing failed:", err)
+		log.Fatal("Build and sign failed:", err)
 	}
 	rawTxHex, builtTxID := transaction.SerializeHex(), transaction.TxID()
 
@@ -214,8 +214,10 @@ func main() {
 		log.Fatal("Broadcast failed:", err)
 	}
 
-	// 8. Mark UTXOs as spent
-	spentSet.MarkBroadcast(verified, txid)
+	// 8. Mark UTXOs as spent. A write failure is an alert: the payment is out.
+	if err := spentSet.MarkBroadcast(verified, txid); err != nil {
+		log.Printf("ALERT spent set not written after broadcast %s: %v", txid, err)
+	}
 
 	// 9. Inject change for immediate availability (Defense 13). Read the value
 	//    off the transaction; BuildSendTransaction only adds a change output if

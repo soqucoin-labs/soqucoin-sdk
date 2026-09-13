@@ -422,9 +422,12 @@ func (m *Manager) Sign(address string, digest []byte) ([]byte, error) {
 		skArr[i] = 0
 	}
 
-	// Sign the digest (deterministic, no context string)
+	// Sign the digest with the hedged (randomized) variant FIPS 204 recommends
+	// for a signer whose host an attacker may profile; no context string.
+	// Verification does not depend on the randomizer, so the node accepts
+	// either form and two signatures of one digest legitimately differ.
 	sig := make([]byte, mldsa44.SignatureSize)
-	if err := mldsa44.SignTo(&sk, digest, nil, false, sig); err != nil {
+	if err := mldsa44.SignTo(&sk, digest, nil, true, sig); err != nil {
 		return nil, fmt.Errorf("dilithium sign: %w", err)
 	}
 

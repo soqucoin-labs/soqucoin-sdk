@@ -215,8 +215,11 @@ func (e *Engine) Build(in *Intent) error {
 		return e.fail(in, fmt.Errorf("select inputs: %w", err), false)
 	}
 	if err := e.Spent.Reserve(inputs, in.ID, e.reservationTTL()); err != nil {
-		// Another intent won the race for one of these inputs. Not a failure of
-		// this intent; the caller retries Build and selection skips them now.
+		// Either another intent won the race for one of these inputs
+		// (utxo.ErrAlreadyReserved; the caller retries Build and selection
+		// skips them now) or the spent set could not be written
+		// (utxo.ErrPersist; nothing is reserved and nothing is built until the
+		// disk is fixed). Not a failure of this intent.
 		in.Attempts++
 		in.LastError = err.Error()
 		_ = e.save(in)
@@ -224,7 +227,7 @@ func (e *Engine) Build(in *Intent) error {
 	}
 	rawHex, txid, err := e.BuildSign(inputs, in.Address, in.Amount, in.FeeRate)
 	if err != nil {
-		e.Spent.Release(in.ID)
+		e.release(in)
 		return e.fail(in, fmt.Errorf("build and sign: %w", err), false)
 	}
 	in.RawHex, in.TxID = rawHex, txid
@@ -235,7 +238,7 @@ func (e *Engine) Build(in *Intent) error {
 	in.State = StateBuilt
 	if err := e.save(in); err != nil {
 		// Not durable, so it must not reach the network: release and report.
-		e.Spent.Release(in.ID)
+		e.release(in)
 		in.State, in.RawHex, in.TxID, in.Inputs = StateCreated, "", "", nil
 		return fmt.Errorf("persist built intent %s: %w", in.ID, err)
 	}
@@ -253,6 +256,12 @@ func (e *Engine) Build(in *Intent) error {
 // can select them however long this takes to resolve, the intent stays Built
 // with NodeTxID recording what the node said, and the error is returned for
 // the operator. It is not a rejection and must not be treated as one.
+//
+// If the node accepted the transaction but the spent set could not be
+// written (utxo.ErrPersist), the intent is still saved as Broadcast and that
+// error is returned: the payment is out, this process refuses the inputs,
+// and Recover re-marks them from the intent store after a restart. Check
+// in.State when Broadcast returns an error.
 func (e *Engine) Broadcast(in *Intent) error {
 	if in.State != StateBuilt {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
@@ -266,8 +275,15 @@ func (e *Engine) Broadcast(in *Intent) error {
 	case err == nil:
 		in.State = StateBroadcast
 		in.LastError = ""
-		e.Spent.MarkBroadcastFor(e.inputs(in), in.TxID, in.ID)
-		return e.save(in)
+		perr := e.Spent.MarkBroadcastFor(e.inputs(in), in.TxID, in.ID)
+		if perr != nil {
+			perr = fmt.Errorf("%s broadcast as %s, spent set not written: %w", in.ID, in.TxID, perr)
+			in.LastError = perr.Error()
+		}
+		if saveErr := e.save(in); saveErr != nil {
+			return errors.Join(perr, saveErr)
+		}
+		return perr
 	case errors.Is(err, rpc.ErrTxIDMismatch):
 		if got == "" {
 			// A Broadcaster that reports the kind without the node's txid
@@ -276,13 +292,16 @@ func (e *Engine) Broadcast(in *Intent) error {
 		}
 		in.NodeTxID = got
 		in.LastError = err.Error()
-		e.Spent.MarkBroadcastFor(e.inputs(in), got, in.ID)
+		if perr := e.Spent.MarkBroadcastFor(e.inputs(in), got, in.ID); perr != nil {
+			err = errors.Join(err, perr)
+			in.LastError = err.Error()
+		}
 		if saveErr := e.save(in); saveErr != nil {
 			return errors.Join(err, saveErr)
 		}
 		return err
 	case errors.Is(err, rpc.ErrPermanent):
-		e.Spent.Release(in.ID)
+		e.release(in)
 		return e.fail(in, err, true)
 	default:
 		// ErrUnknownOutcome or ErrTransient: the transaction may or may not be
@@ -332,32 +351,48 @@ func (e *Engine) Process(id string) (*Intent, error) {
 	return in, nil
 }
 
-// Recover is called once at startup. Built intents are re-reserved and
-// re-broadcast with their persisted bytes; nothing is rebuilt. Broadcast
-// intents are left for UpdateConfirmations. Intents held after a txid
-// mismatch are left as they are: their inputs are already spent entries and
-// nothing may be sent for them; each is logged and reported as ErrHeld so
-// startup alerting sees it. It returns the first error but attempts every
-// intent.
+// Recover is called once at startup. Broadcast intents have their inputs
+// re-marked spent from the intent store, so a spent-set write that failed
+// before the restart cannot re-expose them. Built intents are re-reserved
+// and re-broadcast with their persisted bytes; nothing is rebuilt. Intents
+// held after a txid mismatch are left as they are: their inputs are
+// re-marked under the node's txid and nothing may be sent for them; each is
+// logged and reported as ErrHeld so startup alerting sees it. It returns the
+// first error but attempts every intent.
 func (e *Engine) Recover() error {
-	built, err := e.Store.List(StateBuilt)
+	var firstErr error
+	note := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	broadcast, err := e.Store.List(StateBroadcast)
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	for _, in := range broadcast {
+		if err := e.Spent.MarkBroadcastFor(e.inputs(in), in.TxID, in.ID); err != nil {
+			note(fmt.Errorf("recover %s: %w", in.ID, err))
+		}
+	}
+	built, err := e.Store.List(StateBuilt)
+	if err != nil {
+		return errors.Join(firstErr, err)
+	}
 	for _, in := range built {
 		if in.NodeTxID != "" {
 			log.Printf("[withdraw] recover %s: held, node accepted %s for computed %s; resolve by hand", in.ID, in.NodeTxID, in.TxID)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("recover %s: %w: node accepted %s for computed %s", in.ID, ErrHeld, in.NodeTxID, in.TxID)
+			if err := e.Spent.MarkBroadcastFor(e.inputs(in), in.NodeTxID, in.ID); err != nil {
+				note(fmt.Errorf("recover %s: %w", in.ID, err))
 			}
+			note(fmt.Errorf("recover %s: %w: node accepted %s for computed %s", in.ID, ErrHeld, in.NodeTxID, in.TxID))
 			continue
 		}
 		if err := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); err != nil {
 			log.Printf("[withdraw] recover %s: re-reserve: %v", in.ID, err)
 		}
-		if err := e.Broadcast(in); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("recover %s: %w", in.ID, err)
+		if err := e.Broadcast(in); err != nil {
+			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
 	}
 	return firstErr
@@ -377,13 +412,28 @@ func (e *Engine) UpdateConfirmations(in *Intent) error {
 		return err
 	}
 	in.Confirmations = n
+	var confirmErr error
 	if n >= e.RequiredConfirmations && e.RequiredConfirmations > 0 {
 		in.State = StateConfirmed
 		for _, o := range in.Inputs {
-			e.Spent.ConfirmSpent(o.TxID, o.Vout)
+			if cerr := e.Spent.ConfirmSpent(o.TxID, o.Vout); cerr != nil && confirmErr == nil {
+				confirmErr = cerr // the entry stays unconfirmed on disk until the next write succeeds
+			}
 		}
 	}
-	return e.save(in)
+	if err := e.save(in); err != nil {
+		return errors.Join(confirmErr, err)
+	}
+	return confirmErr
+}
+
+// release drops an intent's reservation. A write failure here leaves a stale
+// reservation on disk that expires by its TTL; nothing is at risk, so it is
+// logged rather than returned.
+func (e *Engine) release(in *Intent) {
+	if err := e.Spent.Release(in.ID); err != nil {
+		log.Printf("[withdraw] %s: release reservation: %v", in.ID, err)
+	}
 }
 
 func (e *Engine) fail(in *Intent, cause error, keepTx bool) error {

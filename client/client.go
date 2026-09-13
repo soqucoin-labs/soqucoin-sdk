@@ -1,4 +1,9 @@
 // Package soqsigner provides an HTTP client for the soq-signer REST API.
+//
+// Scope: soq-signer is the project's own internal payout service. Exchanges
+// integrating Soqucoin do not run it and do not need this package; the
+// integration path is keys, tx, rpc, deposit and withdraw. It stays in the
+// module for the pool tooling and may move to its own module later.
 // soq-signer is the out-of-process Dilithium signing service used for SOQ payouts
 // because soqucoind runs with disablewallet=1 (PQ keys cannot be in-daemon).
 //

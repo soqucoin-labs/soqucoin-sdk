@@ -155,7 +155,7 @@ func TestDepositCreditedAfterNodeCrossCheck(t *testing.T) {
 func TestWithdrawalEndToEnd(t *testing.T) {
 	f := setup(t)
 	_, recipient := newKey(t)
-	spent := utxo.NewSpentSet(filepath.Join(t.TempDir(), "spent.json"))
+	spent := openSpent(t, filepath.Join(t.TempDir(), "spent.json"))
 	e := f.engine(t, withdraw.NewMemStore(), spent, f.n.rpc)
 	amount := 1_000 * types.ShorsPerSOQ
 	if _, _, err := e.Submit("wd-1", recipient, amount, types.RecommendedFeeRate); err != nil {
@@ -242,7 +242,7 @@ func TestLostBroadcastReplyNeverPaysTwice(t *testing.T) {
 	_, recipient := newKey(t)
 	dir := t.TempDir()
 	store, _ := withdraw.NewFileStore(filepath.Join(dir, "intents.json"))
-	spent := utxo.NewSpentSet(filepath.Join(dir, "spent.json"))
+	spent := openSpent(t, filepath.Join(dir, "spent.json"))
 	lb := &lossyBroadcaster{inner: f.n.rpc, drop: true}
 	e := f.engine(t, store, spent, lb)
 	amount := 700 * types.ShorsPerSOQ
@@ -254,7 +254,7 @@ func TestLostBroadcastReplyNeverPaysTwice(t *testing.T) {
 	// "Restart": a new engine over the same files recovers and re-sends the
 	// SAME bytes; the node reports the duplicate as already known.
 	store2, _ := withdraw.NewFileStore(filepath.Join(dir, "intents.json"))
-	e2 := f.engine(t, store2, utxo.NewSpentSet(filepath.Join(dir, "spent.json")), f.n.rpc)
+	e2 := f.engine(t, store2, openSpent(t, filepath.Join(dir, "spent.json")), f.n.rpc)
 	e2.BuildSign = func([]types.UTXO, string, int64, int64) (string, string, error) {
 		t.Fatal("recovery rebuilt a transaction")
 		return "", "", nil
@@ -280,7 +280,7 @@ func TestConcurrentWithdrawalsNeverShareInputs(t *testing.T) {
 	f := setup(t)
 	_, r1 := newKey(t)
 	_, r2 := newKey(t)
-	spent := utxo.NewSpentSet(filepath.Join(t.TempDir(), "spent.json"))
+	spent := openSpent(t, filepath.Join(t.TempDir(), "spent.json"))
 	e := f.engine(t, withdraw.NewMemStore(), spent, f.n.rpc)
 	e.Submit("a", r1, 400_000*types.ShorsPerSOQ, types.RecommendedFeeRate)
 	e.Submit("b", r2, 400_000*types.ShorsPerSOQ, types.RecommendedFeeRate)
@@ -397,7 +397,7 @@ func TestRetriesPastTheReservationTTLKeepTheInputs(t *testing.T) {
 	f := setup(t)
 	_, r1 := newKey(t)
 	_, r2 := newKey(t)
-	spent := utxo.NewSpentSet(filepath.Join(t.TempDir(), "spent.json"))
+	spent := openSpent(t, filepath.Join(t.TempDir(), "spent.json"))
 	down := &downBroadcaster{inner: f.n.rpc, failures: 3}
 	e := f.engine(t, withdraw.NewMemStore(), spent, down)
 	e.ReservationTTL = 3 * time.Second    // b's selection below must complete well inside one TTL
@@ -443,7 +443,7 @@ func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
 	f := setup(t)
 	_, r1 := newKey(t)
 	_, r2 := newKey(t)
-	spent := utxo.NewSpentSet(filepath.Join(t.TempDir(), "spent.json"))
+	spent := openSpent(t, filepath.Join(t.TempDir(), "spent.json"))
 	e := f.engine(t, withdraw.NewMemStore(), spent, lyingBroadcaster{inner: f.n.rpc})
 	e.ReservationTTL = 50 * time.Millisecond // spent inputs must not depend on a reservation
 	amount := 400_000 * types.ShorsPerSOQ
@@ -486,4 +486,14 @@ func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
 	if n, err := e.Confirmer.Confirmations(a.TxID); err != nil || n != 1 {
 		t.Fatalf("a's payment did not confirm: %d %v", n, err)
 	}
+}
+
+// openSpent opens a file-backed spent set the way production code must.
+func openSpent(t *testing.T, path string) *utxo.SpentSet {
+	t.Helper()
+	ss, err := utxo.OpenSpentSet(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ss
 }
