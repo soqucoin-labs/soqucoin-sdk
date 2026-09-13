@@ -428,14 +428,26 @@ func TestTxIDMismatchHoldsInputsAndRecordsTheNodeTxID(t *testing.T) {
 	if w2, err := e.Process("w2"); err == nil || w2.State != StateFailed {
 		t.Fatalf("w2 %+v %v: must not build on inputs the node has already spent", w2, err)
 	}
-	// Retrying w1 gives the same answer and changes nothing; the operator
-	// resolves it.
-	net.setMode("mismatch")
-	if err := e.Broadcast(w1); !errors.Is(err, rpc.ErrTxIDMismatch) {
-		t.Fatalf("retry: %v", err)
+	// A retry sends nothing, even when the node would now answer "already in
+	// chain" for these bytes (fakeNet "ok" is that answer): the intent must
+	// not become a Broadcast intent under a txid the node does not know.
+	net.setMode("ok")
+	sent := net.sentCount()
+	if err := e.Broadcast(w1); !errors.Is(err, ErrHeld) {
+		t.Fatalf("retry of a held intent: %v, want ErrHeld", err)
 	}
 	w1, _, _ = e.Store.Get("w1")
-	if w1.State != StateBuilt || w1.Attempts != 2 {
-		t.Fatalf("retry changed the intent: %+v", w1)
+	if w1.State != StateBuilt || w1.Attempts != 1 || net.sentCount() != sent {
+		t.Fatalf("retry changed or sent something: %+v, sent %d", w1, net.sentCount()-sent)
+	}
+	// Recover leaves it alone too: no re-reserve error, no broadcast.
+	if err := e.Recover(); err != nil {
+		t.Fatalf("recover over a held intent: %v", err)
+	}
+	if net.sentCount() != sent {
+		t.Fatal("recover broadcast a held intent")
+	}
+	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("recover disturbed the spent entry of a held intent")
 	}
 }

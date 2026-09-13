@@ -101,8 +101,9 @@ type rpcResponse struct {
 //	                  than the one the caller computed. The payment is in the
 //	                  mempool; the caller's serialization or hashing disagrees
 //	                  with the node's. Neither permanent (the inputs are
-//	                  spent) nor retryable (the same bytes give the same
-//	                  answer): stop, keep the inputs reserved, investigate.
+//	                  spent) nor retryable (once mined, the node reports the
+//	                  same bytes as already in chain and the disagreement is
+//	                  hidden): stop, hold the inputs, investigate.
 var (
 	ErrTransient      = errors.New("rpc: transient failure, retry later")
 	ErrPermanent      = errors.New("rpc: request rejected")

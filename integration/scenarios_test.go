@@ -400,7 +400,7 @@ func TestRetriesPastTheReservationTTLKeepTheInputs(t *testing.T) {
 	spent := utxo.NewSpentSet(filepath.Join(t.TempDir(), "spent.json"))
 	down := &downBroadcaster{inner: f.n.rpc, failures: 3}
 	e := f.engine(t, withdraw.NewMemStore(), spent, down)
-	e.ReservationTTL = 150 * time.Millisecond
+	e.ReservationTTL = 3 * time.Second    // b's selection below must complete well inside one TTL
 	amount := 400_000 * types.ShorsPerSOQ // each takes most of the hot balance; two need disjoint coins
 	e.Submit("a", r1, amount, types.RecommendedFeeRate)
 	a, err := e.Process("a")
@@ -408,7 +408,7 @@ func TestRetriesPastTheReservationTTLKeepTheInputs(t *testing.T) {
 		t.Fatalf("node down: err=%v state=%s", err, a.State)
 	}
 	for i := 0; i < 2; i++ {
-		time.Sleep(100 * time.Millisecond) // inside each TTL, past the first one in total
+		time.Sleep(2 * time.Second) // inside each TTL, past the first one in total
 		if err := e.Broadcast(a); !errors.Is(err, rpc.ErrTransient) || errors.Is(err, withdraw.ErrReservationLost) {
 			t.Fatalf("retry %d: %v", i, err)
 		}

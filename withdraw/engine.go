@@ -151,6 +151,12 @@ var (
 	// different address, amount or fee rate: the idempotency key is being
 	// reused for a different payment, which is a caller bug worth stopping.
 	ErrConflict = errors.New("withdraw: intent id already used for a different withdrawal")
+	// ErrHeld is returned by Broadcast for an intent the node accepted under a
+	// different txid (NodeTxID is set). Nothing is sent: once the node mines
+	// the payment it would report the same bytes as already in chain, and the
+	// intent would silently become a Broadcast intent under a txid the node
+	// does not know. An operator resolves it by hand.
+	ErrHeld = errors.New("withdraw: intent is held after a txid mismatch; resolve by hand")
 	// ErrReservationLost is returned, wrapped around the broadcast error, when
 	// a Built intent's inputs could not be re-reserved because another
 	// withdrawal took them after the reservation expired. Both transactions
@@ -251,6 +257,9 @@ func (e *Engine) Broadcast(in *Intent) error {
 	if in.State != StateBuilt {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
 	}
+	if in.NodeTxID != "" {
+		return fmt.Errorf("%w: %s computed %s, node accepted %s", ErrHeld, in.ID, in.TxID, in.NodeTxID)
+	}
 	in.Attempts++
 	got, err := e.Broadcaster.Broadcast(in.RawHex, in.TxID)
 	switch {
@@ -320,7 +329,9 @@ func (e *Engine) Process(id string) (*Intent, error) {
 
 // Recover is called once at startup. Built intents are re-reserved and
 // re-broadcast with their persisted bytes; nothing is rebuilt. Broadcast
-// intents are left for UpdateConfirmations. It returns the first error but
+// intents are left for UpdateConfirmations. Intents held after a txid
+// mismatch are left as they are and logged: their inputs are already spent
+// entries and nothing may be sent for them. It returns the first error but
 // attempts every intent.
 func (e *Engine) Recover() error {
 	built, err := e.Store.List(StateBuilt)
@@ -329,6 +340,10 @@ func (e *Engine) Recover() error {
 	}
 	var firstErr error
 	for _, in := range built {
+		if in.NodeTxID != "" {
+			log.Printf("[withdraw] recover %s: held, node accepted %s for computed %s; resolve by hand", in.ID, in.NodeTxID, in.TxID)
+			continue
+		}
 		if err := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); err != nil {
 			log.Printf("[withdraw] recover %s: re-reserve: %v", in.ID, err)
 		}

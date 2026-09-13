@@ -307,8 +307,9 @@ cannot afford impossible by construction:
   shorter than `ReservationTTL` (default 15 minutes).
 - **A node that accepts the bytes under a different txid** (`rpc.ErrTxIDMismatch`) is neither a
   rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
-  node's txid, the intent stays Built with `NodeTxID` recorded; stop withdrawals and investigate
-  before anything is rebuilt.
+  node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
+  refuse to send it again (`withdraw.ErrHeld`); stop withdrawals and investigate before anything
+  is rebuilt.
 
 `Recover` at startup re-sends anything persisted but not yet acknowledged. The circuit breaker is
 fed through `RecordResult`, which never counts a per-request error (a bad address, an amount below
