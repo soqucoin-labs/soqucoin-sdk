@@ -253,7 +253,20 @@ func TestReleasePruneAndConfirmReportPersistFailure(t *testing.T) {
 	if err := ss.Prune(); !errors.Is(err, ErrPersist) {
 		t.Errorf("Prune: %v", err)
 	}
-	if err := ss.ConfirmSpentAll(rUTXOs()[1:]); err != nil {
-		t.Errorf("nothing to change must not touch the disk: %v", err)
+	// Nothing to change must not touch the disk: a set whose entries are all
+	// confirmed already, on an unwritable path, reports no error.
+	quiet := NewSpentSet("")
+	if err := quiet.MarkBroadcast(rUTXOs(), "txid-broadcast"); err != nil {
+		t.Fatal(err)
+	}
+	if err := quiet.ConfirmSpentAll(rUTXOs()); err != nil {
+		t.Fatal(err)
+	}
+	quiet.filePath = unwritablePath(t)
+	if err := quiet.ConfirmSpentAll(rUTXOs()); err != nil {
+		t.Errorf("no-op confirm wrote to disk: %v", err)
+	}
+	if err := quiet.ConfirmSpentAll([]types.UTXO{{TxID: "not-tracked", Vout: 0}}); err != nil {
+		t.Errorf("confirming an untracked input wrote to disk: %v", err)
 	}
 }
