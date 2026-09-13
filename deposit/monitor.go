@@ -77,6 +77,11 @@ type Monitor struct {
 	Addresses func() []string // the deposit addresses to scan
 	Required  Policy
 
+	// Network supplies the chain's coinbase maturity: a mined-to deposit is
+	// credited only once consensus lets it be spent. The zero value is
+	// types.Mainnet. Set it to the same value as the rpc.Client behind Node.
+	Network types.Network
+
 	// MaxCacheAge bounds how stale the indexer cache may be before a scan is
 	// skipped entirely (default 5 minutes). A stale cache is an outage, not
 	// "no deposits".
@@ -119,6 +124,14 @@ func (m *Monitor) clock() time.Time {
 		return m.now()
 	}
 	return time.Now()
+}
+
+// network returns the chain parameters in force: Network when set, else mainnet.
+func (m *Monitor) network() types.Network {
+	if m.Network.ChainID != "" {
+		return m.Network
+	}
+	return types.Mainnet
 }
 
 func (m *Monitor) maxCacheAge() time.Duration {
@@ -213,7 +226,7 @@ func (m *Monitor) verifyWithNode(addr, wantHex string, u types.UTXO, confs int64
 		m.alert(AlertIndexerMismatch, "%s:%d: indexer attributes it to %s but the node's script is %s", u.TxID, u.Vout, addr, out.ScriptPubKey.Hex)
 	case out.Confirmations < m.Required(u.Value):
 		m.alert(AlertIndexerMismatch, "%s:%d for %s: indexer depth %d, node depth %d, required %d", u.TxID, u.Vout, addr, confs, out.Confirmations, m.Required(u.Value))
-	case out.Coinbase && out.Confirmations < types.CoinbaseMaturity:
+	case out.Coinbase && out.Confirmations < m.network().CoinbaseMaturity:
 		// Real, but not spendable yet; credit when mature. Not an alarm.
 	default:
 		return Deposit{

@@ -126,6 +126,7 @@ func main() {
 	defer elx.Stop()
 
 	rpcClient := rpc.NewClient("http://127.0.0.1:28332", "rpcuser", "rpcpass")
+	rpcClient.Network = types.Stagenet // port 28332 is a stagenet node; RequireSynced checks the chain
 
 	// 2. Open the keystore holding the key for myAddr, and track the address.
 	//    *keys.Manager satisfies tx.Signer, so it can be passed to BuildAndSign.

@@ -36,6 +36,18 @@ type Network struct {
 	ElectrumPort int    // ElectrumX TCP port
 	RPCPort      int    // JSON-RPC port
 	GenesisHash  string // Block 0 hash, lowercase hex, as the node's chainparams.cpp asserts it
+
+	// ChainID is the node's own name for the chain, chainparams.cpp
+	// strNetworkID, as getblockchaininfo reports it in "chain". rpc.Client
+	// compares it with the node it is pointed at.
+	ChainID string
+
+	// CoinbaseMaturity is the number of confirmations a coinbase output needs
+	// before consensus lets it be spent (chainparams.cpp nCoinbaseMaturity of
+	// the tier in force). rpc.Client and deposit.Monitor read it from their
+	// Network; an immature coinbase is real but is neither selected for
+	// spending nor credited.
+	CoinbaseMaturity int64
 }
 
 // GenesisHashesForHRP returns the genesis hashes a server serving addresses
@@ -58,32 +70,44 @@ var (
 	// Mainnet is the production Soqucoin network.
 	Mainnet = Network{
 		Name:         "mainnet",
+		ChainID:      "main",
 		GenesisHash:  "0d828600816cbd7c23789660b53f90cb6ec7ff85540698e13845eb2d2f0486a8",
 		HRP:          "sq",
 		DefaultPort:  33388,
 		ElectrumPort: 50001,
 		RPCPort:      33389,
+		// The block-1 tier's nCoinbaseMaturity, equal to the finality horizon.
+		CoinbaseMaturity: 288,
 	}
 
 	// Stagenet is the Soqucoin staging/test network.
 	Stagenet = Network{
 		Name:         "stagenet",
+		ChainID:      "stagenet",
 		GenesisHash:  "97df3ae79eaf5623c0feecfa1079439f8acdfea06a0f2acb4ef63c6b9ad91bb0",
 		HRP:          "ssq",
 		DefaultPort:  28333,
 		ElectrumPort: 50001,
 		RPCPort:      28332,
+		// Consensus is 30 below height 100,000 and 288 from there (the tier
+		// that mirrors mainnet). The SDK waits 288 on both sides of that
+		// gate: a coinbase is never treated as spendable before consensus
+		// allows it, and on the low side it is merely credited later.
+		CoinbaseMaturity: 288,
 	}
 
 	// Regtest is the local regression test network. Note: regtest shares the
 	// mainnet HRP ("sq") in the node's chainparams; only stagenet uses "ssq".
 	Regtest = Network{
 		Name:         "regtest",
+		ChainID:      "regtest",
 		GenesisHash:  "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5",
 		HRP:          "sq",
 		DefaultPort:  18444,
 		ElectrumPort: 50001,
 		RPCPort:      18332,
+		// Regtest's consensus value, chosen in the node for fast tests.
+		CoinbaseMaturity: 60,
 	}
 )
 
@@ -125,7 +149,11 @@ const (
 // MaxReorgDepth + 1 confirmations is final in the consensus sense.
 const MaxReorgDepth int64 = 288
 
-// CoinbaseMaturity is the number of confirmations a coinbase output needs
-// before it may be spent: consensus nCoinbaseMaturity of the tier active from
-// block 1 on mainnet and stagenet (chainparams.cpp). Regtest uses 60.
-const CoinbaseMaturity int64 = 240
+// CoinbaseMaturity is mainnet's coinbase maturity, 288 confirmations.
+//
+// Deprecated: the value is per network; read Network.CoinbaseMaturity from
+// the network you are on (Mainnet, Stagenet or Regtest) or set rpc.Client.Network
+// and deposit.Monitor.Network and let them apply it. This constant is kept
+// at mainnet's value, which is the largest of the three, so code that still
+// uses it is conservative on every network.
+const CoinbaseMaturity int64 = 288

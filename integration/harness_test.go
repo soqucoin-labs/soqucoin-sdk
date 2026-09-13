@@ -84,6 +84,7 @@ func startNode(t *testing.T) *node {
 	}
 	n := &node{t: t, dir: dir, cmd: cmd, port: rpcPort,
 		rpc: rpc.NewClient(fmt.Sprintf("http://127.0.0.1:%d", rpcPort), "it", "it")}
+	n.rpc.Network = types.Regtest
 	t.Cleanup(n.stop)
 	deadline := time.Now().Add(60 * time.Second)
 	for {

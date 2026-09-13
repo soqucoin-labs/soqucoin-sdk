@@ -255,11 +255,13 @@ func main() {
 
 	// Your own node. Nothing is credited on the indexer's word alone.
 	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass")
+	node.Network = types.Mainnet // RequireSynced refuses a node on any other chain
 
 	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}}
 	monitor := &deposit.Monitor{
 		Cache:     elx,
 		Node:      node,
+		Network:   types.Mainnet, // coinbase maturity 288; a mined-to deposit waits for it
 		Ledger:    ledger,
 		Addresses: func() []string { return depositAddresses },
 		Required:  requiredConfirmations,
@@ -348,6 +350,7 @@ func main() {
 	defer elx.Stop()
 	elx.StartPolling()
 	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass")
+	node.Network = types.Mainnet
 
 	// Halts only for systemic failures (RecordResult never counts a bad
 	// request), and the reconciler trips it when the book and the chain
@@ -461,7 +464,7 @@ than to a rule of thumb carried over from another chain:
 | Parameter | Value | Meaning |
 |-----------|:-----:|---------|
 | `nMaxReorgDepth` | **288 blocks** (~4.8 h) | The chain's own finality horizon, exposed as `types.MaxReorgDepth`. Nodes reject headers building on a fork deeper than this, once they have finished initial download |
-| `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus |
+| `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus. Exposed per network as `types.Network.CoinbaseMaturity` (mainnet 288, stagenet 288, regtest 60); `rpc.Client` and `deposit.Monitor` apply it from their `Network` field, mainnet when unset |
 
 Recommended thresholds:
 
@@ -633,8 +636,10 @@ soqucoin-cli testmempoolaccept '["<rawHex>"]'
 Exchanges accumulate many small UTXOs from deposits. Periodically consolidate them to avoid hitting the 80-input limit during large withdrawals:
 
 ```go
-// Select the smallest UTXOs for consolidation
-smallUTXOs, total, err := selector.SelectSmallestUTXOs(allUTXOs, 50, 6, tipHeight, nil)
+// Select the smallest UTXOs for consolidation. Consolidate only outputs that
+// are final (past the reorg horizon); a consolidation that spends a shallow
+// output is undone with it.
+smallUTXOs, total, err := selector.SelectSmallestUTXOs(allUTXOs, 50, int(types.MaxReorgDepth)+1, tipHeight, nil)
 // Build a single TX that merges them into one output to your hot wallet
 ```
 

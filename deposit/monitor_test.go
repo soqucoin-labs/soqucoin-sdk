@@ -246,19 +246,39 @@ func TestPausesWhenNodeSyncingOrCacheStale(t *testing.T) {
 	}
 }
 
+// A coinbase deposit is real and waits for the network's maturity without an
+// alarm; it is credited at exactly that depth and not one block earlier. 240,
+// the upstream value the SDK carried until v0.3.5, is immature on mainnet.
+// Mainnet is the default when Network is unset; regtest matures at 60.
 func TestImmatureCoinbaseWaitsWithoutAlarm(t *testing.T) {
-	m, cache, node, led, al, a := setup(t)
-	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
-	node.outs[key(txA, 0)] = txout(t, a, 88, 51, true)
-	if got, _ := m.Scan(); len(got) != 0 || len(led.credited) != 0 {
-		t.Fatal("immature coinbase credited")
+	cases := []struct {
+		name     string
+		network  types.Network
+		immature []int64
+		mature   int64
+	}{
+		{"mainnet by default", types.Network{}, []int64{51, 240, 287}, 288},
+		{"mainnet", types.Mainnet, []int64{240}, 288},
+		{"stagenet", types.Stagenet, []int64{30, 287}, 288},
+		{"regtest", types.Regtest, []int64{59}, 60},
 	}
-	if len(al.kinds) != 0 {
-		t.Errorf("immature coinbase is not an alarm: %v", al.kinds)
-	}
-	node.outs[key(txA, 0)] = txout(t, a, 88, types.CoinbaseMaturity, true)
-	if got, _ := m.Scan(); len(got) != 1 {
-		t.Fatal("mature coinbase not credited")
+	for _, c := range cases {
+		m, cache, node, led, al, a := setup(t)
+		m.Network = c.network
+		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
+		for _, confs := range c.immature {
+			node.outs[key(txA, 0)] = txout(t, a, 88, confs, true)
+			if got, _ := m.Scan(); len(got) != 0 || len(led.credited) != 0 {
+				t.Fatalf("%s: coinbase at %d confirmations credited", c.name, confs)
+			}
+			if len(al.kinds) != 0 {
+				t.Errorf("%s: an immature coinbase is not an alarm: %v", c.name, al.kinds)
+			}
+		}
+		node.outs[key(txA, 0)] = txout(t, a, 88, c.mature, true)
+		if got, _ := m.Scan(); len(got) != 1 {
+			t.Fatalf("%s: coinbase at %d confirmations not credited", c.name, c.mature)
+		}
 	}
 }
 

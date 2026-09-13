@@ -33,6 +33,14 @@ import (
 
 // Client is a JSON-RPC client for soqucoind.
 type Client struct {
+	// Network is the chain the node is expected to serve. It supplies the
+	// chain's coinbase maturity to VerifyAndFilterUTXOs, and RequireSynced
+	// refuses a node whose getblockchaininfo "chain" differs from its ChainID
+	// (ErrWrongChain), so a stagenet URL in a mainnet deployment fails closed
+	// instead of quietly applying the wrong rules. The zero value means
+	// types.Mainnet without the chain check.
+	Network types.Network
+
 	url      string
 	user     string
 	password string
@@ -45,6 +53,11 @@ type Client struct {
 //   - url: Full URL including port (e.g., "http://127.0.0.1:33389" on mainnet)
 //   - user: RPC username from soqucoin.conf
 //   - password: RPC password from soqucoin.conf
+//
+// Set Network afterwards for any chain other than mainnet:
+//
+//	c := rpc.NewClient(url, user, password)
+//	c.Network = types.Stagenet
 func NewClient(url, user, password string) *Client {
 	return &Client{
 		url:      url,
@@ -90,6 +103,7 @@ var (
 	ErrUnknownOutcome = errors.New("rpc: outcome unknown, the request may have taken effect")
 	ErrAlreadyInChain = errors.New("rpc: transaction already in chain")
 	ErrNodeSyncing    = fmt.Errorf("%w: node is in initial block download or behind its headers", ErrTransient)
+	ErrWrongChain     = fmt.Errorf("%w: node serves a different chain than Client.Network", ErrPermanent)
 )
 
 // Node error codes this package interprets (src/rpc/protocol.h in the node).
@@ -430,16 +444,32 @@ type BlockchainInfo struct {
 // is out of initial block download and its block height has caught up with
 // its header height. Until then the node's UTXO set is incomplete and a nil
 // gettxout is not evidence of a spend.
+//
+// When Network is set it also returns ErrWrongChain (permanent) if the node
+// reports a chain other than Network.ChainID. That is a deployment error, not
+// a condition to wait out.
 func (c *Client) RequireSynced() error {
 	info, err := c.GetBlockchainInfo()
 	if err != nil {
 		return err
+	}
+	if want := c.Network.ChainID; want != "" && info.Chain != want {
+		return fmt.Errorf("%w: node reports %q, client configured for %q", ErrWrongChain, info.Chain, want)
 	}
 	if info.InitialSync || info.Headers > info.Blocks {
 		return fmt.Errorf("%w (blocks %d, headers %d, initialblockdownload %v)",
 			ErrNodeSyncing, info.Blocks, info.Headers, info.InitialSync)
 	}
 	return nil
+}
+
+// network returns the chain parameters in force for this client: Network
+// when set, otherwise mainnet.
+func (c *Client) network() types.Network {
+	if c.Network.ChainID != "" {
+		return c.Network
+	}
+	return types.Mainnet
 }
 
 // VerifyUTXO checks if a UTXO exists on-chain using gettxout (Defense 11).
@@ -496,11 +526,11 @@ func (c *Client) VerifyAndFilterUTXOs(
 			continue
 		}
 		// An immature coinbase output is real but not yet spendable
-		// (consensus: nCoinbaseMaturity). Keep it in the cache, leave it out
-		// of this selection.
-		if txout.Coinbase && txout.Confirmations < types.CoinbaseMaturity {
+		// (consensus: nCoinbaseMaturity of this client's Network). Keep it in
+		// the cache, leave it out of this selection.
+		if maturity := c.network().CoinbaseMaturity; txout.Coinbase && txout.Confirmations < maturity {
 			log.Printf("[rpc] UTXO %s:%d is an immature coinbase (%d of %d confirmations), skipping",
-				shortID(u.TxID, 12), u.Vout, txout.Confirmations, types.CoinbaseMaturity)
+				shortID(u.TxID, 12), u.Vout, txout.Confirmations, maturity)
 			continue
 		}
 
