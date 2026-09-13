@@ -172,12 +172,24 @@ func TestBroadcastRejectionIsPermanent(t *testing.T) {
 	}
 }
 
-func TestBroadcastRefusesTxIDMismatch(t *testing.T) {
+// The node accepted the bytes but named them differently. That is its own
+// kind: not permanent (the inputs are spent now), not transient, not unknown
+// (the node answered). The node's txid is returned so the caller can record it.
+func TestBroadcastReportsTxIDMismatchAsItsOwnKind(t *testing.T) {
 	c, _ := rpcServer(t, func(method string, _ []interface{}) string {
 		return ok(`"` + someTxID + `"`)
 	})
-	if _, err := c.Broadcast("00", "not-the-same"); !errors.Is(err, ErrPermanent) {
+	got, err := c.Broadcast("00", "not-the-same")
+	if !errors.Is(err, ErrTxIDMismatch) {
 		t.Fatalf("node/caller txid disagreement not surfaced: %v", err)
+	}
+	for _, kind := range []error{ErrPermanent, ErrTransient, ErrUnknownOutcome, ErrAlreadyInChain} {
+		if errors.Is(err, kind) {
+			t.Errorf("mismatch must not also be %v", kind)
+		}
+	}
+	if got != someTxID {
+		t.Errorf("node txid %q not returned", got)
 	}
 }
 

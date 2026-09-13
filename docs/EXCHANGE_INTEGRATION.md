@@ -302,7 +302,14 @@ cannot afford impossible by construction:
   (`rpc.ErrUnknownOutcome`) is retried with the **same bytes**, never rebuilt. `rpc.Broadcast`
   resolves that case against your node and treats "already in chain" as success.
 - **No own double-spend.** Inputs are reserved in the spent set when the transaction is built,
-  all-or-nothing, and unconfirmed spends survive restarts however long confirmation takes.
+  all-or-nothing, and unconfirmed spends survive restarts however long confirmation takes. Every
+  unsettled broadcast attempt renews the reservation, so retry Built intents at an interval
+  shorter than `ReservationTTL` (default 15 minutes).
+- **A node that accepts the bytes under a different txid** (`rpc.ErrTxIDMismatch`) is neither a
+  rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
+  node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
+  refuse to send it again (`withdraw.ErrHeld`); stop withdrawals and investigate before anything
+  is rebuilt.
 
 `Recover` at startup re-sends anything persisted but not yet acknowledged. The circuit breaker is
 fed through `RecordResult`, which never counts a per-request error (a bad address, an amount below
@@ -436,6 +443,10 @@ func main() {
 	if err != nil {
 		// rpc.ErrUnknownOutcome or rpc.ErrTransient: the intent stays Built.
 		// Call Process again later; the same bytes go out.
+		// rpc.ErrTxIDMismatch: also Built, inputs held, intent.NodeTxID set;
+		// the breaker counts it, and every later Process of that intent
+		// returns withdraw.ErrHeld, which also counts. Stop and investigate,
+		// never rebuild.
 		log.Printf("process %s: state %s: %v", requestID, intent.State, err)
 		return
 	}

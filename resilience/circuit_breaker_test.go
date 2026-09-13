@@ -2,8 +2,11 @@ package resilience
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 )
 
 func TestCircuitBreakerStartsClosed(t *testing.T) {
@@ -198,5 +201,18 @@ func TestCircuitBreakerTotalStats(t *testing.T) {
 	}
 	if failures != 1 {
 		t.Errorf("expected 1 total failure, got %d", failures)
+	}
+}
+
+// A node that accepts a transaction under a different txid than the SDK
+// computed is a systemic disagreement between signer and node, not a bad
+// request: it must count toward opening the breaker.
+func TestTxIDMismatchCountsAsSystemic(t *testing.T) {
+	cb := NewCircuitBreaker(1, time.Minute)
+	if !cb.RecordResult(fmt.Errorf("broadcast: %w", rpc.ErrTxIDMismatch)) {
+		t.Fatal("txid mismatch was ignored as a per-request error")
+	}
+	if cb.Allow() == nil {
+		t.Fatal("breaker did not open on a txid mismatch")
 	}
 }
