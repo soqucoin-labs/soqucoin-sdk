@@ -464,7 +464,7 @@ than to a rule of thumb carried over from another chain:
 | Parameter | Value | Meaning |
 |-----------|:-----:|---------|
 | `nMaxReorgDepth` | **288 blocks** (~4.8 h) | The chain's own finality horizon, exposed as `types.MaxReorgDepth`. Nodes reject headers building on a fork deeper than this, once they have finished initial download |
-| `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus. Exposed per network as `types.Network.CoinbaseMaturity` (mainnet 288, stagenet 288, regtest 60); `rpc.Client` and `deposit.Monitor` apply it from their `Network` field, mainnet when unset |
+| `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus. Exposed per network as `types.Network.CoinbaseMaturity` (mainnet 288, stagenet 288, regtest 60); `rpc.Client` and `deposit.Monitor` apply it from their `Network` field, mainnet when unset. With `Network` set, `Monitor.Scan` refuses a node that reports another chain; if you wrap `*rpc.Client` behind your own `deposit.Node`, forward `RequireChain` so that check still reaches the node |
 
 Recommended thresholds:
 

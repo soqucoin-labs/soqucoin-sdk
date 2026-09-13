@@ -130,12 +130,18 @@ func (m *Monitor) clock() time.Time {
 	return time.Now()
 }
 
-// network returns the chain parameters in force: Network when set, else mainnet.
+// network returns the chain parameters in force: Network when set, else
+// mainnet. A hand-built Network without a maturity gets mainnet's, the
+// largest, rather than zero, which would credit every coinbase at once.
 func (m *Monitor) network() types.Network {
-	if m.Network.ChainID != "" {
-		return m.Network
+	n := m.Network
+	if n.ChainID == "" {
+		return types.Mainnet
 	}
-	return types.Mainnet
+	if n.CoinbaseMaturity <= 0 {
+		n.CoinbaseMaturity = types.Mainnet.CoinbaseMaturity
+	}
+	return n
 }
 
 func (m *Monitor) maxCacheAge() time.Duration {
@@ -173,7 +179,6 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 			if err := cc.RequireChain(want); err != nil {
 				if errors.Is(err, rpc.ErrWrongChain) {
 					m.alert(AlertNodeWrongChain, "%v", err)
-					return nil, err
 				}
 				return nil, err
 			}

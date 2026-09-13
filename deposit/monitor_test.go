@@ -274,6 +274,7 @@ func TestImmatureCoinbaseWaitsWithoutAlarm(t *testing.T) {
 		{"mainnet", types.Mainnet, []int64{240}, 288},
 		{"stagenet", types.Stagenet, []int64{30, 287}, 288},
 		{"regtest", types.Regtest, []int64{59}, 60},
+		{"hand-built network without a maturity", types.Network{ChainID: "main"}, []int64{287}, 288},
 	}
 	for _, c := range cases {
 		m, cache, node, led, al, a := setup(t)

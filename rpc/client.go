@@ -484,12 +484,17 @@ func checkChain(info *BlockchainInfo, want string) error {
 }
 
 // network returns the chain parameters in force for this client: Network
-// when set, otherwise mainnet.
+// when set, otherwise mainnet. A hand-built Network without a maturity gets
+// mainnet's, the largest, rather than zero, which would select every coinbase.
 func (c *Client) network() types.Network {
-	if c.Network.ChainID != "" {
-		return c.Network
+	n := c.Network
+	if n.ChainID == "" {
+		return types.Mainnet
 	}
-	return types.Mainnet
+	if n.CoinbaseMaturity <= 0 {
+		n.CoinbaseMaturity = types.Mainnet.CoinbaseMaturity
+	}
+	return n
 }
 
 // VerifyUTXO checks if a UTXO exists on-chain using gettxout (Defense 11).

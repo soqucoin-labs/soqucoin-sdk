@@ -264,6 +264,8 @@ func TestVerifyAndFilterAppliesTheNetworkMaturityAtTheBoundary(t *testing.T) {
 		{"regtest, 60", types.Regtest, 60, true},
 		{"stagenet, 30", types.Stagenet, 30, false},
 		{"stagenet, 288", types.Stagenet, 288, true},
+		{"hand-built network without a maturity, 287", types.Network{ChainID: "main"}, 287, false},
+		{"hand-built network without a maturity, 288", types.Network{ChainID: "main"}, 288, true},
 	}
 	for _, c := range cases {
 		evicted := 0
