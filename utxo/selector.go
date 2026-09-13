@@ -180,6 +180,9 @@ func (ss *SpentSet) Reserve(inputs []types.UTXO, intentID string, ttl time.Durat
 	previous := make(map[SpentKey]*SpentEntry, len(inputs))
 	for _, u := range inputs {
 		key := SpentKey{u.TxID, u.Vout}
+		if _, seen := previous[key]; seen {
+			continue // the same outpoint twice: keep the state from before the first write
+		}
 		if e, exists := ss.entries[key]; exists {
 			e := e
 			previous[key] = &e
@@ -287,16 +290,28 @@ func (ss *SpentSet) IsSpent(txid string, vout uint32) bool {
 
 // ConfirmSpent marks a spent entry as confirmed (UTXO disappeared from ElectrumX).
 func (ss *SpentSet) ConfirmSpent(txid string, vout uint32) error {
+	return ss.ConfirmSpentAll([]types.UTXO{{TxID: txid, Vout: vout}})
+}
+
+// ConfirmSpentAll marks every listed input confirmed and writes the file once.
+// Use it for an intent's inputs together rather than ConfirmSpent per input.
+func (ss *SpentSet) ConfirmSpentAll(inputs []types.UTXO) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
-	key := SpentKey{txid, vout}
-	if entry, exists := ss.entries[key]; exists && !entry.Confirmed {
-		entry.Confirmed = true
-		ss.entries[key] = entry
-		return ss.persist()
+	changed := false
+	for _, u := range inputs {
+		key := SpentKey{u.TxID, u.Vout}
+		if entry, exists := ss.entries[key]; exists && !entry.Confirmed {
+			entry.Confirmed = true
+			ss.entries[key] = entry
+			changed = true
+		}
 	}
-	return nil
+	if !changed {
+		return nil
+	}
+	return ss.persist()
 }
 
 // Prune removes confirmed entries older than 1 hour and expired

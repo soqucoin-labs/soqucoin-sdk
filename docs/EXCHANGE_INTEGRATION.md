@@ -311,11 +311,13 @@ cannot afford impossible by construction:
   refuse to send it again (`withdraw.ErrHeld`); stop withdrawals and investigate before anything
   is rebuilt.
 
-If `Process` returns an error and the intent's state is `Broadcast`, the node accepted the payment
-and the spent set could not be written (`utxo.ErrPersist`): the process still refuses those inputs,
-and `Recover` re-marks every Broadcast intent's inputs from the intent store at startup, so a
-restart does not re-expose them. Open the spent set with `utxo.OpenSpentSet`, which refuses a file
-that exists but cannot be read; an empty set in that case would forget every unconfirmed spend.
+If `Process` returns an error that is `utxo.ErrPersist`, the node accepted the payment and the
+spent set could not be written: the intent is saved as `Broadcast`, the process still refuses those
+inputs, and `Recover` re-marks every Broadcast intent's inputs from the intent store at startup, so
+a restart does not re-expose them. That guarantee holds only if you stop when `Recover` returns an
+error: a failed `List` means nothing was re-marked. Open the spent set with `utxo.OpenSpentSet`,
+which refuses a file that exists but cannot be read; an empty set in that case would forget every
+unconfirmed spend.
 
 `Recover` at startup re-sends anything persisted but not yet acknowledged. The circuit breaker is
 fed through `RecordResult`, which never counts a per-request error (a bad address, an amount below
@@ -425,10 +427,13 @@ func main() {
 		},
 	}
 
-	// After a restart: re-send persisted transactions with the same bytes.
-	// Nothing is ever rebuilt.
+	// After a restart: re-mark broadcast spends from the intent store and
+	// re-send persisted transactions with the same bytes. Nothing is ever
+	// rebuilt. Do not start paying out if this fails: the spent set may be
+	// missing spends the store knows about. withdraw.ErrHeld here is an
+	// intent an operator must resolve first.
 	if err := engine.Recover(); err != nil {
-		log.Printf("recover: %v", err)
+		log.Fatalf("recover: %v", err)
 	}
 
 	// A withdrawal request. The id is your idempotency key: the same id never

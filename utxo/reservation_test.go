@@ -219,3 +219,41 @@ func TestOpenSpentSetRefusesACorruptFile(t *testing.T) {
 		t.Fatal("NewSpentSet on a corrupt file should have started empty")
 	}
 }
+
+// The same outpoint listed twice must roll back to the state before the first
+// write, not to the reservation the first pass created.
+func TestReserveRollbackWithDuplicateOutpoint(t *testing.T) {
+	ss := NewSpentSet(unwritablePath(t))
+	u := rUTXOs()[0]
+	if err := ss.Reserve([]types.UTXO{u, u}, "w1", time.Hour); !errors.Is(err, ErrPersist) {
+		t.Fatalf("got %v", err)
+	}
+	if ss.IsSpent(u.TxID, u.Vout) {
+		t.Fatal("a phantom reservation survived the rollback")
+	}
+}
+
+// Release, Prune and ConfirmSpentAll report a failed write too.
+func TestReleasePruneAndConfirmReportPersistFailure(t *testing.T) {
+	ss := NewSpentSet("")
+	if err := ss.Reserve(rUTXOs()[:1], "w1", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.MarkBroadcast(rUTXOs()[1:], "txid-broadcast"); err != nil {
+		t.Fatal(err)
+	}
+	ss.filePath = unwritablePath(t)
+	if err := ss.Release("w1"); !errors.Is(err, ErrPersist) {
+		t.Errorf("Release: %v", err)
+	}
+	if err := ss.ConfirmSpentAll(rUTXOs()[1:]); !errors.Is(err, ErrPersist) {
+		t.Errorf("ConfirmSpentAll: %v", err)
+	}
+	ss.entries[SpentKey{rTxB, 1}] = SpentEntry{TxID: rTxB, Vout: 1, Confirmed: true, SpentAt: time.Now().Add(-3 * time.Hour)}
+	if err := ss.Prune(); !errors.Is(err, ErrPersist) {
+		t.Errorf("Prune: %v", err)
+	}
+	if err := ss.ConfirmSpentAll(rUTXOs()[1:]); err != nil {
+		t.Errorf("nothing to change must not touch the disk: %v", err)
+	}
+}

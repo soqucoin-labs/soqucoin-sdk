@@ -357,13 +357,13 @@ func (e *Engine) Process(id string) (*Intent, error) {
 // and re-broadcast with their persisted bytes; nothing is rebuilt. Intents
 // held after a txid mismatch are left as they are: their inputs are
 // re-marked under the node's txid and nothing may be sent for them; each is
-// logged and reported as ErrHeld so startup alerting sees it. It returns the
-// first error but attempts every intent.
+// logged and reported as ErrHeld so startup alerting sees it. It attempts
+// every intent and returns every error joined, so errors.Is finds each kind.
 func (e *Engine) Recover() error {
-	var firstErr error
+	var errs []error
 	note := func(err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 	broadcast, err := e.Store.List(StateBroadcast)
@@ -377,7 +377,7 @@ func (e *Engine) Recover() error {
 	}
 	built, err := e.Store.List(StateBuilt)
 	if err != nil {
-		return errors.Join(firstErr, err)
+		return errors.Join(append(errs, err)...)
 	}
 	for _, in := range built {
 		if in.NodeTxID != "" {
@@ -395,7 +395,7 @@ func (e *Engine) Recover() error {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
 	}
-	return firstErr
+	return errors.Join(errs...)
 }
 
 // UpdateConfirmations refreshes a Broadcast intent's confirmation count and
@@ -415,11 +415,9 @@ func (e *Engine) UpdateConfirmations(in *Intent) error {
 	var confirmErr error
 	if n >= e.RequiredConfirmations && e.RequiredConfirmations > 0 {
 		in.State = StateConfirmed
-		for _, o := range in.Inputs {
-			if cerr := e.Spent.ConfirmSpent(o.TxID, o.Vout); cerr != nil && confirmErr == nil {
-				confirmErr = cerr // the entry stays unconfirmed on disk until the next write succeeds
-			}
-		}
+		// One write for all inputs. On failure the entries stay unconfirmed on
+		// disk (spent inputs stay excluded; only pruning is delayed).
+		confirmErr = e.Spent.ConfirmSpentAll(e.inputs(in))
 	}
 	if err := e.save(in); err != nil {
 		return errors.Join(confirmErr, err)

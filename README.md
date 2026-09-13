@@ -120,8 +120,10 @@ rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, t
 //    durably; use it for real withdrawals (Step 3 of the exchange guide).
 sentTxID, err := rpcClient.Broadcast(rawTx, txid)
 
-// 5. Mark spent (Defense 12)
-spentSet.MarkBroadcast(verified, sentTxID)
+// 5. Mark spent (Defense 12). A failed write is an alert: the payment is out.
+if err := spentSet.MarkBroadcast(verified, sentTxID); err != nil {
+    log.Printf("ALERT spent set not written: %v", err)
+}
 ```
 
 ## Packages
