@@ -79,7 +79,10 @@ type Monitor struct {
 
 	// Network supplies the chain's coinbase maturity: a mined-to deposit is
 	// credited only once consensus lets it be spent. The zero value is
-	// types.Mainnet. Set it to the same value as the rpc.Client behind Node.
+	// types.Mainnet. When it is set and Node can report its chain (as
+	// *rpc.Client does through RequireChain), Scan refuses to credit anything
+	// while the node serves another chain, so the maturity applied and the
+	// node consulted cannot drift apart.
 	Network types.Network
 
 	// MaxCacheAge bounds how stale the indexer cache may be before a scan is
@@ -100,6 +103,7 @@ type AlertKind string
 
 const (
 	AlertNodeSyncing     AlertKind = "node_syncing"     // crediting paused; node not caught up
+	AlertNodeWrongChain  AlertKind = "node_wrong_chain" // node serves another chain than Network; crediting refused until the deployment is fixed
 	AlertCacheStale      AlertKind = "cache_stale"      // indexer has not refreshed; crediting paused
 	AlertIndexerMismatch AlertKind = "indexer_mismatch" // indexer and node disagree on an output; NOT credited
 	AlertDepositVanished AlertKind = "deposit_vanished" // a credited, non-final output is gone from the node
@@ -141,15 +145,39 @@ func (m *Monitor) maxCacheAge() time.Duration {
 	return 5 * time.Minute
 }
 
+// chainChecker is the optional part of Node that reports which chain the node
+// serves; *rpc.Client implements it.
+type chainChecker interface {
+	RequireChain(chainID string) error
+}
+
 // Scan performs one pass. It returns the deposits credited in this pass, or
-// ErrPaused (wrapped with the reason) when crediting was not safe. Errors from
-// the node are returned as-is; the pass credits nothing in that case.
+// ErrPaused (wrapped with the reason) when crediting was not safe. A node on
+// the wrong chain is returned as rpc.ErrWrongChain, a permanent error, not as
+// a pause. Other errors from the node are returned as-is; the pass credits
+// nothing in that case.
 func (m *Monitor) Scan() ([]Deposit, error) {
-	// 1. The node must have caught up. During initial block download the
-	//    finality horizon is not enforced and gettxout is incomplete.
+	// 1. The node must serve this Monitor's chain and must have caught up.
+	//    During initial block download the finality horizon is not enforced
+	//    and gettxout is incomplete.
 	if err := m.Node.RequireSynced(); err != nil {
+		if errors.Is(err, rpc.ErrWrongChain) {
+			m.alert(AlertNodeWrongChain, "%v", err)
+			return nil, err
+		}
 		m.alert(AlertNodeSyncing, "%v", err)
 		return nil, fmt.Errorf("%w: %v", ErrPaused, err)
+	}
+	if want := m.Network.ChainID; want != "" {
+		if cc, ok := m.Node.(chainChecker); ok {
+			if err := cc.RequireChain(want); err != nil {
+				if errors.Is(err, rpc.ErrWrongChain) {
+					m.alert(AlertNodeWrongChain, "%v", err)
+					return nil, err
+				}
+				return nil, err
+			}
+		}
 	}
 	// 2. The indexer must be fresh. A cache that stopped refreshing looks
 	//    exactly like "no new deposits".

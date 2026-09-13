@@ -244,8 +244,8 @@ func TestTxOutValueShors(t *testing.T) {
 }
 
 // The maturity applied is the configured network's, at the exact boundary:
-// 240, the value inherited from upstream that the SDK itself carried until
-// v0.3.5, is immature on mainnet and 288 is mature; regtest matures at 60;
+// 240, the value inherited from upstream that the SDK itself carried through
+// v0.3.4, is immature on mainnet and 288 is mature; regtest matures at 60;
 // stagenet is held to 288 although consensus allows 30 below height 100,000.
 // An unset Network means mainnet.
 func TestVerifyAndFilterAppliesTheNetworkMaturityAtTheBoundary(t *testing.T) {
@@ -339,5 +339,24 @@ func TestRequireSyncedRefusesANodeOnAnotherChain(t *testing.T) {
 		if evicted != 0 {
 			t.Errorf("%s: %d outputs evicted on a wrong-chain node", c.name, evicted)
 		}
+	}
+}
+
+// RequireChain is what deposit.Monitor asks when the client's own Network was
+// left unset; it must hold the node to the chain it is given and pass on an
+// empty one.
+func TestRequireChainHoldsTheNodeToTheGivenChain(t *testing.T) {
+	cl, _ := rpcServer(t, func(method string, _ []interface{}) string {
+		return ok(`{"chain":"regtest","blocks":1000,"headers":1000,"initialblockdownload":false}`)
+	})
+	if err := cl.RequireChain(types.Regtest.ChainID); err != nil {
+		t.Errorf("regtest node, regtest wanted: %v", err)
+	}
+	if err := cl.RequireChain(""); err != nil {
+		t.Errorf("empty chain id must pass: %v", err)
+	}
+	err := cl.RequireChain(types.Mainnet.ChainID)
+	if !errors.Is(err, ErrWrongChain) || !errors.Is(err, ErrPermanent) {
+		t.Errorf("regtest node, mainnet wanted: got %v, want ErrWrongChain", err)
 	}
 }

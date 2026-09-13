@@ -453,12 +453,32 @@ func (c *Client) RequireSynced() error {
 	if err != nil {
 		return err
 	}
-	if want := c.Network.ChainID; want != "" && info.Chain != want {
-		return fmt.Errorf("%w: node reports %q, client configured for %q", ErrWrongChain, info.Chain, want)
+	if err := checkChain(info, c.Network.ChainID); err != nil {
+		return err
 	}
 	if info.InitialSync || info.Headers > info.Blocks {
 		return fmt.Errorf("%w (blocks %d, headers %d, initialblockdownload %v)",
 			ErrNodeSyncing, info.Blocks, info.Headers, info.InitialSync)
+	}
+	return nil
+}
+
+// RequireChain returns ErrWrongChain (permanent) unless the node reports
+// chainID (a types.Network.ChainID) in getblockchaininfo. An empty chainID
+// passes. deposit.Monitor calls it with its own Network so that its maturity
+// rule and the node it asks are on the same chain even when Client.Network
+// was left unset.
+func (c *Client) RequireChain(chainID string) error {
+	info, err := c.GetBlockchainInfo()
+	if err != nil {
+		return err
+	}
+	return checkChain(info, chainID)
+}
+
+func checkChain(info *BlockchainInfo, want string) error {
+	if want != "" && info.Chain != want {
+		return fmt.Errorf("%w: node reports %q, configured for %q", ErrWrongChain, info.Chain, want)
 	}
 	return nil
 }

@@ -261,7 +261,7 @@ func main() {
 	monitor := &deposit.Monitor{
 		Cache:     elx,
 		Node:      node,
-		Network:   types.Mainnet, // coinbase maturity 288; a mined-to deposit waits for it
+		Network:   types.Mainnet, // coinbase maturity 288; Scan refuses a node on any other chain
 		Ledger:    ledger,
 		Addresses: func() []string { return depositAddresses },
 		Required:  requiredConfirmations,
