@@ -20,14 +20,20 @@
 // States and transitions:
 //
 //	Created ──Build──► Built ──Broadcast──► Broadcast ──Confirm──► Confirmed
-//	   │                 │        │ (unknown outcome: stay Built, retry same hex)
+//	   │                 │        │ (unknown outcome: stay Built, reservation
+//	   │                 │        │  renewed, retry same hex)
+//	   │                 │        │ (node accepted under another txid: stay
+//	   │                 │        │  Built, NodeTxID recorded, inputs held)
 //	   │                 │        └──(rejected)──► Failed (inputs released)
 //	   └──(cannot build)─┴──────────────────────► Failed
 //
 // Recover re-drives Built intents after a restart with the same bytes. It
-// never rebuilds. The engine is agnostic about where coins come from and how
-// they are signed: those are injected so the exchange can wire its own
-// ElectrumX client, key manager and node.
+// never rebuilds. Every non-final broadcast attempt renews the input
+// reservation, so a Built intent that is retried at least once per
+// ReservationTTL never loses its inputs to another withdrawal. The engine is
+// agnostic about where coins come from and how they are signed: those are
+// injected so the exchange can wire its own ElectrumX client, key manager
+// and node.
 package withdraw
 
 import (
@@ -69,8 +75,12 @@ type Intent struct {
 	Amount  int64  `json:"amount"`
 	FeeRate int64  `json:"fee_rate"`
 
-	State         State      `json:"state"`
-	TxID          string     `json:"txid,omitempty"`
+	State State  `json:"state"`
+	TxID  string `json:"txid,omitempty"`
+	// NodeTxID is set when the node accepted the transaction under a txid
+	// other than TxID (rpc.ErrTxIDMismatch). The intent stays Built with its
+	// inputs reserved; an operator resolves it. Empty otherwise.
+	NodeTxID      string     `json:"node_txid,omitempty"`
 	RawHex        string     `json:"raw_hex,omitempty"`
 	Inputs        []Outpoint `json:"inputs,omitempty"`
 	Attempts      int        `json:"attempts"`
@@ -122,7 +132,9 @@ type Engine struct {
 	// policy; docs/EXCHANGE_INTEGRATION.md discusses the horizon.
 	RequiredConfirmations int64
 	// ReservationTTL bounds how long inputs stay reserved for an intent that
-	// is built but not yet broadcast. Recover re-reserves on restart.
+	// is built but not yet broadcast (default 15 minutes). Every Broadcast
+	// attempt that does not end the intent renews it, and Recover re-reserves
+	// on restart, so retry Built intents at an interval shorter than this.
 	ReservationTTL time.Duration
 
 	mu sync.Mutex // serialises Build across intents so two cannot pick the same inputs between select and reserve
@@ -139,6 +151,11 @@ var (
 	// different address, amount or fee rate: the idempotency key is being
 	// reused for a different payment, which is a caller bug worth stopping.
 	ErrConflict = errors.New("withdraw: intent id already used for a different withdrawal")
+	// ErrReservationLost is returned, wrapped around the broadcast error, when
+	// a Built intent's inputs could not be re-reserved because another
+	// withdrawal took them after the reservation expired. Both transactions
+	// cannot confirm; the operator resolves which one the network took.
+	ErrReservationLost = errors.New("withdraw: inputs of a built intent were taken by another withdrawal")
 )
 
 func (e *Engine) now() time.Time { return time.Now().UTC() }
@@ -221,33 +238,61 @@ func (e *Engine) Build(in *Intent) error {
 
 // Broadcast sends a Built intent's transaction. On success the intent is
 // Broadcast and its inputs are permanently marked spent. On an unknown
-// outcome the intent stays Built with the attempt recorded, and the caller
-// calls Broadcast again later: the same bytes go out, never a new transaction.
-// On a permanent rejection the intent is Failed and its inputs released.
+// outcome the intent stays Built with the attempt recorded and the input
+// reservation renewed, and the caller calls Broadcast again later: the same
+// bytes go out, never a new transaction. On a permanent rejection the intent
+// is Failed and its inputs released. When the node accepted the transaction
+// under a different txid (rpc.ErrTxIDMismatch) the payment is in the mempool:
+// the inputs are marked spent under the node's txid so no later withdrawal
+// can select them however long this takes to resolve, the intent stays Built
+// with NodeTxID recording what the node said, and the error is returned for
+// the operator. It is not a rejection and must not be treated as one.
 func (e *Engine) Broadcast(in *Intent) error {
 	if in.State != StateBuilt {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
 	}
 	in.Attempts++
-	_, err := e.Broadcaster.Broadcast(in.RawHex, in.TxID)
+	got, err := e.Broadcaster.Broadcast(in.RawHex, in.TxID)
 	switch {
 	case err == nil:
 		in.State = StateBroadcast
 		in.LastError = ""
 		e.Spent.MarkBroadcastFor(e.inputs(in), in.TxID, in.ID)
 		return e.save(in)
+	case errors.Is(err, rpc.ErrTxIDMismatch):
+		in.NodeTxID = got
+		in.LastError = err.Error()
+		e.Spent.MarkBroadcastFor(e.inputs(in), got, in.ID)
+		if saveErr := e.save(in); saveErr != nil {
+			return errors.Join(err, saveErr)
+		}
+		return err
 	case errors.Is(err, rpc.ErrPermanent):
 		e.Spent.Release(in.ID)
 		return e.fail(in, err, true)
 	default:
 		// ErrUnknownOutcome or ErrTransient: the transaction may or may not be
 		// out. Keep the reservation, keep the bytes, report, retry later.
-		in.LastError = err.Error()
-		if saveErr := e.save(in); saveErr != nil {
-			return errors.Join(err, saveErr)
-		}
-		return err
+		return e.holdBuilt(in, err)
 	}
+}
+
+// holdBuilt keeps a Built intent Built after a broadcast attempt that did not
+// settle it: the reservation is renewed for another TTL so the inputs cannot
+// be selected by a later withdrawal while this one is unresolved, the cause
+// is recorded, and the cause is returned.
+func (e *Engine) holdBuilt(in *Intent, cause error) error {
+	if rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {
+		// The reservation had expired and another withdrawal took an input.
+		// Do not release anything and do not fail this intent: its bytes may
+		// be in the mempool. Report both facts.
+		cause = fmt.Errorf("%w: %v: %w", ErrReservationLost, rerr, cause)
+	}
+	in.LastError = cause.Error()
+	if saveErr := e.save(in); saveErr != nil {
+		return errors.Join(cause, saveErr)
+	}
+	return cause
 }
 
 // Process drives an intent from wherever it is to Broadcast in one call, or

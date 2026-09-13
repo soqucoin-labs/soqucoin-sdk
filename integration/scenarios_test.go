@@ -4,6 +4,7 @@ package integration
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -207,6 +208,35 @@ func (l *lossyBroadcaster) Broadcast(raw, txid string) (string, error) {
 	return got, err
 }
 
+// downBroadcaster is a node that cannot be reached for the first `failures`
+// attempts and then behaves; nothing reaches the network while it is down.
+type downBroadcaster struct {
+	inner    *rpc.Client
+	failures int
+}
+
+func (d *downBroadcaster) Broadcast(raw, txid string) (string, error) {
+	if d.failures > 0 {
+		d.failures--
+		return "", fmt.Errorf("broadcast: %w: harness node down", rpc.ErrTransient)
+	}
+	return d.inner.Broadcast(raw, txid)
+}
+
+// lyingBroadcaster relays to the real node and then reports a different txid,
+// the shape rpc.Client.Broadcast produces when node and SDK disagree on the
+// serialization. The payment is really in the node's mempool.
+type lyingBroadcaster struct{ inner *rpc.Client }
+
+func (l lyingBroadcaster) Broadcast(raw, txid string) (string, error) {
+	got, err := l.inner.Broadcast(raw, txid)
+	if err != nil {
+		return got, err
+	}
+	fake := "f" + got[1:]
+	return fake, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", rpc.ErrTxIDMismatch, fake, txid)
+}
+
 func TestLostBroadcastReplyNeverPaysTwice(t *testing.T) {
 	f := setup(t)
 	_, recipient := newKey(t)
@@ -357,5 +387,103 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	// And the book is not credited a second time for anything.
 	if again, _ := m.Scan(); len(again) != 0 {
 		t.Fatalf("credited after the reorg: %+v", again)
+	}
+}
+
+// 7. The node is unreachable for longer than the reservation TTL. Each retry
+// renews the reservation, so a withdrawal submitted meanwhile cannot take the
+// first one's inputs; when the node returns, both confirm on disjoint inputs.
+func TestRetriesPastTheReservationTTLKeepTheInputs(t *testing.T) {
+	f := setup(t)
+	_, r1 := newKey(t)
+	_, r2 := newKey(t)
+	spent := utxo.NewSpentSet(filepath.Join(t.TempDir(), "spent.json"))
+	down := &downBroadcaster{inner: f.n.rpc, failures: 3}
+	e := f.engine(t, withdraw.NewMemStore(), spent, down)
+	e.ReservationTTL = 150 * time.Millisecond
+	amount := 400_000 * types.ShorsPerSOQ // each takes most of the hot balance; two need disjoint coins
+	e.Submit("a", r1, amount, types.RecommendedFeeRate)
+	a, err := e.Process("a")
+	if !errors.Is(err, rpc.ErrTransient) || a.State != withdraw.StateBuilt {
+		t.Fatalf("node down: err=%v state=%s", err, a.State)
+	}
+	for i := 0; i < 2; i++ {
+		time.Sleep(100 * time.Millisecond) // inside each TTL, past the first one in total
+		if err := e.Broadcast(a); !errors.Is(err, rpc.ErrTransient) || errors.Is(err, withdraw.ErrReservationLost) {
+			t.Fatalf("retry %d: %v", i, err)
+		}
+	}
+	e.Submit("b", r2, amount, types.RecommendedFeeRate)
+	b, err := e.Process("b")
+	if err != nil {
+		t.Fatalf("b: %v", err)
+	}
+	for _, x := range a.Inputs {
+		for _, y := range b.Inputs {
+			if x.TxID == y.TxID && x.Vout == y.Vout {
+				t.Fatalf("b took a's reserved input %s:%d after the first TTL", x.TxID, x.Vout)
+			}
+		}
+	}
+	if err := e.Broadcast(a); err != nil { // the node is back
+		t.Fatalf("a after the node returned: %v", err)
+	}
+	f.n.mine(f.hot, 1)
+	for _, in := range []*withdraw.Intent{a, b} {
+		if n, err := e.Confirmer.Confirmations(in.TxID); err != nil || n != 1 {
+			t.Fatalf("%s: confirmations %d, %v", in.ID, n, err)
+		}
+	}
+}
+
+// 8. The node accepts the transaction but names it differently. The payment is
+// in the mempool; the engine keeps the intent Built with its inputs held and
+// records the node's txid, and a later withdrawal cannot spend those inputs.
+func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
+	f := setup(t)
+	_, r1 := newKey(t)
+	_, r2 := newKey(t)
+	spent := utxo.NewSpentSet(filepath.Join(t.TempDir(), "spent.json"))
+	e := f.engine(t, withdraw.NewMemStore(), spent, lyingBroadcaster{inner: f.n.rpc})
+	e.ReservationTTL = 50 * time.Millisecond // spent inputs must not depend on a reservation
+	amount := 400_000 * types.ShorsPerSOQ
+	e.Submit("a", r1, amount, types.RecommendedFeeRate)
+	a, err := e.Process("a")
+	if !errors.Is(err, rpc.ErrTxIDMismatch) || errors.Is(err, rpc.ErrPermanent) {
+		t.Fatalf("mismatch: %v", err)
+	}
+	if a.State != withdraw.StateBuilt || a.NodeTxID == "" || a.NodeTxID == a.TxID {
+		t.Fatalf("after mismatch %+v", a)
+	}
+	for _, o := range a.Inputs {
+		if !spent.IsSpent(o.TxID, o.Vout) {
+			t.Fatalf("input %s:%d released while the payment sits in the mempool", o.TxID, o.Vout)
+		}
+	}
+	// The real transaction is in the node's mempool under the SDK's txid.
+	if n, err := e.Confirmer.Confirmations(a.TxID); err != nil || n != 0 {
+		t.Fatalf("node does not hold %s in its mempool: %d %v", a.TxID, n, err)
+	}
+	time.Sleep(100 * time.Millisecond) // past the TTL: the inputs stay spent
+	for _, o := range a.Inputs {
+		if !spent.IsSpent(o.TxID, o.Vout) {
+			t.Fatalf("input %s:%d lapsed back into selection", o.TxID, o.Vout)
+		}
+	}
+	// A second withdrawal of the same size cannot reuse those inputs.
+	e.Broadcaster = f.n.rpc
+	e.Submit("b", r2, amount, types.RecommendedFeeRate)
+	if b, err := e.Process("b"); err == nil {
+		for _, x := range a.Inputs {
+			for _, y := range b.Inputs {
+				if x.TxID == y.TxID && x.Vout == y.Vout {
+					t.Fatalf("b spent a's input %s:%d", x.TxID, x.Vout)
+				}
+			}
+		}
+	}
+	f.n.mine(f.hot, 1)
+	if n, err := e.Confirmer.Confirmations(a.TxID); err != nil || n != 1 {
+		t.Fatalf("a's payment did not confirm: %d %v", n, err)
 	}
 }

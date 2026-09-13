@@ -151,7 +151,8 @@ ML-DSA signatures are not malleable in the ECDSA sense, so the classic txid
 mutation does not apply. The property you should still enforce is agreement:
 
 ```go
-// Broadcast refuses a node txid that differs from the one the SDK computed,
+// Broadcast reports a node txid that differs from the one the SDK computed as
+// rpc.ErrTxIDMismatch (the payment is out; hold the inputs, investigate),
 // resolves a lost reply against the node, and reports "already in chain" as
 // success. rpc.ErrUnknownOutcome means retry these bytes, never rebuild.
 txid, err := rpcClient.Broadcast(rawHex, builtTxID)

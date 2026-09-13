@@ -97,6 +97,12 @@ type rpcResponse struct {
 //	                  "failed" and rebuilds pays twice.
 //	ErrAlreadyInChain the transaction is already mined. For a broadcast that
 //	                  is success, not failure.
+//	ErrTxIDMismatch   the node ACCEPTED the transaction but under a txid other
+//	                  than the one the caller computed. The payment is in the
+//	                  mempool; the caller's serialization or hashing disagrees
+//	                  with the node's. Neither permanent (the inputs are
+//	                  spent) nor retryable (the same bytes give the same
+//	                  answer): stop, keep the inputs reserved, investigate.
 var (
 	ErrTransient      = errors.New("rpc: transient failure, retry later")
 	ErrPermanent      = errors.New("rpc: request rejected")
@@ -104,6 +110,7 @@ var (
 	ErrAlreadyInChain = errors.New("rpc: transaction already in chain")
 	ErrNodeSyncing    = fmt.Errorf("%w: node is in initial block download or behind its headers", ErrTransient)
 	ErrWrongChain     = fmt.Errorf("%w: node serves a different chain than Client.Network", ErrPermanent)
+	ErrTxIDMismatch   = errors.New("rpc: node accepted the transaction under a different txid")
 )
 
 // Node error codes this package interprets (src/rpc/protocol.h in the node).
@@ -248,7 +255,10 @@ func (c *Client) SendRawTransaction(rawTxHex string) (string, error) {
 //     must retry THIS transaction, never build another one for the same
 //     withdrawal.
 //
-// The txid must match the transaction; a mismatch is refused before sending.
+// The node's txid must equal the caller's. When it does not, the node has
+// already accepted the transaction, so the result is ErrTxIDMismatch carrying
+// the node's txid, not ErrPermanent: the inputs are spent and nothing may be
+// rebuilt on them.
 func (c *Client) Broadcast(rawTxHex, txid string) (string, error) {
 	if txid == "" {
 		return "", fmt.Errorf("broadcast: %w: txid is required", ErrPermanent)
@@ -260,7 +270,7 @@ func (c *Client) Broadcast(rawTxHex, txid string) (string, error) {
 			return "", fmt.Errorf("broadcast: parse txid: %w", err)
 		}
 		if got != txid {
-			return got, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", ErrPermanent, got, txid)
+			return got, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", ErrTxIDMismatch, got, txid)
 		}
 		return txid, nil
 	}

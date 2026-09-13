@@ -23,7 +23,7 @@ const (
 // fakeNet records every broadcast and answers according to mode.
 type fakeNet struct {
 	mu     sync.Mutex
-	mode   string // "ok", "lost", "reject", "transient"
+	mode   string // "ok", "lost", "reject", "transient", "mismatch"
 	sent   []string
 	builds int
 }
@@ -39,6 +39,8 @@ func (f *fakeNet) Broadcast(rawHex, txid string) (string, error) {
 		return "", fmt.Errorf("broadcast: %w", &rpc.Error{Code: rpc.CodeVerifyRejected, Message: "min relay fee not met"})
 	case "transient":
 		return "", fmt.Errorf("broadcast: %w", rpc.ErrTransient)
+	case "mismatch":
+		return "node-" + txid, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", rpc.ErrTxIDMismatch, "node-"+txid, txid)
 	}
 	return txid, nil
 }
@@ -317,5 +319,123 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	built, _ := s2.List(StateBuilt)
 	if len(built) != 1 || built[0].RawHex != "00" {
 		t.Fatalf("filtered list: %+v", built)
+	}
+}
+
+// The reservation of a Built intent is renewed on every unsettled broadcast
+// attempt. With a 40 ms TTL and a network that keeps losing replies, a second
+// withdrawal submitted after several TTLs must still not select the first
+// one's inputs; without renewal the spent set forgets them after the first
+// TTL and the two withdrawals share an input.
+func TestUnsettledBroadcastRenewsTheReservation(t *testing.T) {
+	spent := utxo.NewSpentSet("")
+	net := &fakeNet{mode: "lost"}
+	e := newEngine(t, NewMemStore(), spent, net, coins())
+	e.ReservationTTL = 40 * time.Millisecond
+	e.Submit("w1", dst, 4_500_000, 1000) // only txA (5,000,000) covers it alone
+	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrUnknownOutcome) {
+		t.Fatalf("first attempt: %v", err)
+	}
+	w1, _, _ := e.Store.Get("w1")
+	for i := 0; i < 3; i++ {
+		time.Sleep(30 * time.Millisecond) // inside the TTL each time, past it in total
+		if err := e.Broadcast(w1); !errors.Is(err, rpc.ErrUnknownOutcome) || errors.Is(err, ErrReservationLost) {
+			t.Fatalf("retry %d: %v", i, err)
+		}
+	}
+	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("reservation expired although the intent was retried inside every TTL")
+	}
+	net.setMode("ok")
+	e.Submit("w2", dst, 4_500_000, 1000)
+	w2, err := e.Process("w2")
+	if err == nil {
+		for _, o := range w2.Inputs {
+			if o.TxID == w1.Inputs[0].TxID && o.Vout == w1.Inputs[0].Vout {
+				t.Fatalf("w2 selected w1's input %s:%d", o.TxID, o.Vout)
+			}
+		}
+		t.Fatalf("w2 built on %+v; the only coin large enough is held by w1", w2.Inputs)
+	}
+	if w2.State != StateFailed {
+		t.Fatalf("w2 %+v, want failed for lack of free coins", w2)
+	}
+	// w1 still completes on its own bytes once the network heals.
+	if err := e.Broadcast(w1); err != nil {
+		t.Fatal(err)
+	}
+	if net.builds != 1 {
+		t.Errorf("builder ran %d times, want 1: w2 must fail at selection and never reach the builder", net.builds)
+	}
+}
+
+// If the reservation did expire and another withdrawal took the input before
+// the retry, the retry must not release or fail the first intent (its bytes
+// may be in the mempool) and must say what happened.
+func TestRetryAfterLostReservationReportsAndHolds(t *testing.T) {
+	spent := utxo.NewSpentSet("")
+	net := &fakeNet{mode: "lost"}
+	e := newEngine(t, NewMemStore(), spent, net, coins())
+	e.ReservationTTL = 20 * time.Millisecond
+	e.Submit("w1", dst, 4_500_000, 1000)
+	e.Process("w1")
+	w1, _, _ := e.Store.Get("w1")
+	time.Sleep(40 * time.Millisecond) // no retry inside the TTL: the reservation lapses
+	net.setMode("ok")
+	e.Submit("w2", dst, 4_500_000, 1000)
+	w2, err := e.Process("w2")
+	if err != nil || w2.Inputs[0].TxID != w1.Inputs[0].TxID {
+		t.Fatalf("w2 should have taken the lapsed input: %v %+v", err, w2)
+	}
+	net.setMode("lost")
+	err = e.Broadcast(w1)
+	if !errors.Is(err, ErrReservationLost) || !errors.Is(err, rpc.ErrUnknownOutcome) {
+		t.Fatalf("retry after the input was taken: %v, want ErrReservationLost wrapping the broadcast error", err)
+	}
+	w1, _, _ = e.Store.Get("w1")
+	if w1.State != StateBuilt || w1.RawHex == "" {
+		t.Fatalf("w1 %+v, want still Built with its bytes", w1)
+	}
+	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("w2's broadcast entry was released by w1's retry")
+	}
+}
+
+// The node accepted the bytes under a different txid: the payment is out on
+// this intent's inputs. The engine must keep the intent Built, record the
+// node's txid, and mark the inputs spent so that they never expire back into
+// selection; the next withdrawal must not be able to select them.
+func TestTxIDMismatchHoldsInputsAndRecordsTheNodeTxID(t *testing.T) {
+	spent := utxo.NewSpentSet("")
+	net := &fakeNet{mode: "mismatch"}
+	e := newEngine(t, NewMemStore(), spent, net, coins())
+	e.ReservationTTL = 20 * time.Millisecond // a mere reservation would lapse below
+	e.Submit("w1", dst, 4_500_000, 1000)
+	_, err := e.Process("w1")
+	if !errors.Is(err, rpc.ErrTxIDMismatch) || errors.Is(err, rpc.ErrPermanent) {
+		t.Fatalf("mismatch: %v, want ErrTxIDMismatch and not ErrPermanent", err)
+	}
+	w1, _, _ := e.Store.Get("w1")
+	if w1.State != StateBuilt || w1.RawHex == "" || w1.NodeTxID != "node-"+w1.TxID {
+		t.Fatalf("after mismatch %+v: want Built, bytes kept, NodeTxID recorded", w1)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("inputs free after the TTL although the node accepted the transaction")
+	}
+	net.setMode("ok")
+	e.Submit("w2", dst, 4_500_000, 1000)
+	if w2, err := e.Process("w2"); err == nil || w2.State != StateFailed {
+		t.Fatalf("w2 %+v %v: must not build on inputs the node has already spent", w2, err)
+	}
+	// Retrying w1 gives the same answer and changes nothing; the operator
+	// resolves it.
+	net.setMode("mismatch")
+	if err := e.Broadcast(w1); !errors.Is(err, rpc.ErrTxIDMismatch) {
+		t.Fatalf("retry: %v", err)
+	}
+	w1, _, _ = e.Store.Get("w1")
+	if w1.State != StateBuilt || w1.Attempts != 2 {
+		t.Fatalf("retry changed the intent: %+v", w1)
 	}
 }
