@@ -68,7 +68,7 @@ func setup(t *testing.T) *fixture {
 	// Fund the hot wallet with coinbase and bury it past coinbase maturity.
 	n.mine(hot, 5)
 	n.mine(dep, 1) // one deposit worth of coinbase to the deposit address, buried below
-	n.mine(hot, int(types.CoinbaseMaturity)+5)
+	n.mine(hot, int(types.Regtest.CoinbaseMaturity)+5)
 	f.scan = newScanner(n, hot, dep)
 	if err := f.scan.RefreshAll(); err != nil {
 		t.Fatal(err)
@@ -78,7 +78,8 @@ func setup(t *testing.T) *fixture {
 
 func (f *fixture) monitor(t *testing.T, led *memLedger, required int64) *deposit.Monitor {
 	return &deposit.Monitor{
-		Cache: f.scan, Node: f.n.rpc, Ledger: led,
+		Network: types.Regtest, // coinbase maturity 60; every harness deposit is a coinbase
+		Cache:   f.scan, Node: f.n.rpc, Ledger: led,
 		Addresses: func() []string { return []string{f.dep} },
 		Required:  func(int64) int64 { return required },
 		OnAlert: func(k deposit.AlertKind, m string) {
@@ -109,7 +110,7 @@ func (f *fixture) engine(t *testing.T, store withdraw.Store, spent *utxo.SpentSe
 			// Every coin in the harness is a coinbase, so require maturity here;
 			// VerifyAndFilterUTXOs would otherwise drop an immature pick and the
 			// selection would come back empty.
-			selected, _, err := sel.SelectUTXOs(f.scan.GetAllUTXOs(), amount+1100*feeRate, int(types.CoinbaseMaturity)+1, f.n.height(), []string{f.hot})
+			selected, _, err := sel.SelectUTXOs(f.scan.GetAllUTXOs(), amount+1100*feeRate, int(types.Regtest.CoinbaseMaturity)+1, f.n.height(), []string{f.hot})
 			if err != nil {
 				return nil, err
 			}
@@ -333,7 +334,7 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	if _, err := f.n.rpc.Call("invalidateblock", depositBlock); err != nil {
 		t.Fatalf("invalidateblock: %v", err)
 	}
-	f.n.mine(f.hot, int(types.CoinbaseMaturity)+10) // a longer chain without the deposit
+	f.n.mine(f.hot, int(types.Regtest.CoinbaseMaturity)+10) // a longer chain without the deposit
 	if err := f.scan.RefreshAll(); err != nil {
 		t.Fatal(err)
 	}

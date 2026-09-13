@@ -65,6 +65,7 @@ func main() {
 	spentSetPath := flag.String("spent-set", "pool_payout_spent_set.json", "Persistent spent-set path")
 	webhookURL := flag.String("webhook", "", "Slack webhook URL for alerts (optional)")
 	dryRun := flag.Bool("dry-run", false, "Build and sign but do not broadcast or record anything")
+	regtest := flag.Bool("regtest", false, "The node is a regtest node (the sq address prefix is shared with mainnet)")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
@@ -76,7 +77,7 @@ func main() {
 		keystorePath: *keystorePath, poolAddress: *poolAddress,
 		payoutsPath: *payoutsPath, feeRate: *feeRate,
 		spentSetPath: *spentSetPath, webhookURL: *webhookURL,
-		dryRun: *dryRun,
+		dryRun: *dryRun, regtest: *regtest,
 	}); err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -93,6 +94,7 @@ type runConfig struct {
 	spentSetPath             string
 	webhookURL               string
 	dryRun                   bool
+	regtest                  bool
 }
 
 func run(cfg runConfig) error {
@@ -135,6 +137,15 @@ func run(cfg runConfig) error {
 				shortID(p.Address, 20), p.Amount)
 		}
 	}
+	// Regtest shares mainnet's address prefix, so the addresses cannot tell the
+	// two apart; the operator says so. The chain check in rpc.RequireSynced then
+	// holds the node to it, and the regtest coinbase maturity (60) applies.
+	if cfg.regtest {
+		if network.Name != types.Mainnet.Name {
+			return fmt.Errorf("-regtest given but the pool address is on %s", network.Name)
+		}
+		network = types.Regtest
+	}
 
 	passphrase := os.Getenv("SOQ_KEYSTORE_PASSPHRASE")
 	if passphrase == "" {
@@ -152,6 +163,7 @@ func run(cfg runConfig) error {
 	}
 
 	rpcClient := rpc.NewClient(cfg.rpcURL, cfg.rpcUser, cfg.rpcPass)
+	rpcClient.Network = network // refuse a node on another chain; apply its coinbase maturity
 	elxClient := electrumx.NewClient(cfg.elxHost, 15*time.Second)
 	elxClient.HRP = network.HRP
 	if cfg.elxTLS {

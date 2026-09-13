@@ -242,3 +242,123 @@ func TestTxOutValueShors(t *testing.T) {
 		}
 	}
 }
+
+// The maturity applied is the configured network's, at the exact boundary:
+// 240, the value inherited from upstream that the SDK itself carried through
+// v0.3.4, is immature on mainnet and 288 is mature; regtest matures at 60;
+// stagenet is held to 288 although consensus allows 30 below height 100,000.
+// An unset Network means mainnet.
+func TestVerifyAndFilterAppliesTheNetworkMaturityAtTheBoundary(t *testing.T) {
+	cases := []struct {
+		name    string
+		network types.Network
+		confs   int
+		mature  bool
+	}{
+		{"mainnet by default, 240", types.Network{}, 240, false},
+		{"mainnet by default, 287", types.Network{}, 287, false},
+		{"mainnet by default, 288", types.Network{}, 288, true},
+		{"mainnet, 240", types.Mainnet, 240, false},
+		{"mainnet, 288", types.Mainnet, 288, true},
+		{"regtest, 59", types.Regtest, 59, false},
+		{"regtest, 60", types.Regtest, 60, true},
+		{"stagenet, 30", types.Stagenet, 30, false},
+		{"stagenet, 288", types.Stagenet, 288, true},
+		{"hand-built network without a maturity, 287", types.Network{ChainID: "main"}, 287, false},
+		{"hand-built network without a maturity, 288", types.Network{ChainID: "main"}, 288, true},
+	}
+	for _, c := range cases {
+		evicted := 0
+		chain := c.network.ChainID
+		if chain == "" {
+			chain = types.Mainnet.ChainID
+		}
+		cl, _ := rpcServer(t, func(method string, _ []interface{}) string {
+			switch method {
+			case "getblockchaininfo":
+				return ok(`{"chain":"` + chain + `","blocks":1000,"headers":1000,"initialblockdownload":false}`)
+			case "gettxout":
+				return ok(`{"value":88,"confirmations":` + itoa(c.confs) + `,"coinbase":true}`)
+			}
+			return ok(`null`)
+		})
+		cl.Network = c.network
+		got, err := cl.VerifyAndFilterUTXOs([]types.UTXO{{TxID: someTxID, Vout: 0}},
+			func(string, uint32) { evicted++ }, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if (len(got) == 1) != c.mature {
+			t.Errorf("%s: %d outputs selected, want mature=%v", c.name, len(got), c.mature)
+		}
+		if evicted != 0 {
+			t.Errorf("%s: an immature coinbase was evicted from the cache", c.name)
+		}
+	}
+}
+
+// A mainnet deployment pointed at a stagenet node, or the reverse, fails
+// closed and permanently before any output is selected or evicted. Without a
+// configured Network the check is off, as before.
+func TestRequireSyncedRefusesANodeOnAnotherChain(t *testing.T) {
+	cases := []struct {
+		name    string
+		network types.Network
+		chain   string
+		refuse  bool
+	}{
+		{"mainnet client, stagenet node", types.Mainnet, "stagenet", true},
+		{"stagenet client, mainnet node", types.Stagenet, "main", true},
+		{"mainnet client, regtest node", types.Mainnet, "regtest", true},
+		{"regtest client, regtest node", types.Regtest, "regtest", false},
+		{"mainnet client, mainnet node", types.Mainnet, "main", false},
+		{"unset client, stagenet node", types.Network{}, "stagenet", false},
+	}
+	for _, c := range cases {
+		evicted := 0
+		cl, _ := rpcServer(t, func(method string, _ []interface{}) string {
+			if method == "getblockchaininfo" {
+				return ok(`{"chain":"` + c.chain + `","blocks":1000,"headers":1000,"initialblockdownload":false}`)
+			}
+			return ok(`null`) // every output "spent", should the check be skipped
+		})
+		cl.Network = c.network
+		err := cl.RequireSynced()
+		if !c.refuse {
+			if err != nil {
+				t.Errorf("%s: %v", c.name, err)
+			}
+			continue
+		}
+		if !errors.Is(err, ErrWrongChain) || !errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) {
+			t.Errorf("%s: got %v, want ErrWrongChain (permanent, not transient)", c.name, err)
+		}
+		_, verr := cl.VerifyAndFilterUTXOs([]types.UTXO{{TxID: someTxID, Vout: 0}},
+			func(string, uint32) { evicted++ }, nil)
+		if !errors.Is(verr, ErrWrongChain) {
+			t.Errorf("%s: VerifyAndFilterUTXOs got %v, want ErrWrongChain", c.name, verr)
+		}
+		if evicted != 0 {
+			t.Errorf("%s: %d outputs evicted on a wrong-chain node", c.name, evicted)
+		}
+	}
+}
+
+// RequireChain is what deposit.Monitor asks when the client's own Network was
+// left unset; it must hold the node to the chain it is given and pass on an
+// empty one.
+func TestRequireChainHoldsTheNodeToTheGivenChain(t *testing.T) {
+	cl, _ := rpcServer(t, func(method string, _ []interface{}) string {
+		return ok(`{"chain":"regtest","blocks":1000,"headers":1000,"initialblockdownload":false}`)
+	})
+	if err := cl.RequireChain(types.Regtest.ChainID); err != nil {
+		t.Errorf("regtest node, regtest wanted: %v", err)
+	}
+	if err := cl.RequireChain(""); err != nil {
+		t.Errorf("empty chain id must pass: %v", err)
+	}
+	err := cl.RequireChain(types.Mainnet.ChainID)
+	if !errors.Is(err, ErrWrongChain) || !errors.Is(err, ErrPermanent) {
+		t.Errorf("regtest node, mainnet wanted: got %v, want ErrWrongChain", err)
+	}
+}

@@ -3,6 +3,7 @@ package deposit
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -50,15 +51,27 @@ func (c *fakeCache) GetUTXOs(a string) []types.UTXO  { return c.utxos[a] }
 func (c *fakeCache) LastRefresh() (time.Time, error) { return c.at, c.err }
 
 type fakeNode struct {
-	synced bool
-	tip    int64
-	outs   map[string]*rpc.TxOut // "txid:vout"
-	calls  int
+	synced  bool
+	syncErr error  // returned by RequireSynced when set, in place of ErrNodeSyncing
+	chain   string // what getblockchaininfo would report
+	tip     int64
+	outs    map[string]*rpc.TxOut // "txid:vout"
+	calls   int
+}
+
+func (n *fakeNode) RequireChain(want string) error {
+	if want != "" && n.chain != want {
+		return fmt.Errorf("%w: node reports %q, configured for %q", rpc.ErrWrongChain, n.chain, want)
+	}
+	return nil
 }
 
 func key(txid string, vout uint32) string { return txid + ":" + string(rune('0'+vout)) }
 
 func (n *fakeNode) RequireSynced() error {
+	if n.syncErr != nil {
+		return n.syncErr
+	}
 	if !n.synced {
 		return rpc.ErrNodeSyncing
 	}
@@ -117,7 +130,7 @@ func setup(t *testing.T) (*Monitor, *fakeCache, *fakeNode, *fakeLedger, *alerts,
 	a := addr(t, 0x11)
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 	cache := &fakeCache{utxos: map[string][]types.UTXO{}, at: now}
-	node := &fakeNode{synced: true, tip: 1000, outs: map[string]*rpc.TxOut{}}
+	node := &fakeNode{synced: true, chain: types.Mainnet.ChainID, tip: 1000, outs: map[string]*rpc.TxOut{}}
 	led := newLedger()
 	al := &alerts{}
 	m := &Monitor{
@@ -246,19 +259,43 @@ func TestPausesWhenNodeSyncingOrCacheStale(t *testing.T) {
 	}
 }
 
+// A coinbase deposit is real and waits for the network's maturity without an
+// alarm; it is credited at exactly that depth and not one block earlier. 240,
+// the upstream value the SDK carried through v0.3.4, is immature on mainnet.
+// Mainnet is the default when Network is unset; regtest matures at 60.
 func TestImmatureCoinbaseWaitsWithoutAlarm(t *testing.T) {
-	m, cache, node, led, al, a := setup(t)
-	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
-	node.outs[key(txA, 0)] = txout(t, a, 88, 51, true)
-	if got, _ := m.Scan(); len(got) != 0 || len(led.credited) != 0 {
-		t.Fatal("immature coinbase credited")
+	cases := []struct {
+		name     string
+		network  types.Network
+		immature []int64
+		mature   int64
+	}{
+		{"mainnet by default", types.Network{}, []int64{51, 240, 287}, 288},
+		{"mainnet", types.Mainnet, []int64{240}, 288},
+		{"stagenet", types.Stagenet, []int64{30, 287}, 288},
+		{"regtest", types.Regtest, []int64{59}, 60},
+		{"hand-built network without a maturity", types.Network{ChainID: "main"}, []int64{287}, 288},
 	}
-	if len(al.kinds) != 0 {
-		t.Errorf("immature coinbase is not an alarm: %v", al.kinds)
-	}
-	node.outs[key(txA, 0)] = txout(t, a, 88, types.CoinbaseMaturity, true)
-	if got, _ := m.Scan(); len(got) != 1 {
-		t.Fatal("mature coinbase not credited")
+	for _, c := range cases {
+		m, cache, node, led, al, a := setup(t)
+		m.Network = c.network
+		if c.network.ChainID != "" {
+			node.chain = c.network.ChainID
+		}
+		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
+		for _, confs := range c.immature {
+			node.outs[key(txA, 0)] = txout(t, a, 88, confs, true)
+			if got, _ := m.Scan(); len(got) != 0 || len(led.credited) != 0 {
+				t.Fatalf("%s: coinbase at %d confirmations credited", c.name, confs)
+			}
+			if len(al.kinds) != 0 {
+				t.Errorf("%s: an immature coinbase is not an alarm: %v", c.name, al.kinds)
+			}
+		}
+		node.outs[key(txA, 0)] = txout(t, a, 88, c.mature, true)
+		if got, _ := m.Scan(); len(got) != 1 {
+			t.Fatalf("%s: coinbase at %d confirmations not credited", c.name, c.mature)
+		}
 	}
 }
 
@@ -319,5 +356,53 @@ func TestPolicyAppliedFromNodeDepth(t *testing.T) {
 	}
 	if _, ok := led.credited[key(txA, 0)]; ok {
 		t.Error("large deposit credited before its required depth")
+	}
+}
+
+// A Monitor configured for regtest whose node serves mainnet must credit
+// nothing: with the regtest maturity of 60 it would otherwise credit a mainnet
+// coinbase 228 blocks before consensus lets it be spent. The refusal is a
+// permanent deployment error with its own alert, not a syncing pause, whether
+// the node itself reports the mismatch (an rpc.Client with Network set) or the
+// Monitor asks (an rpc.Client whose Network was left unset). An unset Monitor
+// Network performs no chain check, as documented.
+func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
+	deposit := func(m *Monitor, cache *fakeCache, node *fakeNode, a string) {
+		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
+		node.outs[key(txA, 0)] = txout(t, a, 88, 60, true) // mature on regtest, immature on mainnet
+	}
+	check := func(name string, m *Monitor, led *fakeLedger, al *alerts) {
+		got, err := m.Scan()
+		if len(got) != 0 || len(led.credited) != 0 {
+			t.Fatalf("%s: credited %+v on a node serving another chain", name, got)
+		}
+		if !errors.Is(err, rpc.ErrWrongChain) || !errors.Is(err, rpc.ErrPermanent) || errors.Is(err, ErrPaused) {
+			t.Errorf("%s: got %v, want rpc.ErrWrongChain (permanent, not a pause)", name, err)
+		}
+		if len(al.kinds) != 1 || al.kinds[0] != AlertNodeWrongChain {
+			t.Errorf("%s: alerts %v, want exactly one %s", name, al.kinds, AlertNodeWrongChain)
+		}
+	}
+
+	// The Monitor asks: node reports mainnet, Monitor is regtest.
+	m, cache, node, led, al, a := setup(t)
+	m.Network = types.Regtest
+	deposit(m, cache, node, a)
+	check("monitor asks", m, led, al)
+
+	// The node reports it itself from RequireSynced.
+	m, cache, node, led, al, a = setup(t)
+	m.Network = types.Regtest
+	node.syncErr = fmt.Errorf("%w: node reports %q, configured for %q", rpc.ErrWrongChain, "main", "regtest")
+	deposit(m, cache, node, a)
+	check("node reports", m, led, al)
+
+	// Unset Monitor Network: mainnet rules, no chain check; the 60-deep
+	// coinbase waits without an alarm.
+	m, cache, node, led, al, a = setup(t)
+	node.chain = types.Regtest.ChainID
+	deposit(m, cache, node, a)
+	if got, err := m.Scan(); err != nil || len(got) != 0 || len(al.kinds) != 0 {
+		t.Fatalf("unset network: got %+v, err %v, alerts %v; want no credit, no error, no alert", got, err, al.kinds)
 	}
 }

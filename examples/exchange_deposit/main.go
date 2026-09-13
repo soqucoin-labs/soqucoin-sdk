@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/deposit"
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
@@ -141,12 +142,22 @@ func main() {
 	log.Printf("tracking %d deposit addresses via %s", len(depositAddresses), electrumxHost)
 
 	// ── Your node: the verdict ──
+	// The node must serve the chain the deposit addresses belong to;
+	// RequireSynced refuses it otherwise, and the chain's coinbase maturity
+	// gates mined-to deposits. Regtest shares mainnet's address prefix, so
+	// against a regtest node set network = types.Regtest here.
+	network, err := address.NetworkOf(depositAddresses[0])
+	if err != nil {
+		log.Fatalf("deposit address network: %v", err)
+	}
 	node := rpc.NewClient(nodeURL, os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"))
+	node.Network = network
 
 	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}}
 	monitor := &deposit.Monitor{
 		Cache:     elx,
 		Node:      node,
+		Network:   network,
 		Ledger:    ledger,
 		Addresses: func() []string { return depositAddresses },
 		Required:  requiredConfirmations,
