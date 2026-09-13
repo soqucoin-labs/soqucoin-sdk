@@ -444,7 +444,9 @@ func main() {
 		// rpc.ErrUnknownOutcome or rpc.ErrTransient: the intent stays Built.
 		// Call Process again later; the same bytes go out.
 		// rpc.ErrTxIDMismatch: also Built, inputs held, intent.NodeTxID set;
-		// the breaker counts it. Stop and investigate, never rebuild.
+		// the breaker counts it, and every later Process of that intent
+		// returns withdraw.ErrHeld, which also counts. Stop and investigate,
+		// never rebuild.
 		log.Printf("process %s: state %s: %v", requestID, intent.State, err)
 		return
 	}

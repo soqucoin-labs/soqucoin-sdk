@@ -269,6 +269,11 @@ func (e *Engine) Broadcast(in *Intent) error {
 		e.Spent.MarkBroadcastFor(e.inputs(in), in.TxID, in.ID)
 		return e.save(in)
 	case errors.Is(err, rpc.ErrTxIDMismatch):
+		if got == "" {
+			// A Broadcaster that reports the kind without the node's txid
+			// must still arm the hold; the hold is keyed on NodeTxID.
+			got = "unknown"
+		}
 		in.NodeTxID = got
 		in.LastError = err.Error()
 		e.Spent.MarkBroadcastFor(e.inputs(in), got, in.ID)
@@ -330,9 +335,10 @@ func (e *Engine) Process(id string) (*Intent, error) {
 // Recover is called once at startup. Built intents are re-reserved and
 // re-broadcast with their persisted bytes; nothing is rebuilt. Broadcast
 // intents are left for UpdateConfirmations. Intents held after a txid
-// mismatch are left as they are and logged: their inputs are already spent
-// entries and nothing may be sent for them. It returns the first error but
-// attempts every intent.
+// mismatch are left as they are: their inputs are already spent entries and
+// nothing may be sent for them; each is logged and reported as ErrHeld so
+// startup alerting sees it. It returns the first error but attempts every
+// intent.
 func (e *Engine) Recover() error {
 	built, err := e.Store.List(StateBuilt)
 	if err != nil {
@@ -342,6 +348,9 @@ func (e *Engine) Recover() error {
 	for _, in := range built {
 		if in.NodeTxID != "" {
 			log.Printf("[withdraw] recover %s: held, node accepted %s for computed %s; resolve by hand", in.ID, in.NodeTxID, in.TxID)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("recover %s: %w: node accepted %s for computed %s", in.ID, ErrHeld, in.NodeTxID, in.TxID)
+			}
 			continue
 		}
 		if err := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); err != nil {

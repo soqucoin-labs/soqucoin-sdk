@@ -23,7 +23,7 @@ const (
 // fakeNet records every broadcast and answers according to mode.
 type fakeNet struct {
 	mu     sync.Mutex
-	mode   string // "ok", "lost", "reject", "transient", "mismatch"
+	mode   string // "ok", "lost", "reject", "transient", "mismatch", "mismatch-blank"
 	sent   []string
 	builds int
 }
@@ -41,6 +41,8 @@ func (f *fakeNet) Broadcast(rawHex, txid string) (string, error) {
 		return "", fmt.Errorf("broadcast: %w", rpc.ErrTransient)
 	case "mismatch":
 		return "node-" + txid, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", rpc.ErrTxIDMismatch, "node-"+txid, txid)
+	case "mismatch-blank": // a third-party Broadcaster that reports the kind without the txid
+		return "", fmt.Errorf("broadcast: %w", rpc.ErrTxIDMismatch)
 	}
 	return txid, nil
 }
@@ -440,14 +442,33 @@ func TestTxIDMismatchHoldsInputsAndRecordsTheNodeTxID(t *testing.T) {
 	if w1.State != StateBuilt || w1.Attempts != 1 || net.sentCount() != sent {
 		t.Fatalf("retry changed or sent something: %+v, sent %d", w1, net.sentCount()-sent)
 	}
-	// Recover leaves it alone too: no re-reserve error, no broadcast.
-	if err := e.Recover(); err != nil {
-		t.Fatalf("recover over a held intent: %v", err)
+	// Recover leaves it alone too and reports it: no broadcast, ErrHeld.
+	if err := e.Recover(); !errors.Is(err, ErrHeld) {
+		t.Fatalf("recover over a held intent: %v, want ErrHeld reported", err)
 	}
 	if net.sentCount() != sent {
 		t.Fatal("recover broadcast a held intent")
 	}
 	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
 		t.Fatal("recover disturbed the spent entry of a held intent")
+	}
+}
+
+// A Broadcaster that reports the mismatch kind without the node's txid must
+// still arm the hold.
+func TestTxIDMismatchWithoutANodeTxIDStillHolds(t *testing.T) {
+	net := &fakeNet{mode: "mismatch-blank"}
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet(""), net, coins())
+	e.Submit("w1", dst, 4_500_000, 1000)
+	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrTxIDMismatch) {
+		t.Fatalf("mismatch: %v", err)
+	}
+	w1, _, _ := e.Store.Get("w1")
+	if w1.NodeTxID == "" || w1.State != StateBuilt {
+		t.Fatalf("hold not armed: %+v", w1)
+	}
+	net.setMode("ok")
+	if err := e.Broadcast(w1); !errors.Is(err, ErrHeld) {
+		t.Fatalf("retry: %v, want ErrHeld", err)
 	}
 }
