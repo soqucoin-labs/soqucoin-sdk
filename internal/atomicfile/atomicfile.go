@@ -1,7 +1,7 @@
 // Package atomicfile replaces a file so that a crash or power loss at any
 // point leaves either the old content or the new content at the path, never
 // a partial file, and so that the new content is on disk when WriteFile
-// returns.
+// returns without error.
 package atomicfile
 
 import (
@@ -20,9 +20,9 @@ var fsync = func(f *os.File) error { return f.Sync() }
 // directory so the rename itself survives a power loss.
 //
 // A failure before the rename removes the temporary file and leaves path
-// unchanged. A failure of the directory sync is reported after the rename:
-// path then holds the new content, synced to disk as a file but with the
-// directory entry not yet forced out. Treat a returned error as "not known to
+// unchanged. A failure after the rename (opening or syncing the directory) is
+// reported with path holding the new content, synced to disk as a file but
+// with the directory entry not yet forced out. Treat a returned error as "not known to
 // be durable", never as "undone". The directory sync is skipped on Windows,
 // where syncing a directory handle fails; the file sync still runs there.
 //
