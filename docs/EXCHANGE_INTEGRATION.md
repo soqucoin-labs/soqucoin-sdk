@@ -318,8 +318,10 @@ pauses only when every address is stale. The ceiling on one client is therefore
 
     addresses x round trip per call  <  MaxCacheAge
 
-which at a 5 ms round trip gives about 60,000 addresses and at 50 ms about 6,000. Measure the round
-trip on your own indexer and size against it, or run one client per block of addresses. A pass
+which at a 5 ms round trip gives about 60,000 addresses and at 50 ms about 6,000, and the poll
+interval given to `electrumx.NewClient` must also stay well inside `MaxCacheAge`, since an
+address's age when `Scan` reads it is up to one interval plus its position in the pass. Measure
+the round trip on your own indexer and size against it, or run one client per block of addresses. A pass
 that skips any address raises one `AlertCacheStale` with the count; the deposits at those addresses
 wait for the next pass that reaches them, they are not lost. In v0.3.5 one failed call marked the
 whole pass stale and paused every credit until a pass succeeded for every address.

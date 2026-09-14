@@ -494,12 +494,14 @@ func (c *Client) RefreshAll() error {
 			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
 		}
 		c.mu.Lock()
-		rec := c.refreshed[addr]
-		rec.err = err
-		if err == nil {
-			rec.at = time.Now()
+		if c.tracked(addr) { // TrackAddresses may have dropped it during the call
+			rec := c.refreshed[addr]
+			rec.err = err
+			if err == nil {
+				rec.at = time.Now()
+			}
+			c.refreshed[addr] = rec
 		}
-		c.refreshed[addr] = rec
 		c.mu.Unlock()
 	}
 	err := errors.Join(errs...)
@@ -522,6 +524,16 @@ func (c *Client) LastRefresh() (time.Time, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastRefreshAt, c.lastRefreshErr
+}
+
+// tracked reports whether addr is on the tracked list. Caller holds mu.
+func (c *Client) tracked(addr string) bool {
+	for _, a := range c.addresses {
+		if a == addr {
+			return true
+		}
+	}
+	return false
 }
 
 // LastRefreshOf reports when one tracked address last refreshed successfully

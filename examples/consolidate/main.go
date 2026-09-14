@@ -16,9 +16,16 @@
 // given. Inputs worth less than the fee they add are left alone, and the
 // input count is capped so the fee stays under tx.MaxFeeShors. A run that
 // ends in rpc.ErrUnknownOutcome may or may not have broadcast; running it
-// again is safe, since the same inputs are either spent on the node, and
-// filtered out, or in the mempool, and a second sweep of them is refused as a
-// conflict.
+// again is safe: the node check asks gettxout with the mempool included, so
+// an input the first sweep spent, mined or still in the mempool, is filtered
+// out before anything is built.
+//
+// Do not run this alongside a withdraw.Engine that spends from the same
+// keystore. The engine's reservations live in its own spent set and are not
+// visible to this process or to gettxout until the engine broadcasts, so a
+// consolidation could take an input the engine has reserved and the engine's
+// broadcast would then fail on a missing input; nothing is lost, the
+// withdrawal is rebuilt, but the two should not overlap.
 //
 // Usage:
 //
@@ -192,7 +199,20 @@ func run(cfg config) error {
 	if skipped := len(selected) - len(economic); skipped > 0 {
 		log.Printf("left %d outputs worth less than the %s SOQ each costs to spend at %d shors/vB", skipped, soq(perInput), feeRate)
 	}
-	if len(economic) == 0 || (len(economic) == 1 && economic[0].Address == cfg.to) {
+	destSPK, err := address.ScriptFor(cfg.to)
+	if err != nil {
+		return fmt.Errorf("destination address: %w", err)
+	}
+	// The set as a whole must also cover the transaction's base bytes and
+	// leave an output at or above the relay floor, or the builder refuses it;
+	// for a scheduled run that is "nothing to consolidate", not a failure.
+	var sum int64
+	for _, u := range economic {
+		sum += u.Value
+	}
+	base := (int64(tx.TxOverheadWeight+tx.EstimatedOutputWeight)+3)/4 + tx.FeeMarginVBytes
+	if len(economic) == 0 || (len(economic) == 1 && economic[0].Address == cfg.to) ||
+		sum <= perInput*int64(len(economic))+base*feeRate+tx.MinOutputValue(destSPK) {
 		log.Printf("nothing to consolidate")
 		return nil
 	}
@@ -210,10 +230,6 @@ func run(cfg config) error {
 		return errors.New("no spendable outputs remain after verification")
 	}
 
-	destSPK, err := address.ScriptFor(cfg.to)
-	if err != nil {
-		return fmt.Errorf("destination address: %w", err)
-	}
 	transaction, err := tx.BuildSignedSweep(verified, destSPK, feeRate, keystore)
 	if err != nil {
 		return fmt.Errorf("build and sign: %w", err)
