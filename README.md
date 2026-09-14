@@ -22,12 +22,12 @@ Requires **Go 1.26+** (per the `go` directive in `go.mod`).
 
 ## Integration model
 
-**You run the node. You do not use the node's built-in wallet.** `soqucoind` ships with
+**You run the node. You do not use the node's built-in wallet.** Run `soqucoind` with
 `disablewallet=1`, so wallet RPCs (`listunspent`, `getbalance`, `sendtoaddress`) are not part of the
 integration surface. You still perform wallet *functions* (address derivation, key custody,
 signing), but they run in your own infrastructure through this SDK. The node is a chain reader and
-broadcaster; your key vault stays your key vault. The node runs with `txindex=1` and
-`disablewallet=1`; ports, sizing and the indexer are in the guide's
+broadcaster; your key vault stays your key vault. Run it with `txindex=1` and `disablewallet=1`;
+ports, sizing and the indexer are in the guide's
 [What you run](docs/EXCHANGE_INTEGRATION.md#what-you-run).
 
 | Component | What you use | SDK package |

@@ -297,8 +297,9 @@ func (c *Client) knowsTransaction(txid string) (bool, error) {
 	} else if errors.Is(err, ErrTransient) {
 		return false, err
 	}
-	// Without -txindex a mined transaction is not served by getrawtransaction;
-	// its own first output is, unless already spent.
+	// Without -txindex the node finds a mined transaction only through its UTXO
+	// set, so once every output is spent getrawtransaction reports nothing;
+	// gettxout on the first output is the last cheap check before "unknown".
 	out, err := c.GetTxOut(txid, 0, true)
 	if err != nil {
 		return false, err

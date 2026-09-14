@@ -36,7 +36,7 @@ import (
 // key, about 3,900 WU. A signed 80-input, 2-output transaction measures
 // 312,786 WU (docs/EXCHANGE_INTEGRATION.md, Transaction Size), 39% of the
 // node's MAX_STANDARD_TX_WEIGHT of 800,000 WU (src/policy/policy.h:39, the
-// same in every node release since v2.3.0). The cap is an operational limit
+// same in every node release from v1.1.0 on). The cap is an operational limit
 // kept from the period when the node's limit was 400,000 WU and transactions
 // of 200 inputs were rejected; raising it is a policy choice, not a protocol
 // change.

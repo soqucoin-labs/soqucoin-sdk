@@ -117,17 +117,17 @@ something that does not fit your operations.
 
 ## What you run
 
-Two processes, both yours: the node and an ElectrumX indexer. Everything the SDK reads or
-broadcasts goes through them.
+Two processes: the node, and an ElectrumX indexer, yours under option A above. Everything the
+SDK reads or broadcasts goes through them.
 
 ### The node
 
 | | |
 |---|---|
-| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The SDK and its harness need v2.3.0 or later. |
-| `txindex=1` | **Required, and set before the first start**; adding it later reindexes the chain. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index that call serves mempool transactions only, and the fallback `gettxout` on output 0 reads a mined transaction whose first output has since been spent as unknown, so the withdrawal never settles in the engine's view. |
+| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The SDK is verified against v2.3.0 (the golden transaction vector), v2.4.0 and v2.5.0 (the harness). |
+| `txindex=1` | **Required, and set before the first start**; adding it later reindexes the chain. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
 | `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every node we operate runs with it. |
-| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | `rpc.Client` speaks JSON-RPC over HTTP with no TLS option; bind RPC to localhost or your private network ([Security Guide](SECURITY.md#network-security)). |
+| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC has no TLS. `rpc.Client` takes a URL, so either bind RPC to localhost or your private network, or terminate TLS in front of it ([Security Guide](SECURITY.md#network-security)). |
 | `stagenet=1` | For the staging network. Omit it for mainnet. |
 | `dbcache` | Our nodes run 512 MB; the node's default is 450. |
 
@@ -140,9 +140,11 @@ Ports, as `types.Mainnet`, `types.Stagenet` and `types.Regtest` carry them (node
 | stagenet | `ssq1p` | 28333 | 28332 |
 | regtest | `sq1p` | 18444 | 18332 |
 
-`rpc.Client` compares the node's `chain` with the network you configured and refuses a mismatch
-(`rpc.ErrWrongChain`), so a mainnet configuration pointed at a stagenet node fails at the first
-call rather than at the first withdrawal.
+Set `Client.Network` (`c.Network = types.Mainnet`). `RequireSynced`, which `deposit.Monitor`, the
+reconciler and `VerifyAndFilterUTXOs` call, then compares the node's `chain` with `Network.ChainID`
+and refuses a mismatch with `rpc.ErrWrongChain`, so a mainnet deployment pointed at a stagenet node
+fails before it credits a deposit or signs a withdrawal. Left unset, the client applies mainnet
+rules without the check.
 
 ### The indexer
 
@@ -152,29 +154,29 @@ branch `soqucoin`, tag `mainnet-genesis-2026-09-03`. Configuration is in its `SO
 service port is 50001 (`types.Network.ElectrumPort`); TLS is whatever port you terminate it on.
 
 One operational note from running it. ElectrumX stores its history flush counter in 16 bits
-(`server/history.py`, `pack_be_uint16(self.flush_count)`). Every start flushes, so a server left in
-a restart loop under a supervisor exhausts the counter after 65,535 flushes and from then on exits
-on every start with `struct.error: 'H' format requires 0 <= number <= 65535`, its index frozen at
-one height. Alert on the unit's restart count, and run `electrumx_compact_history` with the server
-stopped before the count approaches the limit.
+(`src/electrumx/server/history.py`, `flush_id = pack_be_uint16(self.flush_count)`). Every start
+that catches up to the node flushes, and so does a clean shutdown, so a server left in a restart
+loop under a supervisor exhausts the counter after 65,535 flushes and from then on exits on every
+start with `struct.error: 'H' format requires 0 <= number <= 65535`, its index frozen at one
+height. Alert on the unit's restart count, and run `electrumx_compact_history` with the server
+stopped before the count approaches the limit; compaction resets it.
 
 ### Sizing, measured
 
-Stagenet on 2026-09-14 at height 82,061, read from our nodes (`getblockchaininfo`,
+Stagenet on 2026-09-14 UTC at height 82,061, read from our nodes (`getblockchaininfo`,
 `systemctl show -p MemoryCurrent`, `du`):
 
 | | |
 |---|---|
-| Node data directory with `txindex=1` | 425 MB (`size_on_disk`); the chainstate is under 1 MB |
+| Node data directory with `txindex=1` | 425 MB (`size_on_disk`), of which the chainstate is 532 KB |
 | `soqucoind` resident memory | 110 MB on a node serving RPC only, 340 MB on one also feeding an indexer, both at `dbcache=512` |
 | ElectrumX database (LevelDB) | 64 MB |
 | ElectrumX resident memory | 110 MB |
-| Host | a 4 vCPU, 8 GB VPS runs node plus indexer with headroom |
+| Hosts these were read from | 4 vCPU with 8 GB running node plus indexer; 8 vCPU with 16 GB |
 
 Blocks arrive one a minute (`nPowTargetSpacing = 60`). Mainnet starts from its genesis block at
 launch, so it stays smaller than stagenet for months; plan storage from the stagenet figures and
-the growth you observe. We have not timed an initial sync on a reference host; at 425 MB it is
-bounded by your download bandwidth, and the indexer follows the node.
+the growth you observe. We have not timed an initial sync on a reference host.
 
 ---
 
@@ -719,8 +721,8 @@ Roughly 3,782 bytes per additional input, so estimate
 `3,880 + 3,782 x (inputs - 1)` bytes.
 
 **The 80-input cap is not the node's weight limit.** `MAX_STANDARD_TX_WEIGHT` is
-800,000 WU in every node release the SDK supports (v2.3.0 and later,
-`src/policy/policy.h`), and 80 inputs use 312,786 of it, about 39%. The cap dates
+800,000 WU in every node release from v1.1.0 on (`src/policy/policy.h`), and 80 inputs use
+312,786 of it, about 39%. The cap dates
 from the period when the limit was 400,000 WU and 200-input transactions were
 rejected for size. It is an operational limit in this SDK, not a protocol
 constant.
