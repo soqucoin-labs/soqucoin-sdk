@@ -48,16 +48,19 @@ type Client struct {
 	// set, every call to such a URL returns ErrRemoteNode before anything is
 	// sent. Each request carries the RPC password in a Basic Auth header, so
 	// a URL copied from another deployment or mistyped would hand the
-	// password to whichever host it names, in plaintext over http://, and
-	// would take that host's word on the chain. Set it when the node is
-	// elsewhere on purpose, with an https:// URL (the certificate is verified
-	// against the system roots) or a tunnel that ends on this machine.
-	// Loopback is 127.0.0.0/8, ::1 or the name "localhost", read from the URL;
-	// no name is resolved.
+	// password to whichever host it names and would take that host's word
+	// on the chain. Set it when the node is elsewhere on purpose, with an
+	// https:// URL (the certificate is verified against the system roots) or
+	// a tunnel that ends on this machine. AllowRemote does not permit
+	// plaintext: a non-loopback URL whose scheme is not https returns
+	// ErrPlaintextRemote whether or not it is set, since the password would
+	// cross the network in the clear. Loopback is 127.0.0.0/8, ::1 or the
+	// name "localhost", read from the URL; no name is resolved.
 	AllowRemote bool
 
 	url      string
 	host     string
+	scheme   string
 	remote   bool
 	user     string
 	password string
@@ -81,6 +84,7 @@ func NewClient(url, user, password string) *Client {
 	return &Client{
 		url:      url,
 		host:     host,
+		scheme:   schemeOf(url),
 		remote:   host != "" && !loopback,
 		user:     user,
 		password: password,
@@ -110,6 +114,17 @@ func hostOf(rawURL string) (host string, loopback bool) {
 	}
 	ip := net.ParseIP(host)
 	return host, ip != nil && ip.IsLoopback()
+}
+
+// schemeOf returns the scheme of rawURL in lower case, or "" for a URL that
+// does not parse. url.Parse lowers the scheme itself; the fold here is so
+// the guard does not depend on that.
+func schemeOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Scheme)
 }
 
 // rpcRequest is a JSON-RPC 1.0 request.
@@ -155,7 +170,13 @@ var (
 	ErrNodeSyncing    = fmt.Errorf("%w: node is in initial block download or behind its headers", ErrTransient)
 	ErrWrongChain     = fmt.Errorf("%w: node serves a different chain than Client.Network", ErrPermanent)
 	ErrRemoteNode     = fmt.Errorf("%w: node URL is not loopback and Client.AllowRemote is not set", ErrPermanent)
-	ErrTxIDMismatch   = errors.New("rpc: node accepted the transaction under a different txid")
+	// ErrPlaintextRemote is returned, with nothing sent, for a node URL whose
+	// host is not loopback and whose scheme is not https, whether or not
+	// AllowRemote is set: the RPC password would cross the network in the
+	// clear. Use https:// to a TLS terminator or a tunnel that ends on
+	// this machine.
+	ErrPlaintextRemote = fmt.Errorf("%w: node URL is not loopback and not https; the RPC password would cross the network in plaintext", ErrPermanent)
+	ErrTxIDMismatch    = errors.New("rpc: node accepted the transaction under a different txid")
 )
 
 // Node error codes this package interprets (src/rpc/protocol.h in the node).
@@ -211,12 +232,15 @@ func (e *transportError) Is(target error) bool {
 // SetTimeout replaces the per-request HTTP timeout (default 30 s).
 func (c *Client) SetTimeout(d time.Duration) { c.client.Timeout = d }
 
-// Call sends a JSON-RPC request and returns the raw result. It returns
-// ErrRemoteNode, with nothing sent, for a URL whose host is not loopback
-// unless AllowRemote is set.
+// Call sends a JSON-RPC request and returns the raw result. For a URL whose
+// host is not loopback it returns, with nothing sent, ErrRemoteNode unless
+// AllowRemote is set, and ErrPlaintextRemote unless the scheme is https.
 func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, error) {
 	if c.remote && !c.AllowRemote {
 		return nil, fmt.Errorf("%w: host %q", ErrRemoteNode, c.host)
+	}
+	if c.remote && c.scheme != "https" {
+		return nil, fmt.Errorf("%w: %s://%s", ErrPlaintextRemote, c.scheme, c.host)
 	}
 	if params == nil {
 		params = []interface{}{}

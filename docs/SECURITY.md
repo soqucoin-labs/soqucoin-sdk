@@ -31,7 +31,7 @@ system. Knowing where its remit ends is the first step in integrating it safely.
 | Spend limits, rate limiting, approval workflow | The SDK enforces no policy on amounts or authorisation |
 | Deposit crediting idempotency | See [the deposit example](../examples/exchange_deposit) for the pattern |
 | Zeroing key material after use | Not reliably possible in pure Go. See [Memory hygiene](#memory-hygiene) |
-| Transport to a `soqucoind` on another host | `rpc.Client` refuses a URL that is not loopback until `AllowRemote` is set. An `https://` URL is verified against the system roots; there is no private-CA or pinning option, so a private CA means a tunnel. See [Network security](#network-security) |
+| Transport to a `soqucoind` on another host | `rpc.Client` refuses a URL that is not loopback until `AllowRemote` is set, and refuses `http://` to such a host whether or not it is set. An `https://` URL is verified against the system roots; there is no private-CA or pinning option, so a private CA means a tunnel. See [Network security](#network-security) |
 
 ---
 
@@ -301,7 +301,12 @@ Every request carries the RPC password in a Basic Auth header. The client refuse
 URL whose host is not loopback (`127.0.0.0/8`, `::1` or the name `localhost`, read
 from the URL without resolving it) with `rpc.ErrRemoteNode` before anything is sent,
 until `AllowRemote` is set. A URL copied from another deployment, or mistyped, fails
-instead of handing the password to whichever host it names. The client does not follow
+instead of handing the password to whichever host it names. `AllowRemote` permits the
+host, not plaintext to it: a non-loopback URL whose scheme is not `https` is refused with
+`rpc.ErrPlaintextRemote`, again before anything is sent, whether or not the flag is set.
+Loopback is read from the URL as written and nothing is resolved, so a Docker service
+name, `host.docker.internal` or a Kubernetes service is a remote host to the client even
+when it reaches this machine, and takes `AllowRemote` with `https://`, or a tunnel. The client does not follow
 an HTTP redirect either: a node never sends one, and a proxy that answers `http://` with a
 redirect to `https://` fails as a transport error instead of being followed.
 
@@ -314,8 +319,8 @@ redirect to `https://` fails as a transport error instead of being followed.
   URL to a TLS terminator in front of the node. Go's default transport verifies the
   certificate against the system roots and refuses an invalid one; the client has no
   option for a private CA or a pinned certificate, so a private CA means a tunnel.
-  Never `http://` to a remote host: the password and every transaction cross the
-  network in plaintext.
+  `http://` to a remote host is refused by the client (`rpc.ErrPlaintextRemote`): the
+  password and every transaction would cross the network in plaintext.
 
 ```go
 node := rpc.NewClient("https://node.internal:33389", rpcUser, rpcPassword)
