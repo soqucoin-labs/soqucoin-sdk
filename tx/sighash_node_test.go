@@ -208,25 +208,29 @@ func TestNodeVectorKeyIsTheSeedKey(t *testing.T) {
 func TestNodeVectorRejectsEveryPreimageMutation(t *testing.T) {
 	v := loadNodeVector(t)
 	cases := []struct {
-		name   string
-		mutate func(tr *Transaction)
-		fail   []int // inputs whose verification must now fail
-		want   error
+		name    string
+		mutate  func(tr *Transaction)
+		fail    []int // inputs whose verification must now fail
+		want    error
+		witness bool // the mutation is to the witness, so no digest moves
 	}{
-		{"input 0 value", func(tr *Transaction) { tr.Inputs[0].Value++ }, []int{0}, ErrSignature},
-		{"input 1 value", func(tr *Transaction) { tr.Inputs[1].Value++ }, []int{1}, ErrSignature},
-		{"input 0 sequence", func(tr *Transaction) { tr.Inputs[0].Sequence-- }, []int{0, 1}, ErrSignature},
-		{"input 1 sequence", func(tr *Transaction) { tr.Inputs[1].Sequence-- }, []int{0, 1}, ErrSignature},
-		{"input 0 scriptCode", func(tr *Transaction) { tr.Inputs[0].ScriptPubKey[33] ^= 0x01 }, []int{0}, ErrWrongKey},
-		{"input 1 outpoint vout", func(tr *Transaction) { tr.Inputs[1].Vout++ }, []int{0, 1}, ErrSignature},
-		{"input 0 outpoint txid", func(tr *Transaction) { tr.Inputs[0].TxID[0] ^= 0x01 }, []int{0, 1}, ErrSignature},
-		{"output 0 value", func(tr *Transaction) { tr.Outputs[0].Value++ }, []int{0, 1}, ErrSignature},
-		{"output 1 script", func(tr *Transaction) { tr.Outputs[1].ScriptPubKey[5] ^= 0x01 }, []int{0, 1}, ErrSignature},
-		{"version", func(tr *Transaction) { tr.Version++ }, []int{0, 1}, ErrSignature},
-		{"locktime", func(tr *Transaction) { tr.LockTime++ }, []int{0, 1}, ErrSignature},
-		{"input 0 signature byte", func(tr *Transaction) { tr.Inputs[0].WitnessData[0][100] ^= 0x01 }, []int{0}, ErrSignature},
-		{"input 1 hashtype byte", func(tr *Transaction) { tr.Inputs[1].WitnessData[0][types.SignatureSize] = SigHashNone }, []int{1}, ErrHashType},
-		{"input 0 public key byte", func(tr *Transaction) { tr.Inputs[0].WitnessData[1][7] ^= 0x01 }, []int{0}, ErrWrongKey},
+		{"input 0 value", func(tr *Transaction) { tr.Inputs[0].Value++ }, []int{0}, ErrSignature, false},
+		{"input 1 value", func(tr *Transaction) { tr.Inputs[1].Value++ }, []int{1}, ErrSignature, false},
+		{"input 0 sequence", func(tr *Transaction) { tr.Inputs[0].Sequence-- }, []int{0, 1}, ErrSignature, false},
+		{"input 1 sequence", func(tr *Transaction) { tr.Inputs[1].Sequence-- }, []int{0, 1}, ErrSignature, false},
+		// A changed scriptCode fails the key-to-program check before the
+		// signature is reached; the digest loop below shows it moved input 0's
+		// digest only.
+		{"input 0 scriptCode", func(tr *Transaction) { tr.Inputs[0].ScriptPubKey[33] ^= 0x01 }, []int{0}, ErrWrongKey, false},
+		{"input 1 outpoint vout", func(tr *Transaction) { tr.Inputs[1].Vout++ }, []int{0, 1}, ErrSignature, false},
+		{"input 0 outpoint txid", func(tr *Transaction) { tr.Inputs[0].TxID[0] ^= 0x01 }, []int{0, 1}, ErrSignature, false},
+		{"output 0 value", func(tr *Transaction) { tr.Outputs[0].Value++ }, []int{0, 1}, ErrSignature, false},
+		{"output 1 script", func(tr *Transaction) { tr.Outputs[1].ScriptPubKey[5] ^= 0x01 }, []int{0, 1}, ErrSignature, false},
+		{"version", func(tr *Transaction) { tr.Version++ }, []int{0, 1}, ErrSignature, false},
+		{"locktime", func(tr *Transaction) { tr.LockTime++ }, []int{0, 1}, ErrSignature, false},
+		{"input 0 signature byte", func(tr *Transaction) { tr.Inputs[0].WitnessData[0][100] ^= 0x01 }, []int{0}, ErrSignature, true},
+		{"input 1 hashtype byte", func(tr *Transaction) { tr.Inputs[1].WitnessData[0][types.SignatureSize] = SigHashNone }, []int{1}, ErrHashType, true},
+		{"input 0 public key byte", func(tr *Transaction) { tr.Inputs[0].WitnessData[1][7] ^= 0x01 }, []int{0}, ErrWrongKey, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -248,19 +252,16 @@ func TestNodeVectorRejectsEveryPreimageMutation(t *testing.T) {
 					t.Errorf("input %d must be unaffected, got %v", i, err)
 				}
 			}
-			// The digest of a failing input moved; the digest of an unaffected
-			// input did not.
+			// A preimage mutation moves the digest of exactly the failing
+			// inputs; a witness mutation moves none.
 			for i := range tr.Inputs {
-				if c.want != ErrSignature || tr.Inputs[i].WitnessData[0][100] != mustHex(t, v.Witness[i][0])[100] {
-					continue // a witness-only mutation leaves every digest alone
-				}
 				got, err := tr.ComputeSigHash(i, SigHashAll)
 				if err != nil {
 					t.Fatal(err)
 				}
 				moved := hex.EncodeToString(got) != v.Digests[i]
-				if moved != mustFail[i] {
-					t.Errorf("input %d: digest moved=%v, verification fails=%v", i, moved, mustFail[i])
+				if wantMoved := mustFail[i] && !c.witness; moved != wantMoved {
+					t.Errorf("input %d: digest moved=%v, want %v", i, moved, wantMoved)
 				}
 			}
 		})
