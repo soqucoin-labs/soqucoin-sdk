@@ -335,7 +335,9 @@ func (m *Manager) Save() error {
 	return nil
 }
 
-// ImportPrivateKey imports a raw Dilithium private key (from wallet.dat dump).
+// ImportPrivateKey adds a key held in memory: a derived deposit key at sweep
+// time, or a raw key from a wallet.dat dump. Call Save only for a hot-wallet
+// key that should persist.
 func (m *Manager) ImportPrivateKey(privKey []byte, pubKey []byte, address string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
