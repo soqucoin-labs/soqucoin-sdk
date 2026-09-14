@@ -5,6 +5,7 @@ package tx
 
 import (
 	"errors"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -74,6 +75,8 @@ func TestSweepRefusals(t *testing.T) {
 		{"remainder under the relay floor", []types.UTXO{realUTXO(t, 0x10, 0, fee+MinOutputValue(dest)-1)}, 1000, ErrBelowDust},
 		{"zero rate", one, 0, ErrInvalidAmount},
 		{"rate above the cap", one, MaxFeeRateShorsPerVB + 1, ErrFeeTooHigh},
+		// The fee product wraps at this rate; the rate bound is checked first.
+		{"rate at MaxInt64", one, math.MaxInt64, ErrFeeTooHigh},
 	}
 	// 80 inputs at 3,000 shors/vB is about 2.35 SOQ of fee, over MaxFeeShors.
 	var eighty []types.UTXO

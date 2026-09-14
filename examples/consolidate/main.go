@@ -40,7 +40,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
@@ -139,6 +141,11 @@ func run(cfg config) error {
 	if cfg.elxHost == "" {
 		cfg.elxHost = fmt.Sprintf("localhost:%d", network.ElectrumPort)
 	}
+	// The indexer sees every address tracked; off this machine that goes over
+	// TLS or not at all.
+	if !cfg.elxTLS && !loopbackHost(cfg.elxHost) {
+		return fmt.Errorf("electrumx %s is not on this machine; pass -electrumx-tls", cfg.elxHost)
+	}
 	elx := electrumx.NewClient(cfg.elxHost, 15*time.Second)
 	elx.HRP = network.HRP
 	if cfg.elxTLS {
@@ -217,6 +224,10 @@ func run(cfg config) error {
 	if len(verified) == 0 {
 		return errors.New("no spendable outputs remain after verification")
 	}
+	if len(verified) == 1 && verified[0].Address == cfg.to {
+		log.Printf("nothing to consolidate: one output, already at the destination")
+		return nil
+	}
 	destSPK, err := address.ScriptFor(cfg.to)
 	if err != nil {
 		return fmt.Errorf("destination address: %w", err)
@@ -265,6 +276,9 @@ func run(cfg config) error {
 // target, clamped to the range the builders accept and logged when the node
 // had no estimate.
 func feeRateFor(node *rpc.Client, flagRate int64) (int64, error) {
+	if flagRate < 0 {
+		return 0, fmt.Errorf("-fee-rate %d: must be 0 (ask the node) or a positive rate", flagRate)
+	}
 	if flagRate > 0 {
 		return flagRate, nil
 	}
@@ -292,6 +306,20 @@ func inputsWithinFeeCap(feeRate int64) int {
 		return utxo.MaxInputsPerTX
 	}
 	return int(n)
+}
+
+// loopbackHost reports whether host:port names this machine: the name
+// localhost or a loopback IP literal. Nothing is resolved.
+func loopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func soq(shors int64) string {

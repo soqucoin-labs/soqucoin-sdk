@@ -39,7 +39,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
@@ -169,6 +171,11 @@ func run(cfg runConfig) error {
 
 	rpcClient := rpc.NewClient(cfg.rpcURL, cfg.rpcUser, cfg.rpcPass)
 	rpcClient.Network = network // refuse a node on another chain; apply its coinbase maturity
+	// The indexer sees every address tracked; off this machine that goes over
+	// TLS or not at all.
+	if !cfg.elxTLS && !loopbackHost(cfg.elxHost) {
+		return fmt.Errorf("electrumx %s is not on this machine; pass -electrumx-tls", cfg.elxHost)
+	}
 	elxClient := electrumx.NewClient(cfg.elxHost, 15*time.Second)
 	elxClient.HRP = network.HRP
 	if cfg.elxTLS {
@@ -355,6 +362,20 @@ func loadPayouts(path string) ([]Payout, error) {
 		return nil, fmt.Errorf("payouts file %s is empty", path)
 	}
 	return payouts, nil
+}
+
+// loopbackHost reports whether host:port names this machine: the name
+// localhost or a loopback IP literal. Nothing is resolved.
+func loopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func soq(sats int64) float64 {
