@@ -265,7 +265,7 @@ func fundingUTXOs(node *rpc.Client, keystore *keys.Manager, list string) ([]type
 		out = append(out, types.UTXO{
 			TxID:    parts[0],
 			Vout:    uint32(vout),
-			Value:   txout.ValueShors(),
+			Value:   txout.Value,
 			Height:  tip - txout.Confirmations + 1,
 			Address: addr,
 		})
@@ -291,7 +291,7 @@ func printRecord(node *rpc.Client, txid string) error {
 			Witness []string `json:"txinwitness"`
 		} `json:"vin"`
 		Vout []struct {
-			Value float64 `json:"value"`
+			Value json.Number `json:"value"` // the node's decimal SOQ figure, printed as received
 		} `json:"vout"`
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -323,7 +323,7 @@ func printRecord(node *rpc.Client, txid string) error {
 		fmt.Printf("input %d         %s:%d witness [%s]\n", i, in.TxID, in.Vout, strings.Join(sizes, ", "))
 	}
 	for i, out := range decoded.Vout {
-		fmt.Printf("output %d        %.8f SOQ\n", i, out.Value)
+		fmt.Printf("output %d        %s SOQ\n", i, out.Value)
 	}
 	return nil
 }

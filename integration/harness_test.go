@@ -208,8 +208,8 @@ func (s *scanner) RefreshAll() error {
 					Vout uint32 `json:"vout"`
 				} `json:"vin"`
 				Vout []struct {
-					Value        float64 `json:"value"`
-					N            uint32  `json:"n"`
+					Value        json.Number `json:"value"`
+					N            uint32      `json:"n"`
 					ScriptPubKey struct {
 						Hex string `json:"hex"`
 					} `json:"scriptPubKey"`
@@ -226,8 +226,13 @@ func (s *scanner) RefreshAll() error {
 			}
 			for _, out := range tx.Vout {
 				if addr, ok := s.tracked[out.ScriptPubKey.Hex]; ok {
+					value, err := types.ParseSOQ(out.Value.String())
+					if err != nil {
+						s.lastErr = err
+						return err
+					}
 					s.utxos[okey(tx.TxID, out.N)] = types.UTXO{TxID: tx.TxID, Vout: out.N,
-						Value: (&rpc.TxOut{Value: out.Value}).ValueShors(), Height: h, Address: addr}
+						Value: value, Height: h, Address: addr}
 				}
 			}
 		}

@@ -106,13 +106,28 @@ func (fs *FileStore) Get(id string) (*Intent, bool, error) {
 }
 
 // Put implements Store. It returns only after the new file is on disk and
-// renamed into place, and the directory entry is synced.
+// renamed into place, and the directory entry is synced. When the write
+// fails the store keeps reporting the record it held before, so a caller that
+// treats the error as "not saved" and Get agree; the next successful Put
+// writes the whole store from memory again.
 func (fs *FileStore) Put(in *Intent) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	prev, had := fs.intents[in.ID]
 	cp := *in
 	fs.intents[in.ID] = &cp
+	if err := fs.write(); err != nil {
+		if had {
+			fs.intents[in.ID] = prev
+		} else {
+			delete(fs.intents, in.ID)
+		}
+		return err
+	}
+	return nil
+}
 
+func (fs *FileStore) write() error {
 	all := filterSorted(fs.intents, nil)
 	buf, err := json.MarshalIndent(fileStoreFile{Version: 1, Updated: time.Now().UTC(), Intents: all}, "", "  ")
 	if err != nil {

@@ -58,8 +58,8 @@ func recon(t *testing.T, halt bool) (*Reconciler, *fakeSource, *fakeNode, *Circu
 		{TxID: rTxB, Vout: 1, Value: 50_000_000, Height: 10},
 	}}
 	node := &fakeNode{synced: true, outs: map[string]*rpc.TxOut{
-		k(rTxA, 0): {Value: 1.5},
-		k(rTxB, 1): {Value: 0.5},
+		k(rTxA, 0): {Value: 150_000_000},
+		k(rTxB, 1): {Value: 50_000_000},
 	}}
 	cb := NewCircuitBreaker(3, time.Hour)
 	var alerts []string
@@ -90,7 +90,7 @@ func TestReconcilerDetectsMismatchAndHalts(t *testing.T) {
 		mutate func(n *fakeNode)
 	}{
 		{"output missing on node", func(n *fakeNode) { delete(n.outs, k(rTxA, 0)) }},
-		{"value differs", func(n *fakeNode) { n.outs[k(rTxA, 0)] = &rpc.TxOut{Value: 1.4} }},
+		{"value differs", func(n *fakeNode) { n.outs[k(rTxA, 0)] = &rpc.TxOut{Value: 140_000_000} }},
 	}
 	for _, tc := range cases {
 		r, _, node, cb, alerts := recon(t, true)

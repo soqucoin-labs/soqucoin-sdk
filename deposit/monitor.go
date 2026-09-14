@@ -253,8 +253,8 @@ func (m *Monitor) verifyWithNode(addr, wantHex string, u types.UTXO, confs int64
 	switch {
 	case out == nil:
 		m.alert(AlertIndexerMismatch, "%s:%d for %s: indexer reports a confirmed output the node does not have (or it is already spent)", u.TxID, u.Vout, addr)
-	case out.ValueShors() != u.Value:
-		m.alert(AlertIndexerMismatch, "%s:%d for %s: indexer value %d, node value %d", u.TxID, u.Vout, addr, u.Value, out.ValueShors())
+	case out.Value != u.Value:
+		m.alert(AlertIndexerMismatch, "%s:%d for %s: indexer value %d, node value %d", u.TxID, u.Vout, addr, u.Value, out.Value)
 	case !strings.EqualFold(out.ScriptPubKey.Hex, wantHex):
 		m.alert(AlertIndexerMismatch, "%s:%d: indexer attributes it to %s but the node's script is %s", u.TxID, u.Vout, addr, out.ScriptPubKey.Hex)
 	case out.Confirmations < m.Required(u.Value):

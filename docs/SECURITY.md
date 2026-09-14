@@ -31,7 +31,7 @@ system. Knowing where its remit ends is the first step in integrating it safely.
 | Spend limits, rate limiting, approval workflow | The SDK enforces no policy on amounts or authorisation |
 | Deposit crediting idempotency | See [the deposit example](../examples/exchange_deposit) for the pattern |
 | Zeroing key material after use | Not reliably possible in pure Go. See [Memory hygiene](#memory-hygiene) |
-| Transport encryption to `soqucoind` RPC | The RPC client has no TLS options; protect it at the network layer |
+| Transport to a `soqucoind` on another host | `rpc.Client` refuses a URL that is not loopback until `AllowRemote` is set. An `https://` URL is verified against the system roots; there is no private-CA or pinning option, so a private CA means a tunnel. See [Network security](#network-security) |
 
 ---
 
@@ -297,12 +297,28 @@ default.
 rpcClient := rpc.NewClient("http://127.0.0.1:33389", rpcUser, rpcPassword)
 ```
 
-The client offers no TLS options. Protect the RPC transport at the network layer:
+Every request carries the RPC password in a Basic Auth header. The client refuses a
+URL whose host is not loopback (`127.0.0.0/8`, `::1` or the name `localhost`, read
+from the URL without resolving it) with `rpc.ErrRemoteNode` before anything is sent,
+until `AllowRemote` is set. A URL copied from another deployment, or mistyped, fails
+instead of handing the password to whichever host it names.
 
-- Bind `soqucoind` RPC to `127.0.0.1` and never expose it publicly.
+- Bind `soqucoind` RPC to `127.0.0.1` and never expose it publicly. The node itself
+  speaks plaintext only.
 - Use a long random password. `rpcauth` with a salted hash is preferable to a
   plaintext `rpcpassword` in `soqucoin.conf`.
-- Cross-host RPC belongs in a tunnel, not on the open internet with a password.
+- For a node on another host, either run a tunnel that ends on this machine, so the
+  URL stays loopback and needs no setting, or set `AllowRemote` and use an `https://`
+  URL to a TLS terminator in front of the node. Go's default transport verifies the
+  certificate against the system roots and refuses an invalid one; the client has no
+  option for a private CA or a pinned certificate, so a private CA means a tunnel.
+  Never `http://` to a remote host: the password and every transaction cross the
+  network in plaintext.
+
+```go
+node := rpc.NewClient("https://node.internal:33389", rpcUser, rpcPassword)
+node.AllowRemote = true // the host is not loopback, and that is intended
+```
 
 ---
 
@@ -345,11 +361,13 @@ because the script derived from an address is what BIP143 commits to as the
 
 ### Amounts
 
-**All amounts in this SDK are `int64` shors.** There is no `Amount` type and no
-parser, so nothing converts or validates on your behalf. 1 SOQ is
-`types.ShorsPerSOQ` shors.
+**All amounts in this SDK are `int64` shors.** There is no `Amount` type. 1 SOQ is
+`types.ShorsPerSOQ` shors. `types.ParseSOQ` converts a decimal SOQ figure to shors
+exactly; the RPC client reads every value the node prints through it, and it accepts
+the same form from a user (`"12.5"`, up to eight fraction digits, no sign or
+exponent). Nothing validates the amount's meaning on your behalf.
 
-Parse user input yourself, and do not route it through `float64`. The builders
+Do not route an amount through `float64`. The builders
 refuse amounts outside `0 < v <= tx.MaxMoney` (`tx.ErrInvalidAmount`), recipient
 amounts below the node's relay floor (`tx.MinOutputValue`, `tx.ErrBelowDust`), and
 input sums that would overflow; treat all of those as per-request errors, not as
@@ -362,9 +380,11 @@ if amountShors <= 0 {
 }
 ```
 
-A `float64` holds 53 bits of mantissa. Large SOQ amounts in shors exceed that
-and round silently, so `strconv.ParseFloat` on a user-supplied amount can produce
-a value that differs from what was typed.
+A `float64` holds 53 bits of mantissa, about 90,071,992 SOQ in shors. Above that
+it rounds silently: `strconv.ParseFloat` on a user-supplied amount can produce a
+value that differs from what was typed, and through v0.3.5 the RPC client read the
+node's output values that way. `types.ParseSOQ` is exact for every value the node
+can print.
 
 ### Fee rate is per vByte
 

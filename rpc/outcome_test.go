@@ -244,13 +244,43 @@ func TestVerifyAndFilterSkipsImmatureCoinbaseWithoutEvicting(t *testing.T) {
 	}
 }
 
-func TestTxOutValueShors(t *testing.T) {
+// The node prints the value as a decimal SOQ figure; TxOut.Value holds it as
+// shors, exactly, including past 2^53 shors where a float64 cannot.
+func TestTxOutValueIsExactShors(t *testing.T) {
 	for _, tc := range []struct {
-		soq   float64
+		raw   string
 		shors int64
-	}{{1.5, 150_000_000}, {0.00000001, 1}, {88, 8_800_000_000}, {12345.67891234, 1_234_567_891_234}} {
-		if got := (&TxOut{Value: tc.soq}).ValueShors(); got != tc.shors {
-			t.Errorf("%v SOQ -> %d shors, want %d", tc.soq, got, tc.shors)
+	}{
+		{"1.50000000", 150_000_000}, {"0.00000001", 1}, {"88.00000000", 8_800_000_000},
+		{"12345.67891234", 1_234_567_891_234},
+		{"90071992.54740993", 1<<53 + 1},
+	} {
+		c, _ := rpcServer(t, func(method string, _ []interface{}) string {
+			return ok(`{"bestblock":"00","confirmations":3,"value":` + tc.raw + `,"scriptPubKey":{"hex":"5120aa"},"coinbase":false,"assettype":0}`)
+		})
+		out, err := c.GetTxOut(someTxID, 0, true)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if out.Value != tc.shors || out.Confirmations != 3 || out.ScriptPubKey.Hex != "5120aa" {
+			t.Errorf("%s -> %+v, want value %d", tc.raw, out, tc.shors)
+		}
+	}
+}
+
+// A reply whose value is not the node's decimal form is an error, never a
+// zero the caller could mistake for a real amount.
+func TestTxOutRefusesNonDecimalValue(t *testing.T) {
+	for _, body := range []string{
+		`{"confirmations":3,"value":-1,"scriptPubKey":{"hex":"51"}}`,
+		`{"confirmations":3,"value":1e-8,"scriptPubKey":{"hex":"51"}}`,
+		`{"confirmations":3,"value":0.000000001,"scriptPubKey":{"hex":"51"}}`,
+		`{"confirmations":3,"scriptPubKey":{"hex":"51"}}`,
+	} {
+		c, _ := rpcServer(t, func(string, []interface{}) string { return ok(body) })
+		out, err := c.GetTxOut(someTxID, 0, true)
+		if !errors.Is(err, types.ErrAmountFormat) {
+			t.Errorf("%s: got %+v, %v; want ErrAmountFormat", body, out, err)
 		}
 	}
 }

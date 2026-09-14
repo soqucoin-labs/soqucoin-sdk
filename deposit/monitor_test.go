@@ -146,7 +146,7 @@ func setup(t *testing.T) (*Monitor, *fakeCache, *fakeNode, *fakeLedger, *alerts,
 // txout builds the node's view of an output paying `a`.
 func txout(t *testing.T, a string, soq float64, confs int64, coinbase bool) *rpc.TxOut {
 	t.Helper()
-	return &rpc.TxOut{Value: soq, Confirmations: confs, Coinbase: coinbase,
+	return &rpc.TxOut{Value: int64(soq * float64(types.ShorsPerSOQ)), Confirmations: confs, Coinbase: coinbase,
 		ScriptPubKey: rpc.ScriptPubKey{Hex: scriptHex(t, a)}}
 }
 

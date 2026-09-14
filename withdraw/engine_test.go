@@ -325,6 +325,128 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	}
 }
 
+// breakStoreFile replaces the store's file with a non-empty directory, so the
+// next write fails at the rename, on any platform and as any user. The
+// returned func clears the path again.
+func breakStoreFile(t *testing.T, path string) (fix func()) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// When the write fails, the store keeps reporting the record it held before,
+// so Get and the caller that treated the error as "not saved" agree. A record
+// whose first save failed is not reported at all. Once the path is writable
+// the next Put writes the whole store, and a reload shows only what was saved.
+func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intents.json")
+	s, err := NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := &Intent{ID: "w1", State: StateCreated, CreatedAt: time.Now().UTC()}
+	if err := s.Put(created); err != nil {
+		t.Fatal(err)
+	}
+	fix := breakStoreFile(t, path)
+
+	built := *created
+	built.State, built.RawHex, built.TxID = StateBuilt, "00", "t"
+	if err := s.Put(&built); err == nil {
+		t.Fatal("a write onto a directory succeeded")
+	}
+	got, ok, _ := s.Get("w1")
+	if !ok || got.State != StateCreated || got.RawHex != "" {
+		t.Fatalf("after the failed Put, Get reports %+v; want the Created record", got)
+	}
+	if list, _ := s.List(StateBuilt); len(list) != 0 {
+		t.Fatalf("List reports a Built intent whose save failed: %+v", list)
+	}
+	if err := s.Put(&Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err == nil {
+		t.Fatal("a write onto a directory succeeded")
+	}
+	if _, ok, _ := s.Get("w2"); ok {
+		t.Fatal("a record whose first save failed is reported")
+	}
+
+	fix()
+	if err := s.Put(&built); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, _ := s2.List()
+	if len(all) != 1 || all[0].ID != "w1" || all[0].State != StateBuilt {
+		t.Fatalf("reloaded store: %+v; want only w1, Built", all)
+	}
+}
+
+// The case the store rule exists for. A Built save fails: Build releases the
+// inputs and reverts the caller's intent to Created. If the store still
+// reported Built, the next Process would broadcast a transaction whose inputs
+// are free for any other withdrawal to take. With the store keeping its
+// previous record, the next Process builds again, on inputs it reserves, and
+// only that transaction is sent.
+func TestFailedBuiltSaveIsNotBroadcastByTheNextProcess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intents.json")
+	store, err := NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spent := utxo.NewSpentSet("")
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, store, spent, net, coins())
+	if _, _, err := e.Submit("w1", dst, 1_000_000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	fix := breakStoreFile(t, path)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, err := e.Process("w1"); err == nil {
+			t.Fatalf("attempt %d: persist failure was not reported", attempt)
+		}
+		if n := net.sentCount(); n != 0 {
+			t.Fatalf("attempt %d: %d transactions broadcast although no record of them was saved", attempt, n)
+		}
+		if held := spent.ReservedIntents(); len(held) != 0 {
+			t.Fatalf("attempt %d: reservations %v kept after the failed save", attempt, held)
+		}
+		w, ok, err := store.Get("w1")
+		if err != nil || !ok || w.State != StateCreated {
+			t.Fatalf("attempt %d: store reports %+v, %v; want w1 Created", attempt, w, err)
+		}
+	}
+
+	fix()
+	w, err := e.Process("w1")
+	if err != nil || w.State != StateBroadcast || net.sentCount() != 1 {
+		t.Fatalf("after the disk is back: %+v, %v, %d sent; want one broadcast", w, err, net.sentCount())
+	}
+	for _, in := range w.Inputs {
+		if !spent.IsSpent(in.TxID, in.Vout) {
+			t.Errorf("broadcast input %s:%d is not marked spent", in.TxID, in.Vout)
+		}
+	}
+	reloaded, err := NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, _ := reloaded.Get("w1"); !ok || got.State != StateBroadcast || got.RawHex != w.RawHex {
+		t.Fatalf("file holds %+v; want the broadcast record", got)
+	}
+}
+
 // The reservation of a Built intent is renewed on every unsettled broadcast
 // attempt. With a 40 ms TTL and a network that keeps losing replies, a second
 // withdrawal submitted after several TTLs must still not select the first

@@ -211,13 +211,13 @@ func (r *Reconciler) reconcile() Report {
 		case out == nil:
 			rep.Findings = append(rep.Findings, Finding{TxID: u.TxID, Vout: u.Vout, Address: u.Address,
 				CacheVal: u.Value, Missing: true, Reason: "in cache, not in the node's UTXO set"})
-		case out.ValueShors() != u.Value:
-			rep.NodeTotal += out.ValueShors()
+		case out.Value != u.Value:
+			rep.NodeTotal += out.Value
 			rep.Findings = append(rep.Findings, Finding{TxID: u.TxID, Vout: u.Vout, Address: u.Address,
-				CacheVal: u.Value, NodeVal: out.ValueShors(),
-				Reason: fmt.Sprintf("cache value %d, node value %d", u.Value, out.ValueShors())})
+				CacheVal: u.Value, NodeVal: out.Value,
+				Reason: fmt.Sprintf("cache value %d, node value %d", u.Value, out.Value)})
 		default:
-			rep.NodeTotal += out.ValueShors()
+			rep.NodeTotal += out.Value
 		}
 	}
 	if len(rep.Findings) == 0 && absInt64(rep.CacheTotal-rep.NodeTotal) > r.cfg.DeltaThreshold {
