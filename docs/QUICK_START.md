@@ -135,7 +135,7 @@ func main() {
 		log.Fatal("Load keystore:", err)
 	}
 
-	myAddr := keystore.GetSignableAddresses()[0]
+	myAddr := keystore.GetAddresses()[0]
 	recipientAddr := "ssq1p..." // whoever you are paying
 
 	if err := elx.TrackAddresses([]string{myAddr}); err != nil {

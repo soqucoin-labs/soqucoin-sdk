@@ -59,12 +59,12 @@ func main() {
 	if err := os.MkdirAll(*dir, 0o700); err != nil {
 		log.Fatal(err)
 	}
+	// Load refuses a missing file; only -init, the first run, may create one.
 	keystore := keys.NewManager(filepath.Join(*dir, "keys.enc"), passphrase)
-	if err := keystore.Load(); err != nil {
-		log.Fatalf("load keystore: %v", err)
-	}
-
 	if *initKeys {
+		if err := keystore.LoadOrCreate(); err != nil {
+			log.Fatalf("create keystore: %v", err)
+		}
 		if err := createKeys(keystore); err != nil {
 			log.Fatal(err)
 		}
@@ -73,6 +73,9 @@ func main() {
 	if *inputs == "" || *to == "" || *amountSOQ <= 0 || *confirmations < 1 {
 		flag.Usage()
 		os.Exit(2)
+	}
+	if err := keystore.Load(); err != nil {
+		log.Fatalf("load keystore: %v", err)
 	}
 	if err := run(*dir, keystore, *inputs, *to, *amountSOQ*types.ShorsPerSOQ, *confirmations); err != nil {
 		log.Fatal(err)
@@ -95,7 +98,7 @@ func createKeys(keystore *keys.Manager) error {
 
 	var addrs []string
 	for index := uint32(0); len(addrs) < 2; index++ {
-		seed, err := keys.DeriveSeed(master, index)
+		seed, err := keys.DeriveSeed(master, network.HRP, index)
 		if err != nil {
 			return err
 		}
@@ -217,7 +220,7 @@ func run(dir string, keystore *keys.Manager, inputList, to string, amount, requi
 // unconfirmed or paid to any other script is refused.
 func fundingUTXOs(node *rpc.Client, keystore *keys.Manager, list string) ([]types.UTXO, string, error) {
 	scripts := map[string]string{}
-	for _, addr := range keystore.GetSignableAddresses() {
+	for _, addr := range keystore.GetAddresses() {
 		spk, err := address.ScriptFor(addr)
 		if err != nil {
 			return nil, "", err

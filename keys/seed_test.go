@@ -85,54 +85,102 @@ func TestFromSeedIsDeterministicAndSeedsDiffer(t *testing.T) {
 	}
 }
 
-// DeriveSeed is a published scheme: HMAC-SHA256(master, domain || index).
-// These vectors pin it. An integrator who implements the scheme in their own
-// key-management system must land on the same seeds and addresses; a change
-// to the domain string or the index encoding fails here first.
+// DeriveSeed is a published scheme: HMAC-SHA256(master, domain || hrp || "/"
+// || index). These vectors pin it. An integrator who implements the scheme in
+// their own key-management system must land on the same seeds and addresses;
+// a change to the domain string, the HRP encoding or the index encoding fails
+// here first.
 func TestDeriveSeedVectors(t *testing.T) {
 	var master [32]byte
 	for i := range master {
 		master[i] = byte(i)
 	}
 	cases := []struct {
+		hrp     string
 		index   uint32
 		seed    string
-		address string // FromSeed("sq", seed)
+		address string // FromSeed(hrp, seed)
 	}{
-		{0, "fbb22041c07fe40cc7a1678a3afb411b6005640d625f46f0f286e4e9b50b662d", "sq1pz5ynntauhsf42tr0qe49ne48m7k6ujv4dac5xkeua0q782gyw0ns96tyy7"},
-		{1, "5ccbff2bef90678dba6301e419453279ea13081220d7ababf1f4f7222afe8f03", "sq1pq9x6dhgqwh88aaen23dzqe58u9d2f7kfhnhhn6dmsejnnepvdtqseu6qwp"},
-		{0xFFFFFFFF, "1f5edd8755f63111a41a2675e8340fa1298d5517b158a6c4073790d8210377c3", "sq1pww8ccgjk7wtgcngvf5xxz0z2m72pcdxqnyzy45s3urp3t4nmzkuswc953d"},
+		{"sq", 0, "d69ce1bf3460d6d29ac7fda99eb661d8d3e356f503517488230da95bfa2522da", "sq1py24wh5pnmv0r2sxkp6szq4t3ffwgjsmkk9wwkmdwm623mg5jw5dqpvfrfg"},
+		{"sq", 1, "bf84c2ed07fe03340293480578bbd2be6b46aaeb642ffee9a86b2af2aef783ad", "sq1pxaq2fv8j6fayzlgyce967w7fuymqxytsk4fu2zdyx80er7julg8s4uyqdp"},
+		{"sq", 0xFFFFFFFF, "cc9e53ef5f1589ff6b18f7949b8c49a6a9c4de60bb8b18edc1780cc3a1c47d30", "sq1pgrtjsngzgflau69sa9vmlr98u3xfznqx7thgczfeqfl9xj7m7q4s0l5utv"},
+		{"ssq", 0, "3e8199d248b1937624e7957516bc76f48ea3da350a2cd502fe0e0e759f68ca48", "ssq1p03cjmljk8mmruetjg46h23qsqtlzvwldd66wwup2cg7m0a7w9pussyseaz"},
+		{"ssq", 1, "192ac037c943c34c02e2a4a5e1b616fcb2008dd0a0812259d545d8995c47d5cf", "ssq1plu2t4n0p0fq7fek93ytap00ak4the6ddf2c6wsnwxtq3m3gz36qqs9y3pc"},
+		{"ssq", 0xFFFFFFFF, "e945274e9f692fa3f89d7a7accebe8019d55499505e614f7b8843cb207355fd2", "ssq1p50czjtcfmwhmrcw0pn9suhzl85lyu35k2xxqqfqq9zsx7ld5pd2qmkf90h"},
 	}
 	for _, c := range cases {
-		seed, err := DeriveSeed(master[:], c.index)
+		seed, err := DeriveSeed(master[:], c.hrp, c.index)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got := hex.EncodeToString(seed[:]); got != c.seed {
-			t.Errorf("index %d: seed %s, want %s", c.index, got, c.seed)
+			t.Errorf("%s/%d: seed %s, want %s", c.hrp, c.index, got, c.seed)
 		}
-		kp, err := FromSeed("sq", seed)
+		kp, err := FromSeed(c.hrp, seed)
 		if err != nil {
-			t.Fatalf("index %d: %v", c.index, err)
+			t.Fatalf("%s/%d: %v", c.hrp, c.index, err)
 		}
 		if kp.Address != c.address {
-			t.Errorf("index %d: address %s, want %s", c.index, kp.Address, c.address)
+			t.Errorf("%s/%d: address %s, want %s", c.hrp, c.index, kp.Address, c.address)
 		}
 	}
 }
 
-func TestDeriveSeedRefusesShortMasterAndSeparatesInputs(t *testing.T) {
-	if _, err := DeriveSeed(make([]byte, MinMasterSize-1), 0); !errors.Is(err, ErrShortMaster) {
+// The attack the network binding closes: a production master that reaches a
+// stagenet host. Under v1 the stagenet key at every index was the mainnet key
+// with another prefix; under v2 the two derivations share nothing.
+func TestDeriveSeedBindsTheNetwork(t *testing.T) {
+	master := bytes.Repeat([]byte{0x5A}, 32)
+	main, err := DeriveSeed(master, "sq", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := DeriveSeed(master, "ssq", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main == stage {
+		t.Fatal("mainnet and stagenet derive the same seed for one master and index")
+	}
+	kpMain, err := FromSeed("sq", main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kpStage, err := FromSeed("ssq", stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(kpMain.PublicKey, kpStage.PublicKey) {
+		t.Fatal("mainnet and stagenet derive the same key")
+	}
+	// A stagenet key re-encoded with the mainnet prefix is not a mainnet
+	// deposit address this master ever produced.
+	reencoded, err := AddressFor("sq", kpStage.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reencoded == kpMain.Address {
+		t.Fatal("the stagenet key re-encoded for mainnet is the mainnet deposit address")
+	}
+}
+
+func TestDeriveSeedRefusesShortMasterUnknownHRPAndSeparatesInputs(t *testing.T) {
+	if _, err := DeriveSeed(make([]byte, MinMasterSize-1), "sq", 0); !errors.Is(err, ErrShortMaster) {
 		t.Fatalf("31-byte master accepted: %v", err)
 	}
-	if _, err := DeriveSeed(nil, 0); !errors.Is(err, ErrShortMaster) {
+	if _, err := DeriveSeed(nil, "sq", 0); !errors.Is(err, ErrShortMaster) {
 		t.Fatalf("nil master accepted: %v", err)
 	}
 	m1 := bytes.Repeat([]byte{0xA5}, 32)
+	for _, hrp := range []string{"", "bc", "SQ", "sq/", "soq"} {
+		if _, err := DeriveSeed(m1, hrp, 0); !errors.Is(err, ErrUnknownHRP) {
+			t.Errorf("hrp %q accepted: %v", hrp, err)
+		}
+	}
 	m2 := bytes.Repeat([]byte{0xA5}, 33)
-	s10, _ := DeriveSeed(m1, 0)
-	s11, _ := DeriveSeed(m1, 1)
-	s20, _ := DeriveSeed(m2, 0)
+	s10, _ := DeriveSeed(m1, "sq", 0)
+	s11, _ := DeriveSeed(m1, "sq", 1)
+	s20, _ := DeriveSeed(m2, "sq", 0)
 	if s10 == s11 {
 		t.Error("indices 0 and 1 derive the same seed")
 	}
@@ -142,9 +190,9 @@ func TestDeriveSeedRefusesShortMasterAndSeparatesInputs(t *testing.T) {
 	// The scheme as an integrator would write it in their own key-management
 	// system, spelled out independently of DeriveSeed's implementation.
 	mac := hmac.New(sha256.New, m1)
-	mac.Write([]byte("soqucoin-sdk/keys/seed/v1"))
+	mac.Write([]byte("soqucoin-sdk/keys/seed/v2/sq/"))
 	mac.Write([]byte{0, 0, 0, 1})
 	if !bytes.Equal(mac.Sum(nil), s11[:]) {
-		t.Error("DeriveSeed(index 1) is not HMAC-SHA256(master, domain || 00000001)")
+		t.Error("DeriveSeed(sq, 1) is not HMAC-SHA256(master, domain || \"sq/\" || 00000001)")
 	}
 }

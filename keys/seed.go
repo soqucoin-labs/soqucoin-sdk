@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa44"
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 // SeedSize is the length of the seed FIPS 204 KeyGen takes; FromSeed takes
@@ -19,12 +21,22 @@ const SeedSize = mldsa44.SeedSize
 const MinMasterSize = 32
 
 // seedDomain separates SDK deposit-key seeds from any other value an
-// integrator derives from the same master secret. Changing it changes every
-// derived address; it is part of the scheme, not a tunable.
-const seedDomain = "soqucoin-sdk/keys/seed/v1"
+// integrator derives from the same master secret, and, with the HRP that
+// follows it, one network's seeds from another's. Changing it changes every
+// derived address; it is part of the scheme, not a tunable. v1 had no
+// network in the message and was replaced before any integrator derived an
+// address under it.
+const seedDomain = "soqucoin-sdk/keys/seed/v2/"
 
-// ErrShortMaster marks a master secret shorter than MinMasterSize bytes.
-var ErrShortMaster = errors.New("keys: master secret is shorter than 32 bytes")
+var (
+	// ErrShortMaster marks a master secret shorter than MinMasterSize bytes.
+	ErrShortMaster = errors.New("keys: master secret is shorter than 32 bytes")
+
+	// ErrUnknownHRP marks an address prefix that belongs to no Soqucoin
+	// network. DeriveSeed refuses it rather than derive keys for a network
+	// that does not exist.
+	ErrUnknownHRP = errors.New("keys: address prefix belongs to no known network")
+)
 
 // FromSeed derives the ML-DSA-44 keypair FIPS 204 KeyGen produces from seed,
 // and its bech32m address for hrp ("sq" mainnet, "ssq" stagenet). The
@@ -62,26 +74,39 @@ func FromSeed(hrp string, seed [SeedSize]byte) (*KeyPair, error) {
 }
 
 // DeriveSeed returns the FromSeed seed for one derivation index under a
-// master secret:
+// master secret, for the network whose address prefix is hrp:
 //
-//	HMAC-SHA256(key = master, message = "soqucoin-sdk/keys/seed/v1" || index as 4 bytes big-endian)
+//	HMAC-SHA256(key = master, message = "soqucoin-sdk/keys/seed/v2/" || hrp || "/" || index as 4 bytes big-endian)
 //
 // One master secret held in your key-management system therefore yields one
-// key and one address per index, and the master plus the index a user was
-// given are the only recovery material. When FromSeed refuses the seed for an
-// index (ErrInvalidPublicKey), give the user the next index and record it;
-// the refused index stays unused.
+// key and one address per network and index, and the master plus the index a
+// user was given are the only recovery material. Pass the same hrp to
+// FromSeed. When FromSeed refuses the seed for an index
+// (ErrInvalidPublicKey), give the user the next index and record it; the
+// refused index stays unused.
+//
+// The network is part of the message so that one master derives different
+// keys on mainnet and stagenet: a production master that reaches a test host
+// yields that host stagenet keys only, never a key that also spends mainnet
+// funds. It is not a defence against the master itself leaking; whoever holds
+// the master derives every key on every network.
 //
 // The master must be at least MinMasterSize bytes of secret random data.
 // DeriveSeed refuses a shorter one (ErrShortMaster) because every address
-// derived from a guessable master is spendable by whoever guesses it.
-func DeriveSeed(master []byte, index uint32) ([SeedSize]byte, error) {
+// derived from a guessable master is spendable by whoever guesses it. An hrp
+// that belongs to no Soqucoin network is refused (ErrUnknownHRP).
+func DeriveSeed(master []byte, hrp string, index uint32) ([SeedSize]byte, error) {
 	var seed [SeedSize]byte
 	if len(master) < MinMasterSize {
 		return seed, ErrShortMaster
 	}
+	if len(types.GenesisHashesForHRP(hrp)) == 0 {
+		return seed, fmt.Errorf("%w: %q", ErrUnknownHRP, hrp)
+	}
 	mac := hmac.New(sha256.New, master)
 	mac.Write([]byte(seedDomain))
+	mac.Write([]byte(hrp))
+	mac.Write([]byte{'/'})
 	var idx [4]byte
 	binary.BigEndian.PutUint32(idx[:], index)
 	mac.Write(idx[:])
