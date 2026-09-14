@@ -38,9 +38,15 @@ var ErrShortMaster = errors.New("keys: master secret is shorter than 32 bytes")
 // nothing else, because a deterministic scheme has no next draw. Record the
 // index as skipped and derive the next one (see DeriveSeed).
 //
-// The seed is the private key. FromSeed does not keep it; zero the caller's
-// copy when the KeyPair is no longer needed.
+// The seed is the private key. FromSeed zeroes its own copy before returning
+// and keeps nothing; zero the caller's copy when the KeyPair is no longer
+// needed.
 func FromSeed(hrp string, seed [SeedSize]byte) (*KeyPair, error) {
+	defer func() {
+		for i := range seed {
+			seed[i] = 0
+		}
+	}()
 	pk, sk := mldsa44.NewKeyFromSeed(&seed)
 	pkBytes := pk.Bytes()
 	addr, err := AddressFor(hrp, pkBytes)

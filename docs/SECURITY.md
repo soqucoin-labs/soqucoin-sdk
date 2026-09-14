@@ -44,7 +44,9 @@ Deposit keys are derived, not stored. `keys.DeriveSeed(master, index)` and
 and index on every run, so the master secret in your key-management system and
 the index recorded with each user are the only recovery material. The seed is
 the private key: hold the master with at least the care of a hot-wallet key, and
-zero seeds after use (see [Memory hygiene](#memory-hygiene)). `FromSeed`
+zero seeds after use (see [Memory hygiene](#memory-hygiene)). The scheme does not
+include the network, so a stagenet host gets its own master; a production master
+on a test host exposes mainnet keys there. `FromSeed`
 refuses the roughly 1 seed in 256 whose key the node can never spend from
 (`keys.ErrInvalidPublicKey`); skip that index rather than retrying with it.
 
