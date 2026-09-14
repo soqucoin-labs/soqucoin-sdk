@@ -63,8 +63,9 @@ type Client struct {
 	stopCh       chan struct{}
 	stopOnce     sync.Once
 
-	lastRefreshAt  time.Time // guarded by mu: last time EVERY tracked address refreshed
-	lastRefreshErr error     // guarded by mu: error of the last RefreshAll, nil on success
+	lastRefreshAt  time.Time                // guarded by mu: last time EVERY tracked address refreshed
+	lastRefreshErr error                    // guarded by mu: error of the last RefreshAll, nil on success
+	refreshed      map[string]refreshRecord // guarded by mu: per tracked address, see LastRefreshOf
 
 	// HRP is the network prefix the tracked addresses must carry. Leave it
 	// empty and TrackAddresses infers it from the addresses themselves; set it
@@ -104,6 +105,13 @@ type Client struct {
 // For a private CA or a pinned certificate, set TLSConfig directly instead.
 func (c *Client) UseTLS() {
 	c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+}
+
+// refreshRecord is one address's refresh state: when it last refreshed
+// successfully and the error of the most recent attempt, nil on success.
+type refreshRecord struct {
+	at  time.Time
+	err error
 }
 
 // request is a JSON-RPC request to ElectrumX.
@@ -155,6 +163,7 @@ const maxSkippedLines = 64
 func NewClient(host string, pollInterval time.Duration) *Client {
 	return &Client{
 		utxos:        make(map[string][]types.UTXO),
+		refreshed:    make(map[string]refreshRecord),
 		host:         host,
 		pollInterval: pollInterval,
 		stopCh:       make(chan struct{}),
@@ -446,6 +455,15 @@ func (c *Client) TrackAddresses(addresses []string) error {
 	c.mu.Lock()
 	c.HRP = hrp
 	c.addresses = append([]string(nil), addresses...)
+	tracked := make(map[string]bool, len(addresses))
+	for _, a := range addresses {
+		tracked[a] = true
+	}
+	for a := range c.refreshed {
+		if !tracked[a] {
+			delete(c.refreshed, a)
+		}
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -455,7 +473,14 @@ func (c *Client) TrackAddresses(addresses []string) error {
 // One failing address does not stop the others: every address is attempted
 // and the returned error joins the failures, naming each address. The result
 // is recorded for LastRefresh, which callers must consult before treating an
-// empty UTXO set as "no deposits".
+// empty UTXO set as "no deposits", and per address for LastRefreshOf.
+//
+// The pass is one blockchain.scripthash.listunspent per tracked address, in
+// sequence, on the one connection, each under the 30-second call deadline, so
+// a pass takes the sum of the round trips. deposit.Monitor treats an address
+// as stale once its last successful refresh is older than its MaxCacheAge,
+// which puts a ceiling on the addresses one client can keep fresh: at a
+// 5-minute MaxCacheAge, about 300 seconds divided by the round trip.
 func (c *Client) RefreshAll() error {
 	c.mu.RLock()
 	addrs := make([]string, len(c.addresses))
@@ -464,9 +489,18 @@ func (c *Client) RefreshAll() error {
 
 	var errs []error
 	for _, addr := range addrs {
-		if err := c.refreshAddress(addr); err != nil {
+		err := c.refreshAddress(addr)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
 		}
+		c.mu.Lock()
+		rec := c.refreshed[addr]
+		rec.err = err
+		if err == nil {
+			rec.at = time.Now()
+		}
+		c.refreshed[addr] = rec
+		c.mu.Unlock()
 	}
 	err := errors.Join(errs...)
 
@@ -488,6 +522,18 @@ func (c *Client) LastRefresh() (time.Time, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastRefreshAt, c.lastRefreshErr
+}
+
+// LastRefreshOf reports when one tracked address last refreshed successfully
+// and the error of the most recent attempt for it, nil on success. The zero
+// time means never: the address is not tracked, or no pass has reached it.
+// deposit.Monitor uses it to skip only the addresses the indexer has not
+// answered for instead of pausing every credit when one of thousands fails.
+func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	rec := c.refreshed[addr]
+	return rec.at, rec.err
 }
 
 // refreshAddress fetches UTXOs for a single address via ElectrumX.
@@ -741,14 +787,20 @@ func (c *Client) EvictUTXO(txid string, vout uint32) {
 	}
 }
 
-// AddChangeUTXO injects a known change output into the UTXO cache immediately
-// after broadcast. This eliminates the delay between broadcast and ElectrumX
-// discovering the new UTXO — critical for back-to-back payments.
+// AddChangeUTXO records a change output in the UTXO cache before the indexer
+// reports it, at height 0. It shows in GetBalance's unconfirmed figure and in
+// GetUTXOs at once; the next refresh replaces it with the indexer's record, or
+// drops it if the indexer does not know the transaction yet.
 //
-// Defense 13 (DL-ENTERPRISE-PAYOUT): The change output from a payment TX is
-// deterministic — the builder knows the exact txid, vout, value, and address.
-// By adding it to the cache with height=0 (unconfirmed), it becomes available
-// for the next payment's coin selection immediately.
+// It does not make the change spendable. utxo.CoinSelector selects only
+// outputs with a height above zero at the confirmations asked for, so change
+// becomes an input once it has confirmed and the indexer reports it, whether
+// or not it was injected here. A run that needs the change of one payment to
+// fund the next stalls; keep enough confirmed outputs for the run instead.
+//
+// Deprecated: the injection has no effect on selection and the cache shows
+// the output within one poll anyway. Kept for callers that read the
+// unconfirmed balance; it may be removed in v0.4.
 func (c *Client) AddChangeUTXO(txid string, vout uint32, value int64, addr string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

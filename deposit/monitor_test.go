@@ -113,6 +113,16 @@ func (l *fakeLedger) MarkFinal(txid string, vout uint32) error {
 	return nil
 }
 
+// fakeCachePerAddr is a cache that also reports freshness per address, as
+// *electrumx.Client does.
+type fakeCachePerAddr struct {
+	fakeCache
+	ats  map[string]time.Time
+	errs map[string]error
+}
+
+func (c *fakeCachePerAddr) LastRefreshOf(a string) (time.Time, error) { return c.ats[a], c.errs[a] }
+
 type alerts struct{ kinds []AlertKind }
 
 func (a *alerts) fn(k AlertKind, _ string) { a.kinds = append(a.kinds, k) }
@@ -404,5 +414,60 @@ func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 	deposit(m, cache, node, a)
 	if got, err := m.Scan(); err != nil || len(got) != 0 || len(al.kinds) != 0 {
 		t.Fatalf("unset network: got %+v, err %v, alerts %v; want no credit, no error, no alert", got, err, al.kinds)
+	}
+}
+
+// With per-address freshness, one address the indexer has not refreshed is
+// skipped and alarmed while the others are credited; only when every address
+// is stale does the scan pause. The global LastRefresh is not consulted.
+func TestStaleAddressesAreSkippedNotAllOfThem(t *testing.T) {
+	m, _, node, led, al, a1 := setup(t)
+	a2 := addr(t, 0x22)
+	now := m.now()
+	cache := &fakeCachePerAddr{
+		fakeCache: fakeCache{utxos: map[string][]types.UTXO{}, at: time.Time{}, err: errors.New("one address failed")},
+		ats:       map[string]time.Time{a1: now, a2: now.Add(-time.Hour)},
+		errs:      map[string]error{a2: errors.New("boom")},
+	}
+	m.Cache = cache
+	m.Addresses = func() []string { return []string{a1, a2} }
+	cache.utxos[a1] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a1}}
+	cache.utxos[a2] = []types.UTXO{{TxID: txB, Vout: 0, Value: 150_000_000, Height: 900, Address: a2}}
+	node.outs[key(txA, 0)] = txout(t, a1, 150_000_000, 101, false)
+	node.outs[key(txB, 0)] = txout(t, a2, 150_000_000, 101, false)
+
+	got, err := m.Scan()
+	if err != nil {
+		t.Fatalf("one stale address must not pause the scan: %v", err)
+	}
+	if len(got) != 1 || got[0].TxID != txA {
+		t.Fatalf("credited %+v, want only the fresh address's deposit", got)
+	}
+	if _, ok := led.credited[key(txB, 0)]; ok {
+		t.Fatal("a deposit at a stale address was credited")
+	}
+	if !al.has(AlertCacheStale) {
+		t.Fatal("the stale address was not alarmed")
+	}
+
+	// Every address stale: paused, nothing credited.
+	cache.ats[a1] = now.Add(-time.Hour)
+	al.kinds = nil
+	if _, err := m.Scan(); !errors.Is(err, ErrPaused) || !al.has(AlertCacheStale) {
+		t.Fatalf("all stale: err=%v alerts=%v", err, al.kinds)
+	}
+	if _, ok := led.credited[key(txB, 0)]; ok {
+		t.Fatal("credited while every address was stale")
+	}
+
+	// A never-refreshed address is stale too; a refreshed one is credited.
+	cache.ats[a1] = now
+	delete(cache.ats, a2)
+	if got, err := m.Scan(); err != nil || len(got) != 0 {
+		t.Fatalf("a1 already credited, a2 never refreshed: %v %+v", err, got)
+	}
+	cache.ats[a2] = now
+	if got, err := m.Scan(); err != nil || len(got) != 1 || got[0].TxID != txB {
+		t.Fatalf("after a2 refreshed: %v %+v", err, got)
 	}
 }

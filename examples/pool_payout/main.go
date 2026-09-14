@@ -9,10 +9,16 @@
 //   - Build, sign, broadcast and confirm, with the txid checked against the node
 //
 // The ordering here is deliberate and worth copying: nothing is recorded as spent
-// and no change is injected until the node has ACCEPTED the transaction. Marking
-// inputs spent optimistically drops them from selection while they are still
-// spendable, and recording a payout that did not land is how a pool marks a miner
-// paid without paying them. -dry-run stops before any of those effects.
+// until the node has ACCEPTED the transaction. Marking inputs spent
+// optimistically drops them from selection while they are still spendable, and
+// recording a payout that did not land is how a pool marks a miner paid without
+// paying them. -dry-run stops before any of those effects.
+//
+// Each payout is one transaction and its change is not spendable until it has
+// confirmed and the indexer reports it (the selector takes no output at height
+// 0), so a run needs enough confirmed outputs to fund every payout in it; with
+// one large output the second payout fails for lack of inputs. Split the hot
+// wallet into several outputs ahead of a run, or wait a block between payouts.
 //
 // Usage:
 //
@@ -326,16 +332,12 @@ func executePayout(
 		return "", fmt.Errorf("broadcast: %w", err)
 	}
 
-	// Only now, with the transaction accepted, record the effects. A spent-set
+	// Only now, with the transaction accepted, record the effect. A spent-set
 	// write failure here is an alert, not a retry: the payment is out and this
-	// process still refuses the inputs; a restart would not.
+	// process still refuses the inputs; a restart would not. The change output
+	// reaches the cache on the next poll and becomes an input once confirmed.
 	if err := spentSet.MarkBroadcast(verified, txid); err != nil {
 		log.Printf("ALERT %s broadcast, spent set not written: %v", shortID(txid, 16), err)
-	}
-	if changeAmount > 0 {
-		// Defense 13: make change spendable immediately rather than waiting for
-		// the next ElectrumX poll, so back-to-back payouts do not stall.
-		elxClient.AddChangeUTXO(txid, 1, changeAmount, changeAddr)
 	}
 	return txid, nil
 }
