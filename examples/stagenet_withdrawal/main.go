@@ -159,7 +159,7 @@ func run(dir string, keystore *keys.Manager, inputList, to string, amount, requi
 		Broadcaster:           node,
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
 		RequiredConfirmations: required,
-		ReservationTTL:        15 * time.Minute,
+		// ReservationTTL left at its default, withdraw.DefaultReservationTTL.
 		Select: func(amount, feeRate int64) ([]types.UTXO, error) {
 			if err := node.RequireSynced(); err != nil {
 				return nil, err
