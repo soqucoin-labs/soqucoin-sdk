@@ -483,7 +483,7 @@ func (c *Client) FeeRateShorsPerVB(confTarget int) (FeeEstimate, error) {
 		Blocks  int         `json:"blocks"`
 	}
 	if err := json.Unmarshal(result, &resp); err != nil {
-		return FeeEstimate{}, fmt.Errorf("parse fee estimate: %w", err)
+		return FeeEstimate{}, fmt.Errorf("parse fee estimate: %w: %v", types.ErrAmountFormat, err)
 	}
 	if strings.HasPrefix(resp.FeeRate.String(), "-") {
 		return FeeEstimate{Rate: floor, Fallback: true}, nil

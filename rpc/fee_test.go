@@ -98,11 +98,11 @@ func TestFeeRateShorsPerVBErrors(t *testing.T) {
 	if _, err := c.FeeRateShorsPerVB(6); !errors.Is(err, ErrTransient) {
 		t.Errorf("warmup: %v, want ErrTransient", err)
 	}
-	for _, reply := range []string{`{"blocks":6}`, `{"feerate":"abc","blocks":6}`, `{"feerate":1e-4,"blocks":6}`, `{"feerate":0.000000001,"blocks":6}`} {
+	for _, reply := range []string{`{"blocks":6}`, `{"feerate":null,"blocks":6}`, `{"feerate":"abc","blocks":6}`, `{"feerate":true,"blocks":6}`, `{"feerate":1e-4,"blocks":6}`, `{"feerate":0.000000001,"blocks":6}`} {
 		c, _ := feeServer(t, reply)
 		got, err := c.FeeRateShorsPerVB(6)
-		if err == nil || got.Fallback {
-			t.Errorf("%s: %+v, %v; want an error and no fallback", reply, got, err)
+		if !errors.Is(err, types.ErrAmountFormat) || errors.Is(err, ErrTransient) || errors.Is(err, ErrPermanent) || got.Fallback {
+			t.Errorf("%s: %+v, %v; want ErrAmountFormat and no fallback", reply, got, err)
 		}
 	}
 }

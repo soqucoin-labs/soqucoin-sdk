@@ -183,7 +183,7 @@ func TestRefusesWhatTheNodeDoesNotConfirm(t *testing.T) {
 		{"output does not exist on the node",
 			types.UTXO{TxID: txA, Vout: 0, Value: 100, Height: 900}, nil},
 		{"indexer inflates the value",
-			types.UTXO{TxID: txA, Vout: 0, Value: 200_000_000, Height: 900}, nil}, // set below with real value 1.5
+			types.UTXO{TxID: txA, Vout: 0, Value: 200_000_000, Height: 900}, nil}, // set below with real value 150_000_000
 		{"indexer attributes another address's output to ours",
 			types.UTXO{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900}, nil}, // set below with other script
 		{"indexer claims depth the node has not seen",

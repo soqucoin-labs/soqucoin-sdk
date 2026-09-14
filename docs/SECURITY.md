@@ -301,7 +301,9 @@ Every request carries the RPC password in a Basic Auth header. The client refuse
 URL whose host is not loopback (`127.0.0.0/8`, `::1` or the name `localhost`, read
 from the URL without resolving it) with `rpc.ErrRemoteNode` before anything is sent,
 until `AllowRemote` is set. A URL copied from another deployment, or mistyped, fails
-instead of handing the password to whichever host it names.
+instead of handing the password to whichever host it names. The client does not follow
+an HTTP redirect either: a node never sends one, and a proxy that answers `http://` with a
+redirect to `https://` fails as a transport error instead of being followed.
 
 - Bind `soqucoind` RPC to `127.0.0.1` and never expose it publicly. The node itself
   speaks plaintext only.
