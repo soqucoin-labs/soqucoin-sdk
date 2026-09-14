@@ -85,8 +85,12 @@ if err := keystore.LoadOrCreate(); err != nil {
 `tx.BuildAndSign` and the private key never leaves the manager. The only method
 that returns private key material is `ExportPrivateKey`, which returns a copy and
 is named so that a search of your code base finds every use. `PublicKeyFor`
-returns a copy too, and printing a `keys.KeyPair` with any `fmt` verb, `%d` and
-`%x` included, shows the address and the public key hash, never the private key.
+returns a copy too. Printing a `keys.KeyPair`, a pointer to one, or a struct,
+slice or map holding one in an exported position shows the address and the public
+key hash under every `fmt` verb, `%d` and `%x` included, never the private key.
+Two shapes `fmt` prints raw and no method can intercept: `%p` applied to a
+non-pointer, and a `KeyPair` behind an unexported struct field. Do not hold a
+`KeyPair` where a struct dump can reach it that way.
 
 ### Passphrase handling
 

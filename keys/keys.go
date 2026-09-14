@@ -52,10 +52,13 @@ func (k KeyPair) String() string {
 	return fmt.Sprintf("keys.KeyPair{Address: %s, PubKeyHash: %s, Index: %d}", k.Address, PubKeyHashHex(k.PublicKey), k.Index)
 }
 
-// Format makes every fmt verb print String: a Stringer alone covers %v and
-// %s, and %d or %x on the struct would still walk the fields and print all
-// 2560 private-key bytes. A KeyPair that reaches a log line or an error
-// message through any verb discloses nothing that spends.
+// Format makes every fmt verb print String for a KeyPair, a pointer to one,
+// and one held in an exported field, a slice or a map: a Stringer alone
+// covers the string verbs, and %d or %x on the struct would still walk the
+// fields and print all 2560 private-key bytes. Two shapes fmt prints raw
+// with no method dispatch and nothing here can change: %p applied to a
+// non-pointer, and a KeyPair behind an unexported struct field. Do not hold
+// a KeyPair where a struct dump can reach it that way.
 func (k KeyPair) Format(f fmt.State, verb rune) { io.WriteString(f, k.String()) }
 
 // Keystore holds encrypted key material on disk.
