@@ -270,3 +270,34 @@ func TestReleasePruneAndConfirmReportPersistFailure(t *testing.T) {
 		t.Errorf("confirming an untracked input wrote to disk: %v", err)
 	}
 }
+
+// ReservedIntents names every intent holding a reservation, live or expired,
+// once each; broadcast and confirmed entries are not reservations.
+func TestReservedIntentsListsReservationsOnly(t *testing.T) {
+	ss := NewSpentSet("")
+	if got := ss.ReservedIntents(); len(got) != 0 {
+		t.Fatalf("empty set: %v", got)
+	}
+	if err := ss.Reserve(rUTXOs(), "w2", time.Hour); err != nil { // two inputs, one id
+		t.Fatal(err)
+	}
+	expired := types.UTXO{TxID: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", Vout: 0}
+	if err := ss.Reserve([]types.UTXO{expired}, "w1", time.Nanosecond); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	sent := types.UTXO{TxID: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Vout: 0}
+	if err := ss.MarkBroadcastFor([]types.UTXO{sent}, "txid-d", "w3"); err != nil {
+		t.Fatal(err)
+	}
+	got := ss.ReservedIntents()
+	if len(got) != 2 || got[0] != "w1" || got[1] != "w2" {
+		t.Fatalf("reserved intents %v, want [w1 w2]: expired w1 listed, w2 once, broadcast w3 absent", got)
+	}
+	if err := ss.MarkBroadcastFor(rUTXOs(), "txid-ab", "w2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ss.ReservedIntents(); len(got) != 1 || got[0] != "w1" {
+		t.Fatalf("after w2 broadcast: %v, want [w1]", got)
+	}
+}

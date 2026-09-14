@@ -428,7 +428,20 @@ cannot afford impossible by construction:
   spent set and the intent file are synced to disk before the call that wrote them returns, and
   the directory after the rename, so a power loss right after `Broadcast` returns does not lose
   the record of it. Every unsettled broadcast attempt renews the reservation, so retry Built intents
-  at an interval shorter than `ReservationTTL` (default 15 minutes).
+  at an interval shorter than `ReservationTTL` (default `withdraw.DefaultReservationTTL`, 4 hours).
+  The TTL is a backstop, not the cleanup: `Recover` releases every reservation held for an intent
+  the store knows as Created or Failed, so a crash between reserving and persisting frees the
+  coins at the next start, and a Built intent's bytes, which may already be in a mempool, keep
+  their inputs for hours rather than minutes. The intent store and the spent set are one unit: a
+  reservation under an id the store does not know means the intents file is missing or older than
+  the spent set, and `Recover` keeps it and returns `withdraw.ErrUnknownReservation`. Never start
+  with an empty intents file next to a populated spent set.
+- **A node that is briefly behind does not fail a withdrawal.** A selector error that is
+  `rpc.ErrTransient` (`RequireSynced` while the node is one block behind its headers, a node in
+  warmup, a transport failure) leaves the intent Created with the attempt in `Attempts` and
+  `LastError`; call `Process` again and the same id builds once the node is back. Any other
+  selector error (insufficient funds, `rpc.ErrWrongChain`, a permanent node error, your own
+  selector's failure) fails the intent.
 - **A node that accepts the bytes under a different txid** (`rpc.ErrTxIDMismatch`) is neither a
   rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
   node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
@@ -523,9 +536,9 @@ func main() {
 		Broadcaster:           node, // rpc.Broadcast resolves lost replies against the node
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
 		RequiredConfirmations: types.MaxReorgDepth,
-		ReservationTTL:        15 * time.Minute,
+		// ReservationTTL left at its default, withdraw.DefaultReservationTTL (4 hours).
 		Select: func(amount, feeRate int64) ([]types.UTXO, error) {
-			if err := node.RequireSynced(); err != nil {
+			if err := node.RequireSynced(); err != nil { // transient while behind: the intent stays Created
 				return nil, err
 			}
 			tip, err := node.GetBlockCount()
@@ -580,8 +593,10 @@ func main() {
 	intent, err := engine.Process(requestID)
 	cb.RecordResult(err) // nil = success; per-request errors are ignored; systemic ones count
 	if err != nil {
-		// rpc.ErrUnknownOutcome or rpc.ErrTransient: the intent stays Built.
-		// Call Process again later; the same bytes go out.
+		// rpc.ErrTransient from the selector: the intent stays Created and the
+		// next Process builds it. rpc.ErrUnknownOutcome or rpc.ErrTransient
+		// from the broadcast: the intent stays Built and the same bytes go out
+		// on the next Process. Check intent.State to tell them apart.
 		// rpc.ErrTxIDMismatch: also Built, inputs held, intent.NodeTxID set;
 		// the breaker counts it, and every later Process of that intent
 		// returns withdraw.ErrHeld, which also counts. Stop and investigate,
@@ -681,14 +696,14 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
-| `utxo` | **88.1%** | Coin selection, persistent spent set, reservations, restart survival of unconfirmed spends |
+| `utxo` | **93.8%** | Coin selection, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
 | `rpc` | **78.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering |
 | `deposit` | **77.3%** | Node cross-check before credit, pause conditions, vanished-credit alarm |
 | `electrumx` | **76.2%** | Id-matched replies, notification routing, merge, refresh failures, network inference, genesis check, TLS |
 | `tx` | **76.1%** | Serialized weight, output floor, amount checks, fee caps, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **75.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption, node-derived vectors |
-| `withdraw` | **73.1%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast |
+| `withdraw` | **81.5%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release |
 | `resilience` | **62.1%** | Circuit breaker transitions and classification, reconciler against the node |
 
 Also passes under the race detector (`go test -race`), which matters for `electrumx` because its

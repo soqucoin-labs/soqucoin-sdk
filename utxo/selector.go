@@ -235,6 +235,27 @@ func (ss *SpentSet) Release(intentID string) error {
 	return nil
 }
 
+// ReservedIntents returns the id of every withdrawal that holds a reservation
+// in the set, expired or not, each once, sorted. Broadcast entries are not
+// reservations and do not appear. withdraw.Engine.Recover uses it to release
+// reservations whose intent has nothing built.
+func (ss *SpentSet) ReservedIntents() []string {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	seen := map[string]bool{}
+	for _, e := range ss.entries {
+		if e.reserved() && !seen[e.IntentID] {
+			seen[e.IntentID] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // MarkBroadcast records that the given UTXOs were spent in a broadcast TX.
 // This is the PRIMARY defense against stale UTXO re-selection. Reservations
 // on these inputs become permanent spent entries.
