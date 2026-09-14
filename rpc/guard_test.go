@@ -57,7 +57,7 @@ func (ct *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 // unknown outcome.
 func TestRemoteNodeRefusedUntilAllowed(t *testing.T) {
 	transport := &countingTransport{}
-	c := NewClient("http://10.0.0.5:33389", "u", "p")
+	c := NewClient("https://10.0.0.5:33389", "u", "p")
 	c.client.Transport = transport
 
 	_, err := c.GetBlockCount()
@@ -82,6 +82,77 @@ func TestRemoteNodeRefusedUntilAllowed(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&transport.sent); n != 1 {
 		t.Fatalf("%d requests sent with AllowRemote, want 1", n)
+	}
+}
+
+// AllowRemote permits a remote host, not plaintext to it. A non-loopback URL
+// whose scheme is not https is refused before anything is sent even with
+// AllowRemote set, through every entry point, and never as an unknown
+// outcome. Without AllowRemote the same URL reads as ErrRemoteNode, so an
+// operator who did not intend a remote host learns that first.
+func TestPlaintextRemoteRefusedEvenWhenAllowed(t *testing.T) {
+	transport := &countingTransport{}
+	c := NewClient("http://10.0.0.5:33389", "u", "p")
+	c.client.Transport = transport
+
+	if _, err := c.GetBlockCount(); !errors.Is(err, ErrRemoteNode) || errors.Is(err, ErrPlaintextRemote) {
+		t.Fatalf("plaintext remote without AllowRemote: %v; want ErrRemoteNode first", err)
+	}
+
+	c.AllowRemote = true
+	_, err := c.GetBlockCount()
+	if !errors.Is(err, ErrPlaintextRemote) || !errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) || errors.Is(err, ErrRemoteNode) {
+		t.Fatalf("plaintext remote with AllowRemote: %v; want ErrPlaintextRemote (permanent)", err)
+	}
+	_, err = c.Broadcast("00", someTxID)
+	if !errors.Is(err, ErrPlaintextRemote) || errors.Is(err, ErrUnknownOutcome) {
+		t.Fatalf("broadcast over plaintext to a remote node: %v; want ErrPlaintextRemote, not an unknown outcome", err)
+	}
+	if err := c.RequireSynced(); !errors.Is(err, ErrPlaintextRemote) {
+		t.Fatalf("RequireSynced over plaintext to a remote node: %v; want ErrPlaintextRemote", err)
+	}
+	if _, err := c.FeeRateShorsPerVB(6); !errors.Is(err, ErrPlaintextRemote) {
+		t.Fatalf("FeeRateShorsPerVB over plaintext to a remote node: %v; want ErrPlaintextRemote", err)
+	}
+	if n := atomic.LoadInt32(&transport.sent); n != 0 {
+		t.Fatalf("%d requests reached the transport over plaintext to a remote host", n)
+	}
+}
+
+// The four scheme and host combinations, with AllowRemote set: loopback is
+// permitted over either scheme (the node itself speaks plaintext on
+// localhost), a remote host only over https. The scheme is read without
+// regard to case.
+func TestSchemeAndHostCombinations(t *testing.T) {
+	for _, tc := range []struct {
+		url  string
+		sent bool
+		want error
+	}{
+		{"http://127.0.0.1:33389", true, nil},
+		{"https://127.0.0.1:33389", true, nil},
+		{"http://localhost:33389", true, nil},
+		{"https://node.internal:33389", true, nil},
+		{"HTTPS://node.internal:33389", true, nil},
+		{"http://node.internal:33389", false, ErrPlaintextRemote},
+		{"HTTP://10.0.0.5:33389", false, ErrPlaintextRemote},
+		{"ws://node.internal:33389", false, ErrPlaintextRemote},
+		{"http://user:pass@node.internal:33389", false, ErrPlaintextRemote},
+	} {
+		transport := &countingTransport{}
+		c := NewClient(tc.url, "u", "p")
+		c.client.Transport = transport
+		c.AllowRemote = true
+		_, err := c.GetBlockCount()
+		if tc.want != nil && !errors.Is(err, tc.want) {
+			t.Errorf("%s: %v; want %v", tc.url, err, tc.want)
+		}
+		if tc.want == nil && (errors.Is(err, ErrPlaintextRemote) || errors.Is(err, ErrRemoteNode)) {
+			t.Errorf("%s: refused: %v", tc.url, err)
+		}
+		if got := atomic.LoadInt32(&transport.sent) == 1; got != tc.sent {
+			t.Errorf("%s: sent=%v, want %v", tc.url, got, tc.sent)
+		}
 	}
 }
 
