@@ -1,9 +1,10 @@
 # Transaction Verification Record
 
 This document lets you verify the signing path independently rather than take our
-word for it. It records a transaction **built, signed, serialized, broadcast and
-confirmed entirely by the public SDK**, with identifiers you can decode against a
-Soqucoin node yourself, and the procedure to reproduce it.
+word for it. It records two transactions **built, signed, serialized, broadcast and
+confirmed entirely by the public SDK**, the second through its withdrawal engine,
+with identifiers you can decode against a Soqucoin node yourself, and the
+procedure to reproduce them.
 
 Nothing here requires access to our infrastructure. Every identifier below is
 public on-chain data.
@@ -32,7 +33,34 @@ soqucoin-cli getrawtransaction \
   99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7 1
 ```
 
-Two things are worth checking specifically.
+## The confirmed withdrawal through `withdraw.Engine`
+
+Stagenet, three inputs, produced from the v0.3.5 tree by
+[`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal): the intent was persisted, the
+inputs reserved, the transaction broadcast through `rpc.Client.Broadcast` and confirmed through
+`withdraw.RPCConfirmer`, all against a stagenet node with `txindex=1`.
+
+| | |
+|---|---|
+| **Transaction id** | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` |
+| **Block** | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` (height 82,297) |
+| Funding transactions | `c776afdd025599fafa86707d90b55c13ead24cba705ba1950a1c12913478267b`, `43c457ab09f9666ba347663fed80a7236329d79bf07d81e3ce6240d3fe625e0c`, `f9a53afe4399fa8c83885d7f24dfeab1e80f245541fc953ff818826f528ee35c`, output 0 of each |
+| Inputs / outputs | 3 in, 2 out (payment plus change) |
+| Size / vsize | 11,444 bytes / 3,026 vB |
+| Witness stack, each input | `[2421, 1313]` bytes |
+| Network | stagenet |
+| SDK version | `v0.3.5` and later |
+
+```bash
+soqucoin-cli getrawtransaction \
+  13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be 1
+```
+
+The keys were derived with `keys.DeriveSeed` and `keys.FromSeed` from a master secret created for
+the run; the funding came from the stagenet faucet. To reproduce, run the example's `-init` step,
+fund the address it prints, and run it again with the funding outpoints.
+
+Two things are worth checking specifically on either transaction.
 
 **The witness stack sizes are 2421 and 1313, not 2420 and 1312.** The extra byte
 on each is the sighash type and the FIPS 204 key prefix; see
@@ -143,14 +171,15 @@ proceed.
 
 Stated precisely, so you can see exactly what has and has not been demonstrated.
 
-- **This is a single-input, single-signature payment.** It does not exercise
-  multi-input batching, USDSOQ asset transactions, or the authority paths.
-- **It was performed on stagenet.** Mainnet construction is covered by unit tests
+- **These are single-signature SOQ payments of one and three inputs.** They do not
+  exercise USDSOQ asset transactions or the authority paths.
+- **Both were performed on stagenet.** Mainnet construction is covered by unit tests
   across all three networks and by address vectors produced by the node's own
   encoder, but no mainnet transaction has been broadcast: the mainnet genesis
   exists (2026-09-02) and the network launches later.
-- **It proves the signing and serialization path, not the whole SDK.** The
-  deposit-monitoring path depends on an indexer and is not covered here.
+- **They prove the signing, serialization and withdrawal-engine paths, not the
+  whole SDK.** The deposit-monitoring path depends on an indexer and is not
+  covered here.
 
 Per-package unit test coverage is reported in
 [Exchange Integration](EXCHANGE_INTEGRATION.md#test-coverage-current-status).

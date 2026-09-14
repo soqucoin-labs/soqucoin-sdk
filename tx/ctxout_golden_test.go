@@ -12,10 +12,10 @@
 // per output changes every txid and every BIP143 preimage while every
 // self-referential test still passes.
 //
-// The vectors come from the production reference implementation
-// (soq-signer/internal/txbuilder/ctxout_matrix_test.go), which is itself pinned to
-// the node's own ctxout_format_matrix_tests.cpp. If consensus changes shape again,
-// these fail.
+// The golden vector is the node's own: ctxout_format_matrix_tests.cpp in the
+// soqucoin repository checks the same OP_TRUE fixture to the same bytes. The
+// pre-Phase-4 form is kept here as the negative case. If consensus changes
+// shape again, these fail.
 
 package tx
 

@@ -160,6 +160,50 @@ func TestKeystoreRoundTrip(t *testing.T) {
 	t.Log("Keystore round-trip: PASS")
 }
 
+// TestImportedKeySurvivesCallerZeroing pins that the manager owns its copy of
+// an imported key: a caller that zeroes its buffers after import, as the
+// security guide advises for seeds, must not corrupt the keystore. Before the
+// copy the record shared the caller's slices; a Save after zeroing wrote an
+// all-zero private key and Load rejected the record, with the funds at that
+// address unspendable.
+func TestImportedKeySurvivesCallerZeroing(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "keystore.enc")
+	passwd := "test-passphrase-123!"
+
+	kp, err := GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey() error: %v", err)
+	}
+	pubKey := append([]byte(nil), kp.PublicKey...)
+
+	mgr := NewManager(keyFile, passwd)
+	if err := mgr.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
+		t.Fatalf("ImportPrivateKey() error: %v", err)
+	}
+	for i := range kp.PrivateKey {
+		kp.PrivateKey[i] = 0
+	}
+	for i := range kp.PublicKey {
+		kp.PublicKey[i] = 0
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("Save() after caller zeroing: %v", err)
+	}
+
+	loaded := NewManager(keyFile, passwd)
+	if err := loaded.Load(); err != nil {
+		t.Fatalf("Load() after caller zeroing: %v", err)
+	}
+	sighash := sha256.Sum256([]byte("caller zeroing"))
+	sig, err := loaded.Sign(kp.Address, sighash[:])
+	if err != nil {
+		t.Fatalf("Sign after load: %v", err)
+	}
+	if valid, _ := Verify(pubKey, sighash[:], sig); !valid {
+		t.Fatal("signature from the reloaded key does not verify")
+	}
+}
+
 func TestKeystoreWrongPassword(t *testing.T) {
 	tmpDir := t.TempDir()
 	keyFile := filepath.Join(tmpDir, "test-keystore.enc")

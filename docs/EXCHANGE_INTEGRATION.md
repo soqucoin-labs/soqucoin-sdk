@@ -13,6 +13,9 @@ To support SOQ deposits and withdrawals, your exchange needs to:
 3. **Process withdrawals**: build, sign, and broadcast transactions
 4. **Confirm transactions**: wait for sufficient block confirmations
 
+All four run against a node you operate with `txindex=1` and an ElectrumX indexer; see
+[What you run](#what-you-run) for the configuration, ports and measured sizing.
+
 SOQ uses **NIST FIPS 204 ML-DSA-44** (Dilithium) for all signatures. Transaction structure is similar to Bitcoin/Dogecoin (UTXO model), but witness data contains Dilithium signatures (~2,420 bytes) and public keys (~1,312 bytes).
 
 ---
@@ -109,6 +112,75 @@ the operational risk sits, so it is worth settling before scoping.
 
 If neither option suits your architecture, tell us, we would rather adapt than have you commit to
 something that does not fit your operations.
+
+---
+
+## What you run
+
+Two processes: the node, and an ElectrumX indexer, yours under option A above. Everything the
+SDK reads or broadcasts goes through them.
+
+### The node
+
+| | |
+|---|---|
+| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a v2.5.0 build before the v0.3.5 tag, and the release notes record that binary's digest. |
+| `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
+| `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every node we operate runs with it. |
+| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC has no TLS. `rpc.Client` takes a URL, so either bind RPC to localhost or your private network, or terminate TLS in front of it ([Security Guide](SECURITY.md#network-security)). |
+| `stagenet=1` | For the staging network. Omit it for mainnet. |
+| `dbcache` | Our nodes run 512 MB; the node's default is 450. |
+
+Ports, as `types.Mainnet`, `types.Stagenet` and `types.Regtest` carry them (node
+`src/chainparams.cpp` and `src/chainparamsbase.cpp`):
+
+| Network | Address prefix | P2P | JSON-RPC |
+|---|---|---|---|
+| mainnet | `sq1p` | 33388 | 33389 |
+| stagenet | `ssq1p` | 28333 | 28332 |
+| regtest | `sq1p` | 18444 | 18332 |
+
+Set `Client.Network` (`c.Network = types.Mainnet`). `RequireSynced`, which `deposit.Monitor`, the
+reconciler and `VerifyAndFilterUTXOs` call, then compares the node's `chain` with `Network.ChainID`
+and refuses a mismatch with `rpc.ErrWrongChain`, so a mainnet deployment pointed at a stagenet node
+fails before it credits a deposit or signs a withdrawal. Left unset, the client applies mainnet
+rules without the check.
+
+### The indexer
+
+The ElectrumX fork at [github.com/soqucoin-labs/electrumx](https://github.com/soqucoin-labs/electrumx),
+branch `soqucoin`, tag `mainnet-genesis-2026-09-03`. Configuration is in its `SOQUCOIN.md`:
+`COIN=Soqucoin`, `NET=stagenet` or `mainnet`, `DAEMON_URL` at your node's RPC. The default TCP
+service port is 50001 (`types.Network.ElectrumPort`); TLS is whatever port you terminate it on.
+
+One operational note from running it. ElectrumX stores its history flush counter in 16 bits
+(`src/electrumx/server/history.py`, `flush_id = pack_be_uint16(self.flush_count)`). The counter
+advances on every flush, and a caught-up server flushes after each block it processes
+(`server/block_processor.py`, `_maybe_flush`), so at one block a minute an indexer uses the 65,535
+ids in about 45 days whether or not it restarts; a start or a clean shutdown flushes only when the
+height moved since the last flush (`server/db.py`, `flush_dbs`). At the limit every flush fails
+with `struct.error: 'H' format requires 0 <= number <= 65535`, the process exits, a supervisor
+restarts it, and the index stays frozen at one height. Watch the `flush #N` line the server logs
+on each flush (`flush count: N` at startup) and run `electrumx_compact_history` with the server
+stopped well before N reaches 65,535; compaction resets the counter to about the row count of
+the largest address history.
+
+### Sizing, measured
+
+Stagenet on 2026-09-14 UTC at height 82,061, read from our nodes (`getblockchaininfo`,
+`systemctl show -p MemoryCurrent`, `du`):
+
+| | |
+|---|---|
+| Node data directory with `txindex=1` | 425 MB (`size_on_disk`), of which the chainstate is 532 KB |
+| `soqucoind` resident memory | 110 MB on a node serving RPC only, 340 MB on one also feeding an indexer, both at `dbcache=512` |
+| ElectrumX database (LevelDB) | 64 MB |
+| ElectrumX resident memory | 110 MB |
+| Hosts these were read from | 4 vCPU with 8 GB running node plus indexer; 8 vCPU with 16 GB |
+
+Blocks arrive one a minute (`nPowTargetSpacing = 60`). Mainnet starts from its genesis block at
+launch, so it stays smaller than stagenet for months; plan storage from the stagenet figures and
+the growth you observe. We have not timed an initial sync on a reference host.
 
 ---
 
@@ -455,7 +527,8 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			// Budget the fee against vsize: one Dilithium input is ~1,073 vB.
+			// Budget the fee against vsize: a one-input, two-output payment is about
+			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB.
 			budget := amount + (1100+950*int64(utxo.MaxInputsPerTX))*feeRate
 			selected, _, err := selector.SelectUTXOs(elx.GetAllUTXOs(), budget, 1, tip, []string{hotWallet})
 			if err != nil {
@@ -572,17 +645,19 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 ## Verification: a real confirmed transaction
 
 Rather than asking you to trust that the signing path works, there is a
-[verification record](VERIFICATION.md) for a stagenet transaction **built, signed,
+[verification record](VERIFICATION.md) for two stagenet transactions **built, signed,
 serialized, broadcast and confirmed entirely by this SDK**:
 
-| | |
-|---|---|
-| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` |
-| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` |
-| Witness stack | `[2421, 1313]` bytes, the consensus-required format |
+| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` |
+|---|---|---|
+| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` |
+| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` |
+| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
 
-The transaction id the SDK computed matches the one the node assigned, which
-independently confirms that serialization agrees with consensus byte for byte.
+The transaction id the SDK computed matches the one the node assigned in both
+cases, which independently confirms that serialization agrees with consensus byte
+for byte. The second was produced by [`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal):
+intent persisted, inputs reserved, broadcast and confirmed through the engine.
 
 That document also gives the exact witness format consensus requires, a table
 mapping `testmempoolaccept` rejections to their causes, and the steps to reproduce
@@ -661,11 +736,11 @@ Roughly 3,782 bytes per additional input, so estimate
 `3,880 + 3,782 x (inputs - 1)` bytes.
 
 **The 80-input cap is not the node's weight limit.** `MAX_STANDARD_TX_WEIGHT` is
-800,000 WU, and 80 inputs use 312,786 of it, about 39%. The cap is sized against
-the older 400,000 WU limit because not every production node runs the build that
-raised it. It was reverted from 200 to 80 in May 2026 after transactions were
-rejected in production for size. Treat it as an operational floor that will rise,
-not as a protocol constant.
+800,000 WU in every node release from v1.1.0 on (`src/policy/policy.h`), and 80 inputs use
+312,786 of it, about 39%. The cap dates
+from the period when the limit was 400,000 WU and 200-input transactions were
+rejected for size. It is an operational limit in this SDK, not a protocol
+constant.
 
 `SelectUTXOs` returns `ErrInputLimitReached` with a partial selection when it hits
 the cap before reaching the target. Handle that case: it means the payment needs

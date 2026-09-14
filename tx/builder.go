@@ -177,8 +177,8 @@ type TxInput struct {
 // foreign/AuxPoW-parent encoding. Asset and visibility follow the WITNESS VERSION
 // (USDSOQ = v7 OP_7, confidential = v4 OP_4), so an output carries no extra bytes.
 //
-// This mirrors soq-signer/internal/txbuilder, the production reference, and is
-// pinned byte-identically to the node by the golden vector in the tests.
+// The encoding is pinned byte-identically to the node by the golden vector in
+// the tests.
 type TxOutput struct {
 	Value        int64  // Output value in shors
 	ScriptPubKey []byte // Output script
