@@ -455,8 +455,8 @@ func (e *Engine) inputs(in *Intent) []types.UTXO {
 }
 
 // RPCConfirmer implements Confirmer over the node: getrawtransaction verbose
-// (requires -txindex for mined transactions), falling back to gettxout on the
-// first output.
+// (without -txindex the node serves a mined transaction only while one of its
+// outputs is unspent), falling back to gettxout on the first output.
 type RPCConfirmer struct{ Client *rpc.Client }
 
 // Confirmations implements Confirmer.
@@ -477,7 +477,7 @@ func (c RPCConfirmer) Confirmations(txid string) (int64, error) {
 		return 0, err
 	}
 	if out == nil {
-		return 0, fmt.Errorf("%w: %s is not known to the node (no txindex and first output spent, or never accepted)", rpc.ErrUnknownOutcome, txid)
+		return 0, fmt.Errorf("%w: %s is not known to the node (no txindex and every output spent, or never accepted)", rpc.ErrUnknownOutcome, txid)
 	}
 	return out.Confirmations, nil
 }
