@@ -10,6 +10,7 @@
 package keys
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -337,7 +338,8 @@ func (m *Manager) Save() error {
 
 // ImportPrivateKey adds a key held in memory: a derived deposit key at sweep
 // time, or a raw key from a wallet.dat dump. Call Save only for a hot-wallet
-// key that should persist.
+// key that should persist. The manager keeps its own copy of both slices, so
+// the caller may zero its buffers as soon as the call returns.
 func (m *Manager) ImportPrivateKey(privKey []byte, pubKey []byte, address string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -345,6 +347,8 @@ func (m *Manager) ImportPrivateKey(privKey []byte, pubKey []byte, address string
 	if err := checkKeyRecord(privKey, pubKey, address); err != nil {
 		return err
 	}
+	privKey = bytes.Clone(privKey)
+	pubKey = bytes.Clone(pubKey)
 
 	// Check for duplicate
 	for _, k := range m.keys {

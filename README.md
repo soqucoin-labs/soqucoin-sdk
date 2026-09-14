@@ -229,6 +229,7 @@ See the [`examples/`](./examples) directory:
 - [`send_transaction`](./examples/send_transaction): Build and sign a transaction (does not broadcast)
 - [`exchange_deposit`](./examples/exchange_deposit): Credit deposits verified against your own node (exchange flow)
 - [`pool_payout`](./examples/pool_payout): Batch payouts with circuit breaker
+- [`stagenet_withdrawal`](./examples/stagenet_withdrawal): The withdrawal recorded in [VERIFICATION.md](docs/VERIFICATION.md), through `withdraw.Engine` against your own node
 
 ## Contributing
 

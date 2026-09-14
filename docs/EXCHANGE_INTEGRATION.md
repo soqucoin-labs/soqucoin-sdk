@@ -644,17 +644,19 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 ## Verification: a real confirmed transaction
 
 Rather than asking you to trust that the signing path works, there is a
-[verification record](VERIFICATION.md) for a stagenet transaction **built, signed,
+[verification record](VERIFICATION.md) for two stagenet transactions **built, signed,
 serialized, broadcast and confirmed entirely by this SDK**:
 
-| | |
-|---|---|
-| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` |
-| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` |
-| Witness stack | `[2421, 1313]` bytes, the consensus-required format |
+| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` |
+|---|---|---|
+| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` |
+| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` |
+| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
 
-The transaction id the SDK computed matches the one the node assigned, which
-independently confirms that serialization agrees with consensus byte for byte.
+The transaction id the SDK computed matches the one the node assigned in both
+cases, which independently confirms that serialization agrees with consensus byte
+for byte. The second was produced by [`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal):
+intent persisted, inputs reserved, broadcast and confirmed through the engine.
 
 That document also gives the exact witness format consensus requires, a table
 mapping `testmempoolaccept` rejections to their causes, and the steps to reproduce
