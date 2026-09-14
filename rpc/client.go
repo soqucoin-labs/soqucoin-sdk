@@ -236,7 +236,7 @@ func (c *Client) SetTimeout(d time.Duration) { c.client.Timeout = d }
 
 // Call sends a JSON-RPC request and returns the raw result. For a URL whose
 // host is not loopback it returns, with nothing sent, ErrRemoteNode unless
-// AllowRemote is set, and ErrPlaintextRemote unless the scheme is https.
+// AllowRemote is set, then ErrPlaintextRemote unless the scheme is https.
 func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, error) {
 	if c.remote && !c.AllowRemote {
 		return nil, fmt.Errorf("%w: host %q", ErrRemoteNode, c.host)

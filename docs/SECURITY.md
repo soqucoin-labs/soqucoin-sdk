@@ -321,8 +321,9 @@ redirect to `https://` fails as a transport error instead of being followed.
   URL to a TLS terminator in front of the node. Go's default transport verifies the
   certificate against the system roots and refuses an invalid one; the client has no
   option for a private CA or a pinned certificate, so a private CA means a tunnel.
-  `http://` to a remote host is refused by the client (`rpc.ErrPlaintextRemote`): the
-  password and every transaction would cross the network in plaintext.
+  Once `AllowRemote` is set, `http://` to a remote host is refused by the client
+  (`rpc.ErrPlaintextRemote`): the password and every transaction would cross the network
+  in plaintext.
 
 ```go
 node := rpc.NewClient("https://node.internal:33389", rpcUser, rpcPassword)
