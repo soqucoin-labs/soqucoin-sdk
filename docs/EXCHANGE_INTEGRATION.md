@@ -154,12 +154,16 @@ branch `soqucoin`, tag `mainnet-genesis-2026-09-03`. Configuration is in its `SO
 service port is 50001 (`types.Network.ElectrumPort`); TLS is whatever port you terminate it on.
 
 One operational note from running it. ElectrumX stores its history flush counter in 16 bits
-(`src/electrumx/server/history.py`, `flush_id = pack_be_uint16(self.flush_count)`). Every start
-that catches up to the node flushes, and so does a clean shutdown, so a server left in a restart
-loop under a supervisor exhausts the counter after 65,535 flushes and from then on exits on every
-start with `struct.error: 'H' format requires 0 <= number <= 65535`, its index frozen at one
-height. Alert on the unit's restart count, and run `electrumx_compact_history` with the server
-stopped before the count approaches the limit; compaction resets it.
+(`src/electrumx/server/history.py`, `flush_id = pack_be_uint16(self.flush_count)`). The counter
+advances on every flush, and a caught-up server flushes after each block it processes
+(`server/block_processor.py`, `_maybe_flush`), so at one block a minute an indexer uses the 65,535
+ids in about 45 days whether or not it restarts; a start or a clean shutdown flushes only when the
+height moved since the last flush (`server/db.py`, `flush_dbs`). At the limit every flush fails
+with `struct.error: 'H' format requires 0 <= number <= 65535`, the process exits, a supervisor
+restarts it, and the index stays frozen at one height. Watch the `flush #N` line the server logs
+on each flush (`flush count: N` at startup) and run `electrumx_compact_history` with the server
+stopped well before N reaches 65,535; compaction resets the counter to the row count of the
+largest address history.
 
 ### Sizing, measured
 
