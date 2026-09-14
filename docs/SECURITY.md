@@ -169,8 +169,8 @@ transaction that was stored and reloaded:
 
 ```go
 if err := signed.VerifyAll(); err != nil {
-    // One of tx.ErrUnsigned, tx.ErrWitnessForm, tx.ErrHashType, tx.ErrWrongKey,
-    // tx.ErrSignature, wrapped with the input index. Do not broadcast.
+    // Wraps one of tx.ErrUnsigned, tx.ErrWitnessForm, tx.ErrHashType,
+    // tx.ErrWrongKey, tx.ErrSignature with the input index. Do not broadcast.
     return err
 }
 ```

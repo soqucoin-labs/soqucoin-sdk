@@ -897,6 +897,12 @@ func (tx *Transaction) SignInput(i int, signer Signer, hashType uint32) error {
 	if i < 0 || i >= len(tx.Inputs) {
 		return fmt.Errorf("input index %d out of range [0, %d)", i, len(tx.Inputs))
 	}
+	// ComputeSigHash implements the SIGHASH_ALL preimage only; for any other
+	// type the node would compute a different message, so the witness would be
+	// refused. The parameter stays for source compatibility.
+	if hashType != SigHashAll {
+		return fmt.Errorf("input %d: hashtype %#02x: %w", i, hashType, ErrHashType)
+	}
 	addr := tx.Inputs[i].Address
 	if addr == "" {
 		return fmt.Errorf("input %d has no address to sign for", i)

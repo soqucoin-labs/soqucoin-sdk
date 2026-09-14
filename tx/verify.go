@@ -52,7 +52,9 @@ var (
 // takes a digest the caller computed and so cannot tell whether the byte the
 // node will read agrees with it; this method recomputes the digest from the
 // byte, so a witness that verifies here is one the node verifies the same way.
-// Every error is one of the sentinels above, wrapped with the input index.
+// For an index in range, every error wraps one of the sentinels above together
+// with the input index; a key the node treats as invalid (keys.ErrInvalidPublicKey)
+// is reported as ErrWitnessForm with that error in the chain.
 func (tx *Transaction) VerifyInput(i int) error {
 	if i < 0 || i >= len(tx.Inputs) {
 		return fmt.Errorf("input index %d out of range [0, %d)", i, len(tx.Inputs))
@@ -96,7 +98,9 @@ func (tx *Transaction) VerifyInput(i int) error {
 	}
 	ok, err := keys.Verify(pk[1:], digest, sig[:types.SignatureSize])
 	if err != nil {
-		return fmt.Errorf("input %d: %w", i, err)
+		// The sizes were checked above, so this is the node's invalid-key
+		// marker (first byte 0xFF): a key the node's CPubKey refuses.
+		return fmt.Errorf("input %d: %w: %w", i, ErrWitnessForm, err)
 	}
 	if !ok {
 		return fmt.Errorf("input %d: %w", i, ErrSignature)

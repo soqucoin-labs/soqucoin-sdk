@@ -4,9 +4,12 @@
 package tx
 
 import (
+	"crypto/sha256"
 	"errors"
 	"path/filepath"
 	"testing"
+
+	"github.com/cloudflare/circl/sign/mldsa/mldsa44"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
@@ -161,6 +164,74 @@ func TestVerifyInputWitnessForm(t *testing.T) {
 	}
 	if err := tr.VerifyInput(-1); err == nil {
 		t.Error("negative index accepted")
+	}
+}
+
+// SignInput refuses every hashtype but SIGHASH_ALL: ComputeSigHash implements
+// only that preimage, so any other type would produce a witness the node
+// verifies against a different message.
+func TestSignInputRefusesNonAllHashType(t *testing.T) {
+	m, pairs := realKeys(t, 1)
+	tr := NewTransaction()
+	if err := tr.AddInput(types.UTXO{TxID: displayTxID, Vout: 0, Value: 5_000_000_000, Address: pairs[0].Address}, mustScript(t, pairs[0].Address)); err != nil {
+		t.Fatal(err)
+	}
+	tr.AddOutput(4_000_000_000, ScriptP2WPKH(hash32(0x02)))
+	for _, ht := range []uint32{SigHashNone, SigHashSingle, SigHashAll | SigHashAnyoneCanPay, 0x41, 0x00} {
+		if err := tr.SignInput(0, m, ht); !errors.Is(err, ErrHashType) {
+			t.Errorf("hashtype %#02x: got %v, want ErrHashType", ht, err)
+		}
+		if len(tr.Inputs[0].WitnessData) != 0 {
+			t.Fatalf("hashtype %#02x: a witness was installed", ht)
+		}
+	}
+	if err := tr.SignInput(0, m, SigHashAll); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.VerifyInput(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustScript(t *testing.T, addr string) []byte {
+	t.Helper()
+	s, err := address.ScriptFor(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// A key whose first byte is 0xFF is the node's invalid-key marker; the node
+// cannot spend from it. VerifyInput reports it as ErrWitnessForm with
+// keys.ErrInvalidPublicKey in the chain.
+func TestVerifyInputRefusesInvalidMarkerKey(t *testing.T) {
+	seed := sha256.Sum256([]byte("soqucoin-ff-143")) // the keys package's marker vector
+	pub, priv := mldsa44.NewKeyFromSeed(&seed)
+	pk := pub.Bytes()
+	if pk[0] != 0xFF {
+		t.Fatalf("vector drift: first byte %#02x, want 0xFF", pk[0])
+	}
+	program := sha256.Sum256(pk)
+	tr := NewTransaction()
+	spk := append([]byte{0x51, 0x20}, program[:]...)
+	if err := tr.AddInput(types.UTXO{TxID: displayTxID, Vout: 0, Value: 5_000_000_000}, spk); err != nil {
+		t.Fatal(err)
+	}
+	tr.AddOutput(4_000_000_000, ScriptP2WPKH(hash32(0x02)))
+	digest, err := tr.ComputeSigHash(0, SigHashAll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := make([]byte, mldsa44.SignatureSize+1)
+	if err := mldsa44.SignTo(priv, digest, nil, false, sig[:mldsa44.SignatureSize]); err != nil {
+		t.Fatal(err)
+	}
+	sig[mldsa44.SignatureSize] = SigHashAll
+	tr.Inputs[0].WitnessData = [][]byte{sig, append([]byte{0x00}, pk...)}
+	err = tr.VerifyInput(0)
+	if !errors.Is(err, ErrWitnessForm) || !errors.Is(err, keys.ErrInvalidPublicKey) {
+		t.Fatalf("marker key: got %v, want ErrWitnessForm wrapping keys.ErrInvalidPublicKey", err)
 	}
 }
 
