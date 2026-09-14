@@ -157,7 +157,6 @@ func TestLoadRejectsInconsistentKeystore(t *testing.T) {
 	a, _ := GenerateKeyForNetwork("sq")
 	b, _ := GenerateKeyForNetwork("sq")
 	m.keys = []KeyPair{{PrivateKey: a.PrivateKey, PublicKey: a.PublicKey, Address: b.Address}}
-	m.loaded = true
 	if err := m.Save(); err != nil {
 		t.Fatal(err)
 	}

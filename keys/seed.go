@@ -86,10 +86,12 @@ func FromSeed(hrp string, seed [SeedSize]byte) (*KeyPair, error) {
 // refused index stays unused.
 //
 // The network is part of the message so that one master derives different
-// keys on mainnet and stagenet: a production master that reaches a test host
-// yields that host stagenet keys only, never a key that also spends mainnet
-// funds. It is not a defence against the master itself leaking; whoever holds
-// the master derives every key on every network.
+// keys on mainnet and stagenet: a production master that reaches a stagenet
+// host yields that host stagenet keys only, never a key that also spends
+// mainnet funds. Regtest shares the prefix "sq" with mainnet, so the binding
+// gives a regtest host no separation; give it a master of its own. Nor is the
+// binding a defence against the master itself leaking; whoever holds the
+// master derives every key on every network.
 //
 // The master must be at least MinMasterSize bytes of secret random data.
 // DeriveSeed refuses a shorter one (ErrShortMaster) because every address

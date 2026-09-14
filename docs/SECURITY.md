@@ -46,10 +46,11 @@ system and the index recorded with each user are the only recovery material. The
 seed is the private key: hold the master with at least the care of a hot-wallet
 key, and zero seeds after use (see [Memory hygiene](#memory-hygiene)). The network
 prefix is part of the derivation, so one master yields different keys on mainnet
-and stagenet and a production master that reaches a test host yields stagenet keys
-there, not keys that also spend mainnet funds. Give a test host its own master all
-the same: the derivation limits what a leaked derived key is worth, not what a
-leaked master is worth. `FromSeed` refuses the roughly 1 seed in 256 whose key the
+and stagenet and a production master that reaches a stagenet host yields stagenet
+keys there, not keys that also spend mainnet funds. Regtest shares the `sq` prefix
+with mainnet, so a regtest host gets no such separation. Give every test host its
+own master all the same: the derivation limits what a leaked derived key is worth,
+not what a leaked master is worth. `FromSeed` refuses the roughly 1 seed in 256 whose key the
 node can never spend from (`keys.ErrInvalidPublicKey`); skip that index rather than
 retrying with it.
 
@@ -84,8 +85,8 @@ if err := keystore.LoadOrCreate(); err != nil {
 `tx.BuildAndSign` and the private key never leaves the manager. The only method
 that returns private key material is `ExportPrivateKey`, which returns a copy and
 is named so that a search of your code base finds every use. `PublicKeyFor`
-returns a copy too, and printing a `keys.KeyPair` with `%v` or `%#v` shows the
-address and the public key hash, never the private key.
+returns a copy too, and printing a `keys.KeyPair` with any `fmt` verb, `%d` and
+`%x` included, shows the address and the public key hash, never the private key.
 
 ### Passphrase handling
 

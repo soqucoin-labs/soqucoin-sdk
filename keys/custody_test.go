@@ -167,8 +167,11 @@ func TestKeyPairPrintingRedactsThePrivateKey(t *testing.T) {
 	// or in Go's byte-slice rendering.
 	hexRun := fmt.Sprintf("%x", kp.PrivateKey[100:108])
 	decRun := fmt.Sprintf("%d %d %d %d", kp.PrivateKey[100], kp.PrivateKey[101], kp.PrivateKey[102], kp.PrivateKey[103])
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
-		for _, v := range []interface{}{*kp, kp} {
+	// %d and %x are the verbs a Stringer alone does not cover: on a struct
+	// they walk the fields and print the private key byte by byte.
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%d", "%x", "%q", "%08d"} {
+		wrapped := struct{ K KeyPair }{*kp}
+		for _, v := range []interface{}{*kp, kp, wrapped, []KeyPair{*kp}} {
 			out := fmt.Sprintf(verb, v)
 			if strings.Contains(out, hexRun) || strings.Contains(out, decRun) {
 				t.Errorf("%s prints private key material: %.120s", verb, out)

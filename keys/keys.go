@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
@@ -46,14 +47,16 @@ type KeyPair struct {
 }
 
 // String prints the address and the hash of the public key, never the
-// private key, so a KeyPair that reaches a log line or an error message
-// through %v or %+v discloses nothing that spends.
+// private key.
 func (k KeyPair) String() string {
 	return fmt.Sprintf("keys.KeyPair{Address: %s, PubKeyHash: %s, Index: %d}", k.Address, PubKeyHashHex(k.PublicKey), k.Index)
 }
 
-// GoString is String, so %#v discloses nothing either.
-func (k KeyPair) GoString() string { return k.String() }
+// Format makes every fmt verb print String: a Stringer alone covers %v and
+// %s, and %d or %x on the struct would still walk the fields and print all
+// 2560 private-key bytes. A KeyPair that reaches a log line or an error
+// message through any verb discloses nothing that spends.
+func (k KeyPair) Format(f fmt.State, verb rune) { io.WriteString(f, k.String()) }
 
 // Keystore holds encrypted key material on disk.
 type Keystore struct {
@@ -81,7 +84,6 @@ type Manager struct {
 	keys    []KeyPair
 	keyFile string
 	passwd  []byte
-	loaded  bool
 }
 
 // NewManager creates a new key manager.
@@ -226,7 +228,6 @@ func (m *Manager) load(create bool) error {
 			return fmt.Errorf("%w: %s", ErrKeystoreMissing, m.keyFile)
 		}
 		m.keys = []KeyPair{}
-		m.loaded = true
 		return m.saveLocked()
 	}
 
@@ -286,7 +287,6 @@ func (m *Manager) load(create bool) error {
 		}
 	}
 
-	m.loaded = true
 	return nil
 }
 

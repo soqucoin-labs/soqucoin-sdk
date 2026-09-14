@@ -261,8 +261,9 @@ address = bech32m(hrp, witness version 1, SHA-256(public key))
 
 The master must be at least 32 bytes of secret random data (`keys.MinMasterSize`). The network
 prefix is part of the message, so one master derives different keys for `sq` and `ssq`: a
-production master that reaches a test host yields stagenet keys there, not keys that also spend
-mainnet funds. Give a test host a master of its own all the same. The v1 scheme of v0.3.5, which
+production master that reaches a stagenet host yields stagenet keys there, not keys that also
+spend mainnet funds. Regtest shares `sq` with mainnet and gets no such separation. Give every test
+host a master of its own all the same. The v1 scheme of v0.3.5, which
 had no network in the message, was replaced before any integrator derived an address under it.
 Vectors for the whole chain are in `keys/seed_test.go`; the address encoding is pinned to addresses
 produced by the node's own encoder in `keys/node_vectors_test.go`.
