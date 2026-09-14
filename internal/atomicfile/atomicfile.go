@@ -22,9 +22,10 @@ var fsync = func(f *os.File) error { return f.Sync() }
 // A failure before the rename removes the temporary file and leaves path
 // unchanged. A failure after the rename (opening or syncing the directory) is
 // reported with path holding the new content, synced to disk as a file but
-// with the directory entry not yet forced out. Treat a returned error as "not known to
-// be durable", never as "undone". The directory sync is skipped on Windows,
-// where syncing a directory handle fails; the file sync still runs there.
+// with the directory entry not yet forced out. Treat a returned error as "not
+// known to be durable", never as "undone". The directory sync is skipped on
+// Windows, where syncing a directory handle fails; the file sync still runs
+// there.
 //
 // A crash between the create and the rename can leave a ".<name>.<random>.tmp"
 // file in the directory. It holds nothing the target does not and may be
