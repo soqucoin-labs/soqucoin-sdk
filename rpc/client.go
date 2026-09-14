@@ -52,10 +52,12 @@ type Client struct {
 	// on the chain. Set it when the node is elsewhere on purpose, with an
 	// https:// URL (the certificate is verified against the system roots) or
 	// a tunnel that ends on this machine. AllowRemote does not permit
-	// plaintext: a non-loopback URL whose scheme is not https returns
-	// ErrPlaintextRemote whether or not it is set, since the password would
-	// cross the network in the clear. Loopback is 127.0.0.0/8, ::1 or the
-	// name "localhost", read from the URL; no name is resolved.
+	// plaintext: with it set, a non-loopback URL whose scheme is not https
+	// returns ErrPlaintextRemote, since the password would cross the network
+	// in the clear; so a remote node is reached over https:// or not at all.
+	// Loopback is the name "localhost" or an IP literal in 127.0.0.0/8 or
+	// ::1 (a dotted quad or a bracketed IPv6 address), read from the URL;
+	// no name is resolved and no other spelling of a loopback address counts.
 	AllowRemote bool
 
 	url      string
@@ -74,8 +76,8 @@ type Client struct {
 //   - user: RPC username from soqucoin.conf
 //   - password: RPC password from soqucoin.conf
 //
-// Set Network afterwards for any chain other than mainnet, and AllowRemote
-// for a node that is not on this machine:
+// Set Network afterwards for any chain other than mainnet, and AllowRemote,
+// with an https:// URL, for a node that is not on this machine:
 //
 //	c := rpc.NewClient(url, user, password)
 //	c.Network = types.Stagenet
@@ -116,15 +118,15 @@ func hostOf(rawURL string) (host string, loopback bool) {
 	return host, ip != nil && ip.IsLoopback()
 }
 
-// schemeOf returns the scheme of rawURL in lower case, or "" for a URL that
-// does not parse. url.Parse lowers the scheme itself; the fold here is so
-// the guard does not depend on that.
+// schemeOf returns the scheme of rawURL, or "" for a URL that does not parse.
+// url.Parse returns the scheme in lower case, so "HTTPS://" compares equal to
+// "https"; TestSchemeAndHostCombinations pins that.
 func schemeOf(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return ""
 	}
-	return strings.ToLower(u.Scheme)
+	return u.Scheme
 }
 
 // rpcRequest is a JSON-RPC 1.0 request.
@@ -169,12 +171,12 @@ var (
 	ErrAlreadyInChain = errors.New("rpc: transaction already in chain")
 	ErrNodeSyncing    = fmt.Errorf("%w: node is in initial block download or behind its headers", ErrTransient)
 	ErrWrongChain     = fmt.Errorf("%w: node serves a different chain than Client.Network", ErrPermanent)
-	ErrRemoteNode     = fmt.Errorf("%w: node URL is not loopback and Client.AllowRemote is not set", ErrPermanent)
+	ErrRemoteNode     = fmt.Errorf("%w: node URL is not loopback and Client.AllowRemote is not set (a remote node takes AllowRemote and an https:// URL)", ErrPermanent)
 	// ErrPlaintextRemote is returned, with nothing sent, for a node URL whose
-	// host is not loopback and whose scheme is not https, whether or not
-	// AllowRemote is set: the RPC password would cross the network in the
-	// clear. Use https:// to a TLS terminator or a tunnel that ends on
-	// this machine.
+	// host is not loopback and whose scheme is not https once AllowRemote is
+	// set (without it the same URL returns ErrRemoteNode): the RPC password
+	// would cross the network in the clear. Use https:// to a TLS terminator
+	// or a tunnel that ends on this machine.
 	ErrPlaintextRemote = fmt.Errorf("%w: node URL is not loopback and not https; the RPC password would cross the network in plaintext", ErrPermanent)
 	ErrTxIDMismatch    = errors.New("rpc: node accepted the transaction under a different txid")
 )
@@ -240,7 +242,7 @@ func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, er
 		return nil, fmt.Errorf("%w: host %q", ErrRemoteNode, c.host)
 	}
 	if c.remote && c.scheme != "https" {
-		return nil, fmt.Errorf("%w: %s://%s", ErrPlaintextRemote, c.scheme, c.host)
+		return nil, fmt.Errorf("%w: scheme %q, host %q", ErrPlaintextRemote, c.scheme, c.host)
 	}
 	if params == nil {
 		params = []interface{}{}

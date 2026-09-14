@@ -298,15 +298,17 @@ rpcClient := rpc.NewClient("http://127.0.0.1:33389", rpcUser, rpcPassword)
 ```
 
 Every request carries the RPC password in a Basic Auth header. The client refuses a
-URL whose host is not loopback (`127.0.0.0/8`, `::1` or the name `localhost`, read
-from the URL without resolving it) with `rpc.ErrRemoteNode` before anything is sent,
-until `AllowRemote` is set. A URL copied from another deployment, or mistyped, fails
-instead of handing the password to whichever host it names. `AllowRemote` permits the
-host, not plaintext to it: a non-loopback URL whose scheme is not `https` is refused with
-`rpc.ErrPlaintextRemote`, again before anything is sent, whether or not the flag is set.
+URL whose host is not loopback (the name `localhost`, or an IP literal in `127.0.0.0/8` or
+`::1` written as a dotted quad or a bracketed IPv6 address, read from the URL without
+resolving it) with `rpc.ErrRemoteNode` before anything is sent, until `AllowRemote` is set.
+A URL copied from another deployment, or mistyped, fails instead of handing the password to
+whichever host it names. `AllowRemote` permits the host, not plaintext to it: with the flag
+set, a non-loopback URL whose scheme is not `https` is refused with `rpc.ErrPlaintextRemote`,
+again before anything is sent, so a remote node is reached over `https://` or not at all.
 Loopback is read from the URL as written and nothing is resolved, so a Docker service
-name, `host.docker.internal` or a Kubernetes service is a remote host to the client even
-when it reaches this machine, and takes `AllowRemote` with `https://`, or a tunnel. The client does not follow
+name, `host.docker.internal`, a Kubernetes service, or another spelling of a loopback
+address such as `127.1` or `localhost.` is a remote host to the client even when it reaches
+this machine, and takes `AllowRemote` with `https://`, or a tunnel. The client does not follow
 an HTTP redirect either: a node never sends one, and a proxy that answers `http://` with a
 redirect to `https://` fails as a transport error instead of being followed.
 

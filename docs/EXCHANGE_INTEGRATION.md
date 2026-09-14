@@ -127,7 +127,7 @@ SDK reads or broadcasts goes through them.
 | Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a v2.5.0 build before the v0.3.5 tag, and the release notes record that binary's digest. |
 | `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
 | `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every node we operate runs with it. |
-| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC is plaintext. Bind it to localhost, where `rpc.Client` connects with no further setting. For a node on another host the client refuses the URL until `AllowRemote` is set, and refuses `http://` to it whether or not the flag is set (`rpc.ErrPlaintextRemote`); the route is a tunnel that ends on this machine or an `https://` TLS terminator in front of the node ([Security Guide](SECURITY.md#network-security)). Loopback is read from the URL as written, `127.0.0.0/8`, `::1` or the name `localhost`, and nothing is resolved: a Docker service name, `host.docker.internal` or a Kubernetes service is a remote host to the client and needs the same route. |
+| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC is plaintext. Bind it to localhost, where `rpc.Client` connects with no further setting. For a node on another host the client refuses the URL until `AllowRemote` is set (`rpc.ErrRemoteNode`), and with the flag set refuses `http://` to it (`rpc.ErrPlaintextRemote`); the route is a tunnel that ends on this machine or an `https://` TLS terminator in front of the node ([Security Guide](SECURITY.md#network-security)). Loopback is read from the URL as written, the name `localhost` or a dotted-quad or bracketed IPv6 literal in `127.0.0.0/8` or `::1`, and nothing is resolved: a Docker service name, `host.docker.internal` or a Kubernetes service is a remote host to the client and needs the same route. |
 | `stagenet=1` | For the staging network. Omit it for mainnet. |
 | `dbcache` | Our nodes run 512 MB; the node's default is 450. |
 
@@ -665,8 +665,7 @@ output the node would reject. Before returning, it verifies every input as the n
 (`tx.Transaction.VerifyAll`: the hashtype read from the witness, the key hashed against the
 output's program, the signature checked over the recomputed sighash), so a signer fault surfaces
 as a build error rather than as a rejected broadcast. A payout is pre-flighted with `VerifyAll`,
-never with `keys.Verify` alone: `keys.Verify` checks a signature against a digest you supply and
-cannot tell whether that digest is the one the node will compute from the transaction.
+never with `keys.Verify` alone ([Security Guide](SECURITY.md#a-signature-over-your-own-digest)).
 
 ---
 
