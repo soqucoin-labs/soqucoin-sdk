@@ -11,7 +11,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"log"
 
@@ -107,18 +106,13 @@ func main() {
 	fmt.Printf("Raw TX: %d bytes (hex: %d chars)\n", len(unsignedTx.Serialize()), len(rawTx))
 	fmt.Println()
 
-	// 8. Verify the signature
-	senderPKHash := sha256.Sum256(sender.PublicKey)
-	_ = senderPKHash // Used for address derivation verification
-
-	sigValid, err := keys.Verify(sender.PublicKey, func() []byte {
-		sh, _ := unsignedTx.ComputeSigHash(0, tx.SigHashAll)
-		return sh
-	}(), unsignedTx.Inputs[0].WitnessData[0])
-	if err != nil {
+	// 8. Verify every input as the node will: the hashtype is read from the
+	//    witness, the key is hashed against the output's program, and the
+	//    signature is checked over the sighash recomputed from the transaction.
+	if err := unsignedTx.VerifyAll(); err != nil {
 		log.Fatal("verify:", err)
 	}
-	fmt.Printf("Signature verification: %v\n", sigValid)
+	fmt.Println("Every input verifies against the node's rules")
 	fmt.Println()
 	fmt.Println("In production, broadcast via: rpc.Client.Broadcast(rawTx, txid)")
 }

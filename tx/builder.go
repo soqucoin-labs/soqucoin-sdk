@@ -897,6 +897,12 @@ func (tx *Transaction) SignInput(i int, signer Signer, hashType uint32) error {
 	if i < 0 || i >= len(tx.Inputs) {
 		return fmt.Errorf("input index %d out of range [0, %d)", i, len(tx.Inputs))
 	}
+	// ComputeSigHash implements the SIGHASH_ALL preimage only; for any other
+	// type the node would compute a different message, so the witness would be
+	// refused. The parameter stays for source compatibility.
+	if hashType != SigHashAll {
+		return fmt.Errorf("input %d: hashtype %#02x: %w", i, hashType, ErrHashType)
+	}
 	addr := tx.Inputs[i].Address
 	if addr == "" {
 		return fmt.Errorf("input %d has no address to sign for", i)
@@ -951,6 +957,10 @@ func (tx *Transaction) SignAll(signer Signer) error {
 // than it costs to spend), the weight, the inputs as committed. SerializeHex
 // and TxID give the bytes and id for the node.
 //
+// Every input is verified (VerifyAll) before the transaction is returned, so a
+// signer that returns a signature over the wrong digest, or a key that does
+// not own the output, is an error here and not a rejection at the node.
+//
 // Prefer this or BuildAndSign over hand-wiring build, sighash, sign, witness
 // assembly and serialize: the witness format is Soqucoin-specific and easy to
 // get wrong by a byte at each end.
@@ -968,6 +978,9 @@ func BuildSignedTransaction(
 		return nil, err
 	}
 	if err := t.SignAll(signer); err != nil {
+		return nil, err
+	}
+	if err := t.VerifyAll(); err != nil {
 		return nil, err
 	}
 	return t, nil

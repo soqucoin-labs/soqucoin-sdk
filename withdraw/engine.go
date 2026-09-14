@@ -116,7 +116,9 @@ type Confirmer interface {
 type Selector func(amount, feeRate int64) ([]types.UTXO, error)
 
 // BuildSigner turns selected inputs into a signed transaction. tx.BuildAndSign
-// wrapped with the exchange's scripts and signer is the expected value.
+// wrapped with the exchange's scripts and signer is the expected value; it
+// verifies every input against the node's rules before returning, so a
+// transaction the node would refuse fails Build and never reaches Broadcast.
 type BuildSigner func(inputs []types.UTXO, toAddress string, amount, feeRate int64) (rawHex, txid string, err error)
 
 // Engine drives intents through the state machine.

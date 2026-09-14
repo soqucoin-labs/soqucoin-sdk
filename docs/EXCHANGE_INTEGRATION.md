@@ -602,7 +602,10 @@ func main() {
 amounts below the node's relay floor (`tx.MinOutputValue`, 279,500 shors for a normal output),
 refuses amounts outside the node's range, and refuses fees above `tx.MaxFeeShors` or rates above
 `tx.MaxFeeRateShorsPerVB`. Change below the floor is left to the miner rather than emitted as an
-output the node would reject.
+output the node would reject. Before returning, it verifies every input as the node will
+(`tx.Transaction.VerifyAll`: the hashtype read from the witness, the key hashed against the
+output's program, the signature checked over the recomputed sighash), so a signer fault surfaces
+as a build error rather than as a rejected broadcast.
 
 ---
 
