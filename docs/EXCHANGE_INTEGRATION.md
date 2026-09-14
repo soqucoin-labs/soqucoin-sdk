@@ -142,6 +142,7 @@ and the index each user was given are the only recovery material.
 ```go
 import (
 	"errors"
+	"math"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
@@ -149,17 +150,24 @@ import (
 
 // DepositAddress derives a deposit address starting at derivation index i and
 // returns the index it used. Store that index with the user record; the key is
-// re-derived from it at sweep time.
-func DepositAddress(master []byte, i uint32) (string, uint32, error) {
+// re-derived from it at sweep time. hrp is types.Mainnet.HRP in production and
+// types.Stagenet.HRP on a test host, which has a master of its own.
+func DepositAddress(hrp string, master []byte, i uint32) (string, uint32, error) {
 	for {
 		seed, err := keys.DeriveSeed(master, i)
 		if err != nil {
 			return "", 0, err // keys.ErrShortMaster is a configuration fault, not an index to skip
 		}
-		// types.Stagenet.HRP on a test host ("ssq" → ssq1p... addresses), with its own master.
-		kp, err := keys.FromSeed(types.Mainnet.HRP, seed)
+		kp, err := keys.FromSeed(hrp, seed)
+		for j := range seed {
+			seed[j] = 0 // FromSeed zeroed its own copy; this is the caller's
+		}
 		if errors.Is(err, keys.ErrInvalidPublicKey) {
-			i++ // about 1 index in 256 derives a key the node can never spend from; leave it unused
+			// About 1 index in 256 derives a key the node can never spend from; leave it unused.
+			if i == math.MaxUint32 {
+				return "", 0, errors.New("derivation index space exhausted")
+			}
+			i++
 			continue
 		}
 		if err != nil {
