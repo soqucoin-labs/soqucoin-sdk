@@ -674,8 +674,9 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 		t.Fatalf("setup: %+v", built)
 	}
 
-	// Restart with the files: the healed network re-sends built; the other
-	// three reservations are released; a withdrawal can now take txA.
+	// Restart with the files: the healed network re-sends built; created's
+	// and failed's reservations are released; ghost's is kept and reported;
+	// a withdrawal can now take txA.
 	store2, err := NewFileStore(filepath.Join(dir, "intents.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -693,7 +694,7 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	}
 	err = e2.Recover()
 	if !errors.Is(err, ErrUnknownReservation) || errors.Is(err, ErrHeld) || errors.Is(err, utxo.ErrPersist) {
-		t.Fatalf("recover: %v, want only ErrUnknownReservation for ghost", err)
+		t.Fatalf("recover: %v, want ErrUnknownReservation for ghost and neither ErrHeld nor ErrPersist", err)
 	}
 	e2.BuildSign = realBuildSign
 	if got := fresh.ReservedIntents(); len(got) != 1 || got[0] != "ghost" {
@@ -719,8 +720,9 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	if w, err := e2.Process("next"); err != nil || w.Inputs[0].TxID != txA {
 		t.Fatalf("released input not reusable: %v %+v", err, w)
 	}
-	// The same file reloaded shows the releases were persisted: no reservation
-	// remains, and txA is spent under next's broadcast, not held for created.
+	// The same file reloaded shows the releases were persisted: only ghost's
+	// reservation remains, and txA is spent under next's broadcast, not held
+	// for created.
 	reloaded := utxo.NewSpentSet(spentPath)
 	if got := reloaded.ReservedIntents(); len(got) != 1 || got[0] != "ghost" || !reloaded.IsSpent(txA, 0) || reloaded.IsSpent(txB, 0) {
 		t.Fatalf("on disk after recover: reservations %v, txA spent %v, txB spent %v", got, reloaded.IsSpent(txA, 0), reloaded.IsSpent(txB, 0))
@@ -731,8 +733,10 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 // time, a released input under a Built intent costs money.
 type unreadableStore struct{ *MemStore }
 
+var errStoreDown = errors.New("database unreachable")
+
 func (u *unreadableStore) Get(string) (*Intent, bool, error) {
-	return nil, false, errors.New("database unreachable")
+	return nil, false, errStoreDown
 }
 
 func TestRecoverKeepsReservationsWhenTheStoreCannotBeRead(t *testing.T) {
@@ -741,8 +745,11 @@ func TestRecoverKeepsReservationsWhenTheStoreCannotBeRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := newEngine(t, &unreadableStore{NewMemStore()}, spent, &fakeNet{mode: "ok"}, coins())
-	if err := e.Recover(); err == nil {
-		t.Fatal("recover over an unreadable store returned nil")
+	err := e.Recover()
+	// The store's own error is what the operator must see; a read failure is
+	// not an unknown intent, so it must not be reported as one.
+	if !errors.Is(err, errStoreDown) || errors.Is(err, ErrUnknownReservation) {
+		t.Fatalf("recover over an unreadable store: %v, want the store's error and not ErrUnknownReservation", err)
 	}
 	if !spent.IsSpent(txA, 0) {
 		t.Fatal("a reservation was released although the store could not say what its intent is")

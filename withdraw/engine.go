@@ -172,11 +172,12 @@ var (
 	// cannot confirm; the operator resolves which one the network took.
 	ErrReservationLost = errors.New("withdraw: inputs of a built intent were taken by another withdrawal")
 	// ErrUnknownReservation is reported by Recover for a reservation held by
-	// an intent id the store does not know. Submit persists the intent before
-	// Build can reserve anything, so this means the intent store and the spent
+	// an intent id the store does not know. Process builds only intents that
+	// Submit persisted, so an unknown id means the intent store and the spent
 	// set are not the pair that was running: the intents file is missing or
-	// older than the spent set. The reservation is kept; a Built intent that
-	// the lost store knew may have its bytes in a mempool.
+	// older than the spent set (or Build was called on an intent that was
+	// never submitted). The reservation is kept; a Built intent that the lost
+	// store knew may have its bytes in a mempool.
 	ErrUnknownReservation = errors.New("withdraw: reservation held by an intent the store does not know; intent store and spent set disagree")
 )
 
