@@ -3,6 +3,7 @@ package rpc
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 )
@@ -81,6 +82,34 @@ func TestRemoteNodeRefusedUntilAllowed(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&transport.sent); n != 1 {
 		t.Fatalf("%d requests sent with AllowRemote, want 1", n)
+	}
+}
+
+// A redirect is not followed. A node never sends one; a listener on the
+// loopback address that did could otherwise send the client, and its trust in
+// the reply, to another host with AllowRemote unset.
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	var reached int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&reached, 1)
+		w.Write([]byte(ok("99")))
+	}))
+	t.Cleanup(target.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	c := NewClient(redirector.URL, "u", "p")
+	n, err := c.GetBlockCount()
+	if err == nil || n == 99 {
+		t.Fatalf("redirect was followed: %d, %v", n, err)
+	}
+	if !errors.Is(err, ErrTransient) {
+		t.Fatalf("a redirect reply is not JSON-RPC and should read as a transport failure: %v", err)
+	}
+	if atomic.LoadInt32(&reached) != 0 {
+		t.Fatal("the redirect target received a request")
 	}
 }
 

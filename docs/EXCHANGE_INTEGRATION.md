@@ -698,7 +698,7 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
 | `utxo` | **93.8%** | Coin selection, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
-| `rpc` | **84.8%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
+| `rpc` | **85.0%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **81.1%** | Node cross-check before credit, pause conditions, vanished-credit alarm |
 | `electrumx` | **76.2%** | Id-matched replies, notification routing, merge, refresh failures, network inference, genesis check, TLS |
 | `tx` | **76.1%** | Serialized weight, output floor, amount checks, fee caps, txid byte order, BIP143 sighash, witness format, consensus format vectors |
@@ -786,7 +786,7 @@ if you go lower than the relay floor.
 // tx.MaxFeeRateShorsPerVB], so it is a rate the builders accept.
 est, err := rpcClient.FeeRateShorsPerVB(6)
 if err != nil {
-    return err // the node's error kind: rpc.ErrTransient or rpc.ErrPermanent
+    return err // rpc.ErrTransient, rpc.ErrPermanent, or types.ErrAmountFormat for a reply without a numeric fee rate
 }
 if est.Fallback {
     log.Printf("node has no fee estimate; using the floor, %d shors/vB", est.Rate)

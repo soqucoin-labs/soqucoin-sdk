@@ -86,6 +86,10 @@ func NewClient(url, user, password string) *Client {
 		password: password,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
+			// A node never redirects. Following one would let a listener on
+			// the loopback address send the client, and its trust in the
+			// reply, to another host with AllowRemote unset.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
 }
@@ -460,9 +464,11 @@ type FeeEstimate struct {
 // estimate produces a transaction they refuse.
 //
 // A node that has not observed enough transactions reports a negative fee
-// rate. Rate is then the floor and Fallback is set; log it, since a node that
-// never has an estimate is not seeing the mempool. An error is the node's
-// (ErrTransient or ErrPermanent) or a reply without a numeric fee rate.
+// rate (estimatesmartfee in src/rpc/mining.cpp returns -1 for a zero
+// estimate, otherwise ValueFromAmount of the rate per kilobyte). Rate is then
+// the floor and Fallback is set; log it, since a node that never has an
+// estimate is not seeing the mempool. An error is the node's (ErrTransient or
+// ErrPermanent) or a reply without a numeric fee rate (types.ErrAmountFormat).
 func (c *Client) FeeRateShorsPerVB(confTarget int) (FeeEstimate, error) {
 	floor, ceiling := types.RecommendedFeeRate, tx.MaxFeeRateShorsPerVB
 	if ceiling < floor {

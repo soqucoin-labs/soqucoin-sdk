@@ -363,7 +363,7 @@ because the script derived from an address is what BIP143 commits to as the
 
 **All amounts in this SDK are `int64` shors.** There is no `Amount` type. 1 SOQ is
 `types.ShorsPerSOQ` shors. `types.ParseSOQ` converts a decimal SOQ figure to shors
-exactly; the RPC client reads every value the node prints through it, and it accepts
+exactly; the RPC client reads every output value the node prints through it, and it accepts
 the same form from a user (`"12.5"`, up to eight fraction digits, no sign or
 exponent). Nothing validates the amount's meaning on your behalf.
 
