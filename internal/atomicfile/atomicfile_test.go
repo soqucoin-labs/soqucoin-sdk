@@ -105,8 +105,8 @@ func TestWriteFileSyncFailureKeepsOldContent(t *testing.T) {
 	onlyEntry(t, dir, "state.json")
 }
 
-// A directory sync that fails is reported: the caller must not treat the
-// write as durable. The new content is already at the path by then.
+// A directory sync that fails is reported so the caller does not treat the
+// write as durable. The new content is already at the path by then and stays.
 func TestWriteFileDirectorySyncFailureIsReported(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no directory sync on windows")
@@ -120,6 +120,10 @@ func TestWriteFileDirectorySyncFailureIsReported(t *testing.T) {
 		t.Fatalf("error %v", err)
 	}
 	onlyEntry(t, dir, "state.json")
+	got, _ := os.ReadFile(path)
+	if string(got) != "new" {
+		t.Fatalf("content after a failed directory sync %q, want the renamed file", got)
+	}
 }
 
 // A rename that fails leaves the old content and no temporary file. The
@@ -153,19 +157,17 @@ func TestWriteFileMissingDirectory(t *testing.T) {
 	}
 }
 
-// A first write creates the file with the requested mode, and a rewrite over
-// a wider mode narrows it: the mode comes from the call, not the old file.
+// The mode comes from the call, not from the temporary file's default (0600)
+// and not from the old file: a first write with a wider mode gets that mode,
+// and a rewrite with a narrower one narrows it.
 func TestWriteFileModeComesFromTheCall(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "new.json")
-	if err := WriteFile(path, []byte("v"), 0o600); err != nil {
+	if err := WriteFile(path, []byte("v"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	st, err := os.Stat(path)
-	if err != nil || st.Mode().Perm() != 0o600 {
+	if err != nil || st.Mode().Perm() != 0o640 {
 		t.Fatalf("mode after create %v, %v", st.Mode(), err)
-	}
-	if err := os.Chmod(path, 0o644); err != nil {
-		t.Fatal(err)
 	}
 	if err := WriteFile(path, []byte("w"), 0o600); err != nil {
 		t.Fatal(err)

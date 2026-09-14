@@ -17,14 +17,18 @@ var fsync = func(f *os.File) error { return f.Sync() }
 
 // WriteFile writes data to path with mode perm. It writes to a temporary file
 // in the same directory, syncs it, renames it over path, then syncs the
-// directory so the rename itself survives a power loss. A plain os.WriteFile
-// followed by os.Rename leaves both the data and the directory entry in the
-// page cache; a crash after the rename can then yield an empty or truncated
-// file at path.
+// directory so the rename itself survives a power loss.
 //
-// On any failure the temporary file is removed and path is unchanged. The
-// directory sync is skipped on Windows, where a directory cannot be opened for
-// syncing; the file sync still runs there.
+// A failure before the rename removes the temporary file and leaves path
+// unchanged. A failure of the directory sync is reported after the rename:
+// path then holds the new content, synced to disk as a file but with the
+// directory entry not yet forced out. Treat a returned error as "not known to
+// be durable", never as "undone". The directory sync is skipped on Windows,
+// where syncing a directory handle fails; the file sync still runs there.
+//
+// A crash between the create and the rename can leave a ".<name>.<random>.tmp"
+// file in the directory. It holds nothing the target does not and may be
+// deleted.
 func WriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
@@ -47,12 +51,10 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 		return fail("sync", err)
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close %s: %w", path, err)
+		return fail("close", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("rename %s: %w", path, err)
+		return fail("rename", err)
 	}
 	if runtime.GOOS == "windows" {
 		return nil

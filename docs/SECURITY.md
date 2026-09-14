@@ -99,8 +99,10 @@ The keystore, the spent set (`utxo.SpentSet`) and the withdrawal intent file
 directory, which is synced, renamed into place, and followed by a sync of the
 directory. A crash or power loss at any point leaves the previous file or the new
 one, never a partial one, and a key, a reserved input or an intent is on disk when
-the call that saved it returns. A `Save`, `MarkBroadcast` or `Put` that returns an
-error did not reach the disk; treat it as such.
+the call that saved it returns without error. An error from `Save`, `MarkBroadcast`
+or `Put` means the write is not known to be durable, not that it was undone: a
+failed directory sync is reported after the file is in place. Keep the in-memory
+state (the engine does for a spent set it could not write) and alert.
 
 ### Passphrase handling
 
