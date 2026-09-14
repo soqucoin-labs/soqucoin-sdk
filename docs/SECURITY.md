@@ -103,7 +103,8 @@ makes stagenet safe to experiment on.
 
 ## Memory hygiene
 
-**The SDK does not zero key material, and no pure-Go library can do so reliably.**
+**The SDK zeroes the stack copies it makes, but it cannot zero key material
+reliably, and no pure-Go library can.**
 
 `KeyPair.PrivateKey` is a `[]byte`. Go's garbage collector may relocate a slice
 during its lifetime, so overwriting the copy you hold does not overwrite copies
