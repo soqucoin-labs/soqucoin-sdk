@@ -18,7 +18,7 @@ system. Knowing where its remit ends is the first step in integrating it safely.
 
 | | |
 |---|---|
-| Signing algorithm | ML-DSA-44 (FIPS 204), via [Cloudflare CIRCL](https://github.com/cloudflare/circl) |
+| Signing algorithm | ML-DSA-44 (FIPS 204), via [Cloudflare CIRCL](https://github.com/cloudflare/circl); `keys.Manager.Sign` uses the hedged (randomized) variant, so two signatures of one digest differ and both verify |
 | Keys encrypted at rest | AES-256-GCM with Argon2id key derivation |
 | Network safety | Script derived per address; transactions mixing networks refused |
 | Transport encryption to ElectrumX | Supported, opt-in. See [Network security](#network-security) |

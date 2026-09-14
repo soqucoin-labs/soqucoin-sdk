@@ -311,6 +311,14 @@ cannot afford impossible by construction:
   refuse to send it again (`withdraw.ErrHeld`); stop withdrawals and investigate before anything
   is rebuilt.
 
+If `Process` returns an error that is `utxo.ErrPersist`, the node accepted the payment and the
+spent set could not be written: the intent is saved as `Broadcast`, the process still refuses those
+inputs, and `Recover` re-marks every Broadcast intent's inputs from the intent store at startup, so
+a restart does not re-expose them. That guarantee holds only if you stop when `Recover` returns an
+error: a failed `List` means nothing was re-marked. Open the spent set with `utxo.OpenSpentSet`,
+which refuses a file that exists but cannot be read; an empty set in that case would forget every
+unconfirmed spend.
+
 `Recover` at startup re-sends anything persisted but not yet acknowledged. The circuit breaker is
 fed through `RecordResult`, which never counts a per-request error (a bad address, an amount below
 the floor, insufficient funds, a node rejection of one transaction), so a user cannot halt every
@@ -366,7 +374,10 @@ func main() {
 
 	// Inputs are reserved here at build time, and unconfirmed spends survive
 	// a restart however long confirmation takes.
-	spent := utxo.NewSpentSet("/var/lib/exchange/spent_set.json")
+	spent, err := utxo.OpenSpentSet("/var/lib/exchange/spent_set.json")
+	if err != nil {
+		log.Fatal(err) // a file that exists but cannot be read must not start empty
+	}
 	selector := utxo.NewCoinSelector(spent)
 
 	// Durable intents: persisted before anything is broadcast. An exchange
@@ -416,10 +427,13 @@ func main() {
 		},
 	}
 
-	// After a restart: re-send persisted transactions with the same bytes.
-	// Nothing is ever rebuilt.
+	// After a restart: re-mark broadcast spends from the intent store and
+	// re-send persisted transactions with the same bytes. Nothing is ever
+	// rebuilt. Do not start paying out if this fails: the spent set may be
+	// missing spends the store knows about. withdraw.ErrHeld here is an
+	// intent an operator must resolve first.
 	if err := engine.Recover(); err != nil {
-		log.Printf("recover: %v", err)
+		log.Fatalf("recover: %v", err)
 	}
 
 	// A withdrawal request. The id is your idempotency key: the same id never
@@ -665,7 +679,7 @@ smallUTXOs, total, err := selector.SelectSmallestUTXOs(allUTXOs, 50, int(types.M
 | **Cold storage** | Keep >95% of funds in air-gapped cold wallets. |
 | **Monitoring** | Use the `resilience.Alerter` for Slack notifications on circuit breaker state changes. |
 | **Rate limiting** | Enforce withdrawal rate limits and require manual approval above thresholds. |
-| **Spent tracking** | Always use `utxo.SpentSet` with persistence through `withdraw.Engine`, which reserves inputs at build time. Never re-select a broadcast UTXO. |
+| **Spent tracking** | Always use `utxo.SpentSet` opened with `utxo.OpenSpentSet` and driven through `withdraw.Engine`, which reserves inputs at build time and re-marks broadcast spends on `Recover`. Never re-select a broadcast UTXO. |
 | **Deposit crediting** | Credit only what your own node confirms, through `deposit.Monitor`. Never on the indexer's word alone. |
 | **Withdrawal outcome** | Treat `rpc.ErrUnknownOutcome` as "maybe sent": retry the same bytes, never rebuild. `withdraw.Engine` does this for you. |
 

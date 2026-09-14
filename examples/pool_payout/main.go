@@ -170,7 +170,12 @@ func run(cfg runConfig) error {
 		elxClient.UseTLS()
 	}
 
-	spentSet := utxo.NewSpentSet(cfg.spentSetPath)
+	// A spent-set file that exists but cannot be read must stop the run: an
+	// empty set would re-expose every unconfirmed spend.
+	spentSet, err := utxo.OpenSpentSet(cfg.spentSetPath)
+	if err != nil {
+		return fmt.Errorf("spent set: %w", err)
+	}
 	selector := utxo.NewCoinSelector(spentSet)
 
 	// Trip after 3 consecutive failures, then hold for 15 minutes. The point is
@@ -290,17 +295,13 @@ func executePayout(
 		return "", fmt.Errorf("change address: %w", err)
 	}
 
-	// tx.BuildAndSign does these three steps in one call. They are separate here
-	// only so the change value can be read off the transaction: the fee follows
-	// from feeRate and the final size, so it cannot be recomputed as
-	// total - amount - fee.
-	transaction, err := tx.BuildSendTransaction(
-		verified, recipientSPK, payout.Amount, changeSPK, feeRate)
+	// Build and sign in one call; the transaction is returned because the
+	// change value can only be read off it: the fee follows from feeRate and
+	// the final size, so it cannot be recomputed as total - amount - fee.
+	transaction, err := tx.BuildSignedTransaction(
+		verified, recipientSPK, payout.Amount, changeSPK, feeRate, signer)
 	if err != nil {
-		return "", fmt.Errorf("build: %w", err)
-	}
-	if err := transaction.SignAll(signer); err != nil {
-		return "", fmt.Errorf("sign: %w", err)
+		return "", fmt.Errorf("build and sign: %w", err)
 	}
 	rawTxHex, builtTxID := transaction.SerializeHex(), transaction.TxID()
 
@@ -326,8 +327,12 @@ func executePayout(
 		return "", fmt.Errorf("broadcast: %w", err)
 	}
 
-	// Only now, with the transaction accepted, record the effects.
-	spentSet.MarkBroadcast(verified, txid)
+	// Only now, with the transaction accepted, record the effects. A spent-set
+	// write failure here is an alert, not a retry: the payment is out and this
+	// process still refuses the inputs; a restart would not.
+	if err := spentSet.MarkBroadcast(verified, txid); err != nil {
+		log.Printf("ALERT %s broadcast, spent set not written: %v", shortID(txid, 16), err)
+	}
 	if changeAmount > 0 {
 		// Defense 13: make change spendable immediately rather than waiting for
 		// the next ElectrumX poll, so back-to-back payouts do not stall.

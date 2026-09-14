@@ -172,3 +172,29 @@ func TestBuildSendCapsFees(t *testing.T) {
 	}
 	t.Log(fmt.Sprintf("80-input fee at %d shors/vB: %d sat", types.RecommendedFeeRate, fee))
 }
+
+// BuildSignedTransaction is BuildAndSign with the transaction kept, so the
+// change output can be read where BuildAndSign returns only bytes: same
+// inputs and outputs, same txid, and the change is what the bytes carry.
+func TestBuildSignedTransactionMatchesBuildAndSign(t *testing.T) {
+	inputs := []types.UTXO{realUTXO(t, 0x10, 0, 5_000_000_000)}
+	recipient, change := ScriptP2WPKH(hash32(0x02)), ScriptP2WPKH(hash32(0x03))
+	signer := fakeSigner{sigLen: DilithiumSigSize, pubLen: DilithiumPubKeySize}
+	tr, err := BuildSignedTransaction(inputs, recipient, 1_000_000_000, change, 1000, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawHex, txid, err := BuildAndSign(inputs, recipient, 1_000_000_000, change, 1000, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.TxID() != txid || tr.SerializeHex() != rawHex {
+		t.Fatal("the two one-call forms built different transactions")
+	}
+	if len(tr.Outputs) != 2 || tr.Outputs[1].Value <= 0 || tr.Outputs[1].Value >= 4_000_000_000 {
+		t.Fatalf("change output not readable off the transaction: %+v", tr.Outputs)
+	}
+	if got := tr.Outputs[0].Value; got != 1_000_000_000 {
+		t.Fatalf("recipient output %d", got)
+	}
+}

@@ -2,6 +2,7 @@ package utxo
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -128,5 +129,144 @@ func TestSelectorSkipsReservedInputs(t *testing.T) {
 	}
 	if len(sel) != 1 || sel[0].TxID != rTxB {
 		t.Fatalf("selector picked %+v; the reserved input must be skipped", sel)
+	}
+}
+
+// unwritablePath returns a spent-set path whose parent is a regular file, so
+// the directory cannot be created and no write can succeed.
+func unwritablePath(t *testing.T) string {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(blocker, "spent.json")
+}
+
+// A write that fails is reported. Reserve reserves nothing (a reservation
+// the next process would not see is not a reservation); MarkBroadcast keeps
+// the entries, because the transaction is already out.
+func TestPersistFailureIsReportedNotSwallowed(t *testing.T) {
+	ss := NewSpentSet(unwritablePath(t))
+	err := ss.Reserve(rUTXOs(), "w1", time.Hour)
+	if !errors.Is(err, ErrPersist) {
+		t.Fatalf("Reserve on an unwritable set: %v, want ErrPersist", err)
+	}
+	if ss.IsSpent(rTxA, 0) || ss.IsSpent(rTxB, 1) {
+		t.Fatal("a reservation that could not be written was kept in memory")
+	}
+	err = ss.MarkBroadcast(rUTXOs(), "txid-broadcast")
+	if !errors.Is(err, ErrPersist) {
+		t.Fatalf("MarkBroadcast on an unwritable set: %v, want ErrPersist", err)
+	}
+	if !ss.IsSpent(rTxA, 0) || !ss.IsSpent(rTxB, 1) {
+		t.Fatal("broadcast entries must stay in memory even when the write failed")
+	}
+	if err := ss.ConfirmSpent(rTxA, 0); !errors.Is(err, ErrPersist) {
+		t.Fatalf("ConfirmSpent: %v, want ErrPersist", err)
+	}
+}
+
+// A failed Reserve rolls back to exactly the previous state, including an
+// own expired reservation it was renewing.
+func TestReserveRollbackRestoresThePreviousEntry(t *testing.T) {
+	ss := NewSpentSet("")
+	if err := ss.Reserve(rUTXOs()[:1], "w1", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	ss.filePath = unwritablePath(t) // the disk goes away
+	if err := ss.Reserve(rUTXOs()[:1], "w1", time.Hour); !errors.Is(err, ErrPersist) {
+		t.Fatalf("renewal: %v", err)
+	}
+	if !ss.IsSpent(rTxA, 0) {
+		t.Fatal("the earlier reservation was dropped by a failed renewal")
+	}
+	if ss.IsSpent(rTxB, 1) {
+		t.Fatal("an input that was never reserved appeared")
+	}
+}
+
+// A spent-set file that exists but cannot be parsed must refuse to open:
+// starting empty would forget every unconfirmed spend.
+func TestOpenSpentSetRefusesACorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spent.json")
+	if _, err := OpenSpentSet(path); err != nil {
+		t.Fatalf("missing file is a first run: %v", err)
+	}
+	ss, _ := OpenSpentSet(path)
+	if err := ss.MarkBroadcast(rUTXOs(), "txid-broadcast"); err != nil {
+		t.Fatal(err)
+	}
+	ss2, err := OpenSpentSet(path)
+	if err != nil || !ss2.IsSpent(rTxA, 0) {
+		t.Fatalf("round trip: %v %v", err, ss2)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenSpentSet(path); !errors.Is(err, ErrSpentSetUnreadable) {
+		t.Fatalf("corrupt file opened: %v, want ErrSpentSetUnreadable", err)
+	}
+	if _, err := OpenSpentSet(unwritablePath(t)); !errors.Is(err, ErrSpentSetUnreadable) {
+		t.Fatalf("uncreatable directory: %v, want ErrSpentSetUnreadable", err)
+	}
+	if _, err := OpenSpentSet(""); err == nil {
+		t.Fatal("OpenSpentSet with no path must refuse; NewSpentSet is the in-memory form")
+	}
+	// The older constructor keeps its documented behaviour: it logs and starts empty.
+	if legacy := NewSpentSet(path); legacy.IsSpent(rTxA, 0) {
+		t.Fatal("NewSpentSet on a corrupt file should have started empty")
+	}
+}
+
+// The same outpoint listed twice must roll back to the state before the first
+// write, not to the reservation the first pass created.
+func TestReserveRollbackWithDuplicateOutpoint(t *testing.T) {
+	ss := NewSpentSet(unwritablePath(t))
+	u := rUTXOs()[0]
+	if err := ss.Reserve([]types.UTXO{u, u}, "w1", time.Hour); !errors.Is(err, ErrPersist) {
+		t.Fatalf("got %v", err)
+	}
+	if ss.IsSpent(u.TxID, u.Vout) {
+		t.Fatal("a phantom reservation survived the rollback")
+	}
+}
+
+// Release, Prune and ConfirmSpentAll report a failed write too.
+func TestReleasePruneAndConfirmReportPersistFailure(t *testing.T) {
+	ss := NewSpentSet("")
+	if err := ss.Reserve(rUTXOs()[:1], "w1", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.MarkBroadcast(rUTXOs()[1:], "txid-broadcast"); err != nil {
+		t.Fatal(err)
+	}
+	ss.filePath = unwritablePath(t)
+	if err := ss.Release("w1"); !errors.Is(err, ErrPersist) {
+		t.Errorf("Release: %v", err)
+	}
+	if err := ss.ConfirmSpentAll(rUTXOs()[1:]); !errors.Is(err, ErrPersist) {
+		t.Errorf("ConfirmSpentAll: %v", err)
+	}
+	ss.entries[SpentKey{rTxB, 1}] = SpentEntry{TxID: rTxB, Vout: 1, Confirmed: true, SpentAt: time.Now().Add(-3 * time.Hour)}
+	if err := ss.Prune(); !errors.Is(err, ErrPersist) {
+		t.Errorf("Prune: %v", err)
+	}
+	// Nothing to change must not touch the disk: a set whose entries are all
+	// confirmed already, on an unwritable path, reports no error.
+	quiet := NewSpentSet("")
+	if err := quiet.MarkBroadcast(rUTXOs(), "txid-broadcast"); err != nil {
+		t.Fatal(err)
+	}
+	if err := quiet.ConfirmSpentAll(rUTXOs()); err != nil {
+		t.Fatal(err)
+	}
+	quiet.filePath = unwritablePath(t)
+	if err := quiet.ConfirmSpentAll(rUTXOs()); err != nil {
+		t.Errorf("no-op confirm wrote to disk: %v", err)
+	}
+	if err := quiet.ConfirmSpentAll([]types.UTXO{{TxID: "not-tracked", Vout: 0}}); err != nil {
+		t.Errorf("confirming an untracked input wrote to disk: %v", err)
 	}
 }

@@ -81,6 +81,18 @@ type SpentEntry struct {
 // case: reservation is all-or-nothing.
 var ErrAlreadyReserved = errors.New("utxo: input already reserved or spent")
 
+// ErrPersist is returned when the spent set could not be written to its file.
+// The in-memory set is still correct for this process; a restart would not
+// see the change. Reserve rolls its reservation back and reserves nothing;
+// MarkBroadcast keeps the entries, because the transaction is already out
+// and the process must go on refusing those inputs.
+var ErrPersist = errors.New("utxo: spent set could not be written")
+
+// ErrSpentSetUnreadable is returned by OpenSpentSet when the file exists but
+// cannot be read or parsed. Starting with an empty set in that case would
+// forget every unconfirmed spend and re-expose those inputs to selection.
+var ErrSpentSetUnreadable = errors.New("utxo: spent set file exists but cannot be read")
+
 // ReservedPrefix marks reservation entries in SpentInTx.
 const ReservedPrefix = "reserved:"
 
@@ -110,18 +122,40 @@ type SpentSet struct {
 	filePath string
 }
 
-// NewSpentSet creates a new persistent spent set.
-// If filePath is empty, the spent set is in-memory only.
-// If filePath is set, the spent set loads from disk and persists changes.
+// NewSpentSet creates a spent set. With an empty filePath it is in-memory
+// only. With a filePath it loads from disk and persists changes, but a file
+// that exists and cannot be read is logged and the set starts EMPTY, which
+// forgets every unconfirmed spend. Production code opens a file-backed set
+// with OpenSpentSet, which refuses that case.
 func NewSpentSet(filePath string) *SpentSet {
 	ss := &SpentSet{
 		entries:  make(map[SpentKey]SpentEntry),
 		filePath: filePath,
 	}
 	if filePath != "" {
-		ss.load()
+		if err := ss.load(); err != nil {
+			log.Printf("[utxo] WARNING: %v; starting with an empty spent set", err)
+		}
 	}
 	return ss
+}
+
+// OpenSpentSet opens a file-backed spent set. A missing file is a first run
+// and is fine; a file that exists but cannot be read or parsed, or a
+// directory that cannot be created, is ErrSpentSetUnreadable, and the caller
+// must not start paying out on an empty set.
+func OpenSpentSet(filePath string) (*SpentSet, error) {
+	if filePath == "" {
+		return nil, errors.New("utxo: OpenSpentSet needs a file path; use NewSpentSet(\"\") for an in-memory set")
+	}
+	ss := &SpentSet{
+		entries:  make(map[SpentKey]SpentEntry),
+		filePath: filePath,
+	}
+	if err := ss.load(); err != nil {
+		return nil, err
+	}
+	return ss, nil
 }
 
 // Reserve holds the given inputs for a withdrawal that is about to be built,
@@ -143,8 +177,19 @@ func (ss *SpentSet) Reserve(inputs []types.UTXO, intentID string, ttl time.Durat
 			return fmt.Errorf("%w: %s:%d (%s)", ErrAlreadyReserved, u.TxID, u.Vout, e.SpentInTx)
 		}
 	}
+	previous := make(map[SpentKey]*SpentEntry, len(inputs))
 	for _, u := range inputs {
-		ss.entries[SpentKey{u.TxID, u.Vout}] = SpentEntry{
+		key := SpentKey{u.TxID, u.Vout}
+		if _, seen := previous[key]; seen {
+			continue // the same outpoint twice: keep the state from before the first write
+		}
+		if e, exists := ss.entries[key]; exists {
+			e := e
+			previous[key] = &e
+		} else {
+			previous[key] = nil
+		}
+		ss.entries[key] = SpentEntry{
 			TxID:      u.TxID,
 			Vout:      u.Vout,
 			SpentInTx: ReservedPrefix + intentID,
@@ -153,14 +198,26 @@ func (ss *SpentSet) Reserve(inputs []types.UTXO, intentID string, ttl time.Durat
 			IntentID:  intentID,
 		}
 	}
-	ss.persist()
+	if err := ss.persist(); err != nil {
+		// All-or-nothing includes durability: a reservation this process
+		// would forget on restart is not a reservation. Put back what was
+		// there (an own expired reservation, or nothing) and report.
+		for key, prev := range previous {
+			if prev == nil {
+				delete(ss.entries, key)
+			} else {
+				ss.entries[key] = *prev
+			}
+		}
+		return err
+	}
 	return nil
 }
 
 // Release drops the reservations held by intentID. Broadcast entries are
 // never released here: once a transaction is out, its inputs are spent until
 // the chain says otherwise.
-func (ss *SpentSet) Release(intentID string) {
+func (ss *SpentSet) Release(intentID string) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	released := 0
@@ -171,23 +228,24 @@ func (ss *SpentSet) Release(intentID string) {
 		}
 	}
 	if released > 0 {
-		ss.persist()
+		return ss.persist()
 	}
+	return nil
 }
 
 // MarkBroadcast records that the given UTXOs were spent in a broadcast TX.
 // This is the PRIMARY defense against stale UTXO re-selection. Reservations
 // on these inputs become permanent spent entries.
-func (ss *SpentSet) MarkBroadcast(inputs []types.UTXO, broadcastTxID string) {
-	ss.markBroadcast(inputs, broadcastTxID, "")
+func (ss *SpentSet) MarkBroadcast(inputs []types.UTXO, broadcastTxID string) error {
+	return ss.markBroadcast(inputs, broadcastTxID, "")
 }
 
 // MarkBroadcastFor is MarkBroadcast that also records the withdrawal id.
-func (ss *SpentSet) MarkBroadcastFor(inputs []types.UTXO, broadcastTxID, intentID string) {
-	ss.markBroadcast(inputs, broadcastTxID, intentID)
+func (ss *SpentSet) MarkBroadcastFor(inputs []types.UTXO, broadcastTxID, intentID string) error {
+	return ss.markBroadcast(inputs, broadcastTxID, intentID)
 }
 
-func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID string) {
+func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID string) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
@@ -209,7 +267,10 @@ func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID s
 			len(inputs), shortID(broadcastTxID, 12), len(ss.entries))
 	}
 
-	ss.persist()
+	// The entries stay whatever persist says: the transaction is out and
+	// this process must keep refusing its inputs. The caller learns that a
+	// restart would not.
+	return ss.persist()
 }
 
 // IsSpent checks if a UTXO is in the spent set.
@@ -228,15 +289,29 @@ func (ss *SpentSet) IsSpent(txid string, vout uint32) bool {
 }
 
 // ConfirmSpent marks a spent entry as confirmed (UTXO disappeared from ElectrumX).
-func (ss *SpentSet) ConfirmSpent(txid string, vout uint32) {
+func (ss *SpentSet) ConfirmSpent(txid string, vout uint32) error {
+	return ss.ConfirmSpentAll([]types.UTXO{{TxID: txid, Vout: vout}})
+}
+
+// ConfirmSpentAll marks every listed input confirmed and writes the file once.
+// Use it for an intent's inputs together rather than ConfirmSpent per input.
+func (ss *SpentSet) ConfirmSpentAll(inputs []types.UTXO) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
-	key := SpentKey{txid, vout}
-	if entry, exists := ss.entries[key]; exists && !entry.Confirmed {
-		entry.Confirmed = true
-		ss.entries[key] = entry
+	changed := false
+	for _, u := range inputs {
+		key := SpentKey{u.TxID, u.Vout}
+		if entry, exists := ss.entries[key]; exists && !entry.Confirmed {
+			entry.Confirmed = true
+			ss.entries[key] = entry
+			changed = true
+		}
 	}
+	if !changed {
+		return nil
+	}
+	return ss.persist()
 }
 
 // Prune removes confirmed entries older than 1 hour and expired
@@ -244,7 +319,7 @@ func (ss *SpentSet) ConfirmSpent(txid string, vout uint32) {
 // the transaction that spends them is still in flight until the chain
 // confirms it, however long that takes.
 // Should be called periodically (e.g., after each UTXO refresh).
-func (ss *SpentSet) Prune() {
+func (ss *SpentSet) Prune() error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
@@ -260,8 +335,9 @@ func (ss *SpentSet) Prune() {
 
 	if pruned > 0 {
 		log.Printf("[utxo] Spent set: pruned %d confirmed entries (remaining: %d)", pruned, len(ss.entries))
-		ss.persist()
+		return ss.persist()
 	}
+	return nil
 }
 
 // Size returns the current size of the spent set.
@@ -272,9 +348,9 @@ func (ss *SpentSet) Size() int {
 }
 
 // persist writes the spent set to disk atomically.
-func (ss *SpentSet) persist() {
+func (ss *SpentSet) persist() error {
 	if ss.filePath == "" {
-		return
+		return nil
 	}
 
 	entries := make([]SpentEntry, 0, len(ss.entries))
@@ -290,21 +366,20 @@ func (ss *SpentSet) persist() {
 
 	buf, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		log.Printf("[utxo] ERROR: failed to marshal spent set: %v", err)
-		return
+		return fmt.Errorf("%w: marshal: %v", ErrPersist, err)
 	}
 
 	// Atomic write: write to temp file, then rename
 	tmpFile := ss.filePath + ".tmp"
 	if err := os.WriteFile(tmpFile, buf, 0600); err != nil {
-		log.Printf("[utxo] ERROR: failed to write spent set temp file: %v", err)
-		return
+		return fmt.Errorf("%w: %v", ErrPersist, err)
 	}
 
 	if err := os.Rename(tmpFile, ss.filePath); err != nil {
-		log.Printf("[utxo] ERROR: failed to rename spent set file: %v", err)
 		os.Remove(tmpFile)
+		return fmt.Errorf("%w: rename: %v", ErrPersist, err)
 	}
+	return nil
 }
 
 // load reads the spent set from disk on startup.
@@ -314,28 +389,25 @@ func (ss *SpentSet) persist() {
 // earlier version dropped them after 2 hours, so a restart after a slow
 // confirmation re-exposed the inputs of a transaction that was still in the
 // mempool, and the next withdrawal double-spent them.
-func (ss *SpentSet) load() {
+func (ss *SpentSet) load() error {
 	// Ensure directory exists
 	dir := filepath.Dir(ss.filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("[utxo] WARNING: failed to create spent set directory %s: %v", dir, err)
-		return
+		return fmt.Errorf("%w: create directory %s: %v", ErrSpentSetUnreadable, dir, err)
 	}
 
 	data, err := os.ReadFile(ss.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("[utxo] Spent set file not found (first run) — starting fresh")
-		} else {
-			log.Printf("[utxo] WARNING: failed to read spent set file: %v", err)
+			return nil
 		}
-		return
+		return fmt.Errorf("%w: %v", ErrSpentSetUnreadable, err)
 	}
 
 	var file spentSetFile
 	if err := json.Unmarshal(data, &file); err != nil {
-		log.Printf("[utxo] WARNING: failed to parse spent set file: %v (starting fresh)", err)
-		return
+		return fmt.Errorf("%w: parse %s: %v", ErrSpentSetUnreadable, ss.filePath, err)
 	}
 
 	now := time.Now()
@@ -355,6 +427,7 @@ func (ss *SpentSet) load() {
 
 	log.Printf("[utxo] Spent set loaded: %d entries from disk (%d expired, %d active)",
 		len(file.Entries), expired, loaded)
+	return nil
 }
 
 // CoinSelector provides UTXO coin selection algorithms.

@@ -3,6 +3,7 @@ package withdraw
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -470,5 +471,108 @@ func TestTxIDMismatchWithoutANodeTxIDStillHolds(t *testing.T) {
 	net.setMode("ok")
 	if err := e.Broadcast(w1); !errors.Is(err, ErrHeld) {
 		t.Fatalf("retry: %v, want ErrHeld", err)
+	}
+}
+
+// failingSpentSet returns a file-backed spent set whose every write fails.
+func failingSpentSet(t *testing.T) *utxo.SpentSet {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return utxo.NewSpentSet(filepath.Join(blocker, "spent.json"))
+}
+
+// The spent set cannot be written. Build reserves nothing and sends nothing;
+// the intent stays Created for a retry once the disk is fixed.
+func TestBuildWithUnwritableSpentSetSendsNothing(t *testing.T) {
+	spent := failingSpentSet(t)
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, NewMemStore(), spent, net, coins())
+	e.Submit("w1", dst, 1_000_000, 1000)
+	_, err := e.Process("w1")
+	if !errors.Is(err, utxo.ErrPersist) {
+		t.Fatalf("process: %v, want ErrPersist", err)
+	}
+	w1, _, _ := e.Store.Get("w1")
+	if w1.State != StateCreated || w1.RawHex != "" || net.sentCount() != 0 || net.builds != 0 {
+		t.Fatalf("something happened on an unwritable spent set: %+v, sent %d, built %d", w1, net.sentCount(), net.builds)
+	}
+	if spent.IsSpent(txA, 0) || spent.IsSpent(txB, 0) || spent.IsSpent(txC, 0) {
+		t.Fatal("an unpersisted reservation was kept")
+	}
+}
+
+// The disk fails between a successful broadcast and the spent-set write. The
+// intent is still recorded as Broadcast (the payment is out), the error is
+// returned so the operator hears about it, this process refuses the inputs,
+// and Recover over the intent store re-marks them in a fresh spent set.
+func TestBroadcastWithUnwritableSpentSetReportsAndRecoverRemarks(t *testing.T) {
+	spent := utxo.NewSpentSet("")
+	net := &fakeNet{mode: "ok"}
+	store := NewMemStore()
+	e := newEngine(t, store, spent, net, coins())
+	e.Submit("w1", dst, 1_000_000, 1000)
+	w1, _, _ := e.Store.Get("w1")
+	if err := e.Build(w1); err != nil {
+		t.Fatal(err)
+	}
+	e.Spent = failingSpentSet(t) // the disk goes away after the build
+	err := e.Broadcast(w1)
+	if !errors.Is(err, utxo.ErrPersist) {
+		t.Fatalf("broadcast: %v, want ErrPersist reported", err)
+	}
+	w1, _, _ = store.Get("w1")
+	if w1.State != StateBroadcast || w1.TxID == "" {
+		t.Fatalf("intent %+v, want Broadcast with its txid: the payment is out", w1)
+	}
+	if !e.Spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("this process must keep refusing the inputs even though the write failed")
+	}
+	// Restart with an empty spent set: only the intent store knows the spend.
+	fresh := utxo.NewSpentSet("")
+	e2 := newEngine(t, store, fresh, &fakeNet{mode: "ok"}, coins())
+	if err := e2.Recover(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if !fresh.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("Recover did not re-mark a Broadcast intent's inputs")
+	}
+	e2.Submit("w2", dst, 4_500_000, 1000) // only txA covers it; txA is w1's input
+	if w2, err := e2.Process("w2"); err == nil || w2.State != StateFailed {
+		t.Fatalf("w2 %+v %v: built on an input the previous process spent", w2, err)
+	}
+}
+
+// Recover re-marks a held intent's inputs under the node's txid, and when the
+// spent set cannot be written it still holds them in memory and reports.
+func TestRecoverRemarksHeldIntentsAndReportsAFailedWrite(t *testing.T) {
+	store := NewMemStore()
+	net := &fakeNet{mode: "mismatch"}
+	e := newEngine(t, store, utxo.NewSpentSet(""), net, coins())
+	e.Submit("w1", dst, 4_500_000, 1000)
+	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrTxIDMismatch) {
+		t.Fatalf("mismatch: %v", err)
+	}
+	w1, _, _ := store.Get("w1")
+
+	fresh := utxo.NewSpentSet("")
+	e2 := newEngine(t, store, fresh, &fakeNet{mode: "ok"}, coins())
+	if err := e2.Recover(); !errors.Is(err, ErrHeld) {
+		t.Fatalf("recover: %v, want ErrHeld reported", err)
+	}
+	if !fresh.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("a held intent's inputs were not re-marked from the store")
+	}
+
+	failing := failingSpentSet(t)
+	e3 := newEngine(t, store, failing, &fakeNet{mode: "ok"}, coins())
+	err := e3.Recover()
+	if !errors.Is(err, utxo.ErrPersist) || !errors.Is(err, ErrHeld) {
+		t.Fatalf("recover on an unwritable set: %v, want both ErrPersist and ErrHeld", err)
+	}
+	if !failing.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("re-marked inputs must stay held in memory when the write fails")
 	}
 }
