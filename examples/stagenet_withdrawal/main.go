@@ -70,7 +70,7 @@ func main() {
 		}
 		return
 	}
-	if *inputs == "" || *to == "" || *amountSOQ <= 0 {
+	if *inputs == "" || *to == "" || *amountSOQ <= 0 || *confirmations < 1 {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -82,7 +82,7 @@ func main() {
 // createKeys derives two keys from a fresh 32-byte master secret: the first
 // index that yields a valid key is the funding address, the next one the
 // destination. The master and every seed are zeroed before returning; the
-// encrypted keystore is the only copy of the keys.
+// encrypted keystore is the only copy on disk.
 func createKeys(keystore *keys.Manager) error {
 	if keystore.KeyCount() > 0 {
 		return errors.New("the keystore already holds keys; use another -dir")
@@ -165,7 +165,8 @@ func run(dir string, keystore *keys.Manager, inputList, to string, amount, requi
 			if err != nil {
 				return nil, err
 			}
-			// Budget the fee against vsize: one ML-DSA-44 input is about 1,073 vB.
+			// Budget the fee against vsize: a one-input, two-output payment is about
+			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB.
 			budget := amount + (1100+950*int64(len(funding)))*feeRate
 			selected, _, err := selector.SelectUTXOs(funding, budget, 1, tip, []string{hot})
 			if err != nil {

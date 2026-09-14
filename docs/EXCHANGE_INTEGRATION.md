@@ -124,8 +124,8 @@ SDK reads or broadcasts goes through them.
 
 | | |
 |---|---|
-| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The SDK is verified against v2.3.0 (the golden transaction vector), v2.4.0 and v2.5.0 (the harness). |
-| `txindex=1` | **Required, and set before the first start**; adding it later reindexes the chain. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
+| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a v2.5.0 build before the v0.3.5 tag, and the release notes record that binary's digest. |
+| `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
 | `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every node we operate runs with it. |
 | `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC has no TLS. `rpc.Client` takes a URL, so either bind RPC to localhost or your private network, or terminate TLS in front of it ([Security Guide](SECURITY.md#network-security)). |
 | `stagenet=1` | For the staging network. Omit it for mainnet. |
@@ -162,8 +162,8 @@ height moved since the last flush (`server/db.py`, `flush_dbs`). At the limit ev
 with `struct.error: 'H' format requires 0 <= number <= 65535`, the process exits, a supervisor
 restarts it, and the index stays frozen at one height. Watch the `flush #N` line the server logs
 on each flush (`flush count: N` at startup) and run `electrumx_compact_history` with the server
-stopped well before N reaches 65,535; compaction resets the counter to the row count of the
-largest address history.
+stopped well before N reaches 65,535; compaction resets the counter to about the row count of
+the largest address history.
 
 ### Sizing, measured
 
@@ -527,7 +527,8 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			// Budget the fee against vsize: one Dilithium input is ~1,073 vB.
+			// Budget the fee against vsize: a one-input, two-output payment is about
+			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB.
 			budget := amount + (1100+950*int64(utxo.MaxInputsPerTX))*feeRate
 			selected, _, err := selector.SelectUTXOs(elx.GetAllUTXOs(), budget, 1, tip, []string{hotWallet})
 			if err != nil {

@@ -177,7 +177,6 @@ func TestImportedKeySurvivesCallerZeroing(t *testing.T) {
 	pubKey := append([]byte(nil), kp.PublicKey...)
 
 	mgr := NewManager(keyFile, passwd)
-	mgr.loaded = true
 	if err := mgr.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
 		t.Fatalf("ImportPrivateKey() error: %v", err)
 	}
