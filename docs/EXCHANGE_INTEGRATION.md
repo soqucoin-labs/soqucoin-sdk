@@ -207,25 +207,32 @@ and the index each user was given are the only recovery material.
 
 ```go
 import (
+	"errors"
+
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-// DepositAddress derives the deposit address for derivation index i.
-// Store i with the user record; the key is re-derived from it at sweep time.
-func DepositAddress(master []byte, i uint32) (string, error) {
-	seed, err := keys.DeriveSeed(master, i)
-	if err != nil {
-		return "", err
+// DepositAddress derives a deposit address starting at derivation index i and
+// returns the index it used. Store that index with the user record; the key is
+// re-derived from it at sweep time.
+func DepositAddress(master []byte, i uint32) (string, uint32, error) {
+	for {
+		seed, err := keys.DeriveSeed(master, i)
+		if err != nil {
+			return "", 0, err // keys.ErrShortMaster is a configuration fault, not an index to skip
+		}
+		// types.Stagenet.HRP on a test host ("ssq" → ssq1p... addresses), with its own master.
+		kp, err := keys.FromSeed(types.Mainnet.HRP, seed)
+		if errors.Is(err, keys.ErrInvalidPublicKey) {
+			i++ // about 1 index in 256 derives a key the node can never spend from; leave it unused
+			continue
+		}
+		if err != nil {
+			return "", 0, err
+		}
+		return kp.Address, i, nil
 	}
-	// types.Stagenet.HRP for testing ("ssq" → ssq1p... addresses)
-	kp, err := keys.FromSeed(types.Mainnet.HRP, seed)
-	if err != nil {
-		// keys.ErrInvalidPublicKey: about 1 index in 256 derives a key the node
-		// can never spend from. Leave i unused and give this user index i+1.
-		return "", err
-	}
-	return kp.Address, nil
 }
 ```
 
@@ -238,9 +245,11 @@ key     = ML-DSA-44 KeyGen(seed)                       (FIPS 204, deterministic)
 address = bech32m(hrp, witness version 1, SHA-256(public key))
 ```
 
-The master must be at least 32 bytes of secret random data (`keys.MinMasterSize`). Vectors for the
-whole chain are in `keys/seed_test.go`; the address encoding is pinned to addresses produced by the
-node's own encoder in `keys/node_vectors_test.go`.
+The master must be at least 32 bytes of secret random data (`keys.MinMasterSize`). The network is
+not part of the scheme: one master derives the same key for `sq` and `ssq`, so a test host gets a
+master of its own and never the production one. Vectors for the whole chain are in
+`keys/seed_test.go`; the address encoding is pinned to addresses produced by the node's own encoder
+in `keys/node_vectors_test.go`.
 
 **Two key stores, two jobs.** Derived keys are for deposit addresses: nothing is stored per user
 except the index, and at sweep time you re-derive the key and hand it to an in-memory `keys.Manager`

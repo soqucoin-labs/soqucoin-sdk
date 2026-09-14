@@ -4,9 +4,9 @@
 //
 // Two ways to hold keys: FromSeed with DeriveSeed derives one key per index
 // from a master secret kept in your own key-management system, which is the
-// per-user deposit-address path; Manager holds randomly generated keys in a
-// file encrypted with AES-256-GCM under an Argon2id-derived key, which is the
-// hot-wallet path.
+// per-user deposit-address path; Manager is the hot-wallet store, randomly
+// generated keys in a file encrypted with AES-256-GCM under an Argon2id-derived
+// key, and also signs for a derived key imported in memory at sweep time.
 package keys
 
 import (
