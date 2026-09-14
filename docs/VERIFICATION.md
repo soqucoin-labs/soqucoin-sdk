@@ -176,12 +176,37 @@ Stated precisely, so you can see exactly what has and has not been demonstrated.
 - **These are single-signature SOQ payments of one and three inputs.** They do not
   exercise USDSOQ asset transactions or the authority paths.
 - **Both were performed on stagenet.** Mainnet construction is covered by unit tests
-  across all three networks and by address vectors produced by the node's own
-  encoder, but no mainnet transaction has been broadcast: the mainnet genesis
-  exists (2026-09-02) and the network launches later.
+  across all three networks, by address vectors produced by the node's own
+  encoder, and by a sighash and witness vector produced by the node's own
+  signing path (below), but no mainnet transaction has been broadcast: the
+  mainnet genesis exists (2026-09-02) and the network launches later.
 - **They prove the signing, serialization and withdrawal-engine paths, not the
   whole SDK.** The deposit-monitoring path depends on an indexer and is not
   covered here.
+
+## The node-produced signing vector
+
+The stagenet transactions above prove that the node accepts what the SDK signs,
+with a node present. The fixture in `tx/testdata/sighash_node_vector.json` proves
+the same thing offline, in the direction an integrator can check without any
+infrastructure: a fixed two-input transaction was signed by the node's own
+signing path (the `sdk_sighash_vector_tests` suite in the node repository, which
+asserts the same digests and txid), and the SDK's tests rebuild it from the
+recorded fields and check that
+
+- the SDK's BIP 143 digest for each input equals the digest the node handed its signer;
+- the node's signatures verify over those digests under the SDK's ML-DSA-44 library
+  (a signature verifies over exactly one message, so this is the proof that the two
+  preimages are the same bytes);
+- the serialized transaction and txid are byte-identical to the node's;
+- the key the node signed with is the SDK's own `keys.FromSeed` key for the recorded seed;
+- every field the preimage commits to, changed one at a time, fails verification of
+  exactly the inputs whose preimage carries it.
+
+Run them with `go test ./tx -run NodeVector`, and with `SOQUCOIN_TX` pointing at a
+node's `soqucoin-tx` binary to decode the recorded bytes with the node live. The
+witness in the fixture is one run's output, because ML-DSA-44 signing is
+randomised; the digests, the key and the txid are deterministic.
 
 Per-package unit test coverage is reported in
 [Exchange Integration](EXCHANGE_INTEGRATION.md#test-coverage-current-status).
