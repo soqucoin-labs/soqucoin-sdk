@@ -131,7 +131,7 @@ if err := spentSet.MarkBroadcast(verified, sentTxID); err != nil {
 | Package | Purpose |
 |---------|---------|
 | [`address`](./address) | Bech32m address encoding/decoding, script hash derivation |
-| [`keys`](./keys) | Dilithium keypair generation, keystore encryption, signing |
+| [`keys`](./keys) | ML-DSA-44 keypair generation, derivation from a seed, keystore encryption, signing |
 | [`tx`](./tx) | Transaction building, signing, serialization (wire format) |
 | [`types`](./types) | Shared types: UTXO, Network, asset type constants |
 | [`electrumx`](./electrumx) | Production-hardened ElectrumX TCP client (PF-018, F5, Defense 12) |
