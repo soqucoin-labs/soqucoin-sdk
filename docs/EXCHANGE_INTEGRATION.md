@@ -424,9 +424,11 @@ cannot afford impossible by construction:
   (`rpc.ErrUnknownOutcome`) is retried with the **same bytes**, never rebuilt. `rpc.Broadcast`
   resolves that case against your node and treats "already in chain" as success.
 - **No own double-spend.** Inputs are reserved in the spent set when the transaction is built,
-  all-or-nothing, and unconfirmed spends survive restarts however long confirmation takes. Every
-  unsettled broadcast attempt renews the reservation, so retry Built intents at an interval
-  shorter than `ReservationTTL` (default 15 minutes).
+  all-or-nothing, and unconfirmed spends survive restarts however long confirmation takes. The
+  spent set and the intent file are synced to disk before the call that wrote them returns, and
+  the directory after the rename, so a power loss right after `Broadcast` returns does not lose
+  the record of it. Every unsettled broadcast attempt renews the reservation, so retry Built intents
+  at an interval shorter than `ReservationTTL` (default 15 minutes).
 - **A node that accepts the bytes under a different txid** (`rpc.ErrTxIDMismatch`) is neither a
   rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
   node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
