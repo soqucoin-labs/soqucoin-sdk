@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
+	coinsel "github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
 
 func init() { log.SetOutput(io.Discard) }
@@ -238,11 +239,13 @@ func TestSetAssetTypeUnknownOutpointIsANoOp(t *testing.T) {
 	}
 }
 
-// ── AddChangeUTXO (Defense 13) ─────────────────────────────────────────────
+// ── AddChangeUTXO ──────────────────────────────────────────────────────────
 
-// Change must be spendable immediately, before ElectrumX has seen the
-// transaction, or back-to-back payments fail for lack of inputs.
-func TestAddChangeUTXOIsImmediatelySpendableAsUnconfirmed(t *testing.T) {
+// Injected change is cached as unconfirmed: it counts in the unconfirmed
+// balance and is not selected. The claim it once carried, that it made
+// back-to-back payments possible, was false: the selector requires a height
+// above zero, so an injected output at height 0 is never an input.
+func TestAddChangeUTXOIsCachedAsUnconfirmedAndNotSelected(t *testing.T) {
 	c := newTestClient(nil)
 	c.AddChangeUTXO(txA, 1, 750, adr)
 
@@ -269,6 +272,13 @@ func TestAddChangeUTXOIsImmediatelySpendableAsUnconfirmed(t *testing.T) {
 	}
 	if unconfirmed != 750 {
 		t.Errorf("unconfirmed = %d, want 750", unconfirmed)
+	}
+	// And the selector does not spend it, at one confirmation or at none.
+	sel := coinsel.NewCoinSelector(nil)
+	for _, minConf := range []int{1, 0} {
+		if picked, _, err := sel.SelectUTXOs(c.GetAllUTXOs(), 1, minConf, 100, nil); err == nil {
+			t.Errorf("minConf %d: injected change was selected: %+v", minConf, picked)
+		}
 	}
 }
 

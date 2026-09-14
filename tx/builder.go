@@ -1004,3 +1004,84 @@ func BuildAndSign(
 	}
 	return t.SerializeHex(), t.TxID(), nil
 }
+
+// BuildSweepTransaction constructs an unsigned transaction that spends every
+// input to one output: a consolidation of small outputs, or a sweep of
+// deposit addresses into the hot wallet. There is no amount to choose and no
+// change output; the output carries the input total less the fee, and the fee
+// is measured on the real serialization of this one-output form at feeRate
+// (shors per vByte), so a sweep does not pay for a change output it never has.
+//
+// Refused: no inputs; inputs on different networks; a fee rate outside
+// (0, MaxFeeRateShorsPerVB] or a fee above MaxFeeShors (ErrFeeTooHigh, which
+// an 80-input sweep reaches at about 2,550 shors/vB); inputs worth no more
+// than the fee to spend them (ErrInsufficientFunds); an output below the
+// relay floor for its script (ErrBelowDust).
+func BuildSweepTransaction(
+	inputs []types.UTXO,
+	destinationScriptPubKey []byte,
+	feeRate int64,
+) (*Transaction, error) {
+	if len(inputs) == 0 {
+		return nil, fmt.Errorf("%w: no inputs", ErrInsufficientFunds)
+	}
+	if err := requireSameNetwork(inputs); err != nil {
+		return nil, err
+	}
+	totalInput, err := sumInputs(inputs)
+	if err != nil {
+		return nil, err
+	}
+	tx := NewTransaction()
+	for _, u := range inputs {
+		inputSPK, err := inputScriptPubKey(u.Address)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.AddInput(u, inputSPK); err != nil {
+			return nil, fmt.Errorf("add input: %w", err)
+		}
+	}
+
+	// The value does not change the size (eight bytes either way), so the
+	// one-output form is measured with a placeholder and then filled in.
+	tx.AddOutput(0, destinationScriptPubKey)
+	fee := tx.EstimateFee(feeRate)
+	if err := checkFee(fee, feeRate); err != nil {
+		return nil, err
+	}
+	amount := totalInput - fee
+	if amount <= 0 {
+		return nil, fmt.Errorf("%w: inputs=%d, fee=%d", ErrInsufficientFunds, totalInput, fee)
+	}
+	if floor := MinOutputValue(destinationScriptPubKey); amount < floor {
+		return nil, fmt.Errorf("%w: %d sat left after a fee of %d, floor %d", ErrBelowDust, amount, fee, floor)
+	}
+	if err := checkAmount(amount); err != nil {
+		return nil, err
+	}
+	tx.Outputs[0].Value = amount
+	return tx, nil
+}
+
+// BuildSignedSweep is BuildSweepTransaction followed by SignAll and VerifyAll:
+// the sweep is signed with SIGHASH_ALL on every input and every input is
+// verified as the node verifies it before the transaction is returned.
+func BuildSignedSweep(
+	inputs []types.UTXO,
+	destinationScriptPubKey []byte,
+	feeRate int64,
+	signer Signer,
+) (*Transaction, error) {
+	t, err := BuildSweepTransaction(inputs, destinationScriptPubKey, feeRate)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.SignAll(signer); err != nil {
+		return nil, err
+	}
+	if err := t.VerifyAll(); err != nil {
+		return nil, err
+	}
+	return t, nil
+}

@@ -36,6 +36,17 @@ type Cache interface {
 	LastRefresh() (time.Time, error)
 }
 
+// AddressFreshness is the optional part of Cache that reports, per tracked
+// address, when it last refreshed successfully; *electrumx.Client implements
+// it. When the Cache has it, Scan judges staleness address by address: the
+// addresses the indexer has not answered for within MaxCacheAge are skipped
+// and alarmed, the others are credited, and Scan pauses only when every
+// address is stale. Without it one failed address in a pass makes the whole
+// pass stale and nothing is credited until a pass succeeds for all of them.
+type AddressFreshness interface {
+	LastRefreshOf(addr string) (time.Time, error)
+}
+
 // Node is the exchange's own soqucoind. *rpc.Client satisfies it.
 type Node interface {
 	RequireSynced() error
@@ -47,6 +58,14 @@ type Node interface {
 // the same outpoint will be presented on every scan until it is final, and
 // after a restart. Pending returns credited outpoints that have not yet been
 // reported final, so Monitor can re-verify them.
+//
+// Pending must leave out outputs the exchange has spent itself, such as a
+// deposit swept to the hot wallet before it was final. Monitor asks the node
+// for each pending output, and the node answers the same for an output the
+// exchange spent and for one a reorganisation removed: it is gone. Monitor
+// cannot tell the two apart, so a swept output still in Pending raises
+// AlertDepositVanished on every scan. Record the sweep in the ledger and
+// exclude the output, or mark it final when the sweep transaction is final.
 type Ledger interface {
 	Credit(d Deposit) error
 	IsCredited(txid string, vout uint32) (bool, error)
@@ -104,7 +123,7 @@ type AlertKind string
 const (
 	AlertNodeSyncing     AlertKind = "node_syncing"     // crediting paused; node not caught up
 	AlertNodeWrongChain  AlertKind = "node_wrong_chain" // node serves another chain than Network; crediting refused until the deployment is fixed
-	AlertCacheStale      AlertKind = "cache_stale"      // indexer has not refreshed; crediting paused
+	AlertCacheStale      AlertKind = "cache_stale"      // indexer has not refreshed; crediting paused, or skipped for the stale addresses
 	AlertIndexerMismatch AlertKind = "indexer_mismatch" // indexer and node disagree on an output; NOT credited
 	AlertDepositVanished AlertKind = "deposit_vanished" // a credited, non-final output is gone from the node
 	AlertLedgerError     AlertKind = "ledger_error"     // the exchange's own book returned an error
@@ -185,11 +204,15 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 		}
 	}
 	// 2. The indexer must be fresh. A cache that stopped refreshing looks
-	//    exactly like "no new deposits".
-	at, refreshErr := m.Cache.LastRefresh()
-	if refreshErr != nil || at.IsZero() || m.clock().Sub(at) > m.maxCacheAge() {
-		m.alert(AlertCacheStale, "indexer last refreshed %v, error %v", at, refreshErr)
-		return nil, fmt.Errorf("%w: indexer cache stale (last %v, err %v)", ErrPaused, at, refreshErr)
+	//    exactly like "no new deposits". A cache that reports freshness per
+	//    address is judged address by address in step 4 instead.
+	perAddress, _ := m.Cache.(AddressFreshness)
+	if perAddress == nil {
+		at, refreshErr := m.Cache.LastRefresh()
+		if refreshErr != nil || at.IsZero() || m.clock().Sub(at) > m.maxCacheAge() {
+			m.alert(AlertCacheStale, "indexer last refreshed %v, error %v", at, refreshErr)
+			return nil, fmt.Errorf("%w: indexer cache stale (last %v, err %v)", ErrPaused, at, refreshErr)
+		}
 	}
 	tip, err := m.Node.GetBlockCount()
 	if err != nil {
@@ -201,9 +224,23 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 		return nil, err
 	}
 
-	// 4. Credit new deposits the node agrees with.
+	// 4. Credit new deposits the node agrees with, skipping the addresses the
+	//    indexer has not refreshed within MaxCacheAge when it reports that.
 	var credited []Deposit
-	for _, addr := range m.Addresses() {
+	addrs := m.Addresses()
+	var stale []string
+	var staleErr error
+	for _, addr := range addrs {
+		if perAddress != nil {
+			at, err := perAddress.LastRefreshOf(addr)
+			if at.IsZero() || m.clock().Sub(at) > m.maxCacheAge() {
+				if staleErr == nil {
+					staleErr = err
+				}
+				stale = append(stale, addr)
+				continue
+			}
+		}
 		wantScript, err := address.ScriptFor(addr)
 		if err != nil {
 			// Only v1 addresses are deposit addresses (address.Decode enforces it).
@@ -236,6 +273,13 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 				return credited, err
 			}
 			credited = append(credited, d)
+		}
+	}
+	if len(stale) > 0 {
+		m.alert(AlertCacheStale, "indexer has not refreshed %d of %d addresses within %v (first %s, its last refresh error %v); their deposits wait",
+			len(stale), len(addrs), m.maxCacheAge(), stale[0], staleErr)
+		if len(stale) == len(addrs) {
+			return nil, fmt.Errorf("%w: indexer cache stale for every address", ErrPaused)
 		}
 	}
 	return credited, nil

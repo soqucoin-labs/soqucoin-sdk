@@ -182,6 +182,25 @@ Blocks arrive one a minute (`nPowTargetSpacing = 60`). Mainnet starts from its g
 launch, so it stays smaller than stagenet for months; plan storage from the stagenet figures and
 the growth you observe. We have not timed an initial sync on a reference host.
 
+### Signing, measured
+
+One run of the benchmarks in the repository, 2026-09-14, Apple M4, Go 1.26
+(`go test ./keys ./tx -run '^$' -bench . -benchmem`). Run them on the host that will sign; these
+give the shape of the cost, not a figure for your hardware.
+
+| Operation | Benchmark | Time | Memory per operation |
+|---|---|---|---|
+| One ML-DSA-44 signature, `keys.Manager.Sign` | `BenchmarkManagerSign` (`keys/bench_test.go`) | 178 µs | 3.1 KB, 4 allocations |
+| One verification, `keys.Verify` | `BenchmarkVerify` (`keys/bench_test.go`) | 51 µs | 16.8 KB, 4 allocations |
+| Signing an 80-input payout, `SignAll` | `BenchmarkSignAll80Inputs` (`tx/bench_test.go`) | 14.4 ms | 1.6 MB |
+| Verifying an 80-input payout, `VerifyAll` | `BenchmarkVerifyAll80Inputs` (`tx/verify_test.go`) | 4.4 ms | 2.2 MB |
+| Writing the keystore, `keys.Manager.Save` (Argon2id, AES-256-GCM, durable write) | `BenchmarkManagerSave` (`keys/bench_test.go`) | 39 ms | 67 MB, the Argon2id working memory |
+| Generating a key, `keys.GenerateKeyForNetwork` | `BenchmarkGenerateKeyForNetwork` (`keys/bench_test.go`) | 62 µs | 63 KB |
+
+Signing is not where ML-DSA-44 costs an exchange. The size is: 3,782 bytes per input on the wire
+([Transaction Size](#transaction-size)), and on the deposit side one `listunspent` round trip per
+tracked address per poll ([Step 2](#step-2-monitor-deposits)).
+
 ---
 
 ## Before you write code: run the harness
@@ -290,6 +309,24 @@ horizon is not enforced during initial download) or while the indexer has stoppe
 outage looks exactly like "no deposits"), and it re-verifies every credited deposit until it passes
 the horizon so a reorganisation that removes one is alarmed rather than missed.
 
+**How many addresses one indexer client keeps fresh.** `electrumx.Client.RefreshAll`
+(`electrumx/client.go`) makes one `blockchain.scripthash.listunspent` call per tracked address, in
+sequence, on one connection, each under the 30-second call deadline (`callLocked`), so a pass takes
+the sum of the round trips. `deposit.Monitor` skips an address whose last successful refresh is
+older than `MaxCacheAge`, 5 minutes by default (`deposit/monitor.go`, `AddressFreshness`), and
+pauses only when every address is stale. The ceiling on one client is therefore
+
+    addresses x round trip per call  <  MaxCacheAge
+
+which at a 5 ms round trip gives about 60,000 addresses and at 50 ms about 6,000, and the poll
+interval given to `electrumx.NewClient` must also stay well inside `MaxCacheAge`, since an
+address's age when `Scan` reads it is up to the poll interval when a pass is shorter than the
+interval, and up to the pass duration otherwise. Measure
+the round trip on your own indexer and size against it, or run one client per block of addresses. A pass
+that skips any address raises one `AlertCacheStale` with the count; the deposits at those addresses
+wait for the next pass that reaches them, they are not lost. In v0.3.5 one failed call marked the
+whole pass stale and paused every credit until a pass succeeded for every address.
+
 ```go
 package main
 
@@ -340,6 +377,7 @@ func (l *memLedger) IsCredited(txid string, vout uint32) (bool, error) {
 	_, ok := l.credited[key(txid, vout)]
 	return ok, nil
 }
+// Pending leaves out outputs the exchange spent itself; see below.
 func (l *memLedger) Pending() ([]deposit.Deposit, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -411,6 +449,12 @@ func main() {
 The `Ledger` is your database. `Credit` must be idempotent on the outpoint, and the credit and the
 balance change belong in the same database transaction. Every `OnAlert` is a condition a human
 should see: indexer and node disagreeing, a credited deposit that vanished, crediting paused.
+
+`Pending` must not return an output you spent yourself. A deposit swept to the hot wallet before it
+was final looks to the node exactly like one a reorganisation removed, gone from the UTXO set, and
+`Monitor` cannot tell the two apart: a swept output still in `Pending` raises `AlertDepositVanished`
+on every scan. Record the sweep in the ledger and leave the output out of `Pending`, or mark it
+final once the sweep transaction is.
 
 ---
 
@@ -696,13 +740,13 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
-| `utxo` | **93.8%** | Coin selection, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
+| `utxo` | **94.3%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
 | `rpc` | **85.0%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
-| `deposit` | **81.1%** | Node cross-check before credit, pause conditions, vanished-credit alarm |
-| `electrumx` | **76.2%** | Id-matched replies, notification routing, merge, refresh failures, network inference, genesis check, TLS |
-| `tx` | **76.1%** | Serialized weight, output floor, amount checks, fee caps, txid byte order, BIP143 sighash, witness format, consensus format vectors |
-| `keys` | **75.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption, node-derived vectors |
+| `deposit` | **84.0%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
+| `electrumx` | **77.4%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `tx` | **80.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
+| `keys` | **85.8%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **82.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `resilience` | **62.1%** | Circuit breaker transitions and classification, reconciler against the node |
 
@@ -713,7 +757,7 @@ UTXO cache is shared between the polling goroutine and caller threads.
 
 - **`resilience` (62.1%)**: the breaker and the reconciler are covered against fakes; the Slack
   alerter's HTTP path is not, and it is an operational convenience rather than part of the money path.
-- **`electrumx` (76.2%)**: the protocol path is driven by a scripted fake server, including the
+- **`electrumx` (77.4%)**: the protocol path is driven by a scripted fake server, including the
   notification-in-front-of-reply case. The long-running polling loop's timing is not unit-tested.
 
 **What the tests deliberately target.** Rather than chasing a percentage, they pin the invariants
@@ -808,15 +852,27 @@ soqucoin-cli testmempoolaccept '["<rawHex>"]'
 
 ### UTXO Consolidation
 
-Exchanges accumulate many small UTXOs from deposits. Periodically consolidate them to avoid hitting the 80-input limit during large withdrawals:
+Deposits leave many small outputs, and a withdrawal carries at most 80 inputs
+(`utxo.MaxInputsPerTX`), so consolidate on a schedule: the smallest final outputs into one at the
+hot wallet. `SelectSmallestUTXOs` picks them, and `tx.BuildSignedSweep` builds the one-output
+transaction with the fee measured on that form, signs it and verifies every input. Consolidate only
+outputs past the reorganisation horizon (`types.MaxReorgDepth` + 1 confirmations): a consolidation
+that spends a shallow output is undone with it.
 
 ```go
-// Select the smallest UTXOs for consolidation. Consolidate only outputs that
-// are final (past the reorg horizon); a consolidation that spends a shallow
-// output is undone with it.
-smallUTXOs, total, err := selector.SelectSmallestUTXOs(allUTXOs, 50, int(types.MaxReorgDepth)+1, tipHeight, nil)
-// Build a single TX that merges them into one output to your hot wallet
+small, _, err := selector.SelectSmallestUTXOs(elx.GetAllUTXOs(), utxo.MaxInputsPerTX, int(types.MaxReorgDepth)+1, tipHeight, nil)
+if errors.Is(err, utxo.ErrNoCandidates) {
+    return nil // nothing final to consolidate
+}
+verified, err := node.VerifyAndFilterUTXOs(small, elx.EvictUTXO, elx.SetAssetType) // Defense 11
+// ...
+sweep, err := tx.BuildSignedSweep(verified, hotWalletSPK, feeRate, keystore)
 ```
+
+[`examples/consolidate`](../examples/consolidate) is the whole flow against your own node: the fee
+from `FeeRateShorsPerVB`, outputs worth less than the fee they add left alone, the input count
+capped so the fee stays under `tx.MaxFeeShors` (an 80-input sweep reaches it at about 2,550
+shors/vB), the inputs recorded in the spent set after the broadcast, and `-dry-run`.
 
 ---
 
