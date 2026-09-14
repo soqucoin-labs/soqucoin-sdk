@@ -109,9 +109,10 @@ inputs, total, err := selector.SelectUTXOs(allUTXOs, amount+fee, 1, tipHeight, n
 // 2. Verify on-chain (Defense 11)
 verified, err := rpcClient.VerifyAndFilterUTXOs(inputs, elxClient.EvictUTXO, nil)
 
-// 3. Build, sign and serialize in one call. feeRate is shors per vByte; use
-//    types.RecommendedFeeRate (1000). The builder measures the real weight,
-//    enforces the node's output floor and caps the fee.
+// 3. Build, sign, verify and serialize in one call. feeRate is shors per vByte;
+//    use types.RecommendedFeeRate (1000). The builder measures the real weight,
+//    enforces the node's output floor, caps the fee and verifies every input
+//    as the node will before returning.
 recipientSPK, err := address.ScriptFor(recipientAddr)
 changeSPK, err := address.ScriptFor(changeAddr)
 rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, types.RecommendedFeeRate, keystore)

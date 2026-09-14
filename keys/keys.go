@@ -34,6 +34,10 @@ const (
 	PrivateKeySize = 2560 // ML-DSA-44 private key bytes (FIPS 204)
 	PublicKeySize  = 1312 // ML-DSA-44 public key bytes
 	SignatureSize  = 2420 // ML-DSA-44 signature bytes
+
+	// sigHashAll is the only hashtype this SDK signs (tx.SigHashAll; this
+	// package cannot import tx).
+	sigHashAll = 0x01
 )
 
 // KeyPair holds a Dilithium keypair.
@@ -104,6 +108,10 @@ var (
 	// address do not belong together. A manager that holds such a record would
 	// hand out a deposit address it cannot sign for.
 	ErrKeyMismatch = errors.New("keys: private key, public key and address do not match")
+
+	// ErrHashType marks a witness-form signature (2421 bytes) whose trailing
+	// hashtype byte is not SIGHASH_ALL, the only type this SDK signs.
+	ErrHashType = errors.New("keys: signature hashtype is not SIGHASH_ALL (0x01)")
 
 	// ErrKeystoreMissing is returned by Load when the keystore file does not
 	// exist. A signer that starts with no keys because its path was mistyped
@@ -501,6 +509,11 @@ func (m *Manager) Sign(address string, digest []byte) ([]byte, error) {
 }
 
 // Verify verifies a Dilithium signature against a public key and message digest.
+//
+// The digest is the caller's. Verify cannot tell whether it is the digest the
+// node will compute from the transaction, so a transaction input is checked
+// with tx.VerifyInput, which reads the hashtype from the witness and recomputes
+// the sighash; use Verify for a signature over a digest you produced yourself.
 func Verify(pubKey []byte, digest []byte, signature []byte) (bool, error) {
 	// Accept the witness forms as well as the raw ones: consensus requires the
 	// public key to be pushed as 0x00||pk (1313 bytes) and the signature to
@@ -511,6 +524,13 @@ func Verify(pubKey []byte, digest []byte, signature []byte) (bool, error) {
 		pubKey = pubKey[1:]
 	}
 	if len(signature) == SignatureSize+1 {
+		// The node computes the sighash from this byte. The SDK signs
+		// SIGHASH_ALL only, and a caller's digest is a SIGHASH_ALL digest, so
+		// any other byte means the node would verify against a different
+		// message than the one checked here.
+		if signature[SignatureSize] != sigHashAll {
+			return false, fmt.Errorf("%w: %#02x", ErrHashType, signature[SignatureSize])
+		}
 		signature = signature[:SignatureSize]
 	}
 	if err := checkPublicKey(pubKey); err != nil {

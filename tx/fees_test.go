@@ -177,9 +177,11 @@ func TestBuildSendCapsFees(t *testing.T) {
 // change output can be read where BuildAndSign returns only bytes: same
 // inputs and outputs, same txid, and the change is what the bytes carry.
 func TestBuildSignedTransactionMatchesBuildAndSign(t *testing.T) {
-	inputs := []types.UTXO{realUTXO(t, 0x10, 0, 5_000_000_000)}
+	// Both one-call forms verify every input before returning, so the signer
+	// must be a real key; fixed material fails verification (TestVerifyInputRefusesFixedMaterial).
+	signer, pairs := realKeys(t, 1)
+	inputs := []types.UTXO{{TxID: displayTxID, Vout: 0, Value: 5_000_000_000, Address: pairs[0].Address}}
 	recipient, change := ScriptP2WPKH(hash32(0x02)), ScriptP2WPKH(hash32(0x03))
-	signer := fakeSigner{sigLen: DilithiumSigSize, pubLen: DilithiumPubKeySize}
 	tr, err := BuildSignedTransaction(inputs, recipient, 1_000_000_000, change, 1000, signer)
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +190,9 @@ func TestBuildSignedTransactionMatchesBuildAndSign(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tr.TxID() != txid || tr.SerializeHex() != rawHex {
+	// Signing is hedged, so the two witnesses differ byte for byte; the txid
+	// covers everything but the witness and the serialized size is fixed.
+	if tr.TxID() != txid || len(tr.SerializeHex()) != len(rawHex) {
 		t.Fatal("the two one-call forms built different transactions")
 	}
 	if len(tr.Outputs) != 2 || tr.Outputs[1].Value <= 0 || tr.Outputs[1].Value >= 4_000_000_000 {

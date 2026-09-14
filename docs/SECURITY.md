@@ -155,7 +155,36 @@ or a hardware-isolated signer. This SDK cannot defend against that.
 
 ## Signature verification
 
-`keys.Verify` checks an ML-DSA-44 signature:
+### A signed transaction
+
+`tx.Transaction.VerifyAll` checks every input the way the node's single-key
+Dilithium path does (`src/script/interpreter.cpp`): the witness is two items of
+the consensus sizes, the public key carries its `0x00` prefix and hashes to the
+output's 32-byte program, the hashtype byte at the end of the signature is
+`SIGHASH_ALL`, and the signature verifies over the BIP 143 sighash recomputed from
+the transaction with that hashtype. `tx.BuildSignedTransaction` and
+`tx.BuildAndSign` call it before they return, so a transaction they hand back has
+passed it. Call it yourself after signing by hand and before broadcasting a
+transaction that was stored and reloaded:
+
+```go
+if err := signed.VerifyAll(); err != nil {
+    // One of tx.ErrUnsigned, tx.ErrWitnessForm, tx.ErrHashType, tx.ErrWrongKey,
+    // tx.ErrSignature, wrapped with the input index. Do not broadcast.
+    return err
+}
+```
+
+The hashtype is read from the witness, not supplied by the caller. The node reads
+that byte, refuses the `ANYPREVOUT` types on this path, and computes the sighash
+for the other types under BIP 143 rules this SDK does not implement, so any byte
+other than `SIGHASH_ALL` is refused (`tx.ErrHashType`). The check costs about
+50 µs per input; an 80-input payout verifies in a few milliseconds
+(`BenchmarkVerifyAll80Inputs` in `tx/verify_test.go`).
+
+### A signature over your own digest
+
+`keys.Verify` checks an ML-DSA-44 signature against a digest you computed:
 
 ```go
 ok, err := keys.Verify(pubKey, digest, signature)
@@ -167,17 +196,22 @@ if !ok {
 }
 ```
 
-Note the two-value result. `err` reports malformed input, meaning a public key or
-signature of the wrong length. A cryptographically invalid signature returns
-`false, nil`. Checking only `err` accepts every forged signature of the correct
-size.
+Note the two-value result. `err` reports malformed input: a public key or
+signature of the wrong length, or a witness-form signature (2421 bytes) whose
+trailing hashtype byte is not `SIGHASH_ALL` (`keys.ErrHashType`). A
+cryptographically invalid signature returns `false, nil`. Checking only `err`
+accepts every forged signature of the correct size.
+
+`keys.Verify` cannot tell whether your digest is the one the node will compute
+from a transaction; that is what `VerifyAll` is for. Use `keys.Verify` for
+signatures over messages of your own, such as a signed statement of an address.
 
 ### Constant-time behaviour
 
 Constant-time verification is a property of CIRCL's ML-DSA implementation, which
-this SDK calls. `keys.Verify` performs two length checks and delegates the
-comparison, so the guarantee is CIRCL's rather than ours. That is the right place
-for it to live, but worth knowing precisely if you are reasoning about side
+this SDK calls. `keys.Verify` performs its length and hashtype checks and delegates
+the comparison, so the guarantee is CIRCL's rather than ours. That is the right
+place for it to live, but worth knowing precisely if you are reasoning about side
 channels.
 
 If you compare cryptographic values in your own code, use `crypto/subtle`:

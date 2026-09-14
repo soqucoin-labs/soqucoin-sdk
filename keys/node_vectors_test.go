@@ -199,4 +199,16 @@ func TestVerifyAcceptsWitnessForms(t *testing.T) {
 			t.Errorf("%s: ok=%v err=%v", c.name, ok, err)
 		}
 	}
+
+	// The trailing byte is the hashtype the node computes the sighash from.
+	// The digest here is a SIGHASH_ALL digest, so a witness carrying any other
+	// byte is refused rather than stripped: the node would verify it against a
+	// different message, or refuse the type outright.
+	for _, b := range []byte{0x02, 0x03, 0x41, 0x42, 0x81, 0x00} {
+		sig2421[SignatureSize] = b
+		ok, err := Verify(kp.PublicKey, digest[:], sig2421)
+		if ok || !errors.Is(err, ErrHashType) {
+			t.Errorf("hashtype %#02x: ok=%v err=%v, want ErrHashType", b, ok, err)
+		}
+	}
 }

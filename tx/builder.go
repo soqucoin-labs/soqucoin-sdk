@@ -951,6 +951,10 @@ func (tx *Transaction) SignAll(signer Signer) error {
 // than it costs to spend), the weight, the inputs as committed. SerializeHex
 // and TxID give the bytes and id for the node.
 //
+// Every input is verified (VerifyAll) before the transaction is returned, so a
+// signer that returns a signature over the wrong digest, or a key that does
+// not own the output, is an error here and not a rejection at the node.
+//
 // Prefer this or BuildAndSign over hand-wiring build, sighash, sign, witness
 // assembly and serialize: the witness format is Soqucoin-specific and easy to
 // get wrong by a byte at each end.
@@ -968,6 +972,9 @@ func BuildSignedTransaction(
 		return nil, err
 	}
 	if err := t.SignAll(signer); err != nil {
+		return nil, err
+	}
+	if err := t.VerifyAll(); err != nil {
 		return nil, err
 	}
 	return t, nil
