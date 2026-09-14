@@ -4,7 +4,7 @@ Get up and running with the Soqucoin SDK in five minutes.
 
 ## Prerequisites
 
-- **Go 1.25+**: [download](https://go.dev/dl/)
+- **Go 1.26+**: [download](https://go.dev/dl/)
 - A running `soqucoind` node or ElectrumX server (optional for address generation)
 
 ## Install

@@ -13,6 +13,9 @@ To support SOQ deposits and withdrawals, your exchange needs to:
 3. **Process withdrawals**: build, sign, and broadcast transactions
 4. **Confirm transactions**: wait for sufficient block confirmations
 
+All four run against a node you operate with `txindex=1` and an ElectrumX indexer; see
+[What you run](#what-you-run) for the configuration, ports and measured sizing.
+
 SOQ uses **NIST FIPS 204 ML-DSA-44** (Dilithium) for all signatures. Transaction structure is similar to Bitcoin/Dogecoin (UTXO model), but witness data contains Dilithium signatures (~2,420 bytes) and public keys (~1,312 bytes).
 
 ---
@@ -109,6 +112,69 @@ the operational risk sits, so it is worth settling before scoping.
 
 If neither option suits your architecture, tell us, we would rather adapt than have you commit to
 something that does not fit your operations.
+
+---
+
+## What you run
+
+Two processes, both yours: the node and an ElectrumX indexer. Everything the SDK reads or
+broadcasts goes through them.
+
+### The node
+
+| | |
+|---|---|
+| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The SDK and its harness need v2.3.0 or later. |
+| `txindex=1` | **Required, and set before the first start**; adding it later reindexes the chain. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index that call serves mempool transactions only, and the fallback `gettxout` on output 0 reads a mined transaction whose first output has since been spent as unknown, so the withdrawal never settles in the engine's view. |
+| `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every node we operate runs with it. |
+| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | `rpc.Client` speaks JSON-RPC over HTTP with no TLS option; bind RPC to localhost or your private network ([Security Guide](SECURITY.md#network-security)). |
+| `stagenet=1` | For the staging network. Omit it for mainnet. |
+| `dbcache` | Our nodes run 512 MB; the node's default is 450. |
+
+Ports, as `types.Mainnet`, `types.Stagenet` and `types.Regtest` carry them (node
+`src/chainparams.cpp` and `src/chainparamsbase.cpp`):
+
+| Network | Address prefix | P2P | JSON-RPC |
+|---|---|---|---|
+| mainnet | `sq1p` | 33388 | 33389 |
+| stagenet | `ssq1p` | 28333 | 28332 |
+| regtest | `sq1p` | 18444 | 18332 |
+
+`rpc.Client` compares the node's `chain` with the network you configured and refuses a mismatch
+(`rpc.ErrWrongChain`), so a mainnet configuration pointed at a stagenet node fails at the first
+call rather than at the first withdrawal.
+
+### The indexer
+
+The ElectrumX fork at [github.com/soqucoin-labs/electrumx](https://github.com/soqucoin-labs/electrumx),
+branch `soqucoin`, tag `mainnet-genesis-2026-09-03`. Configuration is in its `SOQUCOIN.md`:
+`COIN=Soqucoin`, `NET=stagenet` or `mainnet`, `DAEMON_URL` at your node's RPC. The default TCP
+service port is 50001 (`types.Network.ElectrumPort`); TLS is whatever port you terminate it on.
+
+One operational note from running it. ElectrumX stores its history flush counter in 16 bits
+(`server/history.py`, `pack_be_uint16(self.flush_count)`). Every start flushes, so a server left in
+a restart loop under a supervisor exhausts the counter after 65,535 flushes and from then on exits
+on every start with `struct.error: 'H' format requires 0 <= number <= 65535`, its index frozen at
+one height. Alert on the unit's restart count, and run `electrumx_compact_history` with the server
+stopped before the count approaches the limit.
+
+### Sizing, measured
+
+Stagenet on 2026-09-14 at height 82,061, read from our nodes (`getblockchaininfo`,
+`systemctl show -p MemoryCurrent`, `du`):
+
+| | |
+|---|---|
+| Node data directory with `txindex=1` | 425 MB (`size_on_disk`); the chainstate is under 1 MB |
+| `soqucoind` resident memory | 110 MB on a node serving RPC only, 340 MB on one also feeding an indexer, both at `dbcache=512` |
+| ElectrumX database (LevelDB) | 64 MB |
+| ElectrumX resident memory | 110 MB |
+| Host | a 4 vCPU, 8 GB VPS runs node plus indexer with headroom |
+
+Blocks arrive one a minute (`nPowTargetSpacing = 60`). Mainnet starts from its genesis block at
+launch, so it stays smaller than stagenet for months; plan storage from the stagenet figures and
+the growth you observe. We have not timed an initial sync on a reference host; at 425 MB it is
+bounded by your download bandwidth, and the indexer follows the node.
 
 ---
 
@@ -644,11 +710,11 @@ Roughly 3,782 bytes per additional input, so estimate
 `3,880 + 3,782 x (inputs - 1)` bytes.
 
 **The 80-input cap is not the node's weight limit.** `MAX_STANDARD_TX_WEIGHT` is
-800,000 WU, and 80 inputs use 312,786 of it, about 39%. The cap is sized against
-the older 400,000 WU limit because not every production node runs the build that
-raised it. It was reverted from 200 to 80 in May 2026 after transactions were
-rejected in production for size. Treat it as an operational floor that will rise,
-not as a protocol constant.
+800,000 WU in every node release the SDK supports (v2.3.0 and later,
+`src/policy/policy.h`), and 80 inputs use 312,786 of it, about 39%. The cap dates
+from the period when the limit was 400,000 WU and 200-input transactions were
+rejected for size. It is an operational limit in this SDK, not a protocol
+constant.
 
 `SelectUTXOs` returns `ErrInputLimitReached` with a partial selection when it hits
 the cap before reaching the target. Handle that case: it means the payment needs

@@ -31,14 +31,15 @@ import (
 )
 
 // MaxInputsPerTX is the hard cap on UTXO inputs per transaction.
-// Dilithium signatures are 2,420 bytes each, so each input adds ~3,896 WU.
-// 80 inputs × 3,896 WU = 311,680 WU — safely within MAX_STANDARD_TX_WEIGHT
-// (400,000 WU) with a 22% safety margin for outputs and overhead.
 //
-// NOTE: SOQ-ARCH-003 raised the soqucoind limit to 800K WU, but that build
-// has NOT been deployed to all production nodes yet. When it is, this can
-// be raised to ~200. Reverted from 200 to 80 on May 26, 2026 after
-// tx-size rejection in production.
+// Each input carries a 2,420-byte ML-DSA-44 signature and a 1,312-byte public
+// key, about 3,900 WU. A signed 80-input, 2-output transaction measures
+// 312,786 WU (docs/EXCHANGE_INTEGRATION.md, Transaction Size), 39% of the
+// node's MAX_STANDARD_TX_WEIGHT of 800,000 WU (src/policy/policy.h:39, the
+// same in every node release since v2.3.0). The cap is an operational limit
+// kept from the period when the node's limit was 400,000 WU and transactions
+// of 200 inputs were rejected; raising it is a policy choice, not a protocol
+// change.
 const MaxInputsPerTX = 80
 
 // ErrInputLimitReached is returned when SelectUTXOs hits MaxInputsPerTX before

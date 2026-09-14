@@ -18,7 +18,7 @@ Soqucoin (SOQ) is the first NIST FIPS 204 (ML-DSA / Dilithium) post-quantum cryp
 go get github.com/soqucoin-labs/soqucoin-sdk
 ```
 
-Requires **Go 1.25+** (per the `go` directive in `go.mod`).
+Requires **Go 1.26+** (per the `go` directive in `go.mod`).
 
 ## Integration model
 
@@ -26,7 +26,9 @@ Requires **Go 1.25+** (per the `go` directive in `go.mod`).
 `disablewallet=1`, so wallet RPCs (`listunspent`, `getbalance`, `sendtoaddress`) are not part of the
 integration surface. You still perform wallet *functions* (address derivation, key custody,
 signing), but they run in your own infrastructure through this SDK. The node is a chain reader and
-broadcaster; your key vault stays your key vault.
+broadcaster; your key vault stays your key vault. The node runs with `txindex=1` and
+`disablewallet=1`; ports, sizing and the indexer are in the guide's
+[What you run](docs/EXCHANGE_INTEGRATION.md#what-you-run).
 
 | Component | What you use | SDK package |
 |-----------|--------------|-------------|
