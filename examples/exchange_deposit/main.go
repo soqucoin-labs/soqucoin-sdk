@@ -97,6 +97,11 @@ func (l *memLedger) IsCredited(txid string, vout uint32) (bool, error) {
 	return ok, nil
 }
 
+// Pending is what Monitor re-verifies on the node until it is final. Leave
+// out any output you spent yourself, such as a deposit swept to the hot
+// wallet before it was final: the node reports a swept output and a
+// reorganised-away one the same way, gone, and Monitor would alarm the sweep
+// as a vanished deposit on every scan. This ledger never sweeps.
 func (l *memLedger) Pending() ([]deposit.Deposit, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

@@ -6,7 +6,7 @@
 //
 //   - Defense 11: gettxout pre-verification before signing
 //   - Defense 12: Merge-based refresh (preserves SpentPending flags)
-//   - Defense 13: Change tracking (immediate availability)
+//   - Change becomes an input once it has confirmed and the indexer reports it
 //   - Persistent spent set: Survives process restarts
 //   - Largest-first coin selection: Minimizes TX weight
 //   - Asset-type-aware selection: Separates SOQ from USDSOQ
@@ -42,6 +42,11 @@ import (
 // of 200 inputs were rejected; raising it is a policy choice, not a protocol
 // change.
 const MaxInputsPerTX = 80
+
+// ErrNoCandidates is returned by SelectSmallestUTXOs when no output meets the
+// confirmation requirement; there is nothing to consolidate, which a scheduled
+// consolidation treats as a normal outcome.
+var ErrNoCandidates = errors.New("utxo: no confirmed UTXOs available for consolidation")
 
 // ErrInputLimitReached is returned when SelectUTXOs hits MaxInputsPerTX before
 // satisfying the target amount. The caller receives a partial selection and
@@ -567,9 +572,12 @@ func (cs *CoinSelector) selectByAssetType(
 	return nil, totalValue, fmt.Errorf("insufficient funds: have %d, need %d", totalValue, targetAmount)
 }
 
-// SelectSmallestUTXOs selects up to maxCount of the smallest confirmed UTXOs.
-// Used for UTXO consolidation — merging many small fragments into one large UTXO.
-// Unlike SelectUTXOs, this does NOT apply MinUTXOValue filtering (that's the point).
+// SelectSmallestUTXOs selects up to maxCount of the smallest native-SOQ
+// outputs with at least minConf confirmations at tipHeight, ascending by
+// value, for consolidation into one output (tx.BuildSweepTransaction). Unlike
+// SelectUTXOs it applies no MinUTXOValue filter: the small outputs are the
+// point. Outputs in the spent set or marked spent-pending are skipped. It
+// returns ErrNoCandidates when nothing qualifies.
 func (cs *CoinSelector) SelectSmallestUTXOs(
 	utxos []types.UTXO,
 	maxCount int,
@@ -619,7 +627,7 @@ func (cs *CoinSelector) SelectSmallestUTXOs(
 	}
 
 	if len(candidates) == 0 {
-		return nil, 0, fmt.Errorf("no confirmed UTXOs available for consolidation")
+		return nil, 0, ErrNoCandidates
 	}
 
 	return candidates, totalValue, nil
