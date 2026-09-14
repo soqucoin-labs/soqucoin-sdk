@@ -40,13 +40,16 @@ var (
 	ErrSignature = errors.New("tx: signature does not verify over the recomputed sighash")
 )
 
-// VerifyInput checks input i exactly as the node's single-key Dilithium path
-// does (src/script/interpreter.cpp, VerifyWitnessProgram and
+// VerifyInput checks input i as the node's single-key Dilithium path does
+// (src/script/interpreter.cpp, VerifyWitnessProgram and
 // TransactionSignatureChecker::CheckSig): the witness is two items of the
 // consensus sizes, the public key carries the 0x00 prefix, its SHA-256 is the
 // 32-byte program in the input's scriptPubKey, the hashtype byte at the end of
 // the signature is SIGHASH_ALL, and the signature verifies over the BIP 143
-// sighash recomputed from the transaction with that hashtype.
+// sighash recomputed from the transaction with that hashtype. It is stricter
+// than the node in one respect: the node also accepts an unprefixed 1312-byte
+// key, a form this SDK never emits. Nothing that passes here is refused by the
+// node.
 //
 // The hashtype is read from the witness, not supplied by the caller. keys.Verify
 // takes a digest the caller computed and so cannot tell whether the byte the

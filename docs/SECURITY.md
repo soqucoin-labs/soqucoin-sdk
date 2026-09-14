@@ -162,7 +162,9 @@ Dilithium path does (`src/script/interpreter.cpp`): the witness is two items of
 the consensus sizes, the public key carries its `0x00` prefix and hashes to the
 output's 32-byte program, the hashtype byte at the end of the signature is
 `SIGHASH_ALL`, and the signature verifies over the BIP 143 sighash recomputed from
-the transaction with that hashtype. `tx.BuildSignedTransaction` and
+the transaction with that hashtype. It is stricter than the node in one respect: the
+node also accepts an unprefixed 1312-byte key, a form this SDK never emits; nothing
+that passes `VerifyAll` is refused by the node. `tx.BuildSignedTransaction` and
 `tx.BuildAndSign` call it before they return, so a transaction they hand back has
 passed it. Call it yourself after signing by hand and before broadcasting a
 transaction that was stored and reloaded:
@@ -197,8 +199,9 @@ if !ok {
 ```
 
 Note the two-value result. `err` reports malformed input: a public key or
-signature of the wrong length, or a witness-form signature (2421 bytes) whose
-trailing hashtype byte is not `SIGHASH_ALL` (`keys.ErrHashType`). A
+signature of the wrong length, a public key beginning with `0xFF`, the node's
+invalid-key marker (`keys.ErrInvalidPublicKey`), or a witness-form signature
+(2421 bytes) whose trailing hashtype byte is not `SIGHASH_ALL` (`keys.ErrHashType`). A
 cryptographically invalid signature returns `false, nil`. Checking only `err`
 accepts every forged signature of the correct size.
 
