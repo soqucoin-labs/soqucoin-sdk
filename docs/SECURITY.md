@@ -92,6 +92,16 @@ Two shapes `fmt` prints raw and no method can intercept: `%p` applied to a
 non-pointer, and a `KeyPair` behind an unexported struct field. Do not hold a
 `KeyPair` where a struct dump can reach it that way.
 
+### State files survive a crash
+
+The keystore, the spent set (`utxo.SpentSet`) and the withdrawal intent file
+(`withdraw.FileStore`) are written the same way: to a temporary file in the same
+directory, which is synced, renamed into place, and followed by a sync of the
+directory. A crash or power loss at any point leaves the previous file or the new
+one, never a partial one, and a key, a reserved input or an intent is on disk when
+the call that saved it returns. A `Save`, `MarkBroadcast` or `Put` that returns an
+error did not reach the disk; treat it as such.
+
 ### Passphrase handling
 
 The passphrase is the whole of the at-rest protection. Argon2id makes guessing

@@ -25,6 +25,7 @@ import (
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa44"
 	soqaddr "github.com/soqucoin-labs/soqucoin-sdk/address"
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/atomicfile"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -376,15 +377,13 @@ func (m *Manager) saveLocked() error {
 		return fmt.Errorf("serialize keystore: %w", err)
 	}
 
-	// Atomic write: temp file + rename
-	tmpFile := m.keyFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+	// Written, synced and renamed into place, then the directory synced, so a
+	// crash at any point leaves the previous keystore or this one and never a
+	// partial file; a key added just before a power loss is on disk when
+	// Save returns.
+	if err := atomicfile.WriteFile(m.keyFile, data, 0600); err != nil {
 		return fmt.Errorf("write keystore: %w", err)
 	}
-	if err := os.Rename(tmpFile, m.keyFile); err != nil {
-		return fmt.Errorf("rename keystore: %w", err)
-	}
-
 	return nil
 }
 

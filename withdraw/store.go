@@ -8,6 +8,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/atomicfile"
 )
 
 func unmarshal(raw json.RawMessage, v interface{}) error { return json.Unmarshal(raw, v) }
@@ -50,10 +52,12 @@ func (m *MemStore) List(states ...State) ([]*Intent, error) {
 	return filterSorted(m.intents, states), nil
 }
 
-// FileStore keeps every intent in one JSON file, rewritten atomically on each
-// Put (write to a temporary file, fsync, rename). Suitable for a single
-// process with modest volume; an exchange with a database should implement
-// Store over it instead and keep the same "durable before broadcast" rule.
+// FileStore keeps every intent in one JSON file, rewritten on each Put: a
+// temporary file in the same directory is written, synced and renamed into
+// place, then the directory is synced so the rename survives a power loss.
+// Suitable for a single process with modest volume; an exchange with a
+// database should implement Store over it instead and keep the same "durable
+// before broadcast" rule.
 type FileStore struct {
 	mu      sync.Mutex
 	path    string
@@ -101,7 +105,8 @@ func (fs *FileStore) Get(id string) (*Intent, bool, error) {
 	return &cp, true, nil
 }
 
-// Put implements Store. It returns only after the file is renamed into place.
+// Put implements Store. It returns only after the new file is on disk and
+// renamed into place, and the directory entry is synced.
 func (fs *FileStore) Put(in *Intent) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -116,28 +121,8 @@ func (fs *FileStore) Put(in *Intent) error {
 	if err := os.MkdirAll(filepath.Dir(fs.path), 0700); err != nil {
 		return fmt.Errorf("create intents dir: %w", err)
 	}
-	tmp := fs.path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
+	if err := atomicfile.WriteFile(fs.path, buf, 0600); err != nil {
 		return fmt.Errorf("write intents: %w", err)
-	}
-	if _, err := f.Write(buf); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("write intents: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("sync intents: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close intents: %w", err)
-	}
-	if err := os.Rename(tmp, fs.path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("rename intents: %w", err)
 	}
 	return nil
 }

@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/atomicfile"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	"strings"
 )
@@ -370,15 +371,11 @@ func (ss *SpentSet) persist() error {
 		return fmt.Errorf("%w: marshal: %v", ErrPersist, err)
 	}
 
-	// Atomic write: write to temp file, then rename
-	tmpFile := ss.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, buf, 0600); err != nil {
+	// Written, synced and renamed into place, then the directory synced: a
+	// spend marked just before a power loss is on disk when persist returns,
+	// so a restart cannot re-select an input of a transaction already sent.
+	if err := atomicfile.WriteFile(ss.filePath, buf, 0600); err != nil {
 		return fmt.Errorf("%w: %v", ErrPersist, err)
-	}
-
-	if err := os.Rename(tmpFile, ss.filePath); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("%w: rename: %v", ErrPersist, err)
 	}
 	return nil
 }
