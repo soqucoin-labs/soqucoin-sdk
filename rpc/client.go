@@ -24,10 +24,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
@@ -41,7 +44,21 @@ type Client struct {
 	// types.Mainnet without the chain check.
 	Network types.Network
 
+	// AllowRemote permits a node URL whose host is not loopback. Until it is
+	// set, every call to such a URL returns ErrRemoteNode before anything is
+	// sent. Each request carries the RPC password in a Basic Auth header, so
+	// a URL copied from another deployment or mistyped would hand the
+	// password to whichever host it names, in plaintext over http://, and
+	// would take that host's word on the chain. Set it when the node is
+	// elsewhere on purpose, with an https:// URL (the certificate is verified
+	// against the system roots) or a tunnel that ends on this machine.
+	// Loopback is 127.0.0.0/8, ::1 or the name "localhost", read from the URL;
+	// no name is resolved.
+	AllowRemote bool
+
 	url      string
+	host     string
+	remote   bool
 	user     string
 	password string
 	client   *http.Client
@@ -54,19 +71,45 @@ type Client struct {
 //   - user: RPC username from soqucoin.conf
 //   - password: RPC password from soqucoin.conf
 //
-// Set Network afterwards for any chain other than mainnet:
+// Set Network afterwards for any chain other than mainnet, and AllowRemote
+// for a node that is not on this machine:
 //
 //	c := rpc.NewClient(url, user, password)
 //	c.Network = types.Stagenet
 func NewClient(url, user, password string) *Client {
+	host, loopback := hostOf(url)
 	return &Client{
 		url:      url,
+		host:     host,
+		remote:   host != "" && !loopback,
 		user:     user,
 		password: password,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
+			// A node never redirects. Following one would let a listener on
+			// the loopback address send the client, and its trust in the
+			// reply, to another host with AllowRemote unset.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
+}
+
+// hostOf returns the host named in rawURL and whether it is loopback: the
+// name "localhost" or an IP literal in 127.0.0.0/8 or ::1. Any other name is
+// not loopback even if it resolves to this machine; the guard reads the URL
+// and resolves nothing. A URL that does not parse, or names no host, returns
+// "" and is left to fail in the request itself with that error.
+func hostOf(rawURL string) (host string, loopback bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", false
+	}
+	host = u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return host, true
+	}
+	ip := net.ParseIP(host)
+	return host, ip != nil && ip.IsLoopback()
 }
 
 // rpcRequest is a JSON-RPC 1.0 request.
@@ -111,6 +154,7 @@ var (
 	ErrAlreadyInChain = errors.New("rpc: transaction already in chain")
 	ErrNodeSyncing    = fmt.Errorf("%w: node is in initial block download or behind its headers", ErrTransient)
 	ErrWrongChain     = fmt.Errorf("%w: node serves a different chain than Client.Network", ErrPermanent)
+	ErrRemoteNode     = fmt.Errorf("%w: node URL is not loopback and Client.AllowRemote is not set", ErrPermanent)
 	ErrTxIDMismatch   = errors.New("rpc: node accepted the transaction under a different txid")
 )
 
@@ -167,8 +211,13 @@ func (e *transportError) Is(target error) bool {
 // SetTimeout replaces the per-request HTTP timeout (default 30 s).
 func (c *Client) SetTimeout(d time.Duration) { c.client.Timeout = d }
 
-// Call sends a JSON-RPC request and returns the raw result.
+// Call sends a JSON-RPC request and returns the raw result. It returns
+// ErrRemoteNode, with nothing sent, for a URL whose host is not loopback
+// unless AllowRemote is set.
 func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, error) {
+	if c.remote && !c.AllowRemote {
+		return nil, fmt.Errorf("%w: host %q", ErrRemoteNode, c.host)
+	}
 	if params == nil {
 		params = []interface{}{}
 	}
@@ -334,19 +383,35 @@ func (c *Client) GetTxOut(txid string, vout uint32, includeMempool bool) (*TxOut
 
 // TxOut represents a gettxout response.
 type TxOut struct {
-	BestBlock     string       `json:"bestblock"`
-	Confirmations int64        `json:"confirmations"`
-	Value         float64      `json:"value"`
-	ScriptPubKey  ScriptPubKey `json:"scriptPubKey"`
-	Coinbase      bool         `json:"coinbase"`
-	AssetType     uint8        `json:"assettype"` // RC7+: 0=SOQ, 1=USDSOQ
+	BestBlock     string `json:"bestblock"`
+	Confirmations int64  `json:"confirmations"`
+	// Value is the output value in shors, converted exactly from the decimal
+	// SOQ figure the node prints (types.ParseSOQ). Through v0.3.5 this field
+	// held that figure as a float64, exact only to 2^53 shors.
+	Value        int64        `json:"-"`
+	ScriptPubKey ScriptPubKey `json:"scriptPubKey"`
+	Coinbase     bool         `json:"coinbase"`
+	AssetType    uint8        `json:"assettype"` // RC7+: 0=SOQ, 1=USDSOQ
 }
 
-// ValueShors returns the output value in shors. The node reports SOQ as a
-// JSON number; rounding to the nearest shor is exact for every value the
-// node can produce.
-func (o *TxOut) ValueShors() int64 {
-	return int64(math.Round(o.Value * float64(types.ShorsPerSOQ)))
+// UnmarshalJSON reads the node's decimal "value" into Value as shors. A reply
+// without a value, or with one that is not the node's decimal form, is an
+// error rather than a zero.
+func (o *TxOut) UnmarshalJSON(b []byte) error {
+	type plain TxOut
+	aux := struct {
+		*plain
+		Value json.Number `json:"value"`
+	}{plain: (*plain)(o)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	v, err := types.ParseSOQ(aux.Value.String())
+	if err != nil {
+		return fmt.Errorf("gettxout value: %w", err)
+	}
+	o.Value = v
+	return nil
 }
 
 // ScriptPubKey contains the output script details.
@@ -371,8 +436,83 @@ func (c *Client) GetBlockCount() (int64, error) {
 	return height, nil
 }
 
+// FeeEstimate is the result of FeeRateShorsPerVB.
+type FeeEstimate struct {
+	// Rate is the fee rate to build with, in shors per virtual byte, always
+	// within [types.RecommendedFeeRate, tx.MaxFeeRateShorsPerVB].
+	Rate int64
+	// NodeRate is the node's estimate in shors per virtual byte, rounded up,
+	// before the clamp; 0 when the node had none.
+	NodeRate int64
+	// Blocks is the confirmation target the node's estimate was found at; 0
+	// when it had none.
+	Blocks int
+	// Fallback is set when the node had no estimate. Rate is then
+	// types.RecommendedFeeRate.
+	Fallback bool
+	// Clamped is set when NodeRate lay outside the range. Rate is then the
+	// nearer bound.
+	Clamped bool
+}
+
+// FeeRateShorsPerVB asks the node for a fee estimate at confTarget and
+// returns a rate the builders accept: the node's figure (SOQ per kilobyte)
+// converted to shors per virtual byte, rounded up, and clamped to
+// [types.RecommendedFeeRate, tx.MaxFeeRateShorsPerVB]. The floor is the
+// miner's default inclusion rate, so no estimate lowers a withdrawal below
+// what a default miner mines; the ceiling is the builders' own cap, so no
+// estimate produces a transaction they refuse.
+//
+// A node that has not observed enough transactions reports a negative fee
+// rate (estimatesmartfee in src/rpc/mining.cpp returns -1 for a zero
+// estimate, otherwise ValueFromAmount of the rate per kilobyte). Rate is then
+// the floor and Fallback is set; log it, since a node that never has an
+// estimate is not seeing the mempool. An error is the node's (ErrTransient or
+// ErrPermanent) or a reply without a numeric fee rate (types.ErrAmountFormat).
+func (c *Client) FeeRateShorsPerVB(confTarget int) (FeeEstimate, error) {
+	floor, ceiling := types.RecommendedFeeRate, tx.MaxFeeRateShorsPerVB
+	if ceiling < floor {
+		return FeeEstimate{}, fmt.Errorf("%w: tx.MaxFeeRateShorsPerVB %d is below types.RecommendedFeeRate %d", ErrPermanent, ceiling, floor)
+	}
+	result, err := c.Call("estimatesmartfee", confTarget)
+	if err != nil {
+		return FeeEstimate{}, fmt.Errorf("estimatesmartfee: %w", err)
+	}
+	var resp struct {
+		FeeRate json.Number `json:"feerate"`
+		Blocks  int         `json:"blocks"`
+	}
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return FeeEstimate{}, fmt.Errorf("parse fee estimate: %w: %v", types.ErrAmountFormat, err)
+	}
+	if strings.HasPrefix(resp.FeeRate.String(), "-") {
+		return FeeEstimate{Rate: floor, Fallback: true}, nil
+	}
+	perKB, err := types.ParseSOQ(resp.FeeRate.String())
+	if err != nil {
+		return FeeEstimate{}, fmt.Errorf("parse fee estimate: %w", err)
+	}
+	est := FeeEstimate{NodeRate: perKB / 1000, Blocks: resp.Blocks}
+	if perKB%1000 != 0 {
+		est.NodeRate++
+	}
+	switch {
+	case est.NodeRate < floor:
+		est.Rate, est.Clamped = floor, true
+	case est.NodeRate > ceiling:
+		est.Rate, est.Clamped = ceiling, true
+	default:
+		est.Rate = est.NodeRate
+	}
+	return est, nil
+}
+
 // EstimateSmartFee returns the estimated fee rate in SOQ/kB for a target
 // number of confirmation blocks.
+//
+// Deprecated: use FeeRateShorsPerVB, which returns the unit the builders
+// take, clamps to their range and reports the fallback. This method returns
+// 0.01 SOQ/kB without saying so when the node has no estimate.
 func (c *Client) EstimateSmartFee(confTarget int) (float64, error) {
 	result, err := c.Call("estimatesmartfee", confTarget)
 	if err != nil {

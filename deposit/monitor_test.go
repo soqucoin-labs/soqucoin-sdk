@@ -144,9 +144,9 @@ func setup(t *testing.T) (*Monitor, *fakeCache, *fakeNode, *fakeLedger, *alerts,
 }
 
 // txout builds the node's view of an output paying `a`.
-func txout(t *testing.T, a string, soq float64, confs int64, coinbase bool) *rpc.TxOut {
+func txout(t *testing.T, a string, shors int64, confs int64, coinbase bool) *rpc.TxOut {
 	t.Helper()
-	return &rpc.TxOut{Value: soq, Confirmations: confs, Coinbase: coinbase,
+	return &rpc.TxOut{Value: shors, Confirmations: confs, Coinbase: coinbase,
 		ScriptPubKey: rpc.ScriptPubKey{Hex: scriptHex(t, a)}}
 }
 
@@ -156,7 +156,7 @@ func txout(t *testing.T, a string, soq float64, confs int64, coinbase bool) *rpc
 func TestCreditsWhenNodeAgrees(t *testing.T) {
 	m, cache, node, led, al, a := setup(t)
 	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a}}
-	node.outs[key(txA, 0)] = txout(t, a, 1.5, 101, false)
+	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
 
 	got, err := m.Scan()
 	if err != nil || len(got) != 1 || got[0].TxID != txA || got[0].Value != 150_000_000 {
@@ -183,7 +183,7 @@ func TestRefusesWhatTheNodeDoesNotConfirm(t *testing.T) {
 		{"output does not exist on the node",
 			types.UTXO{TxID: txA, Vout: 0, Value: 100, Height: 900}, nil},
 		{"indexer inflates the value",
-			types.UTXO{TxID: txA, Vout: 0, Value: 200_000_000, Height: 900}, nil}, // set below with real value 1.5
+			types.UTXO{TxID: txA, Vout: 0, Value: 200_000_000, Height: 900}, nil}, // set below with real value 150_000_000
 		{"indexer attributes another address's output to ours",
 			types.UTXO{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900}, nil}, // set below with other script
 		{"indexer claims depth the node has not seen",
@@ -195,11 +195,11 @@ func TestRefusesWhatTheNodeDoesNotConfirm(t *testing.T) {
 		cache.utxos[a] = []types.UTXO{tc.utxo}
 		switch i {
 		case 1:
-			node.outs[key(txA, 0)] = txout(t, a, 1.5, 101, false)
+			node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
 		case 2:
-			node.outs[key(txA, 0)] = txout(t, addr(t, 0x22), 1.5, 101, false)
+			node.outs[key(txA, 0)] = txout(t, addr(t, 0x22), 150_000_000, 101, false)
 		case 3:
-			node.outs[key(txA, 0)] = txout(t, a, 1.5, 5, false)
+			node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 5, false)
 		}
 		got, err := m.Scan()
 		if err != nil {
@@ -222,8 +222,8 @@ func TestNegativeOrZeroHeightIsNeverConfirmed(t *testing.T) {
 		{TxID: txA, Vout: 0, Value: 150_000_000, Height: -1, Address: a},
 		{TxID: txB, Vout: 0, Value: 150_000_000, Height: 0, Address: a},
 	}
-	node.outs[key(txA, 0)] = txout(t, a, 1.5, 1002, false)
-	node.outs[key(txB, 0)] = txout(t, a, 1.5, 0, false)
+	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 1002, false)
+	node.outs[key(txB, 0)] = txout(t, a, 150_000_000, 0, false)
 	if got, err := m.Scan(); err != nil || len(got) != 0 || len(led.credited) != 0 {
 		t.Fatalf("credited on non-positive height: %v %+v", err, got)
 	}
@@ -233,7 +233,7 @@ func TestNegativeOrZeroHeightIsNeverConfirmed(t *testing.T) {
 func TestPausesWhenNodeSyncingOrCacheStale(t *testing.T) {
 	m, cache, node, led, al, a := setup(t)
 	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a}}
-	node.outs[key(txA, 0)] = txout(t, a, 1.5, 101, false)
+	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
 
 	node.synced = false
 	if _, err := m.Scan(); !errors.Is(err, ErrPaused) || !al.has(AlertNodeSyncing) {
@@ -284,7 +284,7 @@ func TestImmatureCoinbaseWaitsWithoutAlarm(t *testing.T) {
 		}
 		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
 		for _, confs := range c.immature {
-			node.outs[key(txA, 0)] = txout(t, a, 88, confs, true)
+			node.outs[key(txA, 0)] = txout(t, a, 8_800_000_000, confs, true)
 			if got, _ := m.Scan(); len(got) != 0 || len(led.credited) != 0 {
 				t.Fatalf("%s: coinbase at %d confirmations credited", c.name, confs)
 			}
@@ -292,7 +292,7 @@ func TestImmatureCoinbaseWaitsWithoutAlarm(t *testing.T) {
 				t.Errorf("%s: an immature coinbase is not an alarm: %v", c.name, al.kinds)
 			}
 		}
-		node.outs[key(txA, 0)] = txout(t, a, 88, c.mature, true)
+		node.outs[key(txA, 0)] = txout(t, a, 8_800_000_000, c.mature, true)
 		if got, _ := m.Scan(); len(got) != 1 {
 			t.Fatalf("%s: coinbase at %d confirmations not credited", c.name, c.mature)
 		}
@@ -307,14 +307,14 @@ func TestRecheckPendingAlarmsVanishedAndMarksFinal(t *testing.T) {
 		{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a},
 		{TxID: txB, Vout: 0, Value: 150_000_000, Height: 900, Address: a},
 	}
-	node.outs[key(txA, 0)] = txout(t, a, 1.5, 101, false)
-	node.outs[key(txB, 0)] = txout(t, a, 1.5, 101, false)
+	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
+	node.outs[key(txB, 0)] = txout(t, a, 150_000_000, 101, false)
 	if got, err := m.Scan(); err != nil || len(got) != 2 {
 		t.Fatalf("initial credit: %v %+v", err, got)
 	}
 	// A reorg removes A; B is buried past the horizon.
 	delete(node.outs, key(txA, 0))
-	node.outs[key(txB, 0)] = txout(t, a, 1.5, types.MaxReorgDepth+1, false)
+	node.outs[key(txB, 0)] = txout(t, a, 150_000_000, types.MaxReorgDepth+1, false)
 	if _, err := m.Scan(); err != nil {
 		t.Fatal(err)
 	}
@@ -348,8 +348,8 @@ func TestPolicyAppliedFromNodeDepth(t *testing.T) {
 		{TxID: txA, Vout: 0, Value: 5_000_000_000, Height: 950, Address: a}, // 51 confs, needs 120
 		{TxID: txB, Vout: 0, Value: 100_000_000, Height: 950, Address: a},   // 51 confs, needs 30
 	}
-	node.outs[key(txA, 0)] = txout(t, a, 50, 51, false)
-	node.outs[key(txB, 0)] = txout(t, a, 1, 51, false)
+	node.outs[key(txA, 0)] = txout(t, a, 5_000_000_000, 51, false)
+	node.outs[key(txB, 0)] = txout(t, a, 100_000_000, 51, false)
 	got, err := m.Scan()
 	if err != nil || len(got) != 1 || got[0].TxID != txB {
 		t.Fatalf("policy: %v %+v", err, got)
@@ -369,7 +369,7 @@ func TestPolicyAppliedFromNodeDepth(t *testing.T) {
 func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 	deposit := func(m *Monitor, cache *fakeCache, node *fakeNode, a string) {
 		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
-		node.outs[key(txA, 0)] = txout(t, a, 88, 60, true) // mature on regtest, immature on mainnet
+		node.outs[key(txA, 0)] = txout(t, a, 8_800_000_000, 60, true) // mature on regtest, immature on mainnet
 	}
 	check := func(name string, m *Monitor, led *fakeLedger, al *alerts) {
 		got, err := m.Scan()

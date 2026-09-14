@@ -127,7 +127,7 @@ SDK reads or broadcasts goes through them.
 | Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a v2.5.0 build before the v0.3.5 tag, and the release notes record that binary's digest. |
 | `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
 | `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every node we operate runs with it. |
-| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC has no TLS. `rpc.Client` takes a URL, so either bind RPC to localhost or your private network, or terminate TLS in front of it ([Security Guide](SECURITY.md#network-security)). |
+| `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC is plaintext. Bind it to localhost, where `rpc.Client` connects with no further setting. For a node on another host the client refuses the URL until `AllowRemote` is set, and the route should be a tunnel or an `https://` TLS terminator in front of the node ([Security Guide](SECURITY.md#network-security)). |
 | `stagenet=1` | For the staging network. Omit it for mainnet. |
 | `dbcache` | Our nodes run 512 MB; the node's default is 450. |
 
@@ -698,12 +698,12 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
 | `utxo` | **93.8%** | Coin selection, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
-| `rpc` | **78.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering |
-| `deposit` | **77.3%** | Node cross-check before credit, pause conditions, vanished-credit alarm |
+| `rpc` | **85.0%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
+| `deposit` | **81.1%** | Node cross-check before credit, pause conditions, vanished-credit alarm |
 | `electrumx` | **76.2%** | Id-matched replies, notification routing, merge, refresh failures, network inference, genesis check, TLS |
 | `tx` | **76.1%** | Serialized weight, output floor, amount checks, fee caps, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **75.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption, node-derived vectors |
-| `withdraw` | **81.5%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release |
+| `withdraw` | **82.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `resilience` | **62.1%** | Circuit breaker transitions and classification, reconciler against the node |
 
 Also passes under the race detector (`go test -race`), which matters for `electrumx` because its
@@ -781,19 +781,24 @@ node's own 100 SOQ limit. The [verification record](VERIFICATION.md) maps the re
 if you go lower than the relay floor.
 
 ```go
-// Query the node for a dynamic estimate. It returns SOQ per kB.
-soqPerKB, err := rpcClient.EstimateSmartFee(6) // target: 6 blocks
+// Ask the node for an estimate at a 6-block target. The result is already in
+// shors per vByte, rounded up, and clamped to [types.RecommendedFeeRate,
+// tx.MaxFeeRateShorsPerVB], so it is a rate the builders accept.
+est, err := rpcClient.FeeRateShorsPerVB(6)
 if err != nil {
-    return err
+    return err // rpc.ErrTransient, rpc.ErrPermanent, or types.ErrAmountFormat for a reply without a numeric fee rate
 }
-feeRate := int64(soqPerKB * float64(types.ShorsPerSOQ) / 1000) // shors per vByte
-if feeRate < 1000 {
-    feeRate = 1000 // floor: below this the node rate-limits as free
+if est.Fallback {
+    log.Printf("node has no fee estimate; using the floor, %d shors/vB", est.Rate)
 }
+feeRate := est.Rate
 ```
 
-`EstimateSmartFee` falls back to 0.01 SOQ/kB when the node has no estimate, which
-is exactly 1,000 shors per vByte, so the floor above and the fallback agree.
+A node that has not observed enough transactions reports no estimate; `FeeRateShorsPerVB`
+then returns the floor with `Fallback` set. Log it: a node that never has an estimate is not
+seeing the mempool. `Clamped` is set when the node's rate lay outside the range, and
+`NodeRate` carries that rate. The floor is the miner's default inclusion rate, so nothing the
+node reports lowers a withdrawal below what a default miner mines.
 
 Always confirm before you rely on a broadcast:
 
