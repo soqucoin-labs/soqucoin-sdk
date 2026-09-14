@@ -25,15 +25,18 @@
 //	   │                 │        │ (node accepted under another txid: stay
 //	   │                 │        │  Built, NodeTxID recorded, inputs held)
 //	   │                 │        └──(rejected)──► Failed (inputs released)
+//	   ├──(selector transient: stay Created, attempt recorded, retry Build)
 //	   └──(cannot build)─┴──────────────────────► Failed
 //
 // Recover re-drives Built intents after a restart with the same bytes. It
-// never rebuilds. Every non-final broadcast attempt renews the input
-// reservation, so a Built intent that is retried at least once per
-// ReservationTTL never loses its inputs to another withdrawal. The engine is
-// agnostic about where coins come from and how they are signed: those are
-// injected so the exchange can wire its own ElectrumX client, key manager
-// and node.
+// never rebuilds. It also releases reservations held for intents that have
+// nothing built (a crash between the reservation and the Built save), so the
+// reservation TTL is a backstop rather than the mechanism that frees them.
+// Every non-final broadcast attempt renews the input reservation, so a Built
+// intent that is retried at least once per ReservationTTL never loses its
+// inputs to another withdrawal. The engine is agnostic about where coins come
+// from and how they are signed: those are injected so the exchange can wire
+// its own ElectrumX client, key manager and node.
 package withdraw
 
 import (
@@ -134,9 +137,13 @@ type Engine struct {
 	// policy; docs/EXCHANGE_INTEGRATION.md discusses the horizon.
 	RequiredConfirmations int64
 	// ReservationTTL bounds how long inputs stay reserved for an intent that
-	// is built but not yet broadcast (default 15 minutes). Every Broadcast
-	// attempt that does not end the intent renews it, and Recover re-reserves
-	// on restart, so retry Built intents at an interval shorter than this.
+	// is built but not yet broadcast (default DefaultReservationTTL, 4 hours).
+	// Every Broadcast attempt that does not end the intent renews it, and
+	// Recover re-reserves on restart, so retry Built intents at an interval
+	// shorter than this. A Built intent's bytes may already be in a mempool,
+	// so an expired reservation is a double-spend window, not a cleanup; the
+	// default is long because Recover, not the clock, frees the reservations
+	// of intents that have nothing built.
 	ReservationTTL time.Duration
 
 	mu sync.Mutex // serialises Build across intents so two cannot pick the same inputs between select and reserve
@@ -166,13 +173,16 @@ var (
 	ErrReservationLost = errors.New("withdraw: inputs of a built intent were taken by another withdrawal")
 )
 
+// DefaultReservationTTL applies when Engine.ReservationTTL is zero.
+const DefaultReservationTTL = 4 * time.Hour
+
 func (e *Engine) now() time.Time { return time.Now().UTC() }
 
 func (e *Engine) reservationTTL() time.Duration {
 	if e.ReservationTTL > 0 {
 		return e.ReservationTTL
 	}
-	return 15 * time.Minute
+	return DefaultReservationTTL
 }
 
 func (e *Engine) save(in *Intent) error {
@@ -205,6 +215,11 @@ func (e *Engine) Submit(id, address string, amount, feeRate int64) (intent *Inte
 // Build selects and reserves inputs, builds and signs the transaction, and
 // persists it. The intent is Built and its inputs are reserved when this
 // returns nil. Nothing has touched the network.
+//
+// A selector error that is rpc.ErrTransient (the node behind its headers,
+// warming up, or unreachable) leaves the intent Created with the attempt
+// recorded and is returned for a later Build; nothing is reserved. Any other
+// selector error (insufficient funds, a wrong chain) fails the intent.
 func (e *Engine) Build(in *Intent) error {
 	if in.State != StateCreated {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
@@ -214,7 +229,11 @@ func (e *Engine) Build(in *Intent) error {
 
 	inputs, err := e.Select(in.Amount, in.FeeRate)
 	if err != nil {
-		return e.fail(in, fmt.Errorf("select inputs: %w", err), false)
+		err = fmt.Errorf("select inputs: %w", err)
+		if errors.Is(err, rpc.ErrTransient) {
+			return e.deferBuild(in, err)
+		}
+		return e.fail(in, err, false)
 	}
 	if err := e.Spent.Reserve(inputs, in.ID, e.reservationTTL()); err != nil {
 		// Either another intent won the race for one of these inputs
@@ -222,10 +241,7 @@ func (e *Engine) Build(in *Intent) error {
 		// skips them now) or the spent set could not be written
 		// (utxo.ErrPersist; nothing is reserved and nothing is built until the
 		// disk is fixed). Not a failure of this intent.
-		in.Attempts++
-		in.LastError = err.Error()
-		_ = e.save(in)
-		return err
+		return e.deferBuild(in, err)
 	}
 	rawHex, txid, err := e.BuildSign(inputs, in.Address, in.Amount, in.FeeRate)
 	if err != nil {
@@ -312,6 +328,18 @@ func (e *Engine) Broadcast(in *Intent) error {
 	}
 }
 
+// deferBuild keeps a Created intent Created after a Build attempt that did
+// not settle it: the attempt and its cause are recorded and the cause is
+// returned for the caller to retry Build later. Nothing is reserved or built.
+func (e *Engine) deferBuild(in *Intent, cause error) error {
+	in.Attempts++
+	in.LastError = cause.Error()
+	if saveErr := e.save(in); saveErr != nil {
+		return errors.Join(cause, saveErr)
+	}
+	return cause
+}
+
 // holdBuilt keeps a Built intent Built after a broadcast attempt that did not
 // settle it: the reservation is renewed for another TTL so the inputs cannot
 // be selected by a later withdrawal while this one is unresolved, the cause
@@ -355,12 +383,16 @@ func (e *Engine) Process(id string) (*Intent, error) {
 
 // Recover is called once at startup. Broadcast intents have their inputs
 // re-marked spent from the intent store, so a spent-set write that failed
-// before the restart cannot re-expose them. Built intents are re-reserved
-// and re-broadcast with their persisted bytes; nothing is rebuilt. Intents
-// held after a txid mismatch are left as they are: their inputs are
-// re-marked under the node's txid and nothing may be sent for them; each is
-// logged and reported as ErrHeld so startup alerting sees it. It attempts
-// every intent and returns every error joined, so errors.Is finds each kind.
+// before the restart cannot re-expose them. Reservations held for an intent
+// the store does not know, or knows as Created or Failed, are released: the
+// previous process stopped between reserving and persisting a Built intent,
+// so nothing signed exists for them and the coins are free. Built intents
+// are re-reserved and re-broadcast with their persisted bytes; nothing is
+// rebuilt. Intents held after a txid mismatch are left as they are: their
+// inputs are re-marked under the node's txid and nothing may be sent for
+// them; each is logged and reported as ErrHeld so startup alerting sees it.
+// It attempts every intent and returns every error joined, so errors.Is
+// finds each kind.
 func (e *Engine) Recover() error {
 	var errs []error
 	note := func(err error) {
@@ -377,6 +409,7 @@ func (e *Engine) Recover() error {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
 	}
+	note(e.releaseOrphanReservations())
 	built, err := e.Store.List(StateBuilt)
 	if err != nil {
 		return errors.Join(append(errs, err)...)
@@ -396,6 +429,40 @@ func (e *Engine) Recover() error {
 		if err := e.Broadcast(in); err != nil {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
+	}
+	return errors.Join(errs...)
+}
+
+// releaseOrphanReservations drops every reservation whose intent has nothing
+// built: the store does not know the id, or knows it as Created or Failed.
+// Reservations of Built intents are left for Recover to renew, and anything
+// else (Broadcast, Confirmed) is left alone; Recover has already re-marked
+// Broadcast inputs and a reservation on a Confirmed intent expires by its
+// TTL. A store read failure keeps the reservation: a stale hold is safe, a
+// released input under a Built intent is not. Holds the Build lock so an
+// in-flight Build cannot look like an orphan.
+func (e *Engine) releaseOrphanReservations() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var errs []error
+	for _, id := range e.Spent.ReservedIntents() {
+		in, ok, err := e.Store.Get(id)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("recover %s: reservation kept, store read failed: %w", id, err))
+			continue
+		}
+		if ok && in.State != StateCreated && in.State != StateFailed {
+			continue
+		}
+		if err := e.Spent.Release(id); err != nil {
+			errs = append(errs, fmt.Errorf("recover %s: release orphan reservation: %w", id, err))
+			continue
+		}
+		state := "unknown to the store"
+		if ok {
+			state = string(in.State)
+		}
+		log.Printf("[withdraw] recover %s: released reservation of an intent with nothing built (%s)", id, state)
 	}
 	return errors.Join(errs...)
 }

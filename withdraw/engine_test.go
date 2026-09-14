@@ -576,3 +576,209 @@ func TestRecoverRemarksHeldIntentsAndReportsAFailedWrite(t *testing.T) {
 		t.Fatal("re-marked inputs must stay held in memory when the write fails")
 	}
 }
+
+// A selector error the node will clear by itself (behind its headers for one
+// block, warming up after a restart, unreachable) must not end the
+// withdrawal. The intent stays Created with the attempt recorded, nothing is
+// reserved or built, and the next Build goes through with no new id. An
+// insufficient-funds error still fails it.
+func TestTransientSelectorErrorKeepsTheIntentCreated(t *testing.T) {
+	transients := []error{
+		fmt.Errorf("%w (blocks 100, headers 101, initialblockdownload false)", rpc.ErrNodeSyncing),
+		fmt.Errorf("getblockchaininfo: %w", &rpc.Error{Code: rpc.CodeInWarmup, Message: "Loading block index..."}),
+		fmt.Errorf("getblockchaininfo: %w", rpc.ErrTransient),
+	}
+	for i, transient := range transients {
+		spent := utxo.NewSpentSet("")
+		net := &fakeNet{mode: "ok"}
+		e := newEngine(t, NewMemStore(), spent, net, coins())
+		realSelect := e.Select
+		remaining := 2
+		e.Select = func(amount, feeRate int64) ([]types.UTXO, error) {
+			if remaining > 0 {
+				remaining--
+				return nil, transient
+			}
+			return realSelect(amount, feeRate)
+		}
+		e.Submit("w1", dst, 1_000_000, 1000)
+		for attempt := 1; attempt <= 2; attempt++ {
+			_, err := e.Process("w1")
+			if !errors.Is(err, rpc.ErrTransient) || errors.Is(err, rpc.ErrPermanent) {
+				t.Fatalf("case %d attempt %d: %v, want the transient error back", i, attempt, err)
+			}
+			w, _, _ := e.Store.Get("w1")
+			if w.State != StateCreated || w.Attempts != attempt || w.LastError == "" || w.RawHex != "" || w.Inputs != nil {
+				t.Fatalf("case %d attempt %d: %+v, want Created with the attempt recorded and nothing built", i, attempt, w)
+			}
+		}
+		if spent.IsSpent(txA, 0) || spent.IsSpent(txB, 0) || spent.IsSpent(txC, 0) || net.builds != 0 || net.sentCount() != 0 {
+			t.Fatalf("case %d: a transient selector error reserved, built or sent something", i)
+		}
+		w, err := e.Process("w1")
+		if err != nil || w.State != StateBroadcast || w.Attempts != 3 {
+			t.Fatalf("case %d: after the node caught up: %v %+v", i, err, w)
+		}
+	}
+	// The selector's own refusal is permanent: nothing the node does later
+	// changes the answer, so the intent fails and the caller learns now.
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet(""), &fakeNet{mode: "ok"}, coins())
+	e.Submit("w1", dst, 50_000_000, 1000)
+	if _, err := e.Process("w1"); err == nil || errors.Is(err, rpc.ErrTransient) {
+		t.Fatalf("insufficient funds: %v, want a permanent failure", err)
+	}
+	if w, _, _ := e.Store.Get("w1"); w.State != StateFailed {
+		t.Fatalf("insufficient funds left the intent %s, want failed", w.State)
+	}
+}
+
+// The previous process reserved inputs and stopped before the Built save (or
+// its release after a failed build never reached the disk). The store knows
+// the intent as Created or Failed, or does not know it at all; nothing signed
+// exists for it. Recover frees those coins for the next withdrawal, and only
+// those: a Built intent keeps its reservation and is re-sent.
+func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewFileStore(filepath.Join(dir, "intents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spentPath := filepath.Join(dir, "spent.json")
+	spent := utxo.NewSpentSet(spentPath)
+	e := newEngine(t, store, spent, &fakeNet{mode: "lost"}, coins())
+	// created: crash between Reserve (txA) and the Built save.
+	e.Submit("created", dst, 4_500_000, 1000)
+	if err := spent.Reserve([]types.UTXO{coins()[0]}, "created", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	// failed: the build failed and the release of txB never reached the disk.
+	e.Submit("failed", dst, 2_500_000, 1000)
+	if err := spent.Reserve([]types.UTXO{coins()[1]}, "failed", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	failed, _, _ := store.Get("failed")
+	failed.State = StateFailed
+	store.Put(failed)
+	// ghost: an intent the store never saw (written by a process that lost its store).
+	if err := spent.Reserve([]types.UTXO{{TxID: txB, Vout: 7, Value: 1}}, "ghost", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	// built: a real Built intent on the one free coin, txC; broadcast reply lost.
+	e.Submit("built", dst, 500_000, 1000)
+	e.Process("built")
+	built, _, _ := store.Get("built")
+	if built.State != StateBuilt || built.Inputs[0].TxID != txC {
+		t.Fatalf("setup: %+v", built)
+	}
+
+	// Restart with the files: the healed network re-sends built; the other
+	// three reservations are released; a withdrawal can now take txA.
+	store2, err := NewFileStore(filepath.Join(dir, "intents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := utxo.NewSpentSet(spentPath)
+	if got := fresh.ReservedIntents(); len(got) != 4 {
+		t.Fatalf("setup: reservations on disk %v, want built, created, failed, ghost", got)
+	}
+	net2 := &fakeNet{mode: "ok"}
+	e2 := newEngine(t, store2, fresh, net2, coins())
+	realBuildSign := e2.BuildSign
+	e2.BuildSign = func([]types.UTXO, string, int64, int64) (string, string, error) {
+		t.Fatal("Recover built something")
+		return "", "", nil
+	}
+	if err := e2.Recover(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	e2.BuildSign = realBuildSign
+	if got := fresh.ReservedIntents(); len(got) != 0 {
+		t.Fatalf("reservations after recover %v, want none (built's became a broadcast entry)", got)
+	}
+	if fresh.IsSpent(txA, 0) || fresh.IsSpent(txB, 0) || fresh.IsSpent(txB, 7) {
+		t.Fatal("a reservation with nothing built survived Recover")
+	}
+	if !fresh.IsSpent(txC, 0) {
+		t.Fatal("the Built intent's input was released")
+	}
+	if b, _, _ := store2.Get("built"); b.State != StateBroadcast || len(net2.sent) != 1 || net2.sent[0] != built.RawHex {
+		t.Fatalf("built intent after recover: %+v sent %v", b, net2.sent)
+	}
+	if c, _, _ := store2.Get("created"); c.State != StateCreated {
+		t.Fatalf("created intent is %s after recover; releasing its reservation must not change it", c.State)
+	}
+	// The released 5,000,000 coin is selectable again.
+	e2.Submit("next", dst, 4_500_000, 1000)
+	if w, err := e2.Process("next"); err != nil || w.Inputs[0].TxID != txA {
+		t.Fatalf("released input not reusable: %v %+v", err, w)
+	}
+	// The same file reloaded shows the releases were persisted: no reservation
+	// remains, and txA is spent under next's broadcast, not held for created.
+	reloaded := utxo.NewSpentSet(spentPath)
+	if got := reloaded.ReservedIntents(); len(got) != 0 || !reloaded.IsSpent(txA, 0) || reloaded.IsSpent(txB, 0) {
+		t.Fatalf("on disk after recover: reservations %v, txA spent %v, txB spent %v", got, reloaded.IsSpent(txA, 0), reloaded.IsSpent(txB, 0))
+	}
+}
+
+// A store that cannot be read keeps every reservation: a stale hold costs
+// time, a released input under a Built intent costs money.
+type unreadableStore struct{ *MemStore }
+
+func (u *unreadableStore) Get(string) (*Intent, bool, error) {
+	return nil, false, errors.New("database unreachable")
+}
+
+func TestRecoverKeepsReservationsWhenTheStoreCannotBeRead(t *testing.T) {
+	spent := utxo.NewSpentSet("")
+	if err := spent.Reserve([]types.UTXO{coins()[0]}, "maybe-built", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine(t, &unreadableStore{NewMemStore()}, spent, &fakeNet{mode: "ok"}, coins())
+	if err := e.Recover(); err == nil {
+		t.Fatal("recover over an unreadable store returned nil")
+	}
+	if !spent.IsSpent(txA, 0) {
+		t.Fatal("a reservation was released although the store could not say what its intent is")
+	}
+}
+
+// A Built intent's reservation is never released by the orphan sweep, even
+// for an instant: if Recover stops before re-reserving (the Built list
+// failed), the inputs are still held and the operator stops as the guide
+// says, with nothing exposed.
+type builtListFailingStore struct{ *MemStore }
+
+func (s *builtListFailingStore) List(states ...State) ([]*Intent, error) {
+	for _, st := range states {
+		if st == StateBuilt {
+			return nil, errors.New("database unreachable")
+		}
+	}
+	return s.MemStore.List(states...)
+}
+
+func TestRecoverNeverReleasesABuiltIntentsReservation(t *testing.T) {
+	store := &builtListFailingStore{NewMemStore()}
+	spent := utxo.NewSpentSet("")
+	e := newEngine(t, store, spent, &fakeNet{mode: "lost"}, coins())
+	e.Submit("w1", dst, 4_500_000, 1000)
+	e.Process("w1") // Built on txA, reply lost
+	if w, _, _ := store.Get("w1"); w.State != StateBuilt {
+		t.Fatalf("setup: %+v", w)
+	}
+	if err := e.Recover(); err == nil {
+		t.Fatal("recover with a failing Built list returned nil")
+	}
+	if !spent.IsSpent(txA, 0) {
+		t.Fatal("the orphan sweep released a Built intent's input")
+	}
+}
+
+// The documented default: long, because Recover frees orphaned reservations
+// and an expired reservation on a Built intent is a double-spend window.
+func TestReservationTTLDefault(t *testing.T) {
+	e := &Engine{}
+	if e.reservationTTL() != DefaultReservationTTL || DefaultReservationTTL != 4*time.Hour {
+		t.Fatalf("default TTL %v, documented as 4 hours", e.reservationTTL())
+	}
+}
