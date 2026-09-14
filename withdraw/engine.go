@@ -171,6 +171,13 @@ var (
 	// withdrawal took them after the reservation expired. Both transactions
 	// cannot confirm; the operator resolves which one the network took.
 	ErrReservationLost = errors.New("withdraw: inputs of a built intent were taken by another withdrawal")
+	// ErrUnknownReservation is reported by Recover for a reservation held by
+	// an intent id the store does not know. Submit persists the intent before
+	// Build can reserve anything, so this means the intent store and the spent
+	// set are not the pair that was running: the intents file is missing or
+	// older than the spent set. The reservation is kept; a Built intent that
+	// the lost store knew may have its bytes in a mempool.
+	ErrUnknownReservation = errors.New("withdraw: reservation held by an intent the store does not know; intent store and spent set disagree")
 )
 
 // DefaultReservationTTL applies when Engine.ReservationTTL is zero.
@@ -384,9 +391,11 @@ func (e *Engine) Process(id string) (*Intent, error) {
 // Recover is called once at startup. Broadcast intents have their inputs
 // re-marked spent from the intent store, so a spent-set write that failed
 // before the restart cannot re-expose them. Reservations held for an intent
-// the store does not know, or knows as Created or Failed, are released: the
-// previous process stopped between reserving and persisting a Built intent,
-// so nothing signed exists for them and the coins are free. Built intents
+// the store knows as Created or Failed are released: the previous process
+// stopped between reserving and persisting a Built intent, so nothing signed
+// exists for them and the coins are free. A reservation held by an id the
+// store does not know is kept and reported as ErrUnknownReservation: the
+// store and the spent set are not the pair that was running. Built intents
 // are re-reserved and re-broadcast with their persisted bytes; nothing is
 // rebuilt. Intents held after a txid mismatch are left as they are: their
 // inputs are re-marked under the node's txid and nothing may be sent for
@@ -433,14 +442,15 @@ func (e *Engine) Recover() error {
 	return errors.Join(errs...)
 }
 
-// releaseOrphanReservations drops every reservation whose intent has nothing
-// built: the store does not know the id, or knows it as Created or Failed.
-// Reservations of Built intents are left for Recover to renew, and anything
-// else (Broadcast, Confirmed) is left alone; Recover has already re-marked
-// Broadcast inputs and a reservation on a Confirmed intent expires by its
-// TTL. A store read failure keeps the reservation: a stale hold is safe, a
-// released input under a Built intent is not. Holds the Build lock so an
-// in-flight Build cannot look like an orphan.
+// releaseOrphanReservations drops every reservation whose intent the store
+// knows as Created or Failed: nothing built exists for it. Reservations of
+// Built intents are left for Recover to renew, and anything else (Broadcast,
+// Confirmed) is left alone; Recover has already re-marked Broadcast inputs
+// and a reservation on a Confirmed intent expires by its TTL. A reservation
+// whose id the store does not know is kept and reported
+// (ErrUnknownReservation), as is one whose store read failed: a stale hold
+// is safe, a released input under a Built intent is not. Holds the Build
+// lock so an in-flight Build cannot look like an orphan.
 func (e *Engine) releaseOrphanReservations() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -451,18 +461,18 @@ func (e *Engine) releaseOrphanReservations() error {
 			errs = append(errs, fmt.Errorf("recover %s: reservation kept, store read failed: %w", id, err))
 			continue
 		}
-		if ok && in.State != StateCreated && in.State != StateFailed {
+		if !ok {
+			errs = append(errs, fmt.Errorf("recover %s: reservation kept: %w", id, ErrUnknownReservation))
+			continue
+		}
+		if in.State != StateCreated && in.State != StateFailed {
 			continue
 		}
 		if err := e.Spent.Release(id); err != nil {
 			errs = append(errs, fmt.Errorf("recover %s: release orphan reservation: %w", id, err))
 			continue
 		}
-		state := "unknown to the store"
-		if ok {
-			state = string(in.State)
-		}
-		log.Printf("[withdraw] recover %s: released reservation of an intent with nothing built (%s)", id, state)
+		log.Printf("[withdraw] recover %s: released the reservation of a %s intent, nothing built", id, in.State)
 	}
 	return errors.Join(errs...)
 }

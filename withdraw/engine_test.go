@@ -634,9 +634,12 @@ func TestTransientSelectorErrorKeepsTheIntentCreated(t *testing.T) {
 
 // The previous process reserved inputs and stopped before the Built save (or
 // its release after a failed build never reached the disk). The store knows
-// the intent as Created or Failed, or does not know it at all; nothing signed
-// exists for it. Recover frees those coins for the next withdrawal, and only
-// those: a Built intent keeps its reservation and is re-sent.
+// the intent as Created or Failed; nothing signed exists for it. Recover
+// frees those coins for the next withdrawal, and only those: a Built intent
+// keeps its reservation and is re-sent, and a reservation under an id the
+// store has never seen is kept and reported, because Submit persists the
+// intent before anything is reserved, so an unknown id means the store is
+// not the one that was running and a Built intent it knew may be in flight.
 func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewFileStore(filepath.Join(dir, "intents.json"))
@@ -688,15 +691,19 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 		t.Fatal("Recover built something")
 		return "", "", nil
 	}
-	if err := e2.Recover(); err != nil {
-		t.Fatalf("recover: %v", err)
+	err = e2.Recover()
+	if !errors.Is(err, ErrUnknownReservation) || errors.Is(err, ErrHeld) || errors.Is(err, utxo.ErrPersist) {
+		t.Fatalf("recover: %v, want only ErrUnknownReservation for ghost", err)
 	}
 	e2.BuildSign = realBuildSign
-	if got := fresh.ReservedIntents(); len(got) != 0 {
-		t.Fatalf("reservations after recover %v, want none (built's became a broadcast entry)", got)
+	if got := fresh.ReservedIntents(); len(got) != 1 || got[0] != "ghost" {
+		t.Fatalf("reservations after recover %v, want only ghost (built's became a broadcast entry)", got)
 	}
-	if fresh.IsSpent(txA, 0) || fresh.IsSpent(txB, 0) || fresh.IsSpent(txB, 7) {
-		t.Fatal("a reservation with nothing built survived Recover")
+	if fresh.IsSpent(txA, 0) || fresh.IsSpent(txB, 0) {
+		t.Fatal("a reservation of a Created or Failed intent survived Recover")
+	}
+	if !fresh.IsSpent(txB, 7) {
+		t.Fatal("the reservation of an id the store does not know was released")
 	}
 	if !fresh.IsSpent(txC, 0) {
 		t.Fatal("the Built intent's input was released")
@@ -715,7 +722,7 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	// The same file reloaded shows the releases were persisted: no reservation
 	// remains, and txA is spent under next's broadcast, not held for created.
 	reloaded := utxo.NewSpentSet(spentPath)
-	if got := reloaded.ReservedIntents(); len(got) != 0 || !reloaded.IsSpent(txA, 0) || reloaded.IsSpent(txB, 0) {
+	if got := reloaded.ReservedIntents(); len(got) != 1 || got[0] != "ghost" || !reloaded.IsSpent(txA, 0) || reloaded.IsSpent(txB, 0) {
 		t.Fatalf("on disk after recover: reservations %v, txA spent %v, txB spent %v", got, reloaded.IsSpent(txA, 0), reloaded.IsSpent(txB, 0))
 	}
 }

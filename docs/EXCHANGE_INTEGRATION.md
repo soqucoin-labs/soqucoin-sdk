@@ -430,14 +430,18 @@ cannot afford impossible by construction:
   the record of it. Every unsettled broadcast attempt renews the reservation, so retry Built intents
   at an interval shorter than `ReservationTTL` (default `withdraw.DefaultReservationTTL`, 4 hours).
   The TTL is a backstop, not the cleanup: `Recover` releases every reservation held for an intent
-  that has nothing built (the store does not know it, or knows it as Created or Failed), so a
-  crash between reserving and persisting frees the coins at the next start, and a Built intent's
-  bytes, which may already be in a mempool, keep their inputs for hours rather than minutes.
+  the store knows as Created or Failed, so a crash between reserving and persisting frees the
+  coins at the next start, and a Built intent's bytes, which may already be in a mempool, keep
+  their inputs for hours rather than minutes. The intent store and the spent set are one unit: a
+  reservation under an id the store does not know means the intents file is missing or older than
+  the spent set, and `Recover` keeps it and returns `withdraw.ErrUnknownReservation`. Never start
+  with an empty intents file next to a populated spent set.
 - **A node that is briefly behind does not fail a withdrawal.** A selector error that is
   `rpc.ErrTransient` (`RequireSynced` while the node is one block behind its headers, a node in
   warmup, a transport failure) leaves the intent Created with the attempt in `Attempts` and
-  `LastError`; call `Process` again and the same id builds once the node is back. Only the
-  selector's own refusal (insufficient funds, a wrong chain) fails the intent.
+  `LastError`; call `Process` again and the same id builds once the node is back. Any other
+  selector error (insufficient funds, `rpc.ErrWrongChain`, a permanent node error, your own
+  selector's failure) fails the intent.
 - **A node that accepts the bytes under a different txid** (`rpc.ErrTxIDMismatch`) is neither a
   rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
   node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
