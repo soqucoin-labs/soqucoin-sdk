@@ -134,27 +134,74 @@ ElectrumX client is exercised by its own protocol tests against a scripted serve
 
 ## Step 1: Generate Deposit Addresses
 
-Create a unique deposit address for each user. Store the keypair securely, you'll need it to sweep funds.
+Derive one deposit address per user from a master secret that stays in your key-management
+system. The derivation is FIPS 204's own: `keys.FromSeed` runs ML-DSA-44 KeyGen on a 32-byte seed,
+and `keys.DeriveSeed` produces that seed from your master secret and a per-user index. The master
+and the index each user was given are the only recovery material.
 
 ```go
 import (
+	"errors"
+	"math"
+
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-// GenerateDepositAddress creates a new deposit address for a user.
-func GenerateDepositAddress() (addr string, kp *keys.KeyPair, err error) {
-	// Use types.Mainnet.HRP for production ("sq" → sq1p... addresses)
-	// Use types.Stagenet.HRP for testing ("ssq" → ssq1p... addresses)
-	kp, err = keys.GenerateKeyForNetwork(types.Mainnet.HRP)
-	if err != nil {
-		return "", nil, err
+// DepositAddress derives a deposit address starting at derivation index i and
+// returns the index it used. Store that index with the user record; the key is
+// re-derived from it at sweep time. hrp is types.Mainnet.HRP in production and
+// types.Stagenet.HRP on a test host, which has a master of its own.
+func DepositAddress(hrp string, master []byte, i uint32) (string, uint32, error) {
+	for {
+		seed, err := keys.DeriveSeed(master, i)
+		if err != nil {
+			return "", 0, err // keys.ErrShortMaster is a configuration fault, not an index to skip
+		}
+		kp, err := keys.FromSeed(hrp, seed)
+		for j := range seed {
+			seed[j] = 0 // FromSeed zeroed its own copy; this is the caller's
+		}
+		if errors.Is(err, keys.ErrInvalidPublicKey) {
+			// About 1 index in 256 derives a key the node can never spend from; leave it unused.
+			if i == math.MaxUint32 {
+				return "", 0, errors.New("derivation index space exhausted")
+			}
+			i++
+			continue
+		}
+		if err != nil {
+			return "", 0, err
+		}
+		return kp.Address, i, nil
 	}
-	return kp.Address, kp, nil
 }
 ```
 
-**Important:** Keys are not derived from a seed; the encrypted key file written by `keys.Manager` is the only recoverable material. Back it up and see the [Security Guide](SECURITY.md) for key storage. The generator never returns a key the node treats as invalid (a public key whose first byte is `0xFF`), and `Load` refuses a record whose address does not belong to its key.
+The scheme, so that your own key-management system can implement it and land on the same
+addresses:
+
+```
+seed    = HMAC-SHA256(key = master, message = "soqucoin-sdk/keys/seed/v1" || index as 4 bytes big-endian)
+key     = ML-DSA-44 KeyGen(seed)                       (FIPS 204, deterministic)
+address = bech32m(hrp, witness version 1, SHA-256(public key))
+```
+
+The master must be at least 32 bytes of secret random data (`keys.MinMasterSize`). The network is
+not part of the scheme: one master derives the same key for `sq` and `ssq`, so a test host gets a
+master of its own and never the production one. Vectors for the whole chain are in
+`keys/seed_test.go`; the address encoding is pinned to addresses produced by the node's own encoder
+in `keys/node_vectors_test.go`.
+
+**Two key stores, two jobs.** Derived keys are for deposit addresses: nothing is stored per user
+except the index, and at sweep time you re-derive the key and hand it to an in-memory `keys.Manager`
+through `ImportPrivateKey` (no `Save`) to sign. `keys.Manager` with `GenerateKeyForNetwork` is the
+hot-wallet store: randomly generated keys in a file encrypted with AES-256-GCM under an
+Argon2id-derived key, loaded and rewritten as one document, sized for a hot wallet's few addresses
+rather than one per user. Back that file up; a generated key has no seed. Neither `FromSeed` nor the
+generator returns a key the node treats as invalid (a public key whose first byte is `0xFF`), and
+`Load` refuses a record whose address does not belong to its key. Key handling in detail:
+[Security Guide](SECURITY.md).
 
 ---
 
@@ -674,7 +721,7 @@ smallUTXOs, total, err := selector.SelectSmallestUTXOs(allUTXOs, 50, int(types.M
 
 | Concern | Recommendation |
 |---------|---------------|
-| **Key storage** | Use `keys.Manager` (AES-256-GCM, Argon2id) or an HSM for production hot wallets; back up the key file, there are no seeds. |
+| **Key storage** | Deposit keys: derive them with `keys.DeriveSeed` and `keys.FromSeed` from a master secret in your key-management system, and back up the master and each user's index. Hot wallet: `keys.Manager` (AES-256-GCM, Argon2id) or an HSM; back up the key file, a generated key has no seed. |
 | **Key rotation** | Generate fresh deposit addresses periodically. Sweep old addresses to cold storage. |
 | **Cold storage** | Keep >95% of funds in air-gapped cold wallets. |
 | **Monitoring** | Use the `resilience.Alerter` for Slack notifications on circuit breaker state changes. |

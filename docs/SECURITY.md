@@ -37,6 +37,22 @@ system. Knowing where its remit ends is the first step in integrating it safely.
 
 ## Key storage
 
+### Derive deposit keys, store hot-wallet keys
+
+Deposit keys are derived, not stored. `keys.DeriveSeed(master, index)` and
+`keys.FromSeed(hrp, seed)` produce the same key and address for the same master
+and index on every run, so the master secret in your key-management system and
+the index recorded with each user are the only recovery material. The seed is
+the private key: hold the master with at least the care of a hot-wallet key, and
+zero seeds after use (see [Memory hygiene](#memory-hygiene)). The scheme does not
+include the network, so a stagenet host gets its own master; a production master
+on a test host exposes mainnet keys there. `FromSeed`
+refuses the roughly 1 seed in 256 whose key the node can never spend from
+(`keys.ErrInvalidPublicKey`); skip that index rather than retrying with it.
+
+`keys.Manager` is the hot-wallet store, for the few addresses that hold
+operating funds.
+
 ### Use the keystore, not your own file format
 
 `keys.Manager` stores keypairs encrypted with AES-256-GCM under a key derived by
@@ -87,7 +103,8 @@ makes stagenet safe to experiment on.
 
 ## Memory hygiene
 
-**The SDK does not zero key material, and no pure-Go library can do so reliably.**
+**The SDK zeroes the stack copies it makes, but it cannot zero key material
+reliably, and no pure-Go library can.**
 
 `KeyPair.PrivateKey` is a `[]byte`. Go's garbage collector may relocate a slice
 during its lifetime, so overwriting the copy you hold does not overwrite copies

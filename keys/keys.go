@@ -1,7 +1,12 @@
-// Package keys provides Dilithium (FIPS 204 ML-DSA-44) key generation, signing,
-// verification, and encrypted storage for Soqucoin.
+// Package keys provides ML-DSA-44 (FIPS 204) key generation, deterministic
+// derivation from a seed, signing, verification, and encrypted storage for
+// Soqucoin.
 //
-// Keys are stored encrypted at rest using AES-256-GCM with Argon2id key derivation.
+// Two ways to hold keys: FromSeed with DeriveSeed derives one key per index
+// from a master secret kept in your own key-management system, which is the
+// per-user deposit-address path; Manager is the hot-wallet store, randomly
+// generated keys in a file encrypted with AES-256-GCM under an Argon2id-derived
+// key, and also signs for a derived key imported in memory at sweep time.
 package keys
 
 import (
@@ -32,8 +37,11 @@ const (
 type KeyPair struct {
 	PrivateKey []byte `json:"-"` // Never serialized in plain
 	PublicKey  []byte `json:"pubkey"`
-	Address    string `json:"address"` // Bech32m ssq1p... address
-	Index      uint32 `json:"index"`   // Derivation index
+	Address    string `json:"address"` // Bech32m address for the network the key was derived for
+	// Index is the record's position in a Manager's keystore, assigned by
+	// ImportPrivateKey. It is not a derivation index: a KeyPair carries no
+	// record of the seed or DeriveSeed index that produced it.
+	Index uint32 `json:"index"`
 }
 
 // Keystore holds encrypted key material on disk.
@@ -327,7 +335,9 @@ func (m *Manager) Save() error {
 	return nil
 }
 
-// ImportPrivateKey imports a raw Dilithium private key (from wallet.dat dump).
+// ImportPrivateKey adds a key held in memory: a derived deposit key at sweep
+// time, or a raw key from a wallet.dat dump. Call Save only for a hot-wallet
+// key that should persist.
 func (m *Manager) ImportPrivateKey(privKey []byte, pubKey []byte, address string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
