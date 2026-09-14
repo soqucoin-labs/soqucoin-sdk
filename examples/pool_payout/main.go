@@ -155,11 +155,10 @@ func run(cfg runConfig) error {
 	if err := keystore.Load(); err != nil {
 		return fmt.Errorf("load keystore: %w", err)
 	}
-	// Load treats a missing file as an empty keystore, so an empty result means
-	// a wrong path or a wrong passphrase, not "no keys yet".
+	// Load refuses a missing file and a wrong passphrase; a keystore that was
+	// created and never given a key is the one case left to catch here.
 	if keystore.KeyCount() == 0 {
-		return fmt.Errorf("keystore %s holds no keys: wrong path or passphrase",
-			cfg.keystorePath)
+		return fmt.Errorf("keystore %s holds no keys", cfg.keystorePath)
 	}
 
 	rpcClient := rpc.NewClient(cfg.rpcURL, cfg.rpcUser, cfg.rpcPass)

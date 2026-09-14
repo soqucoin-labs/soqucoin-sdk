@@ -39,16 +39,20 @@ system. Knowing where its remit ends is the first step in integrating it safely.
 
 ### Derive deposit keys, store hot-wallet keys
 
-Deposit keys are derived, not stored. `keys.DeriveSeed(master, index)` and
-`keys.FromSeed(hrp, seed)` produce the same key and address for the same master
-and index on every run, so the master secret in your key-management system and
-the index recorded with each user are the only recovery material. The seed is
-the private key: hold the master with at least the care of a hot-wallet key, and
-zero seeds after use (see [Memory hygiene](#memory-hygiene)). The scheme does not
-include the network, so a stagenet host gets its own master; a production master
-on a test host exposes mainnet keys there. `FromSeed`
-refuses the roughly 1 seed in 256 whose key the node can never spend from
-(`keys.ErrInvalidPublicKey`); skip that index rather than retrying with it.
+Deposit keys are derived, not stored. `keys.DeriveSeed(master, hrp, index)` and
+`keys.FromSeed(hrp, seed)` produce the same key and address for the same master,
+network and index on every run, so the master secret in your key-management
+system and the index recorded with each user are the only recovery material. The
+seed is the private key: hold the master with at least the care of a hot-wallet
+key, and zero seeds after use (see [Memory hygiene](#memory-hygiene)). The network
+prefix is part of the derivation, so one master yields different keys on mainnet
+and stagenet and a production master that reaches a stagenet host yields stagenet
+keys there, not keys that also spend mainnet funds. Regtest shares the `sq` prefix
+with mainnet, so a regtest host gets no such separation. Give every test host its
+own master all the same: the derivation limits what a leaked derived key is worth,
+not what a leaked master is worth. `FromSeed` refuses the roughly 1 seed in 256 whose key the
+node can never spend from (`keys.ErrInvalidPublicKey`); skip that index rather than
+retrying with it.
 
 `keys.Manager` is the hot-wallet store, for the few addresses that hold
 operating funds.
@@ -66,17 +70,27 @@ if err := keystore.Load(); err != nil {
 }
 ```
 
-`Load` treats a missing file as an empty keystore, so a typo in the path yields a
-manager with no keys rather than an error. If you expect keys to be present, check:
+`Load` refuses a missing file (`keys.ErrKeystoreMissing`): a mistyped path would
+otherwise start a signer that hands out deposit addresses it can never spend from.
+The first run, and only the first run, calls `LoadOrCreate`, which writes an empty
+encrypted keystore at the path:
 
 ```go
-if keystore.KeyCount() == 0 {
-    return errors.New("keystore empty: wrong path or wrong passphrase")
+if err := keystore.LoadOrCreate(); err != nil {
+    return fmt.Errorf("create keystore: %w", err)
 }
 ```
 
 `*keys.Manager` satisfies `tx.Signer`, so it can be handed directly to
-`tx.BuildAndSign` and the private key never leaves the manager.
+`tx.BuildAndSign` and the private key never leaves the manager. The only method
+that returns private key material is `ExportPrivateKey`, which returns a copy and
+is named so that a search of your code base finds every use. `PublicKeyFor`
+returns a copy too. Printing a `keys.KeyPair`, a pointer to one, or a struct,
+slice or map holding one in an exported position shows the address and the public
+key hash under every `fmt` verb, `%d` and `%x` included, never the private key.
+Two shapes `fmt` prints raw and no method can intercept: `%p` applied to a
+non-pointer, and a `KeyPair` behind an unexported struct field. Do not hold a
+`KeyPair` where a struct dump can reach it that way.
 
 ### Passphrase handling
 

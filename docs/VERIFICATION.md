@@ -57,8 +57,10 @@ soqucoin-cli getrawtransaction \
 ```
 
 The keys were derived with `keys.DeriveSeed` and `keys.FromSeed` from a master secret created for
-the run; the funding came from the stagenet faucet. To reproduce, run the example's `-init` step,
-fund the address it prints, and run it again with the funding outpoints.
+the run (under the v1 scheme of v0.3.5; the keystore file holds the keys, so the v2 derivation of
+v0.3.6 changes nothing about the transaction); the funding came from the stagenet faucet. To
+reproduce, run the example's `-init` step, fund the address it prints, and run it again with the
+funding outpoints.
 
 Two things are worth checking specifically on either transaction.
 

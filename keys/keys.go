@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
@@ -44,6 +45,21 @@ type KeyPair struct {
 	// record of the seed or DeriveSeed index that produced it.
 	Index uint32 `json:"index"`
 }
+
+// String prints the address and the hash of the public key, never the
+// private key.
+func (k KeyPair) String() string {
+	return fmt.Sprintf("keys.KeyPair{Address: %s, PubKeyHash: %s, Index: %d}", k.Address, PubKeyHashHex(k.PublicKey), k.Index)
+}
+
+// Format makes every fmt verb print String for a KeyPair, a pointer to one,
+// and one held in an exported field, a slice or a map: a Stringer alone
+// covers the string verbs, and %d or %x on the struct would still walk the
+// fields and print all 2560 private-key bytes. Two shapes fmt prints raw
+// with no method dispatch and nothing here can change: %p applied to a
+// non-pointer, and a KeyPair behind an unexported struct field. Do not hold
+// a KeyPair where a struct dump can reach it that way.
+func (k KeyPair) Format(f fmt.State, verb rune) { io.WriteString(f, k.String()) }
 
 // Keystore holds encrypted key material on disk.
 type Keystore struct {
@@ -71,7 +87,6 @@ type Manager struct {
 	keys    []KeyPair
 	keyFile string
 	passwd  []byte
-	loaded  bool
 }
 
 // NewManager creates a new key manager.
@@ -88,6 +103,20 @@ var (
 	// address do not belong together. A manager that holds such a record would
 	// hand out a deposit address it cannot sign for.
 	ErrKeyMismatch = errors.New("keys: private key, public key and address do not match")
+
+	// ErrKeystoreMissing is returned by Load when the keystore file does not
+	// exist. A signer that starts with no keys because its path was mistyped
+	// generates deposit addresses it can never spend from, so a missing file
+	// is an error; LoadOrCreate is the first-run call that creates one.
+	ErrKeystoreMissing = errors.New("keys: keystore file does not exist")
+
+	// ErrKeysHeld is returned by Load and LoadOrCreate on a manager that
+	// already holds keys, imported or loaded: reading the file would replace
+	// them without a word.
+	ErrKeysHeld = errors.New("keys: manager already holds keys; Load would discard them")
+
+	// ErrNoKey marks an address this manager holds no key for.
+	ErrNoKey = errors.New("keys: no key for address")
 )
 
 // maxKeygenAttempts bounds the regeneration loop in GenerateKeyForNetwork. The
@@ -169,20 +198,40 @@ func NewManager(keyFile string, passwd string) *Manager {
 	}
 }
 
-// Load decrypts and loads keys from the keystore file.
+// Load decrypts and loads keys from the keystore file. A file that does not
+// exist is ErrKeystoreMissing: a production signer must not start on an
+// empty key set because its path was mistyped. Use LoadOrCreate for the
+// first run. A manager that already holds keys returns ErrKeysHeld.
 func (m *Manager) Load() error {
+	return m.load(false)
+}
+
+// LoadOrCreate is Load for the first run: when the keystore file does not
+// exist it creates an empty, encrypted one at the path, so every later Load
+// on that path succeeds and a second process cannot mistake the path for a
+// new one. Any other failure is reported as by Load.
+func (m *Manager) LoadOrCreate() error {
+	return m.load(true)
+}
+
+func (m *Manager) load(create bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if len(m.keys) > 0 {
+		return fmt.Errorf("%w (%d keys)", ErrKeysHeld, len(m.keys))
+	}
+
 	data, err := os.ReadFile(m.keyFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// No keystore yet — empty state is valid for first run
-			m.keys = []KeyPair{}
-			m.loaded = true
-			return nil
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("read keystore: %w", err)
 		}
-		return fmt.Errorf("read keystore: %w", err)
+		if !create {
+			return fmt.Errorf("%w: %s", ErrKeystoreMissing, m.keyFile)
+		}
+		m.keys = []KeyPair{}
+		return m.saveLocked()
 	}
 
 	var ks Keystore
@@ -241,7 +290,6 @@ func (m *Manager) Load() error {
 		}
 	}
 
-	m.loaded = true
 	return nil
 }
 
@@ -249,7 +297,11 @@ func (m *Manager) Load() error {
 func (m *Manager) Save() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.saveLocked()
+}
 
+// saveLocked is Save with the lock held by the caller.
+func (m *Manager) saveLocked() error {
 	// Serialize key material
 	pk := plaintextKeys{}
 	for _, k := range m.keys {
@@ -384,45 +436,46 @@ func (m *Manager) GetAddresses() []string {
 	return addrs
 }
 
-// GetSignableAddresses returns only addresses whose private keys are
-// the correct FIPS 204 ML-DSA-44 size (2560 bytes). Keys with legacy
-// sizes (e.g., 2528B circl format) cannot be used for signing.
-func (m *Manager) GetSignableAddresses() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var addrs []string
-	for _, k := range m.keys {
-		if len(k.PrivateKey) == PrivateKeySize {
-			addrs = append(addrs, k.Address)
-		}
-	}
-	return addrs
+// HasKey reports whether the manager holds a key for address.
+func (m *Manager) HasKey(address string) bool {
+	_, err := m.keyFor(address)
+	return err == nil
 }
 
-// GetKeyForAddress returns the keypair for a given address.
-func (m *Manager) GetKeyForAddress(address string) (*KeyPair, error) {
+// keyFor returns the record for an address. The slices in the returned value
+// are the manager's own; every exported method that hands bytes out copies
+// them first, and the private key leaves only through ExportPrivateKey.
+func (m *Manager) keyFor(address string) (KeyPair, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	for _, k := range m.keys {
 		if k.Address == address {
-			return &k, nil
+			return k, nil
 		}
 	}
-	return nil, fmt.Errorf("no key for address: %s", address)
+	return KeyPair{}, fmt.Errorf("%w: %s", ErrNoKey, address)
+}
+
+// ExportPrivateKey returns a copy of the private key for address. It is the
+// only way key material leaves a Manager, named so that every use is found by
+// a search of the code base; a sweep to another store or a backup are the
+// expected callers. Zero the copy when it is no longer needed. Signing does
+// not need it: pass the Manager itself as the tx.Signer.
+func (m *Manager) ExportPrivateKey(address string) ([]byte, error) {
+	kp, err := m.keyFor(address)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.Clone(kp.PrivateKey), nil
 }
 
 // Sign signs a message digest with the Dilithium private key for the given address.
 // Uses ML-DSA-44 (FIPS 204) via circl mldsa44 — returns 2420-byte signature.
 func (m *Manager) Sign(address string, digest []byte) ([]byte, error) {
-	kp, err := m.GetKeyForAddress(address)
+	kp, err := m.keyFor(address)
 	if err != nil {
 		return nil, err
-	}
-
-	if len(kp.PrivateKey) != PrivateKeySize {
-		return nil, fmt.Errorf("invalid private key size: %d (expected %d)", len(kp.PrivateKey), PrivateKeySize)
 	}
 
 	// Load raw bytes into FIPS 204 ML-DSA-44 PrivateKey
@@ -540,14 +593,14 @@ func (m *Manager) KeyCount() int {
 	return len(m.keys)
 }
 
-// PublicKeyFor returns the public key for a managed address.
+// PublicKeyFor returns a copy of the public key for a managed address.
 //
 // This exists so that tx.Signer can be satisfied by *Manager directly, without
 // the tx package needing to import this one.
 func (m *Manager) PublicKeyFor(address string) ([]byte, error) {
-	kp, err := m.GetKeyForAddress(address)
+	kp, err := m.keyFor(address)
 	if err != nil {
 		return nil, err
 	}
-	return kp.PublicKey, nil
+	return bytes.Clone(kp.PublicKey), nil
 }

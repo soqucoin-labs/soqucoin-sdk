@@ -270,7 +270,7 @@ func (s *scanner) GetAllUTXOs() []types.UTXO {
 func newKey(t *testing.T) (*keys.Manager, string) {
 	t.Helper()
 	m := keys.NewManager(filepath.Join(t.TempDir(), "keys.enc"), "harness")
-	if err := m.Load(); err != nil {
+	if err := m.LoadOrCreate(); err != nil {
 		t.Fatal(err)
 	}
 	kp, err := keys.GenerateKeyForNetwork(types.Regtest.HRP)

@@ -38,7 +38,6 @@ func TestSignAndVerify(t *testing.T) {
 	// Set up manager with the generated key
 	mgr := NewManager("/dev/null", "test-passwd")
 	mgr.keys = []KeyPair{*kp}
-	mgr.loaded = true
 
 	// Sign
 	sig, err := mgr.Sign(kp.Address, sighash[:])
@@ -71,7 +70,6 @@ func TestSignWrongKey(t *testing.T) {
 	// Sign with key1
 	mgr := NewManager("/dev/null", "test-passwd")
 	mgr.keys = []KeyPair{*kp1}
-	mgr.loaded = true
 
 	sig, err := mgr.Sign(kp1.Address, sighash[:])
 	if err != nil {
@@ -95,7 +93,6 @@ func TestSignModifiedDigest(t *testing.T) {
 
 	mgr := NewManager("/dev/null", "test-passwd")
 	mgr.keys = []KeyPair{*kp}
-	mgr.loaded = true
 
 	sig, _ := mgr.Sign(kp.Address, sighash[:])
 
@@ -122,7 +119,6 @@ func TestKeystoreRoundTrip(t *testing.T) {
 
 	// Create manager, import key, save
 	mgr1 := NewManager(keyFile, passwd)
-	mgr1.loaded = true
 	if err := mgr1.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
 		t.Fatalf("ImportPrivateKey() error: %v", err)
 	}
@@ -212,7 +208,6 @@ func TestKeystoreWrongPassword(t *testing.T) {
 
 	// Save with correct password
 	mgr1 := NewManager(keyFile, "correct-password")
-	mgr1.loaded = true
 	mgr1.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address)
 	mgr1.Save()
 
@@ -228,7 +223,6 @@ func TestKeystoreWrongPassword(t *testing.T) {
 
 func TestSignUnknownAddress(t *testing.T) {
 	mgr := NewManager("/dev/null", "test")
-	mgr.loaded = true
 
 	sighash := sha256.Sum256([]byte("test"))
 	_, err := mgr.Sign("ssq1punknownaddress", sighash[:])
@@ -246,7 +240,6 @@ func TestSigningIsHedged(t *testing.T) {
 	}
 	mgr := NewManager("/dev/null", "test-passwd")
 	mgr.keys = []KeyPair{*kp}
-	mgr.loaded = true
 	digest := make([]byte, 32)
 	for i := range digest {
 		digest[i] = byte(i)
