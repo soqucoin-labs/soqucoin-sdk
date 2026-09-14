@@ -306,6 +306,60 @@ func TestRefreshAllContinuesPastFailingAddress(t *testing.T) {
 	}
 }
 
+// Freshness is recorded per address: the address that refreshed is fresh with
+// no error, the one that failed keeps its zero time and carries the error, and
+// a later success advances it. Untracked addresses read as never refreshed.
+func TestLastRefreshOfIsPerAddress(t *testing.T) {
+	a1, a2 := craftAddr(t, 0x44), craftAddr(t, 0x55)
+	sh1 := scripthashOf(t, a1)
+	var mu sync.Mutex
+	failFirst := true
+	stub := newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
+		mu.Lock()
+		fail := failFirst
+		mu.Unlock()
+		if fail && firstParam(req) == sh1 {
+			return []string{fmt.Sprintf(`{"id":%d,"error":{"code":1,"message":"boom"}}`, req.ID)}
+		}
+		return []string{reply(req.ID, `[]`)}
+	})
+	c := connect(t, stub)
+	if err := c.TrackAddresses([]string{a1, a2}); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now()
+	if err := c.RefreshAll(); err == nil {
+		t.Fatal("expected the first pass to report the failing address")
+	}
+	if at, err := c.LastRefreshOf(a2); at.Before(before) || err != nil {
+		t.Errorf("a2 = (%v, %v): the address that refreshed must be fresh with no error", at, err)
+	}
+	if at, err := c.LastRefreshOf(a1); !at.IsZero() || err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("a1 = (%v, %v): the failing address must keep its zero time and carry the error", at, err)
+	}
+	if at, err := c.LastRefreshOf(craftAddr(t, 0x66)); !at.IsZero() || err != nil {
+		t.Errorf("untracked = (%v, %v), want never", at, err)
+	}
+
+	mu.Lock()
+	failFirst = false
+	mu.Unlock()
+	if err := c.RefreshAll(); err != nil {
+		t.Fatal(err)
+	}
+	if at, err := c.LastRefreshOf(a1); at.IsZero() || err != nil {
+		t.Errorf("a1 after recovery = (%v, %v): must be fresh with no error", at, err)
+	}
+
+	// Tracking a new list forgets the addresses no longer on it.
+	if err := c.TrackAddresses([]string{a2}); err != nil {
+		t.Fatal(err)
+	}
+	if at, _ := c.LastRefreshOf(a1); !at.IsZero() {
+		t.Errorf("a1 still has a refresh time after being untracked: %v", at)
+	}
+}
+
 // Without an explicit HRP the network comes from the addresses; with one,
 // addresses on another network are refused. Nothing silently refreshes zero.
 func TestTrackAddressesInfersAndEnforcesNetwork(t *testing.T) {

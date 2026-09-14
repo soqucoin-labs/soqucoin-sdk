@@ -193,10 +193,10 @@ func main() {
 		log.Fatal("change address:", err)
 	}
 
-	// Build and sign in one call. The transaction itself is returned because
-	// step 9 needs the change value, and the transaction is the only place
-	// that value exists: the fee is derived from feeRate and the final size,
-	// not from a flat number. tx.BuildAndSign returns just the hex and txid.
+	// Build and sign in one call. The transaction itself is returned so the
+	// change can be read off it (Outputs[1], present only when the remainder
+	// is worth more than it costs to spend); tx.BuildAndSign returns just the
+	// hex and txid.
 	transaction, err := tx.BuildSignedTransaction(
 		verified, recipientSPK, paymentAmount, changeSPK, feeRate, keystore)
 	if err != nil {
@@ -219,12 +219,11 @@ func main() {
 		log.Printf("ALERT spent set not written after broadcast %s: %v", txid, err)
 	}
 
-	// 9. Inject change for immediate availability (Defense 13). Read the value
-	//    off the transaction; BuildSendTransaction only adds a change output if
-	//    the remainder is worth more than it costs to spend.
+	// 9. The change output reaches the cache on the next poll and becomes an
+	//    input once it has confirmed; a second payment in the same block needs
+	//    another confirmed output.
 	if len(transaction.Outputs) > 1 {
-		change := transaction.Outputs[1]
-		elx.AddChangeUTXO(txid, 1, change.Value, myAddr)
+		fmt.Printf("Change %d shors returns to %s after confirmation\n", transaction.Outputs[1].Value, myAddr)
 	}
 
 	fmt.Printf("Broadcast %s, spent %d shors of input to send %d shors\n",

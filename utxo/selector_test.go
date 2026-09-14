@@ -1,6 +1,7 @@
 package utxo
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -269,6 +270,12 @@ func TestSelectSmallestUTXOs(t *testing.T) {
 	// Should be sorted smallest first
 	if selected[0].Value != 25000 || selected[1].Value != 50000 {
 		t.Error("expected UTXOs sorted smallest-first")
+	}
+
+	// Nothing deep enough: the named error, so a scheduled consolidation can
+	// treat it as a normal outcome.
+	if _, _, err := cs.SelectSmallestUTXOs(utxos, 2, 12, 20, nil); !errors.Is(err, ErrNoCandidates) {
+		t.Errorf("no candidates: err = %v, want ErrNoCandidates", err)
 	}
 }
 
