@@ -162,3 +162,81 @@ func TestLedgerContextErrorIsNotALedgerAlert(t *testing.T) {
 		t.Fatalf("ledger cancel: %v alerts %v", err, al.kinds)
 	}
 }
+
+// ledgerEnds is a Ledger whose named method ends the context and, if the
+// context it was given has ended, reports that; otherwise it behaves.
+type ledgerEnds struct {
+	*fakeLedger
+	cancel context.CancelFunc
+	method string
+}
+
+func (l *ledgerEnds) Pending(ctx context.Context) ([]Deposit, error) {
+	if l.method == "Pending" {
+		l.cancel()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return l.fakeLedger.Pending(ctx)
+}
+
+func (l *ledgerEnds) Credit(ctx context.Context, d Deposit) error {
+	if l.method == "Credit" {
+		l.cancel()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return l.fakeLedger.Credit(ctx, d)
+}
+
+func (l *ledgerEnds) MarkFinal(ctx context.Context, txid string, vout uint32) error {
+	if l.method == "MarkFinal" {
+		l.cancel()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return l.fakeLedger.MarkFinal(ctx, txid, vout)
+}
+
+// Pending, a read, ends with the caller's context and is returned unalarmed.
+// Credit and MarkFinal, the writes, are made under a context the caller
+// cannot end, so the cancel does not reach them and the record lands.
+func TestLedgerWritesLandAfterTheContextEndsAndReadsDoNot(t *testing.T) {
+	// Pending: the read fails with the context's error, no alert.
+	m, cache, node, led, al, a := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Ledger = &ledgerEnds{fakeLedger: led, cancel: cancel, method: "Pending"}
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
+	if _, err := m.Scan(ctx); !errors.Is(err, context.Canceled) || len(al.kinds) != 0 {
+		t.Fatalf("pending cancel: %v alerts %v", err, al.kinds)
+	}
+	cancel()
+
+	// Credit: the cancel lands during the write; the write is not bound to it.
+	m, cache, node, led, al, a = setup(t)
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	m.Ledger = &ledgerEnds{fakeLedger: led, cancel: cancel, method: "Credit"}
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
+	got, err := m.Scan(ctx)
+	if err != nil || len(got) != 1 || len(led.credited) != 1 || len(al.kinds) != 0 {
+		t.Fatalf("credit with a cancel: %v got %d credited %d alerts %v; the write must land", err, len(got), len(led.credited), al.kinds)
+	}
+
+	// MarkFinal: the same, past the horizon.
+	m, cache, node, led, al, a = setup(t)
+	ctx, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	m.Ledger = &ledgerEnds{fakeLedger: led, cancel: cancel2, method: "MarkFinal"}
+	led.credited[key(txA, 0)] = Deposit{TxID: txA, Vout: 0, Address: a, Value: 100}
+	node.outs[key(txA, 0)] = txout(t, a, 100, types.MaxReorgDepth+1, false)
+	// The write lands; the pass then reports the cancel that followed it.
+	if _, err := m.Scan(ctx); (err != nil && !errors.Is(err, context.Canceled)) || !led.final[key(txA, 0)] || len(al.kinds) != 0 {
+		t.Fatalf("mark final with a cancel: %v final=%v alerts %v; the write must land", err, led.final[key(txA, 0)], al.kinds)
+	}
+}

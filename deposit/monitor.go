@@ -70,7 +70,12 @@ type Node interface {
 // AlertDepositVanished on every scan. Record the sweep in the ledger and
 // exclude the output, or mark it final when the sweep transaction is final.
 //
-// The context is Scan's; a database-backed ledger bounds its queries with it.
+// IsCredited and Pending receive Scan's context. Credit and MarkFinal receive
+// one that does not end when Scan's does (context.WithoutCancel, which also
+// carries no deadline): they record what the node has already confirmed, and
+// a record cut short by the caller is a deposit the book has that no Scan
+// will return. A database-backed ledger bounds every method with its own
+// timeout and does not rely on the context for that.
 type Ledger interface {
 	Credit(ctx context.Context, d Deposit) error
 	IsCredited(ctx context.Context, txid string, vout uint32) (bool, error)
@@ -255,6 +260,11 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	//    indexer has not refreshed within MaxCacheAge when it reports that.
 	var credited []Deposit
 	addrs := m.Addresses(ctx)
+	if err := ctx.Err(); err != nil {
+		// An address provider that answers an ended context with nothing must
+		// not turn a cancelled pass into a clean "no deposits".
+		return nil, err
+	}
 	var stale []string
 	var staleErr error
 	for _, addr := range addrs {
@@ -300,10 +310,11 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			if !ok {
 				continue
 			}
-			if err := m.Ledger.Credit(ctx, d); err != nil {
-				if !ended(ctx, err) {
-					m.alert(AlertLedgerError, "Credit %s:%d: %v", u.TxID, u.Vout, err)
-				}
+			// The node has confirmed the output; the record lands whether or
+			// not the caller is still waiting, and a failure to record it is
+			// a ledger alert whatever the caller's context says.
+			if err := m.Ledger.Credit(context.WithoutCancel(ctx), d); err != nil {
+				m.alert(AlertLedgerError, "Credit %s:%d: %v", u.TxID, u.Vout, err)
 				return credited, err
 			}
 			credited = append(credited, d)
@@ -378,10 +389,8 @@ func (m *Monitor) recheckPending(ctx context.Context, tip int64) error {
 			continue
 		}
 		if out.Confirmations > types.MaxReorgDepth {
-			if err := m.Ledger.MarkFinal(ctx, d.TxID, d.Vout); err != nil {
-				if !ended(ctx, err) {
-					m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
-				}
+			if err := m.Ledger.MarkFinal(context.WithoutCancel(ctx), d.TxID, d.Vout); err != nil {
+				m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
 				return err
 			}
 		}

@@ -233,7 +233,9 @@ Every method that reaches the network, or your storage, takes a `context.Context
 the interfaces you implement for them (`withdraw.Store`, `withdraw.Broadcaster`,
 `withdraw.Confirmer`, `withdraw.Selector`, `withdraw.BuildSigner`, `deposit.Ledger`,
 `deposit.Node`). Methods that only read a cache (`GetUTXOs`, `GetBalance`, `LastRefresh`) take
-none; they never block. The context is how a process bounds a call and how it shuts down:
+none; they never block. The one network call without a context is the webhook post of
+`resilience.Alerter`, which is fire-and-forget on its own goroutine with a ten-second timeout.
+The context is how a process bounds a call and how it shuts down:
 `electrumx.Client.StartPolling` and `resilience.Reconciler.Start` end with it.
 
 What a context that ends does to a withdrawal, state by state
@@ -253,29 +255,36 @@ builds a second transaction. The harness proves it against the node: scenario 9 
 broadcast to the node through a proxy that never returns the reply, cancels, restarts, and pays once.
 
 The context governs what the engine asks of the network and how long it waits for a store read.
-It does not govern the writes: every `withdraw.Store.Put` is made under
-`context.WithoutCancel(ctx)`, because the record of what the network just did (a broadcast
+It does not govern the writes that record what the network did: every `withdraw.Store.Put`
+after `Submit` is made under `context.WithoutCancel(ctx)`, because the record (a broadcast
 accepted, a txid the node disagreed on, a lost reply's attempt) must land whether or not the
-caller is still waiting; so are the reads `Recover` makes to repair the spent set. A
-database-backed `Store` bounds `Put` with its own timeout. `deposit.Monitor.Scan` returns a
-context error plainly, from whichever node or ledger call it ended, never as `ErrPaused` and
-never as an alert: a shutdown is not an indexer lying.
+caller is still waiting; so are the `Get` and `List` calls `Recover` makes to repair the spent
+set. `Submit`'s own write is bound to the caller's context, since nothing has happened yet and
+an abandoned registration must not become a payment. `WithoutCancel` carries no deadline, so a
+database-backed `Store` bounds every method with its own timeout and does not rely on the
+context for that. `deposit.Ledger` follows the same rule: `IsCredited` and `Pending` receive
+`Scan`'s context, `Credit` and `MarkFinal` one the caller cannot end. `deposit.Monitor.Scan`
+returns a context error plainly, from whichever node or ledger read it ended, never as
+`ErrPaused` and never as an alert: a shutdown is not an indexer lying.
 
-`electrumx.Client`: a call whose context ends returns `ctx.Err()` at once. Cut short while
-reading, the connection stays usable and the late reply is discarded by id; cut short while
-writing, the connection is closed, since part of a line may be on the wire, and the next call
-returns `ErrNotConnected` until `Reconnect` or the polling loop restores it. A context deadline
+`electrumx.Client`: a call whose context ends returns `ctx.Err()` at once. Cut short before
+any byte of the reply arrived, the connection stays usable and the late reply is discarded by
+id; cut short while writing, or after part of a reply line was read, the connection is closed,
+since the stream is no longer known to be at a line boundary, and the next call returns
+`ErrNotConnected` until `Reconnect` or the polling loop restores it. A context deadline
 shorter than the 30-second call deadline bounds the exchange.
 
-`resilience`: a reconciliation run the context ends is `Incomplete` and reported, but it neither
-alerts nor trips the breaker, and `CircuitBreaker.RecordResult` treats `context.Canceled` as a
-per-request error that does not count; `context.DeadlineExceeded` counts.
+`resilience`: a reconciliation run the context ends before it found anything is `Incomplete`
+and reported, but it neither alerts nor trips the breaker; a run that had already recorded a
+mismatch when the context ended alerts and trips like any other. `CircuitBreaker.RecordResult`
+treats `context.Canceled` as a per-request error that does not count; `context.DeadlineExceeded`
+counts.
 
 Every component takes a `*log/slog.Logger` in its constructor (`rpc.NewClient`,
 `electrumx.NewClient`, `utxo.OpenSpentSet`, `resilience.NewCircuitBreaker`, `NewAlerter`,
 `NewReconciler`) or as a `Logger` field (`withdraw.Engine`, `deposit.Monitor`). Nil discards
 everything; the SDK writes nothing to the process's default logger. Levels: `Info` for
-connections, refreshes, spent-set writes and clean reconciliations; `Warn` for a reorg seen in
+connections, cache evictions, spent-set writes and clean reconciliations; `Warn` for a reorg seen in
 the cache, a refresh that failed, a reservation that could not be renewed, a reconciliation the
 context ended, a webhook the server did not accept, and, on `deposit.Monitor`, every alert when
 `OnAlert` is nil; `Error` for a circuit breaker opening, a reconciliation that found a mismatch

@@ -27,12 +27,14 @@
 // Every method that reaches the server takes a context.Context first. A call
 // whose context ends returns ctx.Err() at once: the connection deadline is
 // moved to now so the blocked write or read returns. A call cut short while
-// reading leaves the connection usable, and the reply, if it arrives later,
-// carries an id the next call discards; a call cut short while writing
-// closes the connection, since part of a line may be on the wire, and the
-// next call returns ErrNotConnected until Reconnect or the polling loop
-// restores it. Methods that read the cache (GetUTXOs, GetBalance,
-// LastRefresh and the rest) take no context; they never block on the network.
+// waiting for a reply that has not begun to arrive leaves the connection
+// usable, and the reply, if it arrives later, carries an id the next call
+// discards; a call cut short while writing, or after part of a reply line
+// has been read, closes the connection, since the stream is no longer known
+// to be at a line boundary, and the next call returns ErrNotConnected until
+// Reconnect or the polling loop restores it. Methods that read the cache
+// (GetUTXOs, GetBalance, LastRefresh and the rest) take no context; they
+// never block on the network.
 //
 // Copyright (c) 2025-2026 Soqucoin Labs Inc. MIT License.
 package electrumx
@@ -112,9 +114,9 @@ type Client struct {
 // This is the setting an exchange should use for any ElectrumX server it does
 // not reach over a private network.
 //
-//	client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second)
+//	client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second, logger)
 //	client.UseTLS()
-//	client.Connect()
+//	client.Connect(ctx)
 //
 // For a private CA or a pinned certificate, set TLSConfig directly instead.
 func (c *Client) UseTLS() {
@@ -351,11 +353,12 @@ const callDeadline = 30 * time.Second
 //
 // The context ends the exchange the same way the deadline does: when it is
 // done the connection deadline is moved to now, the blocked write or read
-// returns, and ctx.Err() is reported. A read cut short leaves the stream in
-// step: the reply, if it arrives, is a stale id the next call discards. A
-// write cut short does not, since part of a line may be on the wire, so a
-// failed write closes the connection; the next call returns ErrNotConnected
-// and Reconnect, or the polling loop, restores it.
+// returns, and ctx.Err() is reported. A read cut short before any byte of a
+// line arrived leaves the stream in step: the reply, if it arrives, is a
+// stale id the next call discards. A write cut short, or a read cut short
+// with part of a line consumed, does not, so the connection is closed; the
+// next call returns ErrNotConnected and Reconnect, or the polling loop,
+// restores it.
 func (c *Client) callLocked(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	if c.conn == nil {
 		return nil, ErrNotConnected
@@ -421,6 +424,11 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 	for skipped := 0; skipped < maxSkippedLines; skipped++ {
 		line, err := c.reader.ReadBytes('\n')
 		if err != nil {
+			if len(line) > 0 {
+				// Part of a line was consumed; the rest would be read as the
+				// start of the next reply. The stream cannot be trusted.
+				c.dropLocked()
+			}
 			return nil, fmt.Errorf("read response: %w", ctxErr(err))
 		}
 		var in incoming

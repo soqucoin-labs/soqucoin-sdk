@@ -385,11 +385,13 @@ func TestRecoverRepairsTheSpentSetUnderAnEndedContext(t *testing.T) {
 	}
 }
 
-// The context checks in Build and Broadcast also cover an error that carries
-// a context error from somewhere else: a selector or a remote signer with a
-// per-call deadline of its own, or a Broadcaster reporting one, while the
-// caller's context is still live. Deleting the errors.Is checks and keeping
-// only ctx.Err() would fail these.
+// The context checks in Build also cover an error that carries a context
+// error from somewhere else: a selector or a remote signer with a per-call
+// deadline of its own while the caller's context is still live. Deleting the
+// errors.Is checks in Build and keeping only ctx.Err() fails the first two
+// blocks. The third block pins the Broadcaster case's outcome; its ordering
+// before the permanent branch is pinned by
+// TestCancelledBroadcastWrappedAsPermanentIsStillHeld.
 func TestForeignContextErrorsAreTransient(t *testing.T) {
 	// Selector's own deadline: stays Created.
 	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
@@ -438,5 +440,24 @@ func TestForeignContextErrorsAreTransient(t *testing.T) {
 	in, err := e.Process(context.Background(), "w1")
 	if !errors.Is(err, context.DeadlineExceeded) || in.State != StateBuilt || !e.Spent.IsSpent(in.Inputs[0].TxID, in.Inputs[0].Vout) {
 		t.Fatalf("broadcaster deadline: %v %s", err, in.State)
+	}
+}
+
+// Submit's write is bound to the caller's context, unlike every later write:
+// a registration the caller abandoned must not become an intent a worker
+// later pays. The same id submitted again with a live context registers it.
+func TestSubmitUnderAnEndedContextRegistersNothing(t *testing.T) {
+	store := ctxStore{NewMemStore()}
+	e := newEngine(t, store, utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := e.Submit(ctx, "w1", dst, 1_000_000, 1000); !errors.Is(err, context.Canceled) {
+		t.Fatalf("submit under an ended context: %v", err)
+	}
+	if _, ok, _ := store.Get(context.Background(), "w1"); ok {
+		t.Fatal("an abandoned registration was persisted")
+	}
+	if _, created, err := e.Submit(context.Background(), "w1", dst, 1_000_000, 1000); err != nil || !created {
+		t.Fatalf("resubmit: %v created=%v", err, created)
 	}
 }

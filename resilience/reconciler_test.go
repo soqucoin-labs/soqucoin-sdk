@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -261,8 +262,29 @@ func TestTripOpensImmediately(t *testing.T) {
 	}
 }
 
-// A run the context ends is Incomplete and reported, but it is not a mismatch:
-// no alert, no trip. A shutdown mid-run must not page or halt the next start.
+// cancellingNode ends the context on its nth GetTxOut and answers as a node
+// under an ended context would.
+type cancellingNode struct {
+	fakeNode
+	cancel context.CancelFunc
+	onCall int
+	calls  int
+}
+
+func (n *cancellingNode) GetTxOut(ctx context.Context, txid string, vout uint32, mem bool) (*rpc.TxOut, error) {
+	n.calls++
+	if n.calls == n.onCall {
+		n.cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return n.fakeNode.GetTxOut(ctx, txid, vout, mem)
+}
+
+// A run the context ends before it has found anything is Incomplete and
+// reported, but it is not a mismatch: no alert, no trip. A shutdown mid-run
+// must not page or halt the next start.
 func TestRunEndedByTheContextDoesNotTripOrAlert(t *testing.T) {
 	src := &fakeSource{utxos: []types.UTXO{{TxID: "a", Vout: 0, Value: 10}}}
 	node := &fakeNode{outs: map[string]*rpc.TxOut{"a:0": {Value: 10}}}
@@ -285,6 +307,27 @@ func TestRunEndedByTheContextDoesNotTripOrAlert(t *testing.T) {
 	}
 	if st, _, _, _ := cb.State(); st != CircuitClosed {
 		t.Fatalf("breaker %s after a run the context ended, want CLOSED", st)
+	}
+	// A run the context ends AFTER it has found a mismatch is a mismatch: the
+	// node answers the first outpoint with another value, then the context
+	// ends on the second. The finding stands, the alert fires, the breaker trips.
+	src2 := &fakeSource{utxos: []types.UTXO{{TxID: rTxA, Vout: 0, Value: 150_000_000}, {TxID: rTxB, Vout: 0, Value: 10}}, at: time.Now()}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	node2 := &cancellingNode{fakeNode: fakeNode{synced: true, outs: map[string]*rpc.TxOut{rTxA + ":0": {Value: 1}}}, cancel: cancel2, onCall: 2}
+	cb2 := NewCircuitBreaker(3, time.Minute, nil)
+	r2 := NewReconciler(src2, node2, cb2, cfg, nil)
+	alerted2 := ""
+	r2.OnAlert = func(m string) { alerted2 = m }
+	rep = r2.Run(ctx2)
+	if len(rep.Findings) != 1 || !errors.Is(rep.Incomplete, context.Canceled) {
+		t.Fatalf("report %+v, want one finding and the context's error", rep)
+	}
+	if alerted2 == "" || !strings.Contains(alerted2, rTxA) {
+		t.Fatalf("a mismatch found before the context ended was not alerted with its full txid: %q", alerted2)
+	}
+	if st, _, _, _ := cb2.State(); st != CircuitOpen {
+		t.Fatalf("breaker %s after a run that found a mismatch and was then cancelled, want OPEN", st)
 	}
 	// The control: the same Incomplete report under a live context trips it.
 	src.refreshErr = errors.New("indexer down")

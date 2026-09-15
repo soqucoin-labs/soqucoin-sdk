@@ -317,7 +317,7 @@ func (c *Client) SendRawTransaction(ctx context.Context, rawTxHex string) (strin
 	if err != nil {
 		var te *transportError
 		if errors.As(err, &te) {
-			return "", fmt.Errorf("sendrawtransaction: %w: %v", ErrUnknownOutcome, err)
+			return "", fmt.Errorf("sendrawtransaction: %w: %w", ErrUnknownOutcome, err)
 		}
 		return "", fmt.Errorf("sendrawtransaction: %w", err)
 	}
@@ -733,7 +733,7 @@ func (c *Client) VerifyAndFilterUTXOs(
 	for _, u := range utxos {
 		txout, err := c.GetTxOut(ctx, u.TxID, u.Vout, true)
 		if err != nil {
-			return nil, fmt.Errorf("verify UTXO %s:%d: %w", shortID(u.TxID, 12), u.Vout, err)
+			return nil, fmt.Errorf("verify UTXO %s:%d: %w", u.TxID, u.Vout, err)
 		}
 		if txout == nil {
 			c.log.Info("input skipped: not in the node's UTXO set", "txid", u.TxID, "vout", u.Vout)
@@ -761,14 +761,4 @@ func (c *Client) VerifyAndFilterUTXOs(
 	}
 
 	return verified, nil
-}
-
-// shortID truncates an identifier for logging without panicking on short input.
-// Log formatting must never be able to crash the caller: these helpers sit on
-// error paths, and a panic there replaces a handled error with process death.
-func shortID(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

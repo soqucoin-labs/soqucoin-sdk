@@ -148,10 +148,12 @@ func (r *Reconciler) Start(ctx context.Context) {
 func (r *Reconciler) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
 
 // Run performs one reconciliation and returns its report. It also alerts and,
-// when configured, trips the breaker. A run the context ends is Incomplete
-// and is returned and reported through OnReport, but it neither alerts nor
-// trips the breaker: the book was not checked, it was not found wrong, and a
-// shutdown must not page the operator or halt the next start.
+// when configured, trips the breaker. A run the context ends before it has
+// found anything is Incomplete and is returned and reported through OnReport,
+// but it neither alerts nor trips the breaker: the book was not checked, it
+// was not found wrong, and a shutdown must not page the operator or halt the
+// next start. A run the context ends after it has recorded a mismatch alerts
+// and trips like any other: what it found is real whatever ended it.
 func (r *Reconciler) Run(ctx context.Context) Report {
 	rep := r.reconcile(ctx)
 	if r.OnReport != nil {
@@ -161,7 +163,7 @@ func (r *Reconciler) Run(ctx context.Context) Report {
 		r.log.Info("reconciliation clean", "outpoints", rep.Checked, "node_total_shors", rep.NodeTotal)
 		return rep
 	}
-	if rep.Incomplete != nil && (ctx.Err() != nil || errors.Is(rep.Incomplete, context.Canceled) || errors.Is(rep.Incomplete, context.DeadlineExceeded)) {
+	if len(rep.Findings) == 0 && (errors.Is(rep.Incomplete, context.Canceled) || errors.Is(rep.Incomplete, context.DeadlineExceeded)) {
 		r.log.Warn("reconciliation not completed: the context ended", "err", rep.Incomplete)
 		return rep
 	}
@@ -176,13 +178,19 @@ func (r *Reconciler) Run(ctx context.Context) Report {
 	return rep
 }
 
+// describe renders a report that is not clean. A run that recorded findings
+// and then could not complete names both: the findings are what the operator
+// acts on, the cause of the stop is why the list may be short.
 func (r *Reconciler) describe(rep Report) string {
-	if rep.Incomplete != nil {
+	if rep.Incomplete != nil && len(rep.Findings) == 0 {
 		return fmt.Sprintf("reconciliation could not complete: %v", rep.Incomplete)
 	}
 	delta := rep.CacheTotal - rep.NodeTotal
 	msg := fmt.Sprintf("cache and node disagree: %d finding(s), cache %d shors vs node %d shors (delta %d)",
 		len(rep.Findings), rep.CacheTotal, rep.NodeTotal, delta)
+	if rep.Incomplete != nil {
+		msg += fmt.Sprintf("; the run then stopped: %v", rep.Incomplete)
+	}
 	for i, f := range rep.Findings {
 		if i == 5 {
 			msg += fmt.Sprintf("; and %d more", len(rep.Findings)-5)

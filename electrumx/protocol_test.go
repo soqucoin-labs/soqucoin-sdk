@@ -80,7 +80,14 @@ func (s *scriptedStub) serve() {
 					out = s.handler(req)
 				}
 				for _, l := range out {
-					if _, err := c.Write([]byte(l + "\n")); err != nil {
+					// A line ending in NUL is written as a fragment: no
+					// terminator, so a test can leave a reply half sent.
+					if strings.HasSuffix(l, "\x00") {
+						l = strings.TrimSuffix(l, "\x00")
+					} else {
+						l += "\n"
+					}
+					if _, err := c.Write([]byte(l)); err != nil {
 						return
 					}
 				}
