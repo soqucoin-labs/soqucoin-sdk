@@ -50,14 +50,20 @@ def _on_signal(signum, _frame):
     sys.exit(128 + signum)
 
 
-def run_test(package: str, test: str) -> tuple[bool, str]:
-    proc = subprocess.run(
-        ["go", "test", package, "-run", f"^{test}$", "-count=1"],
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-    return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
+def run_test(package: str, test: str, tags: str = "") -> tuple[bool, str]:
+    cmd = ["go", "test"]
+    if tags:
+        cmd += ["-tags", tags]
+    cmd += [package, "-run", f"^{test}$", "-count=1", "-v"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+    output = (proc.stdout + proc.stderr).strip()
+    # `go test -run` exits 0 when the pattern matches nothing, so a misspelled
+    # or tag-hidden test would score as passing both runs. Report it as absent.
+    ran = f"=== RUN   {test}\n" in proc.stdout or f"=== RUN   {test}/" in proc.stdout
+    if not ran:
+        return False, f"no test named {test} ran in {package}" + (
+            f" with -tags {tags}" if tags else "") + f"\n{output[-400:]}"
+    return proc.returncode == 0, output
 
 
 def check(entry: dict) -> tuple[str, str]:
@@ -79,14 +85,15 @@ def check(entry: dict) -> tuple[str, str]:
             "it must occur exactly once so the mutation is unambiguous"
         )
 
-    ok, output = run_test(entry["package"], entry["test"])
+    tags = entry.get("tags", "")
+    ok, output = run_test(entry["package"], entry["test"], tags)
     if not ok:
         return "fail", f"{entry['test']} does not pass unmutated:\n{output[-600:]}"
 
     _in_flight[path] = original
     try:
         path.write_text(original.replace(find, replace, 1))
-        caught, _ = run_test(entry["package"], entry["test"])
+        caught, _ = run_test(entry["package"], entry["test"], tags)
     finally:
         path.write_text(original)
         _in_flight.pop(path, None)
