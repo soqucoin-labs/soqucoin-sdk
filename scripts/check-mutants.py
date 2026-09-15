@@ -14,9 +14,10 @@ script:
 
 Step 4 rewrites the file from a copy held in memory rather than from version
 control, so the run does not discard uncommitted work in a mutated file. That
-copy also goes to a recovery record before the mutation and is removed after
-it, so a run killed in between is detected rather than mistaken for a branch
-that does not carry the line.
+copy also goes to a recovery record before the mutation and is removed once the
+file is back, so a run killed in between is detected rather than mistaken for a
+branch that does not carry the line. The record outlives the run that reports
+it, because the reader needs it to put the file back.
 
 A mutant must leave the program in a defined state. Neutering a guard so that
 the code below it runs on nonsense makes the failure a property of the
@@ -48,7 +49,28 @@ RECOVERY = ROOT / ".check-mutants-recovery.json"
 _in_flight: dict[pathlib.Path, str] = {}
 
 
+def _branch() -> str:
+    """The current branch, or "" when git cannot say. Only ever for a message."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except OSError:
+        return ""
+
+
 def _put_back_all() -> None:
+    """Put back what this run mutated, and drop only this run's own record.
+
+    The early return matters: this runs on every exit path, including the one
+    that refuses because an earlier run left a record behind. Dropping the
+    record there would disarm the guard for the next run and destroy the only
+    saved copy of the text the refusal message points at.
+    """
+    if not _in_flight:
+        return
     for path, original in list(_in_flight.items()):
         path.write_text(original)
         del _in_flight[path]
@@ -56,23 +78,36 @@ def _put_back_all() -> None:
 
 
 def _recovery_report() -> list[str]:
-    """Refuse to run while a killed run's mutation may still be in the tree."""
+    """Refuse to run while a killed run's mutation may still be in the tree.
+
+    Every unreadable shape is reported rather than raised: a record of the
+    wrong type, a missing key and a directory in its place all arrive here,
+    and a traceback would say less than the message does.
+    """
     try:
         rec = json.loads(RECOVERY.read_text())
-    except (OSError, ValueError):
-        return [f"{RECOVERY.name} exists but cannot be read; inspect it by hand."]
-    path = ROOT / rec["file"]
+        name, ident, saved = rec["file"], rec["id"], rec["original"]
+        branch = rec.get("branch", "")
+    except (OSError, ValueError, TypeError, KeyError):
+        return [
+            f"{RECOVERY.name} exists but cannot be read.",
+            "  it is left in place; inspect it by hand and delete it.",
+        ]
+    path = ROOT / name
     current = path.read_text() if path.exists() else ""
-    if current == rec["original"]:
+    if current == saved:
         RECOVERY.unlink(missing_ok=True)
         return []
+    on = f" on {branch}" if branch else ""
     return [
-        f"a previous run was killed while {rec['file']} was mutated for "
-        f"{rec['id']}, and the file no longer holds what it held before.",
-        f"  the text it held is saved under \"original\" in {RECOVERY.name};",
-        "  put that text back, delete the record, and run again.",
-        "  this run is refused rather than reporting on a mutated tree.",
-    ]
+        f"a previous run{on} was killed while {name} was mutated for {ident}, "
+        "and the file no longer holds what it held before.",
+        f"  the text it held is saved under \"original\" in {RECOVERY.name},",
+        "  which is left in place. Put that text back, delete the record, and",
+        "  run again. This run is refused rather than reporting on a mutated",
+        "  tree.",
+    ] + ([f"  the record was written on {branch}; you are not on it now."]
+         if branch and branch != _branch() else [])
 
 
 def _on_signal(signum, _frame):
@@ -131,8 +166,10 @@ def check(entry: dict) -> tuple[str, str]:
 
     _in_flight[path] = original
     try:
-        RECOVERY.write_text(json.dumps(
-            {"id": entry["id"], "file": entry["file"], "original": original}))
+        RECOVERY.write_text(json.dumps({
+            "id": entry["id"], "file": entry["file"],
+            "branch": _branch(), "original": original,
+        }))
         path.write_text(original.replace(find, replace, 1))
         ran, passed, output = run_test(entry["package"], entry["test"], tags)
     finally:
@@ -184,8 +221,9 @@ def main() -> int:
                 print(line, file=sys.stderr)
             return 1
 
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _on_signal)
 
     failures, caught, skipped = [], 0, []
     for e in entries:

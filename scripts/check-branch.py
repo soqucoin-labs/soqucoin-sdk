@@ -4,8 +4,8 @@
 Neither check is about taste. Both answer in a second a question a reading can
 miss.
 
-1. The branch is current with main, decided by comparing the patch text of the
-   two diffs rather than the ancestry or their line counts. `git merge-base --is-ancestor` is the obvious check and it is
+1. The branch is current with main, decided by comparing the patch text of
+   the two diffs rather than the ancestry or their line counts. `git merge-base --is-ancestor` is the obvious check and it is
    wrong whenever main squash-merges: the squash commit is not an ancestor of
    the branch, and the branch's own copy of that work is not an ancestor of
    main, so the ancestry test passes on a branch that is stale. What matters is
@@ -28,16 +28,23 @@ import sys
 DEFAULT_MAX_LINES = 600
 
 
+# Paths unquoted, and no user diff driver or textconv between the gate and the
+# content it compares: the answer must come from the repository, not from
+# whatever is in the reader's git config.
+GIT = ["git", "-c", "core.quotePath=false"]
+DIFF = ["--no-ext-diff", "--no-textconv", "--ignore-submodules=none"]
+
+
 def git(*args: str) -> str:
     return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True
+        [*GIT, *args], capture_output=True, text=True, check=True
     ).stdout
 
 
 def numstat(rev_range: str) -> dict[str, tuple[int, int]]:
     """Return {path: (added, removed)} for a diff range."""
     out: dict[str, tuple[int, int]] = {}
-    for line in git("diff", "--numstat", rev_range).splitlines():
+    for line in git("diff", "--numstat", *DIFF, rev_range).splitlines():
         parts = line.split("\t")
         if len(parts) != 3:
             continue
@@ -49,13 +56,17 @@ def numstat(rev_range: str) -> dict[str, tuple[int, int]]:
 
 
 def patch(rev_range: str, *paths: str) -> str:
-    """The full patch text for a range. Binary files appear as a marker line."""
-    return git("diff", "--no-color", rev_range, "--", *paths)
+    """The full patch text for a range. Binary files appear as a marker line.
+
+    The `index` line carries the blob hashes, so two different pre-image trees
+    cannot produce the same text even where the body is only a binary marker.
+    """
+    return git("diff", "--no-color", *DIFF, rev_range, "--", *paths)
 
 
 def touched(rev_range: str) -> set[str]:
     """Every path in a diff, including the ones numstat reports as binary."""
-    return set(git("diff", "--name-only", rev_range).splitlines())
+    return set(git("diff", "--name-only", *DIFF, rev_range).splitlines())
 
 
 def is_non_test_go(path: str) -> bool:
@@ -82,9 +93,11 @@ def check_current(base: str) -> list[str]:
     lines = [
         f"the branch is behind {base}: what a reviewer sees is not what will land.",
         f"  rendered (three dot): {len(three_p)} files, "
-        f"+{sum(a for a, _ in three.values())}/-{sum(r for _, r in three.values())}",
+        f"+{sum(a for a, _ in three.values())}/-{sum(r for _, r in three.values())}"
+        " text lines",
         f"  landing  (two dot):   {len(two_p)} files, "
-        f"+{sum(a for a, _ in two.values())}/-{sum(r for _, r in two.values())}",
+        f"+{sum(a for a, _ in two.values())}/-{sum(r for _, r in two.values())}"
+        " text lines",
     ]
     if extra:
         lines.append(f"  files in the rendered diff only: {', '.join(extra[:8])}"
