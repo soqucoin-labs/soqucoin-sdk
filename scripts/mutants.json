@@ -131,6 +131,69 @@
       "find": "\treturn fmt.Errorf(\"%w: %w\", ErrNotConnected, err)",
       "replace": "\treturn err",
       "why": "A write that fails on a live context means the socket is gone and dropLocked has forgotten it. Reported as a plain error the refresher classifies it as one the server chose to send, which never rebuilds the connection, and waits out a backoff before finding out through the next call."
+    },
+    {
+      "id": "keystore-kdf-memory-floor-not-enforced",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestKDFParamsOutsideTheRangeAreRefused",
+      "find": "\tcase p.Memory < minMemoryKiB || p.Memory > maxMemoryKiB:",
+      "replace": "\tcase p.Memory < 1:",
+      "why": "Version 2 takes the Argon2id parameters from the file, so whoever can write the file chooses the work factor unless a floor refuses them. Without it a keystore rewritten with 8 MiB of memory still opens, and the passphrase behind it is cheap to guess offline."
+    },
+    {
+      "id": "keystore-header-not-bound-into-the-aead",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestEveryHeaderFieldIsTamperEvident",
+      "find": "\taad, err := json.Marshal(ks)",
+      "replace": "\taad, err := json.Marshal(ks.Version)",
+      "why": "The header is plaintext beside the ciphertext and is bound into the AEAD so an edit to it is a forgery. Without the binding the fields that do not feed the key derivation can be changed silently: the unencrypted public key list is what an operator reads to find the hot-wallet address, and swapping it sends a withdrawal to whoever edited the file."
+    },
+    {
+      "id": "keystore-version-1-opened-with-version-2-bound-data",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestV1KeystoreYieldsTheSameKeysAndAddresses",
+      "find": "\tif ks.Version == keystoreVersionV1 {\n\t\treturn nil, nil\n\t}",
+      "replace": "\tif ks.Version == 0 {\n\t\treturn nil, nil\n\t}",
+      "why": "Version 1 files were sealed with no additional data. Opening one with version 2's bound header makes every keystore written before v0.4 unreadable, which is the loss of the keys in it."
+    },
+    {
+      "id": "keystore-passphrase-file-opened-with-an-external-key",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestKeySourceMismatchIsNamed",
+      "find": "\t\tif m.extKey != nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is passphrase-encrypted, this manager holds an external key\", ErrKDFMismatch)",
+      "replace": "\t\tif m.extKey == nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is passphrase-encrypted, this manager holds an external key\", ErrKDFMismatch)",
+      "why": "The file records which key source wrote it. Without the check, a manager holding a Vault key pointed at a passphrase keystore runs Argon2id over an empty passphrase and reports a decryption failure, sending an operator to look for a wrong passphrase that was never used."
+    },
+    {
+      "id": "keystore-external-key-file-opened-with-a-passphrase",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestKeySourceMismatchIsNamed",
+      "find": "\t\tif m.extKey == nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is encrypted under an external key, this manager holds a passphrase\", ErrKDFMismatch)",
+      "replace": "\t\tif m.extKey != nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is encrypted under an external key, this manager holds a passphrase\", ErrKDFMismatch)",
+      "why": "The mirror of the entry above, and the reason the rule needs both sites: a passphrase manager pointed at an external-key keystore would derive from an empty key and report the same misleading failure."
+    },
+    {
+      "id": "keystore-external-key-derivation-ignores-the-salt",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestExternalKeyDerivationIsSaltBound",
+      "find": "\t\treturn hkdf.Key(sha256.New, m.extKey, ks.Salt, hkdfInfo, encKeySize)",
+      "replace": "\t\treturn hkdf.Key(sha256.New, m.extKey, nil, hkdfInfo, encKeySize)",
+      "why": "An external key does not change between saves. The salt is what makes the AES key differ each time; without it every save of that keystore uses one key and a 96-bit random nonce is the only thing standing between two saves and a repeat."
+    },
+    {
+      "id": "keystore-save-writes-a-version-it-cannot-read",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestSaveWritesAHeaderItWouldAccept",
+      "find": "\t\tVersion: keystoreVersion,",
+      "replace": "\t\tVersion: keystoreVersionV1,",
+      "why": "The header check runs on the way out as well as on the way in, so this package cannot write a file it would refuse to read. Without that, a writer and a reader that disagree produce a keystore nothing opens, and the disagreement surfaces on the next process start rather than at the save."
     }
   ]
 }

@@ -59,8 +59,10 @@ operating funds.
 
 ### Use the keystore, not your own file format
 
-`keys.Manager` stores keypairs encrypted with AES-256-GCM under a key derived by
-Argon2id (time 3, 64 MiB memory, 4 threads). The passphrase is supplied at
+`keys.Manager` stores keypairs encrypted with AES-256-GCM. The encryption key
+comes from one of two places, and the file records which.
+
+**A passphrase**, stretched by Argon2id. The passphrase is supplied at
 construction and never written to the keystore.
 
 ```go
@@ -69,6 +71,33 @@ if err := keystore.Load(); err != nil {
     return fmt.Errorf("load keystore: %w", err)
 }
 ```
+
+**A 32-byte key you already hold**, from Vault, an HSM or anything else that
+unseals a key into the process at start. There is then no passphrase to prompt
+for, type or leave in an environment variable, and the at-rest protection is
+your key-management system's rather than Argon2id over a human secret.
+
+```go
+key, err := fetchKeyFromVault(ctx) // 32 bytes, keys.ExternalKeySize
+if err != nil {
+    return err
+}
+keystore, err := keys.NewManagerWithKey("/var/lib/soq/keystore.enc", key)
+if err != nil {
+    return fmt.Errorf("keystore: %w", err)
+}
+for i := range key {
+    key[i] = 0 // the manager keeps its own copy
+}
+if err := keystore.Load(); err != nil {
+    return fmt.Errorf("load keystore: %w", err)
+}
+```
+
+A manager opens only keystores written under the key source it was built with.
+Opening a passphrase keystore with an external key, or the reverse, is
+`keys.ErrKDFMismatch` and says so, rather than a decryption failure that sends
+you looking for a wrong passphrase.
 
 `Load` refuses a missing file (`keys.ErrKeystoreMissing`): a mistyped path would
 otherwise start a signer that hands out deposit addresses it can never spend from.
@@ -92,6 +121,34 @@ Two shapes `fmt` prints raw and no method can intercept: `%p` applied to a
 non-pointer, and a `KeyPair` behind an unexported struct field. Do not hold a
 `KeyPair` where a struct dump can reach it that way.
 
+### The keystore file, version 2
+
+A version 2 keystore carries its own KDF identifier and, for Argon2id, the
+parameters it was written with (time 3, 64 MiB memory, 4 threads, a 32-byte
+derived key). They are in the file so they can be raised later without a format
+break; putting them there is only safe with the two rules below.
+
+- **A floor and a ceiling.** Parameters weaker than the defaults are refused
+  (`keys.ErrKDFParams`), so nobody can weaken a keystore by editing its header
+  and then guess the passphrase cheaply offline. A header claiming more memory
+  than a gigabyte is refused for the other reason: it is a memory bomb aimed at
+  whatever opens the file.
+- **The header is authenticated.** Everything in the file except the ciphertext
+  — the version, the KDF and its parameters, the salt, the nonce and the
+  unencrypted list of public keys and addresses — is bound into AES-GCM as
+  additional data. An edit to any of it is refused as a forgery. This is what
+  protects the address list an operator reads out of the file to find the
+  hot-wallet address.
+
+Version 1 keystores, written by v0.3.6 and earlier, are read as before and
+rewritten as version 2 by the next `Save`. Nothing is required of you; opening
+one yields the same keys and the same addresses. Version 1 is passphrase-only,
+so open it with `keys.NewManager`.
+
+The encryption key is drawn again on every `Save`, from a fresh salt. With an
+external key that never changes in your key-management system, that is what
+keeps two saves from sharing an AES key.
+
 ### State files survive a crash
 
 The keystore, the spent set (`utxo.SpentSet`) and the withdrawal intent file
@@ -105,6 +162,10 @@ failed directory sync is reported after the file is in place. Keep the in-memory
 state (the engine does for a spent set it could not write) and alert.
 
 ### Passphrase handling
+
+This section is about `keys.NewManager`. On the `NewManagerWithKey` path there
+is no passphrase; the at-rest protection is whatever guards the 32-byte key in
+your key-management system, and the rules to read instead are that system's.
 
 The passphrase is the whole of the at-rest protection. Argon2id makes guessing
 expensive, not impossible.
