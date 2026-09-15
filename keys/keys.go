@@ -360,14 +360,13 @@ func (m *Manager) saveLocked() error {
 		})
 	}
 
-	plaintext, err := json.Marshal(pk)
-	if err != nil {
-		return fmt.Errorf("serialize keys: %w", err)
-	}
-
 	// A version 2 header for this manager's key source, with a fresh salt and
 	// nonce. Save always writes version 2, so a version 1 file that was read
 	// is rewritten in the new format by the first Save after it.
+	//
+	// The header is built before the key material is serialized so that every
+	// way this function can fail early fails before there is a plaintext copy
+	// of the keys on the heap to leave behind.
 	ks, err := m.newHeader()
 	if err != nil {
 		return err
@@ -401,6 +400,11 @@ func (m *Manager) saveLocked() error {
 	gcm, err := openAEAD(encKey)
 	if err != nil {
 		return err
+	}
+
+	plaintext, err := json.Marshal(pk)
+	if err != nil {
+		return fmt.Errorf("serialize keys: %w", err)
 	}
 	ks.Ciphertext = gcm.Seal(nil, ks.Nonce, plaintext, aad)
 

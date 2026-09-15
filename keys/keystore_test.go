@@ -586,6 +586,35 @@ func TestV1KeystoreRefusesTheWrongPassphrase(t *testing.T) {
 	}
 }
 
+// A version 1 header is two fields, and both are refused when they are not
+// what version 1 wrote: the reader supplies that version's parameters from
+// its own constants, so a file that claims others, or claims another KDF, is
+// not a version 1 file and is not read as one.
+func TestMalformedV1HeaderIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(h map[string]any)
+	}{
+		{"parameters version 1 never carried", func(h map[string]any) {
+			h["kdfparams"] = map[string]any{"t": 3, "m": 64 * 1024, "p": 4, "keylen": 32}
+		}},
+		{"a kdf version 1 never used", func(h map[string]any) { h["kdf"] = KDFHKDFSHA256 }},
+		{"no kdf at all", func(h map[string]any) { delete(h, "kdf") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := copyFixture(t)
+			editHeader(t, path, tc.edit)
+			m := NewManager(path, v1FixturePassphrase)
+			if err := m.Load(); !errors.Is(err, ErrKeystoreHeader) {
+				t.Fatalf("Load: %v, want ErrKeystoreHeader", err)
+			}
+			if m.KeyCount() != 0 {
+				t.Error("manager holds keys after a refused Load")
+			}
+		})
+	}
+}
+
 // copyFixture puts a writable copy of the version 1 fixture in a temporary
 // directory, so a test that saves over it does not edit the committed file.
 func copyFixture(t *testing.T) string {
