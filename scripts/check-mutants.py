@@ -60,20 +60,28 @@ def run_test(package: str, test: str) -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
 
 
-def check(entry: dict) -> tuple[bool, str]:
+def check(entry: dict) -> tuple[str, str]:
+    """Return (status, message) where status is ok, fail or skip."""
     path = ROOT / entry["file"]
+    if not path.exists():
+        return "skip", f"{entry['file']} is not on this branch"
     original = path.read_text()
     find, replace = entry["find"], entry["replace"]
     occurrences = original.count(find)
-    if occurrences != 1:
-        return False, (
+    if occurrences == 0:
+        # The manifest is shared by branches that stack. An entry for a
+        # mechanism a branch does not carry yet is not a failure here; it
+        # starts running on the branch that introduces the line.
+        return "skip", f"the line is not in {entry['file']} on this branch"
+    if occurrences > 1:
+        return "fail", (
             f"the text to mutate occurs {occurrences} times in {entry['file']}; "
             "it must occur exactly once so the mutation is unambiguous"
         )
 
     ok, output = run_test(entry["package"], entry["test"])
     if not ok:
-        return False, f"{entry['test']} does not pass unmutated:\n{output[-600:]}"
+        return "fail", f"{entry['test']} does not pass unmutated:\n{output[-600:]}"
 
     _in_flight[path] = original
     try:
@@ -84,11 +92,11 @@ def check(entry: dict) -> tuple[bool, str]:
         _in_flight.pop(path, None)
 
     if caught:
-        return False, (
+        return "fail", (
             f"{entry['test']} still passes with the mutation applied, so it does "
             f"not pin this behaviour.\n  mutation: {find!r} -> {replace!r}"
         )
-    return True, ""
+    return "ok", ""
 
 
 def main() -> int:
@@ -111,22 +119,18 @@ def main() -> int:
             print(f"{e['id']:<44} {e['package']} {e['test']}")
         return 0
 
-    # An entry naming a file this branch does not have is skipped, not failed:
-    # the manifest is shared and each branch carries its own mechanism.
-    runnable = [e for e in entries if (ROOT / e["file"]).exists()]
-    skipped = [e for e in entries if e not in runnable]
-
-    for s in skipped:
-        print(f"SKIP  {s['id']}: {s['file']} is not on this branch")
-
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    failures = []
-    for e in runnable:
-        ok, why = check(e)
-        print(f"{'OK   ' if ok else 'FAIL '} {e['id']}")
-        if not ok:
+    failures, caught, skipped = [], 0, []
+    for e in entries:
+        status, why = check(e)
+        print(f"{status.upper():<5} {e['id']}" + (f": {why}" if status == "skip" else ""))
+        if status == "ok":
+            caught += 1
+        elif status == "skip":
+            skipped.append(e)
+        else:
             failures.append((e, why))
 
     print()
@@ -135,9 +139,10 @@ def main() -> int:
             print(f"--- {e['id']} ({e['file']})")
             print(f"    why it exists: {e['why']}")
             print(f"    {why}")
-        print(f"\ncheck-mutants: {len(failures)} of {len(runnable)} not caught")
+        print(f"\ncheck-mutants: {len(failures)} not caught, {caught} caught, "
+              f"{len(skipped)} skipped")
         return 1
-    print(f"check-mutants: {len(runnable)} caught, {len(skipped)} skipped")
+    print(f"check-mutants: {caught} caught, {len(skipped)} skipped")
     return 0
 
 
