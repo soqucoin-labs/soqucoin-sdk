@@ -212,20 +212,20 @@ func TestNotificationFloodCoalescesToOneRefreshPerPass(t *testing.T) {
 	}
 	// The refresher is not running; drive the pass by hand so the flood lands
 	// before the drain.
-	if err := c.pass(context.Background(), true); err != nil {
+	if _, err := c.pass(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	gen := c.liveGen.Load()
 	for i := 0; i < 10000; i++ {
 		c.noteChange(gen, sh1, fmt.Sprintf("s%d", i))
 	}
-	if err := c.pass(context.Background(), false); err != nil {
+	if _, err := c.pass(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if n := stub.count("blockchain.scripthash.listunspent", sh1); n != 2 {
 		t.Fatalf("%d listunspent after a flood of 10000 notifications, want 2 (the first pass and one drain)", n)
 	}
-	if err := c.pass(context.Background(), false); err != nil {
+	if _, err := c.pass(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if n := stub.count("blockchain.scripthash.listunspent", sh1); n != 2 {
@@ -337,7 +337,7 @@ func TestPingAdvancesOnlyCleanRecords(t *testing.T) {
 	if err := c.TrackAddresses([]string{a1, a2, a3}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.pass(context.Background(), true); err == nil || !strings.Contains(err.Error(), a3) {
+	if _, err := c.pass(context.Background(), true); err == nil || !strings.Contains(err.Error(), a3) {
 		t.Fatalf("pass should fail on a3 only: %v", err)
 	}
 	at1, at2 := mustAt(t, c, a1), mustAt(t, c, a2)
@@ -362,7 +362,7 @@ func TestPingAdvancesOnlyCleanRecords(t *testing.T) {
 	}
 	// Once the pending change is refreshed, a2 is clean again. a3, still
 	// failing, stays marked and the pass names it.
-	if err := c.pass(context.Background(), false); err == nil || !strings.Contains(err.Error(), a3) || strings.Contains(err.Error(), a2) {
+	if _, err := c.pass(context.Background(), false); err == nil || !strings.Contains(err.Error(), a3) || strings.Contains(err.Error(), a2) {
 		t.Fatalf("pass after the change: %v, want a3's failure alone", err)
 	}
 	at2 = mustAt(t, c, a2)
@@ -381,7 +381,7 @@ func TestPingAdvancesOnlyCleanRecords(t *testing.T) {
 	stub.failList[sh1] = true
 	stub.mu.Unlock()
 	at1 = mustAt(t, c, a1)
-	if err := c.pass(context.Background(), true); err == nil || !strings.Contains(err.Error(), a1) {
+	if _, err := c.pass(context.Background(), true); err == nil || !strings.Contains(err.Error(), a1) {
 		t.Fatalf("full pass with a1 failing: %v", err)
 	}
 	if at, rerr := c.LastRefreshOf(a1); rerr == nil || !at.Equal(at1) {
@@ -434,7 +434,7 @@ func TestReplyPredatingANotificationLeavesTheChangePending(t *testing.T) {
 	if err := c.TrackAddresses([]string{a1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.pass(context.Background(), true); err != nil {
+	if _, err := c.pass(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	// The second listunspent: the notification arrives first on the stream.
@@ -452,7 +452,7 @@ func TestReplyPredatingANotificationLeavesTheChangePending(t *testing.T) {
 	if !rec.dirty {
 		t.Fatal("a reply that predates a notification cleared the change flag")
 	}
-	if err := c.pass(context.Background(), false); err != nil {
+	if _, err := c.pass(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(c.GetUTXOs(a1)) != 1 {

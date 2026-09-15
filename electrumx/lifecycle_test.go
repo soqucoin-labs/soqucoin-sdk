@@ -164,14 +164,14 @@ func TestUnchangedStatusDoesNotSkipARefreshAfterAFailure(t *testing.T) {
 	if err := c.TrackAddresses([]string{a1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.pass(context.Background(), true); err != nil {
+	if _, err := c.pass(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	// The indexer refuses the address; the record carries the error.
 	stub.mu.Lock()
 	stub.failList[sh1] = true
 	stub.mu.Unlock()
-	if err := c.pass(context.Background(), true); err == nil {
+	if _, err := c.pass(context.Background(), true); err == nil {
 		t.Fatal("full pass with a failing listunspent succeeded")
 	}
 	stub.mu.Lock()
@@ -187,7 +187,7 @@ func TestUnchangedStatusDoesNotSkipARefreshAfterAFailure(t *testing.T) {
 	if err := c.Reconnect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.pass(context.Background(), false); err != nil {
+	if _, err := c.pass(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if n := stub.count("blockchain.scripthash.listunspent", sh1); n != before+1 {
@@ -213,7 +213,7 @@ func TestNotificationFromAReplacedConnectionIsIgnored(t *testing.T) {
 	if err := c.TrackAddresses([]string{a1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.pass(context.Background(), true); err != nil {
+	if _, err := c.pass(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	old := c.liveGen.Load()

@@ -2,6 +2,7 @@ package electrumx
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -39,5 +40,24 @@ func TestReplyOnANewConnectionDoesNotSatisfyAnOldGenerationsCall(t *testing.T) {
 	c.pendMu.Unlock()
 	if !still {
 		t.Fatal("the old generation's waiter was removed by a reply on the new connection")
+	}
+}
+
+// The tip a headers.subscribe reply carries is recorded only while the
+// connection it came over is still live. A reply buffered on a connection
+// that is then replaced still answers its caller, and the connection that
+// replaced it has already recorded a newer tip in its own handshake: letting
+// the older reply through moves the height backwards.
+func TestATipFromAReplacedConnectionIsNotRecorded(t *testing.T) {
+	c := NewClient("127.0.0.1:1", time.Hour, nil)
+	c.liveGen.Store(2)
+
+	c.recordTipIfLive(2, json.RawMessage(`{"height":100,"hex":"00"}`))
+	if got := c.LastTip(); got != 100 {
+		t.Fatalf("the live connection's reply left the tip at %d, want 100", got)
+	}
+	c.recordTipIfLive(1, json.RawMessage(`{"height":50,"hex":"00"}`))
+	if got := c.LastTip(); got != 100 {
+		t.Errorf("a reply from generation 1 moved the tip to %d", got)
 	}
 }

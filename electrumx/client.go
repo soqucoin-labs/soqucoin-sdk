@@ -92,6 +92,10 @@ type Client struct {
 	reqID   atomic.Int64
 	lastTip atomic.Int64 // latest height seen in a headers.subscribe reply or notification
 
+	// refreshTicket orders overlapping refreshes of one address. Taken before
+	// the call, compared at the commit: see refreshRecord.commit.
+	refreshTicket atomic.Uint64
+
 	addresses         []string
 	reconcileInterval time.Duration
 	stopCh            chan struct{}
@@ -171,6 +175,10 @@ type refreshRecord struct {
 	gen   uint64
 	dirty bool
 	seq   uint64
+	// commit is the ticket of the last refresh of this address that reported.
+	// Overlapping refreshes commit in ticket order and an older one is
+	// dropped, whatever order the replies arrive in.
+	commit uint64
 }
 
 // request is a JSON-RPC request to ElectrumX.
@@ -418,23 +426,49 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 		return fmt.Errorf("address to script hash: %w", err)
 	}
 
+	// One ticket per listunspent, taken before the call goes out. Two
+	// refreshes of the same address can be in flight at once (the refresher's
+	// pass and a caller's RefreshAll), and their replies can arrive in either
+	// order. A commit whose ticket is older than the last one committed for
+	// the address is dropped, so a late reply cannot put an older set back
+	// into the cache and cannot claim its freshness. seq does not cover this:
+	// it counts notifications, and neither of two overlapping calls has one.
+	ticket := c.refreshTicket.Add(1)
+
 	c.mu.RLock()
 	seqBefore := c.refreshed[addr].seq
 	c.mu.RUnlock()
 
 	result, gen, err := c.callGen(ctx, "blockchain.scripthash.listunspent", []interface{}{scriptHash})
 	if err != nil {
-		c.recordRefresh(addr, gen, seqBefore, fmt.Errorf("listunspent: %w", err))
+		c.recordRefresh(addr, gen, seqBefore, ticket, fmt.Errorf("listunspent: %w", err))
 		return fmt.Errorf("listunspent: %w", err)
 	}
 
 	var freshUTXOs []types.UTXO
 	if err := json.Unmarshal(result, &freshUTXOs); err != nil {
-		c.recordRefresh(addr, gen, seqBefore, fmt.Errorf("parse utxos: %w", err))
+		c.recordRefresh(addr, gen, seqBefore, ticket, fmt.Errorf("parse utxos: %w", err))
 		return fmt.Errorf("parse utxos: %w", err)
 	}
 
-	// Build a lookup set of fresh UTXOs from ElectrumX
+	count, committed := c.commitRefresh(addr, gen, seqBefore, ticket, freshUTXOs)
+	if committed && c.OnRefresh != nil {
+		// Outside the lock: a slow OnRefresh must not hold the reader, which
+		// takes mu to note a change, and with it every reply on the
+		// connection. The commit is finished, so a panic here unwinds through
+		// the refresher's recovery with no lock held.
+		c.OnRefresh(addr, count)
+	}
+	return nil
+}
+
+// commitRefresh merges one listunspent reply into the cache under mu and
+// reports the size of the merged set and whether it was committed. A merge,
+// not a replacement: the old code wiped SpentPending on every pass, so a UTXO
+// could be selected again while the transaction that spent it was still in
+// the mempool. Outputs the reply no longer lists are dropped as spent, and
+// outputs it lists for the first time are added.
+func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool) {
 	type utxoKey struct {
 		TxID string
 		Vout uint32
@@ -486,26 +520,22 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 		// TrackAddresses dropped the address while this listunspent was in
 		// flight; committing now would put an untracked address's outputs
 		// back into the cache the balance and the selector read.
-		return nil
+		return 0, false
+	}
+	if ticket < c.refreshed[addr].commit {
+		// A refresh that started later has already committed; this reply is
+		// older than what the cache holds.
+		return 0, false
 	}
 	c.utxos[addr] = merged
-	c.recordRefreshLocked(addr, gen, seqBefore, nil)
-	count := len(merged)
-	c.mu.Unlock()
-
-	// Outside the lock: a slow OnRefresh must not hold the reader, which
-	// takes mu to note a change, and with it every reply on the connection.
-	if c.OnRefresh != nil {
-		c.OnRefresh(addr, count)
-	}
-	c.mu.Lock() // released by the deferred Unlock
-	return nil
+	c.recordRefreshLocked(addr, gen, seqBefore, ticket, nil)
+	return len(merged), true
 }
 
-func (c *Client) recordRefresh(addr string, gen, seqBefore uint64, err error) {
+func (c *Client) recordRefresh(addr string, gen, seqBefore, ticket uint64, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.recordRefreshLocked(addr, gen, seqBefore, err)
+	c.recordRefreshLocked(addr, gen, seqBefore, ticket, err)
 }
 
 // recordRefreshLocked records one listunspent attempt. Caller holds mu. A
@@ -515,11 +545,15 @@ func (c *Client) recordRefresh(addr string, gen, seqBefore uint64, err error) {
 // the flag moves, and the next pass refreshes the address again.
 // TrackAddresses may have dropped the address during the call; then nothing
 // is recorded.
-func (c *Client) recordRefreshLocked(addr string, gen, seqBefore uint64, err error) {
+func (c *Client) recordRefreshLocked(addr string, gen, seqBefore, ticket uint64, err error) {
 	if !c.trackedSet[addr] {
 		return
 	}
 	rec := c.refreshed[addr]
+	if ticket < rec.commit {
+		return // a later refresh of this address has already reported
+	}
+	rec.commit = ticket
 	if !endedErr(err) {
 		// A context that ended says nothing about the indexer; the previous
 		// verdict stands and no alert follows from a shutdown.

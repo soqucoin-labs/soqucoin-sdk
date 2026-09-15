@@ -314,3 +314,41 @@ func TestRefreshPolicyOverRandomTraces(t *testing.T) {
 		}
 	}
 }
+
+// A pass that made no call is not an outcome. The first ping timeout sets a
+// retry, and the retry's pass has nothing to refresh whenever no address has
+// a change pending, which is the ordinary state of a quiet wallet. Reported
+// as a clean pass it reset the reply-timeout count, so the second ping
+// timeout counted as the first and a server that had stopped answering while
+// holding the connection open was never replaced.
+func TestAPassThatMadeNoCallIsNotAnOutcome(t *testing.T) {
+	timeout := fmt.Errorf("ping: %w", errNoReply)
+	p := newRefreshPolicy()
+
+	if act := p.onEvent(evPingErr); !act.report {
+		t.Fatal("the first ping failure was not reported to the policy")
+	}
+	out, report := classifyPass(true, timeout)
+	if !report {
+		t.Fatal("a ping failure is an outcome")
+	}
+	if res := p.onResult(out); res.reconnect {
+		t.Fatal("one reply timeout rebuilt the connection")
+	}
+
+	act := p.onEvent(evRetry)
+	if !act.runPass {
+		t.Fatal("the retry timer did not run a pass")
+	}
+	if _, report := classifyPass(false, nil); report {
+		t.Fatal("a pass that made no call was reported as an outcome")
+	}
+
+	if act := p.onEvent(evPingErr); !act.report {
+		t.Fatal("the second ping failure was not reported to the policy")
+	}
+	out, _ = classifyPass(true, timeout)
+	if res := p.onResult(out); !res.reconnect {
+		t.Error("two reply timeouts in a row did not rebuild the connection")
+	}
+}

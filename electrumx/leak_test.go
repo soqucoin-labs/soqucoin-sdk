@@ -16,9 +16,5 @@ import (
 // a time until the indexer refuses new ones. Nothing in an ordinary assertion
 // notices that, which is why it is checked here rather than test by test.
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m,
-		// net/http's shared transport keeps idle connections and their reader
-		// parked between tests; not ours and not a leak.
-		goleak.IgnoreTopFunction("internal/poll.runtime_pollWait"),
-	)
+	goleak.VerifyTestMain(m)
 }

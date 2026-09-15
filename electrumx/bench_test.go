@@ -61,7 +61,7 @@ func BenchmarkSubscribeAndRefreshPerAddress(b *testing.B) {
 		if err := c.Reconnect(context.Background()); err != nil {
 			b.Fatal(err)
 		}
-		if err := c.pass(context.Background(), true); err != nil {
+		if _, err := c.pass(context.Background(), true); err != nil {
 			b.Fatal(err)
 		}
 	}

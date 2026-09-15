@@ -57,6 +57,21 @@ func classifyOutcome(err error) refreshOutcome {
 	}
 }
 
+// classifyPass maps a pass onto what the policy reasons about, and reports
+// whether the pass is an outcome at all. A pass that made no call and
+// returned no error is not: nothing was asked of the connection, so a clean
+// answer is evidence the pass never gathered. Reporting it as a clean pass
+// reset the reply-timeout count, and a retry pass with no address to refresh
+// is exactly what follows the first ping timeout, so two silent pings in a
+// row never rebuilt the connection against a server that had stopped
+// answering.
+func classifyPass(made bool, err error) (refreshOutcome, bool) {
+	if err == nil && !made {
+		return outOK, false
+	}
+	return classifyOutcome(err), true
+}
+
 // refreshAction is what the policy decides for one event.
 type refreshAction struct {
 	runPass bool

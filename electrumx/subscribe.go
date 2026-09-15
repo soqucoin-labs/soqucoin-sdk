@@ -99,20 +99,39 @@ func (c *Client) subscribe(ctx context.Context, addr string) error {
 			err = fmt.Errorf("status %s is neither a string nor null", raw)
 		}
 	}
-	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.trackedSet[addr] {
-		return nil // dropped by TrackAddresses during the call
-	}
-	rec := c.refreshed[addr]
 	if err != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if !c.trackedSet[addr] {
+			return nil // dropped by TrackAddresses during the call
+		}
 		if !endedErr(err) {
+			rec := c.refreshed[addr]
 			rec.err = err
 			c.refreshed[addr] = rec
 		}
 		return fmt.Errorf("subscribe %s: %w", addr, err)
 	}
+	c.commitSubscribe(addr, gen, status, time.Now())
+	return nil
+}
+
+// commitSubscribe records one acknowledged subscription. It commits nothing
+// for an address TrackAddresses has dropped, and nothing from a connection
+// that has since been replaced: that reply's status was true when the server
+// wrote it, the record would date it now, and the address is not subscribed
+// on the live connection. The next pass subscribes it there and reads the
+// status from that reply.
+func (c *Client) commitSubscribe(addr string, gen uint64, status string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.trackedSet[addr] {
+		return
+	}
+	if live := c.liveGen.Load(); gen != live {
+		return
+	}
+	rec := c.refreshed[addr]
 	c.subscribed[addr] = gen
 	prev, seen := c.status[addr]
 	c.status[addr] = status
@@ -124,7 +143,6 @@ func (c *Client) subscribe(ctx context.Context, addr string) error {
 		rec.seq++
 	}
 	c.refreshed[addr] = rec
-	return nil
 }
 
 // ping proves the session alive to both sides and advances the freshness of
@@ -161,9 +179,9 @@ func (c *Client) touch(gen uint64, now time.Time) {
 // pending, or every address when full (the reconcile, which also records
 // LastRefresh). A lost connection or an ended context stops the pass where
 // it is; the next pass picks up what is left.
-func (c *Client) pass(ctx context.Context, full bool) error {
+func (c *Client) pass(ctx context.Context, full bool) (made bool, err error) {
 	if c.liveGen.Load() == 0 {
-		return ErrNotConnected // nothing to subscribe on; the refresher reconnects
+		return false, ErrNotConnected // nothing to subscribe on; the refresher reconnects
 	}
 	c.mu.RLock()
 	addrs := append([]string(nil), c.addresses...)
@@ -172,15 +190,16 @@ func (c *Client) pass(ctx context.Context, full bool) error {
 	var errs []error
 	for _, addr := range addrs {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(append(errs, err)...)
+			return made, errors.Join(append(errs, err)...)
 		}
 		if c.isSubscribed(addr) {
 			continue
 		}
+		made = true
 		if err := c.subscribe(ctx, addr); err != nil {
 			errs = append(errs, err)
 			if errIsConnection(err) || ctx.Err() != nil {
-				return errors.Join(errs...)
+				return made, errors.Join(errs...)
 			}
 		}
 	}
@@ -196,6 +215,9 @@ func (c *Client) pass(ctx context.Context, full bool) error {
 	}
 	c.changed = make(map[string]bool)
 	c.mu.Unlock()
+	if len(todo) > 0 {
+		made = true
+	}
 	if full || len(todo) > 0 {
 		failed, err := c.refresh(ctx, todo, full)
 		errs = append(errs, err)
@@ -212,7 +234,7 @@ func (c *Client) pass(ctx context.Context, full bool) error {
 			c.mu.Unlock()
 		}
 	}
-	return errors.Join(errs...)
+	return made, errors.Join(errs...)
 }
 
 func (c *Client) pingInterval() time.Duration {
@@ -309,9 +331,10 @@ func (c *Client) run(ctx context.Context, pingErr <-chan error) {
 	step := func(ev refreshEvent, direct error) {
 		act := pol.onEvent(ev)
 		var err error
+		made := true
 		switch {
 		case act.runPass:
-			err = c.pass(ctx, act.full)
+			made, err = c.pass(ctx, act.full)
 		case act.report:
 			err = direct
 		default:
@@ -320,7 +343,11 @@ func (c *Client) run(ctx context.Context, pingErr <-chan error) {
 		if err != nil && (ctx.Err() != nil || c.stopped()) {
 			return // a shutdown says nothing about the connection
 		}
-		res := pol.onResult(classifyOutcome(err))
+		out, report := classifyPass(made, err)
+		if !report {
+			return
+		}
+		res := pol.onResult(out)
 		if err != nil {
 			c.log.Warn("refresh failed", "in", res.backoff, "err", err)
 		}

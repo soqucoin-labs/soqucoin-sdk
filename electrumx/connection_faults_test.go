@@ -3,6 +3,7 @@ package electrumx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -83,5 +84,28 @@ func TestHeaderFromAReplacedConnectionDoesNotMoveTheTip(t *testing.T) {
 	c.handleNotification(c.liveGen.Load(), incoming{Method: "blockchain.headers.subscribe", Params: json.RawMessage(`[{"height":501,"hex":"00"}]`)})
 	if c.LastTip() != 501 {
 		t.Fatalf("a header from the live generation did not move the tip: %d", c.LastTip())
+	}
+}
+
+// A write that fails on a live context is a lost connection: the socket is
+// gone and dropLocked has already forgotten it. Reported as a plain error it
+// is classified as one the server chose to send, which never rebuilds the
+// connection, so the refresher waits out a backoff before discovering through
+// the next call that there is nothing there.
+func TestAFailedWriteReportsALostConnection(t *testing.T) {
+	broken := errors.New("write tcp 127.0.0.1:1: broken pipe")
+
+	err := writeFailure(context.Background(), broken)
+	if !errIsConnection(err) {
+		t.Errorf("a failed write reported %v, which the refresher reads as an application error", err)
+	}
+	if !errors.Is(err, broken) {
+		t.Error("the underlying write error is no longer in the chain")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := writeFailure(ctx, broken); !errors.Is(err, context.Canceled) {
+		t.Errorf("a write cut off by the caller's context reported %v, want the context error", err)
 	}
 }

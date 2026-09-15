@@ -334,10 +334,7 @@ func (c *Client) sendLocked(ctx context.Context, conn net.Conn, gen uint64, meth
 	if werr != nil {
 		c.unregister(id)
 		c.dropLocked()
-		if cerr := ctx.Err(); cerr != nil {
-			werr = cerr
-		}
-		return 0, pendingCall{}, fmt.Errorf("write request: %w", werr)
+		return 0, pendingCall{}, fmt.Errorf("write request: %w", writeFailure(ctx, werr))
 	}
 	if closedByCtx.Load() {
 		// The line went out whole and the socket was then closed by the
@@ -345,6 +342,31 @@ func (c *Client) sendLocked(ctx context.Context, conn net.Conn, gen uint64, meth
 		c.dropLocked()
 	}
 	return id, p, nil
+}
+
+// writeFailure is what a failed write reports. The socket is gone and
+// dropLocked has forgotten it, so the refresher has to read this as a lost
+// connection: without ErrNotConnected in the chain it reads a broken pipe as
+// an error the server chose to send and waits out a backoff before rebuilding
+// a connection that no longer exists. A context that ended during the write is
+// what the caller asked for and is reported as itself.
+func writeFailure(ctx context.Context, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	return fmt.Errorf("%w: %w", ErrNotConnected, err)
+}
+
+// recordTipIfLive records the tip from a headers.subscribe reply that came
+// over gen, and only while gen is still the live connection. The notification
+// path makes the same test: a reply buffered on a connection that has since
+// been replaced still answers its caller, and the connection that replaced it
+// has already recorded a newer tip in its own handshake.
+func (c *Client) recordTipIfLive(gen uint64, result json.RawMessage) {
+	if live := c.liveGen.Load(); gen != live {
+		return
+	}
+	c.recordTip(result)
 }
 
 // await waits for the reply to id, the loss of its connection, Stop, the
@@ -359,7 +381,7 @@ func (c *Client) await(ctx context.Context, id int64, p pendingCall, method stri
 			return nil, fmt.Errorf("electrumx error: %s", string(in.Error))
 		}
 		if method == "blockchain.headers.subscribe" {
-			c.recordTip(in.Result)
+			c.recordTipIfLive(p.gen, in.Result)
 		}
 		return in.Result, nil
 	}
