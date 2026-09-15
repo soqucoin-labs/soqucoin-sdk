@@ -100,7 +100,7 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("electrumx %s: tls handshake: %w", c.host, err)
 	}
 	return tlsConn, nil
@@ -130,18 +130,18 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	if err := c.lockConn(ctx); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return err
 	}
 	defer c.unlockConn()
 	if c.stopped() {
 		// A Stop that raced the dial stands: the client is not reopened.
-		conn.Close()
+		_ = conn.Close()
 		return ErrNotConnected
 	}
 
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 	}
 	c.gen++
 	gen := c.gen
@@ -321,7 +321,7 @@ func (c *Client) sendLocked(ctx context.Context, conn net.Conn, gen uint64, meth
 		defer close(fired)
 		if err := conn.SetWriteDeadline(time.Now()); err != nil {
 			closedByCtx.Store(true)
-			conn.Close()
+			_ = conn.Close()
 		}
 	})
 	_, werr := conn.Write(data)
@@ -487,7 +487,7 @@ func (c *Client) failPending(gen uint64) {
 // dials again; the reader ends on the closed socket and fails the waiters.
 func (c *Client) dropLocked() {
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 	}
 	c.conn = nil
 	c.reader = nil
