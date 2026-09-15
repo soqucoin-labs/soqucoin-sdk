@@ -17,7 +17,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Full history: the static-analysis ratchet compares against origin/main.
+      # The branch check runs in its own job below, off the pull request head.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       # Read the version from go.mod rather than pinning it separately, so CI
       # always builds with the toolchain the module declares.
@@ -55,6 +59,18 @@ jobs:
       - name: Documentation
         run: python3 scripts/check-docs.py
 
+      # A static-analysis floor: staticcheck, errcheck, gosec, nilness and the
+      # rest, pinned, as a ratchet against main. It catches a duller class than
+      # the model tests and the mutation gate below, and it catches it on every
+      # push for free.
+      - name: Static analysis
+        run: make lint
+
+      # Every declared mutant must be caught by the one test that pins it: a
+      # test that cannot fail is not coverage.
+      - name: Mutants
+        run: make mutants
+
       # Known-vulnerability scan against the Go vulnerability database, on the
       # symbols this module actually calls, not just the module graph.
       - name: Vulnerability scan
@@ -62,6 +78,23 @@ jobs:
         with:
           go-version-file: go.mod
           go-package: ./...
+
+  # The branch must be current with main and the change must be one mechanism.
+  # This runs against the pull request's own head, not the merge commit GitHub
+  # checks out by default: the merge commit already contains main, so the
+  # staleness this catches would be invisible from there.
+  branch:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Branch is current and one mechanism
+        run: python3 scripts/check-branch.py
 
   secrets:
     runs-on: ubuntu-latest

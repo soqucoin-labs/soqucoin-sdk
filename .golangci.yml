@@ -1,0 +1,63 @@
+version: "2"
+
+# A static-analysis floor. It catches the duller class the eye slides over —
+# unchecked errors, dead assignments, nil paths, permissive file modes — and it
+# does not catch contract or scheduling defects, which are pinned by the model
+# tests and the mutation gate instead. Pinned to one version, and a ratchet
+# against main so it costs nothing on an ordinary push.
+
+linters:
+  enable:
+    - errcheck     # an unchecked error on the money path is a silent wrong answer
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - bodyclose
+    - rowserrcheck
+
+  settings:
+    govet:
+      enable:
+        - nilness  # a nil dereference the type system permits and the flow forbids
+    gosec:
+      excludes:
+        # G115 (integer conversion overflow) fires on every conversion between
+        # the protocol's sized types. Real overflow on those paths is pinned by
+        # the fuzz targets in tx and address, which check the invariant rather
+        # than the conversion.
+        - G115
+
+  exclusions:
+    generated: lax
+    rules:
+      # Tests may ignore errors from helpers whose failure the assertion below
+      # would catch anyway.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  # A ratchet, not a cleanup. The existing tree reports 56 findings under the
+  # caps set below: errcheck 43, gosec 6, staticcheck 4, ineffassign 3. Thirty
+  # is the count under golangci-lint's own default caps, which the two lines
+  # below remove, so quote 56 and not thirty. The 43 errcheck are 27
+  # `binary.Write` into a `bytes.Buffer`, 12 `Close` on a response body or a
+  # connection, 3 in atomicfile — two cleaning up an already-failing path and a
+  # deferred read-only directory close, none of them the durable `Close` or
+  # either `fsync`, which are all checked — and one `io.WriteString` in a
+  # `fmt.Formatter`, which has no error to return. The two that look
+  # substantive were read and are not defects: two gosec G602 reports on a
+  # slice index the line above bounds, and a dead `fee += change` whose effect
+  # already happens by construction. Clearing 56 cosmetic items would be a
+  # large cross-package diff with no change in behaviour, so the existing tree
+  # is the baseline and new code is held to the bar.
+  new-from-rev: origin/main
+  max-issues-per-linter: 0
+  max-same-issues: 0

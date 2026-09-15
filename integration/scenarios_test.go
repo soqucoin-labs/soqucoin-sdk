@@ -240,12 +240,28 @@ func (d *downBroadcaster) Broadcast(ctx context.Context, raw, txid string) (stri
 // serialization. The payment is really in the node's mempool.
 type lyingBroadcaster struct{ inner *rpc.Client }
 
+// differentTxID returns a txid that is not the one passed in. Replacing the
+// first character with a fixed one returns the input unchanged whenever the
+// input already starts with it. Scenario 8 then fails: it requires the engine
+// to hold a node txid that differs from its own, and the broadcaster handed it
+// two that are equal. The defect was a spurious failure in about one run in
+// sixteen, not a test that passed without checking anything.
+func differentTxID(got string) string {
+	if got == "" {
+		return "f"
+	}
+	if got[0] == 'f' {
+		return "0" + got[1:]
+	}
+	return "f" + got[1:]
+}
+
 func (l lyingBroadcaster) Broadcast(ctx context.Context, raw, txid string) (string, error) {
 	got, err := l.inner.Broadcast(ctx, raw, txid)
 	if err != nil {
 		return got, err
 	}
-	fake := "f" + got[1:]
+	fake := differentTxID(got)
 	return fake, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", rpc.ErrTxIDMismatch, fake, txid)
 }
 
