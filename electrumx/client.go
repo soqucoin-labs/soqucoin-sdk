@@ -333,8 +333,8 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (j
 	return c.callLocked(ctx, method, params)
 }
 
-// callDeadline bounds one request/reply exchange: 30 seconds, or the context's
-// deadline when that comes first.
+// callDeadline bounds one request/reply exchange when the context does not end
+// it first.
 const callDeadline = 30 * time.Second
 
 // callLocked performs one request/reply exchange. Caller holds connMu.
@@ -370,13 +370,13 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 	}
 
 	// One deadline covers the write and the read: a stalled peer must not be
-	// able to hold connMu, and every other caller behind it, forever.
-	deadline := time.Now().Add(callDeadline)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
+	// able to hold connMu, and every other caller behind it, forever. The
+	// context ends the exchange through the same deadline, moved to now when
+	// the context is done; it is not copied into the deadline up front,
+	// because the socket's timer and the context's timer would then fire
+	// together and the read could return before ctx.Err() is set.
 	conn := c.conn
-	if err := conn.SetDeadline(deadline); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(callDeadline)); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
