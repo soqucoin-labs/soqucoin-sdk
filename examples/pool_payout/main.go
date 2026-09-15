@@ -34,13 +34,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -76,10 +78,11 @@ func main() {
 	regtest := flag.Bool("regtest", false, "The node is a regtest node (the sq address prefix is shared with mainnet)")
 	flag.Parse()
 
-	log.SetFlags(log.Ltime | log.Lmsgprefix)
-	log.SetPrefix("[pool-payout] ")
-
-	if err := run(runConfig{
+	// Ctrl-C ends the context: the payout in flight reports an unknown
+	// outcome if its reply is lost, and no further payout starts.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := run(ctx, runConfig{
 		rpcURL: *rpcURL, rpcUser: *rpcUser, rpcPass: *rpcPass,
 		elxHost: *elxHost, elxTLS: *elxTLS,
 		keystorePath: *keystorePath, poolAddress: *poolAddress,
@@ -87,9 +90,13 @@ func main() {
 		spentSetPath: *spentSetPath, webhookURL: *webhookURL,
 		dryRun: *dryRun, regtest: *regtest,
 	}); err != nil {
-		log.Fatalf("%v", err)
+		logger.Error("payout run failed", "err", err)
+		os.Exit(1)
 	}
 }
+
+// logger is shared by the program and the SDK components it builds.
+var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 type runConfig struct {
 	rpcURL, rpcUser, rpcPass string
@@ -105,7 +112,7 @@ type runConfig struct {
 	regtest                  bool
 }
 
-func run(cfg runConfig) error {
+func run(ctx context.Context, cfg runConfig) error {
 	switch {
 	case cfg.keystorePath == "":
 		return errors.New("-keystore is required")
@@ -127,7 +134,7 @@ func run(cfg runConfig) error {
 	if err != nil {
 		return fmt.Errorf("pool address: %w", err)
 	}
-	log.Printf("Network: %s", network.Name)
+	logger.Info("network", "name", network.Name)
 
 	// Every recipient must be on the same network as the pool. Check before
 	// spending anything, not after the first transaction is already on the wire.
@@ -169,14 +176,14 @@ func run(cfg runConfig) error {
 		return fmt.Errorf("keystore %s holds no keys", cfg.keystorePath)
 	}
 
-	rpcClient := rpc.NewClient(cfg.rpcURL, cfg.rpcUser, cfg.rpcPass)
+	rpcClient := rpc.NewClient(cfg.rpcURL, cfg.rpcUser, cfg.rpcPass, logger)
 	rpcClient.Network = network // refuse a node on another chain; apply its coinbase maturity
 	// The indexer sees every address tracked; off this machine that goes over
 	// TLS or not at all.
 	if !cfg.elxTLS && !loopbackHost(cfg.elxHost) {
 		return fmt.Errorf("electrumx %s is not on this machine; pass -electrumx-tls", cfg.elxHost)
 	}
-	elxClient := electrumx.NewClient(cfg.elxHost, 15*time.Second)
+	elxClient := electrumx.NewClient(cfg.elxHost, 15*time.Second, logger)
 	elxClient.HRP = network.HRP
 	if cfg.elxTLS {
 		elxClient.UseTLS()
@@ -184,7 +191,7 @@ func run(cfg runConfig) error {
 
 	// A spent-set file that exists but cannot be read must stop the run: an
 	// empty set would re-expose every unconfirmed spend.
-	spentSet, err := utxo.OpenSpentSet(cfg.spentSetPath)
+	spentSet, err := utxo.OpenSpentSet(cfg.spentSetPath, logger)
 	if err != nil {
 		return fmt.Errorf("spent set: %w", err)
 	}
@@ -193,43 +200,42 @@ func run(cfg runConfig) error {
 	// Trip after 3 consecutive failures, then hold for 15 minutes. The point is
 	// to stop a run that is failing for a systemic reason rather than retry into
 	// a node outage.
-	cb := resilience.NewCircuitBreaker(3, 15*time.Minute)
-	alerter := resilience.NewAlerter(cfg.webhookURL)
+	cb := resilience.NewCircuitBreaker(3, 15*time.Minute, logger)
+	alerter := resilience.NewAlerter(cfg.webhookURL, logger)
 	alerter.WireToCircuitBreaker(cb)
 
-	if err := elxClient.Connect(); err != nil {
+	if err := elxClient.Connect(ctx); err != nil {
 		return fmt.Errorf("connect to electrumx %s: %w", cfg.elxHost, err)
 	}
 	defer elxClient.Stop()
 
 	if err := elxClient.TrackAddresses([]string{cfg.poolAddress}); err != nil {
-		log.Fatalf("track pool address: %v", err)
+		return fmt.Errorf("track pool address: %w", err)
 	}
-	if err := elxClient.RefreshAll(); err != nil {
+	if err := elxClient.RefreshAll(ctx); err != nil {
 		return fmt.Errorf("initial UTXO refresh: %w", err)
 	}
 
 	if cfg.dryRun {
-		log.Printf("DRY RUN: transactions will be built and signed but not broadcast, " +
-			"and neither the spent set nor the UTXO cache will be modified")
+		logger.Info("dry run: transactions will be built and signed but not broadcast, and neither the spent set nor the UTXO cache will be modified")
 	}
 
 	var sent, failed int
 	for i, payout := range payouts {
-		log.Printf("Payout %d/%d: %.4f SOQ to %s",
-			i+1, len(payouts), soq(payout.Amount), shortID(payout.Address, 20))
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("stopped after %d payouts: %w", i, err)
+		}
+		logger.Info("payout", "n", i+1, "of", len(payouts), "soq", soq(payout.Amount), "address", payout.Address)
 
 		if err := cb.Allow(); err != nil {
-			log.Printf("Circuit breaker open: %v", err)
-			log.Printf("Stopping. %d sent, %d failed, %d not attempted",
-				sent, failed, len(payouts)-i)
+			logger.Error("circuit breaker open, stopping", "err", err, "sent", sent, "failed", failed, "not_attempted", len(payouts)-i)
 			return fmt.Errorf("circuit breaker stopped the run after %d payouts", i)
 		}
 
-		txid, err := executePayout(rpcClient, elxClient, selector, spentSet, keystore,
+		txid, err := executePayout(ctx, rpcClient, elxClient, selector, spentSet, keystore,
 			payout, cfg.poolAddress, cfg.feeRate, cfg.dryRun)
 		if err != nil {
-			log.Printf("  FAILED: %v", err)
+			logger.Error("payout failed", "err", err)
 			cb.RecordResult(err)
 			failed++
 			continue
@@ -238,13 +244,13 @@ func run(cfg runConfig) error {
 		cb.RecordSuccess()
 		sent++
 		if cfg.dryRun {
-			log.Printf("  would broadcast %s", shortID(txid, 16))
+			logger.Info("would broadcast", "txid", txid)
 		} else {
-			log.Printf("  broadcast %s", shortID(txid, 16))
+			logger.Info("broadcast", "txid", txid)
 		}
 	}
 
-	log.Printf("Done: %d sent, %d failed, of %d", sent, failed, len(payouts))
+	logger.Info("done", "sent", sent, "failed", failed, "of", len(payouts))
 	if failed > 0 {
 		return fmt.Errorf("%d of %d payouts failed", failed, len(payouts))
 	}
@@ -257,6 +263,7 @@ func run(cfg runConfig) error {
 // ordering is the whole point: marking UTXOs spent before a successful broadcast
 // loses them from selection while they are still spendable.
 func executePayout(
+	ctx context.Context,
 	rpcClient *rpc.Client,
 	elxClient *electrumx.Client,
 	selector *utxo.CoinSelector,
@@ -267,7 +274,7 @@ func executePayout(
 	feeRate int64,
 	dryRun bool,
 ) (string, error) {
-	tipHeight, err := rpcClient.GetBlockCount()
+	tipHeight, err := rpcClient.GetBlockCount(ctx)
 	if err != nil {
 		return "", fmt.Errorf("get block count: %w", err)
 	}
@@ -282,17 +289,17 @@ func executePayout(
 	if err != nil {
 		return "", fmt.Errorf("coin selection: %w", err)
 	}
-	log.Printf("  selected %d UTXOs totaling %.4f SOQ", len(selected), soq(total))
+	logger.Info("selected inputs", "count", len(selected), "total_soq", soq(total))
 
 	// Defense 11: an ElectrumX cache can be stale. Confirm each input is still
 	// unspent according to the node before signing over it.
 	verified, err := rpcClient.VerifyAndFilterUTXOs(
-		selected, elxClient.EvictUTXO, elxClient.SetAssetType)
+		ctx, selected, elxClient.EvictUTXO, elxClient.SetAssetType)
 	if err != nil {
 		return "", fmt.Errorf("UTXO verification: %w", err)
 	}
 	if len(verified) < len(selected) {
-		log.Printf("  Defense 11 filtered %d stale UTXOs", len(selected)-len(verified))
+		logger.Info("dropped inputs the node no longer has", "count", len(selected)-len(verified))
 	}
 	if len(verified) == 0 {
 		return "", errors.New("no spendable UTXOs remain after verification")
@@ -321,8 +328,7 @@ func executePayout(
 	if len(transaction.Outputs) > 1 {
 		changeAmount = transaction.Outputs[1].Value
 	}
-	log.Printf("  built %s: %d inputs, %d vB, change %.4f SOQ",
-		shortID(builtTxID, 16), len(verified), transaction.EstimateWeight()/4, soq(changeAmount))
+	logger.Info("built", "txid", builtTxID, "inputs", len(verified), "vbytes", transaction.EstimateWeight()/4, "change_soq", soq(changeAmount))
 
 	if dryRun {
 		return builtTxID, nil
@@ -334,7 +340,7 @@ func executePayout(
 	// consensus). rpc.ErrUnknownOutcome means the transaction MAY be out: retry
 	// these same bytes later, never rebuild. withdraw.Engine does that
 	// durably; this example keeps the single-shot shape for readability.
-	txid, err := rpcClient.Broadcast(rawTxHex, builtTxID)
+	txid, err := rpcClient.Broadcast(ctx, rawTxHex, builtTxID)
 	if err != nil {
 		return "", fmt.Errorf("broadcast: %w", err)
 	}
@@ -344,7 +350,7 @@ func executePayout(
 	// process still refuses the inputs; a restart would not. The change output
 	// reaches the cache on the next poll and becomes an input once confirmed.
 	if err := spentSet.MarkBroadcast(verified, txid); err != nil {
-		log.Printf("ALERT %s broadcast, spent set not written: %v", shortID(txid, 16), err)
+		logger.Error("ALERT: broadcast, spent set not written", "txid", txid, "err", err)
 	}
 	return txid, nil
 }

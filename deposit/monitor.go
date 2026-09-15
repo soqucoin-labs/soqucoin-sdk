@@ -19,13 +19,16 @@
 package deposit
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
@@ -49,9 +52,9 @@ type AddressFreshness interface {
 
 // Node is the exchange's own soqucoind. *rpc.Client satisfies it.
 type Node interface {
-	RequireSynced() error
-	GetBlockCount() (int64, error)
-	GetTxOut(txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error)
+	RequireSynced(ctx context.Context) error
+	GetBlockCount(ctx context.Context) (int64, error)
+	GetTxOut(ctx context.Context, txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error)
 }
 
 // Ledger is the exchange's book. Credit must be idempotent on (txid, vout):
@@ -66,11 +69,13 @@ type Node interface {
 // cannot tell the two apart, so a swept output still in Pending raises
 // AlertDepositVanished on every scan. Record the sweep in the ledger and
 // exclude the output, or mark it final when the sweep transaction is final.
+//
+// The context is Scan's; a database-backed ledger bounds its queries with it.
 type Ledger interface {
-	Credit(d Deposit) error
-	IsCredited(txid string, vout uint32) (bool, error)
-	Pending() ([]Deposit, error)
-	MarkFinal(txid string, vout uint32) error
+	Credit(ctx context.Context, d Deposit) error
+	IsCredited(ctx context.Context, txid string, vout uint32) (bool, error)
+	Pending(ctx context.Context) ([]Deposit, error)
+	MarkFinal(ctx context.Context, txid string, vout uint32) error
 }
 
 // Deposit is a credited output.
@@ -93,7 +98,7 @@ type Monitor struct {
 	Cache     Cache
 	Node      Node
 	Ledger    Ledger
-	Addresses func() []string // the deposit addresses to scan
+	Addresses func(ctx context.Context) []string // the deposit addresses to scan
 	Required  Policy
 
 	// Network supplies the chain's coinbase maturity: a mined-to deposit is
@@ -111,8 +116,12 @@ type Monitor struct {
 
 	// OnAlert receives every condition a human should see: indexer and node
 	// disagreeing, a credited deposit that vanished, a syncing node. It is
-	// never optional in production; a nil OnAlert only logs.
+	// never optional in production; a nil OnAlert only logs, at warn, through
+	// Logger.
 	OnAlert func(kind AlertKind, msg string)
+
+	// Logger receives the alerts when OnAlert is nil. nil discards.
+	Logger *slog.Logger
 
 	now func() time.Time
 }
@@ -139,7 +148,9 @@ func (m *Monitor) alert(kind AlertKind, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	if m.OnAlert != nil {
 		m.OnAlert(kind, msg)
+		return
 	}
+	logutil.Or(m.Logger).Warn("deposit alert", "kind", string(kind), "msg", msg)
 }
 
 func (m *Monitor) clock() time.Time {
@@ -173,21 +184,27 @@ func (m *Monitor) maxCacheAge() time.Duration {
 // chainChecker is the optional part of Node that reports which chain the node
 // serves; *rpc.Client implements it.
 type chainChecker interface {
-	RequireChain(chainID string) error
+	RequireChain(ctx context.Context, chainID string) error
 }
 
 // Scan performs one pass. It returns the deposits credited in this pass, or
 // ErrPaused (wrapped with the reason) when crediting was not safe. A node on
 // the wrong chain is returned as rpc.ErrWrongChain, a permanent error, not as
 // a pause. Other errors from the node are returned as-is; the pass credits
-// nothing in that case.
-func (m *Monitor) Scan() ([]Deposit, error) {
+// nothing in that case. A context that ends mid-pass is one of those: the
+// deposits credited before it are credited, the rest wait for the next pass.
+func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	// 1. The node must serve this Monitor's chain and must have caught up.
 	//    During initial block download the finality horizon is not enforced
 	//    and gettxout is incomplete.
-	if err := m.Node.RequireSynced(); err != nil {
+	if err := m.Node.RequireSynced(ctx); err != nil {
 		if errors.Is(err, rpc.ErrWrongChain) {
 			m.alert(AlertNodeWrongChain, "%v", err)
+			return nil, err
+		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// The caller ended the pass; the node has said nothing about
+			// itself, so this is neither a pause nor an alert.
 			return nil, err
 		}
 		m.alert(AlertNodeSyncing, "%v", err)
@@ -195,7 +212,7 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 	}
 	if want := m.Network.ChainID; want != "" {
 		if cc, ok := m.Node.(chainChecker); ok {
-			if err := cc.RequireChain(want); err != nil {
+			if err := cc.RequireChain(ctx, want); err != nil {
 				if errors.Is(err, rpc.ErrWrongChain) {
 					m.alert(AlertNodeWrongChain, "%v", err)
 				}
@@ -214,20 +231,20 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 			return nil, fmt.Errorf("%w: indexer cache stale (last %v, err %v)", ErrPaused, at, refreshErr)
 		}
 	}
-	tip, err := m.Node.GetBlockCount()
+	tip, err := m.Node.GetBlockCount(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// 3. Re-verify everything credited but not yet final.
-	if err := m.recheckPending(tip); err != nil {
+	if err := m.recheckPending(ctx, tip); err != nil {
 		return nil, err
 	}
 
 	// 4. Credit new deposits the node agrees with, skipping the addresses the
 	//    indexer has not refreshed within MaxCacheAge when it reports that.
 	var credited []Deposit
-	addrs := m.Addresses()
+	addrs := m.Addresses(ctx)
 	var stale []string
 	var staleErr error
 	for _, addr := range addrs {
@@ -256,7 +273,7 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 			if confs < m.Required(u.Value) {
 				continue
 			}
-			done, err := m.Ledger.IsCredited(u.TxID, u.Vout)
+			done, err := m.Ledger.IsCredited(ctx, u.TxID, u.Vout)
 			if err != nil {
 				m.alert(AlertLedgerError, "IsCredited %s:%d: %v", u.TxID, u.Vout, err)
 				return credited, err
@@ -264,11 +281,11 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 			if done {
 				continue
 			}
-			d, ok := m.verifyWithNode(addr, wantHex, u, confs)
+			d, ok := m.verifyWithNode(ctx, addr, wantHex, u, confs)
 			if !ok {
 				continue
 			}
-			if err := m.Ledger.Credit(d); err != nil {
+			if err := m.Ledger.Credit(ctx, d); err != nil {
 				m.alert(AlertLedgerError, "Credit %s:%d: %v", u.TxID, u.Vout, err)
 				return credited, err
 			}
@@ -288,8 +305,8 @@ func (m *Monitor) Scan() ([]Deposit, error) {
 // verifyWithNode asks the exchange's own node for the exact output and
 // requires agreement on existence, value, destination script, confirmation
 // depth and coinbase maturity. Any disagreement is alarmed and not credited.
-func (m *Monitor) verifyWithNode(addr, wantHex string, u types.UTXO, confs int64) (Deposit, bool) {
-	out, err := m.Node.GetTxOut(u.TxID, u.Vout, false)
+func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u types.UTXO, confs int64) (Deposit, bool) {
+	out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 	if err != nil {
 		m.alert(AlertIndexerMismatch, "%s:%d for %s: node lookup failed: %v", u.TxID, u.Vout, addr, err)
 		return Deposit{}, false
@@ -318,14 +335,14 @@ func (m *Monitor) verifyWithNode(addr, wantHex string, u types.UTXO, confs int64
 // the node with at least its credited depth, and marks it final past the
 // horizon. A vanished output is a reorg or a lie; either way the exchange's
 // book now holds a credit with nothing behind it.
-func (m *Monitor) recheckPending(tip int64) error {
-	pending, err := m.Ledger.Pending()
+func (m *Monitor) recheckPending(ctx context.Context, tip int64) error {
+	pending, err := m.Ledger.Pending(ctx)
 	if err != nil {
 		m.alert(AlertLedgerError, "Pending: %v", err)
 		return err
 	}
 	for _, d := range pending {
-		out, err := m.Node.GetTxOut(d.TxID, d.Vout, false)
+		out, err := m.Node.GetTxOut(ctx, d.TxID, d.Vout, false)
 		if err != nil {
 			return err
 		}
@@ -337,7 +354,7 @@ func (m *Monitor) recheckPending(tip int64) error {
 			continue
 		}
 		if out.Confirmations > types.MaxReorgDepth {
-			if err := m.Ledger.MarkFinal(d.TxID, d.Vout); err != nil {
+			if err := m.Ledger.MarkFinal(ctx, d.TxID, d.Vout); err != nil {
 				m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
 				return err
 			}

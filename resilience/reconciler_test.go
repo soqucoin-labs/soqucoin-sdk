@@ -1,6 +1,7 @@
 package resilience
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -24,7 +25,7 @@ type fakeSource struct {
 	at         time.Time
 }
 
-func (s *fakeSource) RefreshAll() error {
+func (s *fakeSource) RefreshAll(_ context.Context) error {
 	if s.refreshErr != nil {
 		return s.refreshErr
 	}
@@ -41,13 +42,13 @@ type fakeNode struct {
 
 func k(txid string, vout uint32) string { return fmt.Sprintf("%s:%d", txid, vout) }
 
-func (n *fakeNode) RequireSynced() error {
+func (n *fakeNode) RequireSynced(_ context.Context) error {
 	if !n.synced {
 		return rpc.ErrNodeSyncing
 	}
 	return nil
 }
-func (n *fakeNode) GetTxOut(txid string, vout uint32, _ bool) (*rpc.TxOut, error) {
+func (n *fakeNode) GetTxOut(_ context.Context, txid string, vout uint32, _ bool) (*rpc.TxOut, error) {
 	return n.outs[k(txid, vout)], nil
 }
 
@@ -61,16 +62,16 @@ func recon(t *testing.T, halt bool) (*Reconciler, *fakeSource, *fakeNode, *Circu
 		k(rTxA, 0): {Value: 150_000_000},
 		k(rTxB, 1): {Value: 50_000_000},
 	}}
-	cb := NewCircuitBreaker(3, time.Hour)
+	cb := NewCircuitBreaker(3, time.Hour, nil)
 	var alerts []string
-	r := NewReconciler(src, node, cb, ReconciliationConfig{HaltOnMismatch: halt})
+	r := NewReconciler(src, node, cb, ReconciliationConfig{HaltOnMismatch: halt}, nil)
 	r.OnAlert = func(m string) { alerts = append(alerts, m) }
 	return r, src, node, cb, &alerts
 }
 
 func TestReconcilerCleanWhenNodeAgrees(t *testing.T) {
 	r, _, _, cb, alerts := recon(t, true)
-	rep := r.Run()
+	rep := r.Run(context.Background())
 	if !rep.Clean() || rep.Checked != 2 || rep.NodeTotal != 200_000_000 {
 		t.Fatalf("clean run reported %+v", rep)
 	}
@@ -95,7 +96,7 @@ func TestReconcilerDetectsMismatchAndHalts(t *testing.T) {
 	for _, tc := range cases {
 		r, _, node, cb, alerts := recon(t, true)
 		tc.mutate(node)
-		rep := r.Run()
+		rep := r.Run(context.Background())
 		if rep.Clean() || len(rep.Findings) == 0 {
 			t.Fatalf("%s: not detected: %+v", tc.name, rep)
 		}
@@ -114,7 +115,7 @@ func TestReconcilerDetectsMismatchAndHalts(t *testing.T) {
 func TestReconcilerIncompleteIsAFinding(t *testing.T) {
 	r, src, _, cb, alerts := recon(t, true)
 	src.refreshErr = errors.New("indexer down")
-	rep := r.Run()
+	rep := r.Run(context.Background())
 	if rep.Incomplete == nil || rep.Clean() {
 		t.Fatalf("refresh failure not reported: %+v", rep)
 	}
@@ -124,7 +125,7 @@ func TestReconcilerIncompleteIsAFinding(t *testing.T) {
 
 	r2, _, node2, cb2, alerts2 := recon(t, true)
 	node2.synced = false
-	rep = r2.Run()
+	rep = r2.Run(context.Background())
 	if !errors.Is(rep.Incomplete, rpc.ErrNodeSyncing) || len(*alerts2) != 1 {
 		t.Errorf("syncing node: %+v alerts=%v", rep, *alerts2)
 	}
@@ -136,7 +137,7 @@ func TestReconcilerIncompleteIsAFinding(t *testing.T) {
 func TestReconcilerAlertsWithoutHaltingWhenConfigured(t *testing.T) {
 	r, _, node, cb, alerts := recon(t, false)
 	delete(node.outs, k(rTxB, 1))
-	r.Run()
+	r.Run(context.Background())
 	if len(*alerts) != 1 {
 		t.Fatalf("alerts %v", *alerts)
 	}
@@ -150,14 +151,14 @@ func TestReconcilerStartStopHonoursInitialDelayAndIsIdempotent(t *testing.T) {
 	r.cfg.InitialDelay = time.Hour // would block the old implementation's Sleep
 	runs := 0
 	r.OnReport = func(Report) { runs++ }
-	r.Start()
+	r.Start(context.Background())
 	r.Stop()
 	r.Stop()
 	time.Sleep(20 * time.Millisecond)
 	if runs != 0 {
 		t.Errorf("a run happened despite Stop during the initial delay")
 	}
-	if NewReconciler(&fakeSource{}, &fakeNode{}, nil, ReconciliationConfig{Interval: 0}).cfg.Interval <= 0 {
+	if NewReconciler(&fakeSource{}, &fakeNode{}, nil, ReconciliationConfig{Interval: 0}, nil).cfg.Interval <= 0 {
 		t.Error("zero interval not defaulted (NewTicker would panic)")
 	}
 }
@@ -166,7 +167,7 @@ func TestReconcilerStartStopHonoursInitialDelayAndIsIdempotent(t *testing.T) {
 
 // HALF-OPEN admits exactly one probe.
 func TestBreakerHalfOpenAdmitsOneProbe(t *testing.T) {
-	cb := NewCircuitBreaker(1, time.Millisecond)
+	cb := NewCircuitBreaker(1, time.Millisecond, nil)
 	cb.RecordFailure(errors.New("x"))
 	time.Sleep(5 * time.Millisecond)
 	admitted := 0
@@ -186,7 +187,7 @@ func TestBreakerHalfOpenAdmitsOneProbe(t *testing.T) {
 
 // Per-request errors must not move the breaker; systemic ones must.
 func TestRecordResultIgnoresPerRequestErrors(t *testing.T) {
-	cb := NewCircuitBreaker(3, time.Hour)
+	cb := NewCircuitBreaker(3, time.Hour, nil)
 	perRequest := []error{
 		fmt.Errorf("decode: %w", address.ErrInvalidChecksum),
 		fmt.Errorf("build: %w", tx.ErrBelowDust),
@@ -217,7 +218,7 @@ func TestRecordResultIgnoresPerRequestErrors(t *testing.T) {
 		t.Error("three systemic failures did not open the breaker")
 	}
 	custom := errors.New("my per-request error")
-	cb2 := NewCircuitBreaker(1, time.Hour)
+	cb2 := NewCircuitBreaker(1, time.Hour, nil)
 	cb2.PerRequestErrors = []error{custom}
 	if cb2.RecordResult(fmt.Errorf("wrapped: %w", custom)) || cb2.Allow() != nil {
 		t.Error("PerRequestErrors extension not honoured")
@@ -226,7 +227,7 @@ func TestRecordResultIgnoresPerRequestErrors(t *testing.T) {
 
 // Callbacks run outside the lock, so a callback may read the breaker.
 func TestStateChangeCallbackMayReadTheBreaker(t *testing.T) {
-	cb := NewCircuitBreaker(1, time.Hour)
+	cb := NewCircuitBreaker(1, time.Hour, nil)
 	done := make(chan struct{})
 	cb.OnStateChange = func(from, to string, n int, lastErr string) {
 		cb.State() // would deadlock under the old implementation
@@ -241,7 +242,7 @@ func TestStateChangeCallbackMayReadTheBreaker(t *testing.T) {
 }
 
 func TestTripOpensImmediately(t *testing.T) {
-	cb := NewCircuitBreaker(5, time.Hour)
+	cb := NewCircuitBreaker(5, time.Hour, nil)
 	var mu sync.Mutex
 	var transitions []string
 	cb.OnStateChange = func(from, to string, _ int, _ string) {

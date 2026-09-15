@@ -21,7 +21,7 @@ func rUTXOs() []types.UTXO {
 
 // Reservation is all-or-nothing and exclusive between intents.
 func TestReserveIsExclusiveAndAtomic(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	if err := ss.Reserve(rUTXOs(), "w1", time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestReserveIsExclusiveAndAtomic(t *testing.T) {
 }
 
 func TestReleaseDropsOnlyReservationsOfThatIntent(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	ss.Reserve(rUTXOs()[:1], "w1", time.Hour)
 	ss.Reserve(rUTXOs()[1:], "w2", time.Hour)
 	ss.Release("w1")
@@ -63,7 +63,7 @@ func TestReleaseDropsOnlyReservationsOfThatIntent(t *testing.T) {
 }
 
 func TestExpiredReservationIsFree(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	ss.Reserve(rUTXOs(), "w1", 10*time.Millisecond)
 	time.Sleep(30 * time.Millisecond)
 	if ss.IsSpent(rTxA, 0) {
@@ -79,7 +79,7 @@ func TestExpiredReservationIsFree(t *testing.T) {
 // restart re-exposed inputs that were still spent in the mempool.
 func TestUnconfirmedBroadcastSurvivesReloadRegardlessOfAge(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "spent.json")
-	ss := NewSpentSet(path)
+	ss := NewSpentSet(path, nil)
 	ss.MarkBroadcast(rUTXOs(), "txid-broadcast")
 	ss.mu.Lock()
 	for k, e := range ss.entries {
@@ -89,7 +89,7 @@ func TestUnconfirmedBroadcastSurvivesReloadRegardlessOfAge(t *testing.T) {
 	ss.mu.Unlock()
 	ss.persist()
 
-	ss2 := NewSpentSet(path)
+	ss2 := NewSpentSet(path, nil)
 	if !ss2.IsSpent(rTxA, 0) || !ss2.IsSpent(rTxB, 1) {
 		t.Fatal("two-day-old unconfirmed broadcast entries were dropped on reload")
 	}
@@ -103,7 +103,7 @@ func TestUnconfirmedBroadcastSurvivesReloadRegardlessOfAge(t *testing.T) {
 	ss2.mu.Unlock()
 	ss2.persist()
 	time.Sleep(5 * time.Millisecond)
-	ss3 := NewSpentSet(path)
+	ss3 := NewSpentSet(path, nil)
 	if ss3.IsSpent(rTxA, 0) {
 		t.Error("old confirmed entry kept")
 	}
@@ -116,7 +116,7 @@ func TestUnconfirmedBroadcastSurvivesReloadRegardlessOfAge(t *testing.T) {
 }
 
 func TestSelectorSkipsReservedInputs(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	cs := &CoinSelector{SpentSet: ss}
 	coins := []types.UTXO{
 		{TxID: rTxA, Vout: 0, Value: 500, Height: 1, Address: "x"},
@@ -147,7 +147,7 @@ func unwritablePath(t *testing.T) string {
 // the next process would not see is not a reservation); MarkBroadcast keeps
 // the entries, because the transaction is already out.
 func TestPersistFailureIsReportedNotSwallowed(t *testing.T) {
-	ss := NewSpentSet(unwritablePath(t))
+	ss := NewSpentSet(unwritablePath(t), nil)
 	err := ss.Reserve(rUTXOs(), "w1", time.Hour)
 	if !errors.Is(err, ErrPersist) {
 		t.Fatalf("Reserve on an unwritable set: %v, want ErrPersist", err)
@@ -170,7 +170,7 @@ func TestPersistFailureIsReportedNotSwallowed(t *testing.T) {
 // A failed Reserve rolls back to exactly the previous state, including an
 // own expired reservation it was renewing.
 func TestReserveRollbackRestoresThePreviousEntry(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	if err := ss.Reserve(rUTXOs()[:1], "w1", time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -191,31 +191,31 @@ func TestReserveRollbackRestoresThePreviousEntry(t *testing.T) {
 func TestOpenSpentSetRefusesACorruptFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "spent.json")
-	if _, err := OpenSpentSet(path); err != nil {
+	if _, err := OpenSpentSet(path, nil); err != nil {
 		t.Fatalf("missing file is a first run: %v", err)
 	}
-	ss, _ := OpenSpentSet(path)
+	ss, _ := OpenSpentSet(path, nil)
 	if err := ss.MarkBroadcast(rUTXOs(), "txid-broadcast"); err != nil {
 		t.Fatal(err)
 	}
-	ss2, err := OpenSpentSet(path)
+	ss2, err := OpenSpentSet(path, nil)
 	if err != nil || !ss2.IsSpent(rTxA, 0) {
 		t.Fatalf("round trip: %v %v", err, ss2)
 	}
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenSpentSet(path); !errors.Is(err, ErrSpentSetUnreadable) {
+	if _, err := OpenSpentSet(path, nil); !errors.Is(err, ErrSpentSetUnreadable) {
 		t.Fatalf("corrupt file opened: %v, want ErrSpentSetUnreadable", err)
 	}
-	if _, err := OpenSpentSet(unwritablePath(t)); !errors.Is(err, ErrSpentSetUnreadable) {
+	if _, err := OpenSpentSet(unwritablePath(t), nil); !errors.Is(err, ErrSpentSetUnreadable) {
 		t.Fatalf("uncreatable directory: %v, want ErrSpentSetUnreadable", err)
 	}
-	if _, err := OpenSpentSet(""); err == nil {
+	if _, err := OpenSpentSet("", nil); err == nil {
 		t.Fatal("OpenSpentSet with no path must refuse; NewSpentSet is the in-memory form")
 	}
 	// The older constructor keeps its documented behaviour: it logs and starts empty.
-	if legacy := NewSpentSet(path); legacy.IsSpent(rTxA, 0) {
+	if legacy := NewSpentSet(path, nil); legacy.IsSpent(rTxA, 0) {
 		t.Fatal("NewSpentSet on a corrupt file should have started empty")
 	}
 }
@@ -223,7 +223,7 @@ func TestOpenSpentSetRefusesACorruptFile(t *testing.T) {
 // The same outpoint listed twice must roll back to the state before the first
 // write, not to the reservation the first pass created.
 func TestReserveRollbackWithDuplicateOutpoint(t *testing.T) {
-	ss := NewSpentSet(unwritablePath(t))
+	ss := NewSpentSet(unwritablePath(t), nil)
 	u := rUTXOs()[0]
 	if err := ss.Reserve([]types.UTXO{u, u}, "w1", time.Hour); !errors.Is(err, ErrPersist) {
 		t.Fatalf("got %v", err)
@@ -235,7 +235,7 @@ func TestReserveRollbackWithDuplicateOutpoint(t *testing.T) {
 
 // Release, Prune and ConfirmSpentAll report a failed write too.
 func TestReleasePruneAndConfirmReportPersistFailure(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	if err := ss.Reserve(rUTXOs()[:1], "w1", time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestReleasePruneAndConfirmReportPersistFailure(t *testing.T) {
 	}
 	// Nothing to change must not touch the disk: a set whose entries are all
 	// confirmed already, on an unwritable path, reports no error.
-	quiet := NewSpentSet("")
+	quiet := NewSpentSet("", nil)
 	if err := quiet.MarkBroadcast(rUTXOs(), "txid-broadcast"); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestReleasePruneAndConfirmReportPersistFailure(t *testing.T) {
 // ReservedIntents names every intent holding a reservation, live or expired,
 // once each; broadcast and confirmed entries are not reservations.
 func TestReservedIntentsListsReservationsOnly(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	if got := ss.ReservedIntents(); len(got) != 0 {
 		t.Fatalf("empty set: %v", got)
 	}

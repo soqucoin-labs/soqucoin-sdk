@@ -1,12 +1,14 @@
 package resilience
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
@@ -37,15 +39,15 @@ func DefaultReconciliationConfig() ReconciliationConfig {
 
 // UTXOSource is the indexer-side cache under test. *electrumx.Client satisfies it.
 type UTXOSource interface {
-	RefreshAll() error
+	RefreshAll(ctx context.Context) error
 	LastRefresh() (time.Time, error)
 	GetAllUTXOs() []types.UTXO
 }
 
 // Node is the independent source of truth. *rpc.Client satisfies it.
 type Node interface {
-	RequireSynced() error
-	GetTxOut(txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error)
+	RequireSynced(ctx context.Context) error
+	GetTxOut(ctx context.Context, txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error)
 }
 
 // Finding is one disagreement between the cache and the node.
@@ -92,6 +94,7 @@ type Reconciler struct {
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	log      *slog.Logger
 
 	// OnAlert receives a human-readable message for every run that is not
 	// clean. OnReport, if set, receives every report.
@@ -100,35 +103,40 @@ type Reconciler struct {
 }
 
 // NewReconciler wires a reconciler. cb may be nil, in which case
-// HaltOnMismatch has no effect beyond the alert.
-func NewReconciler(source UTXOSource, node Node, cb *CircuitBreaker, cfg ReconciliationConfig) *Reconciler {
+// HaltOnMismatch has no effect beyond the alert. logger receives every run's
+// verdict; nil discards.
+func NewReconciler(source UTXOSource, node Node, cb *CircuitBreaker, cfg ReconciliationConfig, logger *slog.Logger) *Reconciler {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 24 * time.Hour
 	}
 	if cfg.InitialDelay < 0 {
 		cfg.InitialDelay = 0
 	}
-	return &Reconciler{source: source, node: node, cb: cb, cfg: cfg, stopCh: make(chan struct{})}
+	return &Reconciler{source: source, node: node, cb: cb, cfg: cfg, stopCh: make(chan struct{}), log: logutil.Or(logger)}
 }
 
 // Start launches the background goroutine. The initial delay and the ticker
-// both honour Stop.
-func (r *Reconciler) Start() {
-	log.Printf("[reconciler] starting (interval %v, initial delay %v, threshold %d shors, halt-on-mismatch %v)",
-		r.cfg.Interval, r.cfg.InitialDelay, r.cfg.DeltaThreshold, r.cfg.HaltOnMismatch)
+// both honour Stop and ctx; every run is made under ctx.
+func (r *Reconciler) Start(ctx context.Context) {
+	r.log.Info("reconciler starting", "interval", r.cfg.Interval, "initial_delay", r.cfg.InitialDelay,
+		"threshold_shors", r.cfg.DeltaThreshold, "halt_on_mismatch", r.cfg.HaltOnMismatch)
 	go func() {
 		select {
 		case <-time.After(r.cfg.InitialDelay):
+		case <-ctx.Done():
+			return
 		case <-r.stopCh:
 			return
 		}
-		r.Run()
+		r.Run(ctx)
 		ticker := time.NewTicker(r.cfg.Interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				r.Run()
+				r.Run(ctx)
+			case <-ctx.Done():
+				return
 			case <-r.stopCh:
 				return
 			}
@@ -140,18 +148,20 @@ func (r *Reconciler) Start() {
 func (r *Reconciler) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
 
 // Run performs one reconciliation and returns its report. It also alerts and,
-// when configured, trips the breaker.
-func (r *Reconciler) Run() Report {
-	rep := r.reconcile()
+// when configured, trips the breaker. A context that ends mid-run makes the
+// run Incomplete, which is a finding like any other: a book that could not
+// be checked is not known to match.
+func (r *Reconciler) Run(ctx context.Context) Report {
+	rep := r.reconcile(ctx)
 	if r.OnReport != nil {
 		r.OnReport(rep)
 	}
 	if rep.Clean() {
-		log.Printf("[reconciler] clean: %d outpoints, %d shors confirmed by the node", rep.Checked, rep.NodeTotal)
+		r.log.Info("reconciliation clean", "outpoints", rep.Checked, "node_total_shors", rep.NodeTotal)
 		return rep
 	}
 	msg := r.describe(rep)
-	log.Printf("[reconciler] ALERT: %s", msg)
+	r.log.Error("reconciliation alert", "msg", msg)
 	if r.OnAlert != nil {
 		r.OnAlert(msg)
 	}
@@ -178,11 +188,11 @@ func (r *Reconciler) describe(rep Report) string {
 	return msg
 }
 
-func (r *Reconciler) reconcile() Report {
+func (r *Reconciler) reconcile(ctx context.Context) Report {
 	rep := Report{At: time.Now()}
 
 	// A refresh that fails is itself a finding: the cache under test is stale.
-	if err := r.source.RefreshAll(); err != nil {
+	if err := r.source.RefreshAll(ctx); err != nil {
 		rep.Incomplete = fmt.Errorf("indexer refresh failed: %w", err)
 		return rep
 	}
@@ -191,7 +201,7 @@ func (r *Reconciler) reconcile() Report {
 		return rep
 	}
 	// Only a caught-up node can give a verdict.
-	if err := r.node.RequireSynced(); err != nil {
+	if err := r.node.RequireSynced(ctx); err != nil {
 		rep.Incomplete = err
 		return rep
 	}
@@ -202,7 +212,7 @@ func (r *Reconciler) reconcile() Report {
 		}
 		rep.Checked++
 		rep.CacheTotal += u.Value
-		out, err := r.node.GetTxOut(u.TxID, u.Vout, true)
+		out, err := r.node.GetTxOut(ctx, u.TxID, u.Vout, true)
 		if err != nil {
 			rep.Incomplete = fmt.Errorf("gettxout %s:%d: %w", shortID(u.TxID, 12), u.Vout, err)
 			return rep

@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 )
 
 // Alerter sends webhook notifications on important state changes.
@@ -19,20 +21,21 @@ import (
 type Alerter struct {
 	webhookURL string
 	client     *http.Client
+	log        *slog.Logger
 }
 
-// NewAlerter creates a new alerter.
-// Returns a no-op alerter if webhookURL is empty.
-func NewAlerter(webhookURL string) *Alerter {
-	if webhookURL == "" {
-		log.Printf("[alerter] No webhook URL — alerting disabled")
-	} else {
-		log.Printf("[alerter] Webhook alerting enabled")
-	}
-	return &Alerter{
+// NewAlerter creates a new alerter. Returns a no-op alerter if webhookURL is
+// empty. logger receives delivery failures; nil discards. Sends are
+// fire-and-forget on their own goroutine with a 10-second timeout, so they
+// take no context; a webhook is an aside, never on the payment path.
+func NewAlerter(webhookURL string, logger *slog.Logger) *Alerter {
+	a := &Alerter{
 		webhookURL: webhookURL,
 		client:     &http.Client{Timeout: 10 * time.Second},
+		log:        logutil.Or(logger),
 	}
+	a.log.Info("webhook alerting", "enabled", webhookURL != "")
+	return a
 }
 
 // slackPayload is a Slack Incoming Webhook message format.
@@ -157,7 +160,7 @@ func clip(s string) string {
 func (a *Alerter) send(payload slackPayload) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("[alerter] ERROR: marshal payload: %v", err)
+		a.log.Error("alert not sent: marshal payload", "err", err)
 		return
 	}
 
@@ -165,15 +168,15 @@ func (a *Alerter) send(payload slackPayload) {
 	if err != nil {
 		// A Slack incoming-webhook URL is a bearer-equivalent secret and a
 		// *url.Error would print it whole. Log the cause without the URL.
-		log.Printf("[alerter] ERROR: webhook POST failed: %v", redactURLError(err))
+		a.log.Error("alert not sent: webhook post failed", "err", redactURLError(err))
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		log.Printf("[alerter] WARNING: webhook returned HTTP %d", resp.StatusCode)
+		a.log.Warn("alert not accepted by the webhook", "status", resp.StatusCode)
 		return
 	}
 
-	log.Printf("[alerter] Webhook sent successfully")
+	a.log.Debug("alert sent")
 }

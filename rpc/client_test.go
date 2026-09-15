@@ -4,6 +4,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -38,7 +39,7 @@ func rpcServer(t *testing.T, handler func(method string, params []interface{}) s
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return NewClient(srv.URL, "rpcuser", "rpcpass"), &seen
+	return NewClient(srv.URL, "rpcuser", "rpcpass", nil), &seen
 }
 
 func ok(result string) string {
@@ -54,7 +55,7 @@ func TestCallSendsBasicAuthAndJSONRPC(t *testing.T) {
 		}
 		return ok(`123`)
 	})
-	if _, err := c.Call("getblockcount"); err != nil {
+	if _, err := c.Call(context.Background(), "getblockcount"); err != nil {
 		t.Fatalf("Call: %v", err)
 	}
 	if len(*seen) != 1 {
@@ -90,8 +91,8 @@ func TestCallMarshalsEmptyParamsAsArray(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "u", "p")
-	if _, err := c.Call("getblockcount"); err != nil {
+	c := NewClient(srv.URL, "u", "p", nil)
+	if _, err := c.Call(context.Background(), "getblockcount"); err != nil {
 		t.Fatalf("Call: %v", err)
 	}
 	var req map[string]json.RawMessage
@@ -112,7 +113,7 @@ func TestCallSurfacesRPCError(t *testing.T) {
 	c, _ := rpcServer(t, func(string, []interface{}) string {
 		return `{"result":null,"error":{"code":-25,"message":"missing inputs"},"id":1}`
 	})
-	_, err := c.Call("sendrawtransaction", "deadbeef")
+	_, err := c.Call(context.Background(), "sendrawtransaction", "deadbeef")
 	if err == nil {
 		t.Fatal("RPC error was swallowed")
 	}
@@ -128,16 +129,16 @@ func TestCallSurfacesUnparseableBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "u", "p")
-	if _, err := c.Call("getblockcount"); err == nil {
+	c := NewClient(srv.URL, "u", "p", nil)
+	if _, err := c.Call(context.Background(), "getblockcount"); err == nil {
 		t.Error("a non-JSON error page was accepted as a result")
 	}
 }
 
 func TestCallFailsOnUnreachableNode(t *testing.T) {
 	// Port 1 on loopback is reliably closed.
-	c := NewClient("http://127.0.0.1:1", "u", "p")
-	if _, err := c.Call("getblockcount"); err == nil {
+	c := NewClient("http://127.0.0.1:1", "u", "p", nil)
+	if _, err := c.Call(context.Background(), "getblockcount"); err == nil {
 		t.Error("unreachable node did not produce an error")
 	}
 }
@@ -146,7 +147,7 @@ func TestCallFailsOnUnreachableNode(t *testing.T) {
 
 func TestGetBlockCount(t *testing.T) {
 	c, _ := rpcServer(t, func(string, []interface{}) string { return ok(`847221`) })
-	got, err := c.GetBlockCount()
+	got, err := c.GetBlockCount(context.Background())
 	if err != nil {
 		t.Fatalf("GetBlockCount: %v", err)
 	}
@@ -166,7 +167,7 @@ func TestSendRawTransactionReturnsTxID(t *testing.T) {
 		}
 		return ok(`"` + txid + `"`)
 	})
-	got, err := c.SendRawTransaction("0200000001ff")
+	got, err := c.SendRawTransaction(context.Background(), "0200000001ff")
 	if err != nil {
 		t.Fatalf("SendRawTransaction: %v", err)
 	}
@@ -181,7 +182,7 @@ func TestSendRawTransactionPropagatesRejection(t *testing.T) {
 	c, _ := rpcServer(t, func(string, []interface{}) string {
 		return `{"result":null,"error":{"code":-26,"message":"non-mandatory-script-verify-flag"},"id":1}`
 	})
-	if _, err := c.SendRawTransaction("0200000001ff"); err == nil {
+	if _, err := c.SendRawTransaction(context.Background(), "0200000001ff"); err == nil {
 		t.Error("a rejected broadcast reported success")
 	}
 }
@@ -192,7 +193,7 @@ func TestSendRawTransactionPropagatesRejection(t *testing.T) {
 // (nil, nil) so VerifyUTXO can distinguish "spent" from "call failed".
 func TestGetTxOutNullMeansSpent(t *testing.T) {
 	c, _ := rpcServer(t, func(string, []interface{}) string { return ok(`null`) })
-	out, err := c.GetTxOut("aa", 0, true)
+	out, err := c.GetTxOut(context.Background(), "aa", 0, true)
 	if err != nil {
 		t.Fatalf("GetTxOut: %v", err)
 	}
@@ -204,7 +205,7 @@ func TestGetTxOutNullMeansSpent(t *testing.T) {
 func TestVerifyUTXODistinguishesSpentFromError(t *testing.T) {
 	t.Run("spent", func(t *testing.T) {
 		c, _ := rpcServer(t, func(string, []interface{}) string { return ok(`null`) })
-		exists, _, err := c.VerifyUTXO("aa", 0)
+		exists, _, err := c.VerifyUTXO(context.Background(), "aa", 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -216,7 +217,7 @@ func TestVerifyUTXODistinguishesSpentFromError(t *testing.T) {
 		c, _ := rpcServer(t, func(string, []interface{}) string {
 			return ok(`{"value":1.5,"confirmations":300,"assetType":1}`)
 		})
-		exists, assetType, err := c.VerifyUTXO("aa", 0)
+		exists, assetType, err := c.VerifyUTXO(context.Background(), "aa", 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -231,7 +232,7 @@ func TestVerifyUTXODistinguishesSpentFromError(t *testing.T) {
 		c, _ := rpcServer(t, func(string, []interface{}) string {
 			return `{"result":null,"error":{"code":-8,"message":"bad txid"},"id":1}`
 		})
-		exists, _, err := c.VerifyUTXO("zz", 0)
+		exists, _, err := c.VerifyUTXO(context.Background(), "zz", 0)
 		if err == nil {
 			t.Fatal("a node error was reported as a clean answer")
 		}
@@ -259,7 +260,7 @@ func TestVerifyAndFilterUTXOsDropsAndEvictsSpent(t *testing.T) {
 	}
 
 	var evicted []string
-	out, err := c.VerifyAndFilterUTXOs(in,
+	out, err := c.VerifyAndFilterUTXOs(context.Background(), in,
 		func(txid string, _ uint32) { evicted = append(evicted, txid) },
 		nil,
 	)
@@ -285,7 +286,7 @@ func TestVerifyAndFilterUTXOsStampsAssetType(t *testing.T) {
 		assetType uint8
 	}
 	var stamps []stamp
-	_, err := c.VerifyAndFilterUTXOs(
+	_, err := c.VerifyAndFilterUTXOs(context.Background(),
 		[]types.UTXO{{TxID: "aa", Vout: 0, Value: 1}},
 		nil,
 		func(txid string, _ uint32, at uint8) { stamps = append(stamps, stamp{txid, at}) },
@@ -300,7 +301,7 @@ func TestVerifyAndFilterUTXOsStampsAssetType(t *testing.T) {
 
 func TestVerifyAndFilterUTXOsToleratesNilCallbacks(t *testing.T) {
 	c, _ := rpcServer(t, func(string, []interface{}) string { return ok(`null`) })
-	out, err := c.VerifyAndFilterUTXOs([]types.UTXO{{TxID: "aa", Vout: 0}}, nil, nil)
+	out, err := c.VerifyAndFilterUTXOs(context.Background(), []types.UTXO{{TxID: "aa", Vout: 0}}, nil, nil)
 	if err != nil {
 		t.Fatalf("nil callbacks should be tolerated: %v", err)
 	}
@@ -314,7 +315,7 @@ func TestVerifyAndFilterUTXOsEmptyInput(t *testing.T) {
 		t.Error("no RPC call should be made for an empty input set")
 		return ok(`null`)
 	})
-	out, err := c.VerifyAndFilterUTXOs(nil, nil, nil)
+	out, err := c.VerifyAndFilterUTXOs(context.Background(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("empty input: %v", err)
 	}
@@ -332,7 +333,7 @@ func TestEstimateSmartFee(t *testing.T) {
 		}
 		return ok(`{"feerate":0.00012345,"blocks":6}`)
 	})
-	got, err := c.EstimateSmartFee(6)
+	got, err := c.EstimateSmartFee(context.Background(), 6)
 	if err != nil {
 		t.Fatalf("EstimateSmartFee: %v", err)
 	}

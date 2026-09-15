@@ -213,13 +213,57 @@ SOQUCOIND=/path/to/soqucoind make integration   # a soqucoind build, v2.3.0 or l
 ```
 
 The harness starts a throwaway regtest node, mines to SDK-generated addresses, and drives the same
-`deposit` and `withdraw` packages this guide uses through six scenarios: a deposit credited only
+`deposit` and `withdraw` packages this guide uses through nine scenarios: a deposit credited only
 after the node confirms it, a withdrawal built, signed, broadcast, mined and confirmed, a lost
 broadcast reply survived with exactly one payment, two withdrawals that cannot share an input,
 refused inputs (a USDSOQ-form destination, an amount below the relay floor, a fee-rate typo) that
-never reach the node, and a reorganisation that removes a credited deposit and raises the alarm.
+never reach the node, a reorganisation that removes a credited deposit and raises the alarm,
+retries past the reservation TTL that keep their inputs, a node that accepts the bytes under a
+different txid with the inputs held, and a broadcast whose context is cancelled while the node
+holds the reply, recovered after a restart with exactly one payment.
 The indexer role is played by an in-test block scanner, so the harness needs no ElectrumX; the
 ElectrumX client is exercised by its own protocol tests against a scripted server.
+
+---
+
+## Context and logging
+
+Every method that reaches the network, or your storage, takes a `context.Context` first:
+`rpc.Client`, `electrumx.Client`, `deposit.Monitor.Scan`, every `withdraw.Engine` method, and
+the interfaces you implement for them (`withdraw.Store`, `withdraw.Broadcaster`,
+`withdraw.Confirmer`, `withdraw.Selector`, `withdraw.BuildSigner`, `deposit.Ledger`,
+`deposit.Node`). Methods that only read a cache (`GetUTXOs`, `GetBalance`, `LastRefresh`) take
+none; they never block. The context is how a process bounds a call and how it shuts down:
+`electrumx.Client.StartPolling` and `resilience.Reconciler.Start` end with it.
+
+What a context that ends does to a withdrawal, state by state
+(`withdraw/engine.go`, `rpc/client.go`):
+
+| Where it ends | What happens | Why |
+|---|---|---|
+| In the selector or the signer, intent Created | Stays Created, attempt recorded, nothing reserved or built | The node has said nothing about the payment; an interrupted attempt is not a verdict |
+| In `Broadcast`, intent Built | Stays Built, reservation renewed, `rpc.ErrUnknownOutcome` carrying the context's error | The node may hold the transaction; only the same bytes may go out again |
+| In `UpdateConfirmations` | Error returned, no state change | |
+| In `Recover` | The passes over the spent set finish; the re-send loop stops at the first Built intent and reports it | Every Built intent is sent by the next `Recover` |
+
+`rpc.Client.Broadcast` treats a context ending during the send as a lost reply: the resolution
+lookup runs on the same, ended, context and reports nothing, and the outcome stays unknown. It is
+never a rejection. Nothing a context can do releases a Built intent's inputs, fails an intent, or
+builds a second transaction. The harness proves it against the node: scenario 9 hands the
+broadcast to the node through a proxy that never returns the reply, cancels, restarts, and pays once.
+
+`electrumx.Client`: a call whose context ends returns `ctx.Err()` at once and the connection
+stays usable; a reply that arrives later carries an id the next call discards. A context
+deadline shorter than the 30-second call deadline bounds the exchange.
+
+Every component takes a `*log/slog.Logger` in its constructor (`rpc.NewClient`,
+`electrumx.NewClient`, `utxo.OpenSpentSet`, `resilience.NewCircuitBreaker`, `NewAlerter`,
+`NewReconciler`) or as a `Logger` field (`withdraw.Engine`, `deposit.Monitor`). Nil discards
+everything; the SDK writes nothing to the process's default logger. Levels: `Info` for
+connections, refreshes and spent-set writes; `Warn` for a reorg seen in the cache, a refresh
+that failed, a reservation that could not be renewed, and, on `deposit.Monitor`, every alert
+when `OnAlert` is nil; `Error` for a circuit breaker opening and a panic in the polling
+goroutine. Identifiers are logged whole as attributes, never truncated into the message.
 
 ---
 
@@ -331,7 +375,10 @@ whole pass stale and paused every credit until a pass succeeded for every addres
 package main
 
 import (
+	"context"
 	"log"
+	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -355,7 +402,7 @@ func requiredConfirmations(value int64) int64 {
 
 // memLedger stands in for your database. Credit must be idempotent on the
 // outpoint, and in production the credit and the balance change belong in the
-// same database transaction.
+// same database transaction. The context is Scan's; pass it to every query.
 type memLedger struct {
 	mu       sync.Mutex
 	credited map[string]deposit.Deposit
@@ -364,21 +411,21 @@ type memLedger struct {
 
 func key(txid string, vout uint32) string { return txid + ":" + string(rune('0'+vout)) }
 
-func (l *memLedger) Credit(d deposit.Deposit) error {
+func (l *memLedger) Credit(_ context.Context, d deposit.Deposit) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.credited[key(d.TxID, d.Vout)] = d
 	log.Printf("CREDIT %s:%d %d shors to %s at %d confirmations", d.TxID, d.Vout, d.Value, d.Address, d.Confirmations)
 	return nil
 }
-func (l *memLedger) IsCredited(txid string, vout uint32) (bool, error) {
+func (l *memLedger) IsCredited(_ context.Context, txid string, vout uint32) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	_, ok := l.credited[key(txid, vout)]
 	return ok, nil
 }
 // Pending leaves out outputs the exchange spent itself; see below.
-func (l *memLedger) Pending() ([]deposit.Deposit, error) {
+func (l *memLedger) Pending(context.Context) ([]deposit.Deposit, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var out []deposit.Deposit
@@ -389,7 +436,7 @@ func (l *memLedger) Pending() ([]deposit.Deposit, error) {
 	}
 	return out, nil
 }
-func (l *memLedger) MarkFinal(txid string, vout uint32) error {
+func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.final[key(txid, vout)] = true
@@ -399,22 +446,27 @@ func (l *memLedger) MarkFinal(txid string, vout uint32) error {
 func main() {
 	depositAddresses := []string{"sq1p...", "sq1p..."} // one per user, from your database
 
+	// One context for the process, one logger for every component. The SDK
+	// logs nothing unless it is given a logger.
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
 	// The indexer. Over anything but a private network, use TLS: the server
 	// sees every address you track. The network is inferred from the
 	// addresses; mixed or undecodable addresses are refused.
-	elx := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second)
+	elx := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second, logger)
 	elx.UseTLS()
 	if err := elx.TrackAddresses(depositAddresses); err != nil {
 		log.Fatalf("track addresses: %v", err)
 	}
-	if err := elx.Connect(); err != nil { // also verifies the server's genesis hash
+	if err := elx.Connect(ctx); err != nil { // also verifies the server's genesis hash
 		log.Fatalf("connect: %v", err)
 	}
 	defer elx.Stop()
-	elx.StartPolling()
+	elx.StartPolling(ctx) // ends with ctx or Stop
 
 	// Your own node. Nothing is credited on the indexer's word alone.
-	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass")
+	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass", logger)
 	node.Network = types.Mainnet // RequireSynced refuses a node on any other chain
 
 	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}}
@@ -423,7 +475,7 @@ func main() {
 		Node:      node,
 		Network:   types.Mainnet, // coinbase maturity 288; Scan refuses a node on any other chain
 		Ledger:    ledger,
-		Addresses: func() []string { return depositAddresses },
+		Addresses: func(context.Context) []string { return depositAddresses },
 		Required:  requiredConfirmations,
 		OnAlert: func(kind deposit.AlertKind, msg string) {
 			// Route to your paging. Every alert here is a human's problem:
@@ -431,10 +483,14 @@ func main() {
 			// crediting paused because the node or indexer is not current.
 			log.Printf("ALERT %s: %s", kind, msg)
 		},
+		Logger: logger, // receives the alerts when OnAlert is nil
 	}
 
 	for range time.Tick(30 * time.Second) {
-		credited, err := monitor.Scan()
+		// Bound each pass so one stalled node call cannot outlive the interval.
+		passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		credited, err := monitor.Scan(passCtx)
+		cancel()
 		if err != nil {
 			log.Printf("scan: %v", err) // deposit.ErrPaused while the node or indexer is not current
 			continue
@@ -483,9 +539,15 @@ cannot afford impossible by construction:
 - **A node that is briefly behind does not fail a withdrawal.** A selector error that is
   `rpc.ErrTransient` (`RequireSynced` while the node is one block behind its headers, a node in
   warmup, a transport failure) leaves the intent Created with the attempt in `Attempts` and
-  `LastError`; call `Process` again and the same id builds once the node is back. Any other
-  selector error (insufficient funds, `rpc.ErrWrongChain`, a permanent node error, your own
-  selector's failure) fails the intent.
+  `LastError`; call `Process` again and the same id builds once the node is back. So does a
+  context that ends while the selector or the signer is working: nothing is reserved, nothing
+  is built, the intent waits. Any other selector error (insufficient funds,
+  `rpc.ErrWrongChain`, a permanent node error, your own selector's failure) fails the intent.
+- **A context that ends during the broadcast is a lost reply, never a failure.** The intent
+  stays Built with its reservation renewed, the error is `rpc.ErrUnknownOutcome` carrying
+  `context.Canceled` or `context.DeadlineExceeded`, and the next `Process` or `Recover` sends
+  the same bytes. Shutting the process down mid-broadcast leaves exactly the state a crash
+  leaves, and the same recovery applies. See [Context and logging](#context-and-logging).
 - **A node that accepts the bytes under a different txid** (`rpc.ErrTxIDMismatch`) is neither a
   rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
   node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
@@ -509,7 +571,9 @@ withdrawal with three malformed requests.
 package main
 
 import (
+	"context"
 	"log"
+	"log/slog"
 	"os"
 	"time"
 
@@ -526,6 +590,8 @@ import (
 
 func main() {
 	hotWallet := "sq1p..." // the address whose key the keystore holds
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 	// Keys. The manager refuses records the node could not spend from and
 	// records whose address does not belong to their key.
@@ -535,27 +601,27 @@ func main() {
 	}
 
 	// Indexer and node.
-	elx := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second)
+	elx := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second, logger)
 	elx.UseTLS()
 	if err := elx.TrackAddresses([]string{hotWallet}); err != nil {
 		log.Fatalf("track: %v", err)
 	}
-	if err := elx.Connect(); err != nil {
+	if err := elx.Connect(ctx); err != nil {
 		log.Fatalf("connect: %v", err)
 	}
 	defer elx.Stop()
-	elx.StartPolling()
-	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass")
+	elx.StartPolling(ctx)
+	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass", logger)
 	node.Network = types.Mainnet
 
 	// Halts only for systemic failures (RecordResult never counts a bad
 	// request), and the reconciler trips it when the book and the chain
 	// disagree.
-	cb := resilience.NewCircuitBreaker(3, 15*time.Minute)
+	cb := resilience.NewCircuitBreaker(3, 15*time.Minute, logger)
 
 	// Inputs are reserved here at build time, and unconfirmed spends survive
 	// a restart however long confirmation takes.
-	spent, err := utxo.OpenSpentSet("/var/lib/exchange/spent_set.json")
+	spent, err := utxo.OpenSpentSet("/var/lib/exchange/spent_set.json", logger)
 	if err != nil {
 		log.Fatal(err) // a file that exists but cannot be read must not start empty
 	}
@@ -580,12 +646,13 @@ func main() {
 		Broadcaster:           node, // rpc.Broadcast resolves lost replies against the node
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
 		RequiredConfirmations: types.MaxReorgDepth,
+		Logger:                logger,
 		// ReservationTTL left at its default, withdraw.DefaultReservationTTL (4 hours).
-		Select: func(amount, feeRate int64) ([]types.UTXO, error) {
-			if err := node.RequireSynced(); err != nil { // transient while behind: the intent stays Created
+		Select: func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
+			if err := node.RequireSynced(ctx); err != nil { // transient while behind: the intent stays Created
 				return nil, err
 			}
-			tip, err := node.GetBlockCount()
+			tip, err := node.GetBlockCount(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -598,9 +665,9 @@ func main() {
 			}
 			// Defense 11: the node must still have every input. Refuses to
 			// evict on a syncing node; skips immature coinbase.
-			return node.VerifyAndFilterUTXOs(selected, elx.EvictUTXO, elx.SetAssetType)
+			return node.VerifyAndFilterUTXOs(ctx, selected, elx.EvictUTXO, elx.SetAssetType)
 		},
-		BuildSign: func(inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
+		BuildSign: func(_ context.Context, inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
 			recipientSPK, err := address.ScriptFor(to) // v1, 32-byte program only
 			if err != nil {
 				return "", "", err
@@ -614,7 +681,7 @@ func main() {
 	// rebuilt. Do not start paying out if this fails: the spent set may be
 	// missing spends the store knows about. withdraw.ErrHeld here is an
 	// intent an operator must resolve first.
-	if err := engine.Recover(); err != nil {
+	if err := engine.Recover(ctx); err != nil {
 		log.Fatalf("recover: %v", err)
 	}
 
@@ -630,17 +697,18 @@ func main() {
 		log.Printf("withdrawals halted: %v", err)
 		return
 	}
-	if _, _, err := engine.Submit(requestID, toAddress, amount, types.RecommendedFeeRate); err != nil {
+	if _, _, err := engine.Submit(ctx, requestID, toAddress, amount, types.RecommendedFeeRate); err != nil {
 		log.Printf("submit %s: %v", requestID, err)
 		return
 	}
-	intent, err := engine.Process(requestID)
+	intent, err := engine.Process(ctx, requestID)
 	cb.RecordResult(err) // nil = success; per-request errors are ignored; systemic ones count
 	if err != nil {
 		// rpc.ErrTransient from the selector: the intent stays Created and the
 		// next Process builds it. rpc.ErrUnknownOutcome or rpc.ErrTransient
-		// from the broadcast: the intent stays Built and the same bytes go out
-		// on the next Process. Check intent.State to tell them apart.
+		// from the broadcast, or a context that ended during it: the intent
+		// stays Built and the same bytes go out on the next Process. Check
+		// intent.State to tell them apart.
 		// rpc.ErrTxIDMismatch: also Built, inputs held, intent.NodeTxID set;
 		// the breaker counts it, and every later Process of that intent
 		// returns withdraw.ErrHeld, which also counts. Stop and investigate,
@@ -651,7 +719,7 @@ func main() {
 	log.Printf("%s broadcast as %s", requestID, intent.TxID)
 
 	// Later, from a ticker: confirmations complete the intent.
-	if err := engine.UpdateConfirmations(intent); err != nil {
+	if err := engine.UpdateConfirmations(ctx, intent); err != nil {
 		log.Printf("confirmations %s: %v", requestID, err)
 	}
 }

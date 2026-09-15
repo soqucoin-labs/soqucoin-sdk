@@ -1,6 +1,7 @@
 package deposit
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -59,7 +60,7 @@ type fakeNode struct {
 	calls   int
 }
 
-func (n *fakeNode) RequireChain(want string) error {
+func (n *fakeNode) RequireChain(_ context.Context, want string) error {
 	if want != "" && n.chain != want {
 		return fmt.Errorf("%w: node reports %q, configured for %q", rpc.ErrWrongChain, n.chain, want)
 	}
@@ -68,7 +69,7 @@ func (n *fakeNode) RequireChain(want string) error {
 
 func key(txid string, vout uint32) string { return txid + ":" + string(rune('0'+vout)) }
 
-func (n *fakeNode) RequireSynced() error {
+func (n *fakeNode) RequireSynced(_ context.Context) error {
 	if n.syncErr != nil {
 		return n.syncErr
 	}
@@ -77,8 +78,8 @@ func (n *fakeNode) RequireSynced() error {
 	}
 	return nil
 }
-func (n *fakeNode) GetBlockCount() (int64, error) { return n.tip, nil }
-func (n *fakeNode) GetTxOut(txid string, vout uint32, _ bool) (*rpc.TxOut, error) {
+func (n *fakeNode) GetBlockCount(_ context.Context) (int64, error) { return n.tip, nil }
+func (n *fakeNode) GetTxOut(_ context.Context, txid string, vout uint32, _ bool) (*rpc.TxOut, error) {
 	n.calls++
 	return n.outs[key(txid, vout)], nil
 }
@@ -91,15 +92,15 @@ type fakeLedger struct {
 func newLedger() *fakeLedger {
 	return &fakeLedger{credited: map[string]Deposit{}, final: map[string]bool{}}
 }
-func (l *fakeLedger) Credit(d Deposit) error {
+func (l *fakeLedger) Credit(_ context.Context, d Deposit) error {
 	l.credited[key(d.TxID, d.Vout)] = d
 	return nil
 }
-func (l *fakeLedger) IsCredited(txid string, vout uint32) (bool, error) {
+func (l *fakeLedger) IsCredited(_ context.Context, txid string, vout uint32) (bool, error) {
 	_, ok := l.credited[key(txid, vout)]
 	return ok, nil
 }
-func (l *fakeLedger) Pending() ([]Deposit, error) {
+func (l *fakeLedger) Pending(_ context.Context) ([]Deposit, error) {
 	var out []Deposit
 	for k, d := range l.credited {
 		if !l.final[k] {
@@ -108,7 +109,7 @@ func (l *fakeLedger) Pending() ([]Deposit, error) {
 	}
 	return out, nil
 }
-func (l *fakeLedger) MarkFinal(txid string, vout uint32) error {
+func (l *fakeLedger) MarkFinal(_ context.Context, txid string, vout uint32) error {
 	l.final[key(txid, vout)] = true
 	return nil
 }
@@ -145,7 +146,7 @@ func setup(t *testing.T) (*Monitor, *fakeCache, *fakeNode, *fakeLedger, *alerts,
 	al := &alerts{}
 	m := &Monitor{
 		Cache: cache, Node: node, Ledger: led,
-		Addresses: func() []string { return []string{a} },
+		Addresses: func(context.Context) []string { return []string{a} },
 		Required:  func(int64) int64 { return 30 },
 		OnAlert:   al.fn,
 		now:       func() time.Time { return now },
@@ -168,12 +169,12 @@ func TestCreditsWhenNodeAgrees(t *testing.T) {
 	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a}}
 	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
 
-	got, err := m.Scan()
+	got, err := m.Scan(context.Background())
 	if err != nil || len(got) != 1 || got[0].TxID != txA || got[0].Value != 150_000_000 {
 		t.Fatalf("scan: %v %+v", err, got)
 	}
 	// Second scan: already credited, not credited again.
-	got, err = m.Scan()
+	got, err = m.Scan(context.Background())
 	if err != nil || len(got) != 0 {
 		t.Fatalf("second scan credited again: %v %+v", err, got)
 	}
@@ -211,7 +212,7 @@ func TestRefusesWhatTheNodeDoesNotConfirm(t *testing.T) {
 		case 3:
 			node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 5, false)
 		}
-		got, err := m.Scan()
+		got, err := m.Scan(context.Background())
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -234,7 +235,7 @@ func TestNegativeOrZeroHeightIsNeverConfirmed(t *testing.T) {
 	}
 	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 1002, false)
 	node.outs[key(txB, 0)] = txout(t, a, 150_000_000, 0, false)
-	if got, err := m.Scan(); err != nil || len(got) != 0 || len(led.credited) != 0 {
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 0 || len(led.credited) != 0 {
 		t.Fatalf("credited on non-positive height: %v %+v", err, got)
 	}
 }
@@ -246,25 +247,25 @@ func TestPausesWhenNodeSyncingOrCacheStale(t *testing.T) {
 	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
 
 	node.synced = false
-	if _, err := m.Scan(); !errors.Is(err, ErrPaused) || !al.has(AlertNodeSyncing) {
+	if _, err := m.Scan(context.Background()); !errors.Is(err, ErrPaused) || !al.has(AlertNodeSyncing) {
 		t.Fatalf("syncing node: err=%v alerts=%v", err, al.kinds)
 	}
 	node.synced = true
 
 	cache.at = m.now().Add(-time.Hour)
-	if _, err := m.Scan(); !errors.Is(err, ErrPaused) || !al.has(AlertCacheStale) {
+	if _, err := m.Scan(context.Background()); !errors.Is(err, ErrPaused) || !al.has(AlertCacheStale) {
 		t.Fatalf("stale cache: err=%v alerts=%v", err, al.kinds)
 	}
 	cache.at = m.now()
 	cache.err = errors.New("refresh failed")
-	if _, err := m.Scan(); !errors.Is(err, ErrPaused) {
+	if _, err := m.Scan(context.Background()); !errors.Is(err, ErrPaused) {
 		t.Fatalf("errored cache: %v", err)
 	}
 	if len(led.credited) != 0 {
 		t.Fatal("credited while paused")
 	}
 	cache.err = nil
-	if got, err := m.Scan(); err != nil || len(got) != 1 {
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 1 {
 		t.Fatalf("after recovery: %v %+v", err, got)
 	}
 }
@@ -295,7 +296,7 @@ func TestImmatureCoinbaseWaitsWithoutAlarm(t *testing.T) {
 		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
 		for _, confs := range c.immature {
 			node.outs[key(txA, 0)] = txout(t, a, 8_800_000_000, confs, true)
-			if got, _ := m.Scan(); len(got) != 0 || len(led.credited) != 0 {
+			if got, _ := m.Scan(context.Background()); len(got) != 0 || len(led.credited) != 0 {
 				t.Fatalf("%s: coinbase at %d confirmations credited", c.name, confs)
 			}
 			if len(al.kinds) != 0 {
@@ -303,7 +304,7 @@ func TestImmatureCoinbaseWaitsWithoutAlarm(t *testing.T) {
 			}
 		}
 		node.outs[key(txA, 0)] = txout(t, a, 8_800_000_000, c.mature, true)
-		if got, _ := m.Scan(); len(got) != 1 {
+		if got, _ := m.Scan(context.Background()); len(got) != 1 {
 			t.Fatalf("%s: coinbase at %d confirmations not credited", c.name, c.mature)
 		}
 	}
@@ -319,13 +320,13 @@ func TestRecheckPendingAlarmsVanishedAndMarksFinal(t *testing.T) {
 	}
 	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
 	node.outs[key(txB, 0)] = txout(t, a, 150_000_000, 101, false)
-	if got, err := m.Scan(); err != nil || len(got) != 2 {
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 2 {
 		t.Fatalf("initial credit: %v %+v", err, got)
 	}
 	// A reorg removes A; B is buried past the horizon.
 	delete(node.outs, key(txA, 0))
 	node.outs[key(txB, 0)] = txout(t, a, 150_000_000, types.MaxReorgDepth+1, false)
-	if _, err := m.Scan(); err != nil {
+	if _, err := m.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !al.has(AlertDepositVanished) {
@@ -339,7 +340,7 @@ func TestRecheckPendingAlarmsVanishedAndMarksFinal(t *testing.T) {
 	}
 	// Final deposits are not re-queried.
 	before := node.calls
-	m.Scan()
+	m.Scan(context.Background())
 	if node.calls-before > 1 { // only A (still pending) is re-checked
 		t.Errorf("final deposits still re-queried: %d calls", node.calls-before)
 	}
@@ -360,7 +361,7 @@ func TestPolicyAppliedFromNodeDepth(t *testing.T) {
 	}
 	node.outs[key(txA, 0)] = txout(t, a, 5_000_000_000, 51, false)
 	node.outs[key(txB, 0)] = txout(t, a, 100_000_000, 51, false)
-	got, err := m.Scan()
+	got, err := m.Scan(context.Background())
 	if err != nil || len(got) != 1 || got[0].TxID != txB {
 		t.Fatalf("policy: %v %+v", err, got)
 	}
@@ -382,7 +383,7 @@ func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 		node.outs[key(txA, 0)] = txout(t, a, 8_800_000_000, 60, true) // mature on regtest, immature on mainnet
 	}
 	check := func(name string, m *Monitor, led *fakeLedger, al *alerts) {
-		got, err := m.Scan()
+		got, err := m.Scan(context.Background())
 		if len(got) != 0 || len(led.credited) != 0 {
 			t.Fatalf("%s: credited %+v on a node serving another chain", name, got)
 		}
@@ -412,7 +413,7 @@ func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 	m, cache, node, led, al, a = setup(t)
 	node.chain = types.Regtest.ChainID
 	deposit(m, cache, node, a)
-	if got, err := m.Scan(); err != nil || len(got) != 0 || len(al.kinds) != 0 {
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 0 || len(al.kinds) != 0 {
 		t.Fatalf("unset network: got %+v, err %v, alerts %v; want no credit, no error, no alert", got, err, al.kinds)
 	}
 }
@@ -430,13 +431,13 @@ func TestStaleAddressesAreSkippedNotAllOfThem(t *testing.T) {
 		errs:      map[string]error{a2: errors.New("boom")},
 	}
 	m.Cache = cache
-	m.Addresses = func() []string { return []string{a1, a2} }
+	m.Addresses = func(context.Context) []string { return []string{a1, a2} }
 	cache.utxos[a1] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a1}}
 	cache.utxos[a2] = []types.UTXO{{TxID: txB, Vout: 0, Value: 150_000_000, Height: 900, Address: a2}}
 	node.outs[key(txA, 0)] = txout(t, a1, 150_000_000, 101, false)
 	node.outs[key(txB, 0)] = txout(t, a2, 150_000_000, 101, false)
 
-	got, err := m.Scan()
+	got, err := m.Scan(context.Background())
 	if err != nil {
 		t.Fatalf("one stale address must not pause the scan: %v", err)
 	}
@@ -453,7 +454,7 @@ func TestStaleAddressesAreSkippedNotAllOfThem(t *testing.T) {
 	// Every address stale: paused, nothing credited.
 	cache.ats[a1] = now.Add(-time.Hour)
 	al.kinds = nil
-	if _, err := m.Scan(); !errors.Is(err, ErrPaused) || !al.has(AlertCacheStale) {
+	if _, err := m.Scan(context.Background()); !errors.Is(err, ErrPaused) || !al.has(AlertCacheStale) {
 		t.Fatalf("all stale: err=%v alerts=%v", err, al.kinds)
 	}
 	if _, ok := led.credited[key(txB, 0)]; ok {
@@ -463,11 +464,11 @@ func TestStaleAddressesAreSkippedNotAllOfThem(t *testing.T) {
 	// A never-refreshed address is stale too; a refreshed one is credited.
 	cache.ats[a1] = now
 	delete(cache.ats, a2)
-	if got, err := m.Scan(); err != nil || len(got) != 0 {
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 0 {
 		t.Fatalf("a1 already credited, a2 never refreshed: %v %+v", err, got)
 	}
 	cache.ats[a2] = now
-	if got, err := m.Scan(); err != nil || len(got) != 1 || got[0].TxID != txB {
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 1 || got[0].TxID != txB {
 		t.Fatalf("after a2 refreshed: %v %+v", err, got)
 	}
 }

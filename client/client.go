@@ -14,15 +14,17 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
@@ -37,6 +39,7 @@ type Config struct {
 type Client struct {
 	config     Config
 	httpClient *http.Client
+	log        *slog.Logger
 }
 
 // SendRequest is the JSON body for POST /api/v1/send.
@@ -63,8 +66,9 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
-// NewClient creates a new soq-signer HTTP client.
-func NewClient(cfg Config) *Client {
+// NewClient creates a new soq-signer HTTP client. logger receives the
+// payment batches it sends; nil discards.
+func NewClient(cfg Config, logger *slog.Logger) *Client {
 	if cfg.FeeRate <= 0 {
 		cfg.FeeRate = types.RecommendedFeeRate // the miner's default floor; 10 shors/vB was below relay
 	}
@@ -73,12 +77,17 @@ func NewClient(cfg Config) *Client {
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		log: logutil.Or(logger),
 	}
 }
 
 // HealthCheck verifies soq-signer is running.
-func (c *Client) HealthCheck() error {
-	resp, err := c.httpClient.Get(c.config.URL + "/health")
+func (c *Client) HealthCheck(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.config.URL+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("soq-signer health check failed: %w", err)
 	}
@@ -92,7 +101,7 @@ func (c *Client) HealthCheck() error {
 
 // Send sends SOQ to a single recipient address.
 // amount is in shors (1 SOQ = 100,000,000 shors).
-func (c *Client) Send(address string, amountSat int64) (string, error) {
+func (c *Client) Send(ctx context.Context, address string, amountSat int64) (string, error) {
 	req := SendRequest{
 		Address: address,
 		Amount:  amountSat,
@@ -104,7 +113,7 @@ func (c *Client) Send(address string, amountSat int64) (string, error) {
 		return "", fmt.Errorf("marshal send request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", c.config.URL+"/api/v1/send", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.URL+"/api/v1/send", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -148,12 +157,12 @@ type SendManyRequest struct {
 // Uses the /api/v1/sendmany endpoint which builds a single TX with multiple outputs,
 // eliminating the txn-mempool-conflict issue from sequential individual sends.
 // transactions maps address -> amount in SOQ (float64, matching pool balance format).
-func (c *Client) SendMany(transactions map[string]float64) (string, error) {
+func (c *Client) SendMany(ctx context.Context, transactions map[string]float64) (string, error) {
 	if len(transactions) == 0 {
 		return "", errors.New("no transactions to send")
 	}
 
-	if err := c.HealthCheck(); err != nil {
+	if err := c.HealthCheck(ctx); err != nil {
 		return "", fmt.Errorf("pre-flight health check: %w", err)
 	}
 
@@ -172,11 +181,11 @@ func (c *Client) SendMany(transactions map[string]float64) (string, error) {
 	for address, amountSOQ := range transactions {
 		amountSat := int64(math.Round(amountSOQ * 1e8))
 		if amountSat <= 0 {
-			log.Printf("[soqsigner] Skipping zero/negative amount for %s: %.8f SOQ", address, amountSOQ)
+			c.log.Warn("skipping a recipient with a non-positive amount", "address", address, "soq", amountSOQ)
 			continue
 		}
 		recipients[address] = amountSat
-		log.Printf("[soqsigner] Queued %d sat (%.4f SOQ) to %s", amountSat, amountSOQ, address)
+		c.log.Debug("queued a payment", "address", address, "shors", amountSat)
 	}
 
 	if len(recipients) == 0 {
@@ -193,9 +202,9 @@ func (c *Client) SendMany(transactions map[string]float64) (string, error) {
 		return "", fmt.Errorf("marshal sendmany request: %w", err)
 	}
 
-	log.Printf("[soqsigner] Sending batch of %d payments via /api/v1/sendmany", len(recipients))
+	c.log.Info("sending a payment batch", "recipients", len(recipients))
 
-	httpReq, err := http.NewRequest("POST", c.config.URL+"/api/v1/sendmany", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.URL+"/api/v1/sendmany", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -226,8 +235,7 @@ func (c *Client) SendMany(transactions map[string]float64) (string, error) {
 		return "", fmt.Errorf("parse sendmany response: %w", err)
 	}
 
-	log.Printf("[soqsigner] Batch payment sent: txid=%s, %d inputs, %d outputs, elapsed=%s",
-		result.TxID, result.Inputs, result.Outputs, result.Elapsed)
+	c.log.Info("payment batch sent", "txid", result.TxID, "inputs", result.Inputs, "outputs", result.Outputs, "elapsed", result.Elapsed)
 
 	return result.TxID, nil
 }

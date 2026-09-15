@@ -13,7 +13,7 @@ import (
 // ── SpentSet Tests ──
 
 func TestSpentSetMarkAndCheck(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 
 	utxos := []types.UTXO{
 		{TxID: "aabbccddee112233445566778899aabb0011223344556677aabbccddee112233", Vout: 0, Value: 100000},
@@ -41,7 +41,7 @@ func TestSpentSetPersistence(t *testing.T) {
 	path := filepath.Join(dir, "spent_set.json")
 
 	// Create and populate
-	ss1 := NewSpentSet(path)
+	ss1 := NewSpentSet(path, nil)
 	utxos := []types.UTXO{
 		{TxID: "aabbccddee112233445566778899aabb0011223344556677aabbccddee112233", Vout: 0, Value: 100000},
 	}
@@ -53,7 +53,7 @@ func TestSpentSetPersistence(t *testing.T) {
 	}
 
 	// Load from disk in a new instance
-	ss2 := NewSpentSet(path)
+	ss2 := NewSpentSet(path, nil)
 	if !ss2.IsSpent("aabbccddee112233445566778899aabb0011223344556677aabbccddee112233", 0) {
 		t.Error("expected UTXO to persist across restarts")
 	}
@@ -63,7 +63,7 @@ func TestSpentSetPersistence(t *testing.T) {
 }
 
 func TestSpentSetPrune(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 
 	// Manually insert an old confirmed entry
 	ss.mu.Lock()
@@ -84,7 +84,7 @@ func TestSpentSetPrune(t *testing.T) {
 }
 
 func TestSpentSetConfirm(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 
 	utxos := []types.UTXO{
 		{TxID: "aabbccddee112233445566778899aabb0011223344556677aabbccddee112233", Vout: 0, Value: 100000},
@@ -102,7 +102,7 @@ func TestSpentSetConfirm(t *testing.T) {
 // ── CoinSelector Tests ──
 
 func TestSelectUTXOsLargestFirst(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	cs := NewCoinSelector(ss)
 
 	utxos := []types.UTXO{
@@ -126,7 +126,7 @@ func TestSelectUTXOsLargestFirst(t *testing.T) {
 }
 
 func TestSelectUTXOsSkipsSpentSet(t *testing.T) {
-	ss := NewSpentSet("")
+	ss := NewSpentSet("", nil)
 	cs := NewCoinSelector(ss)
 
 	utxos := []types.UTXO{

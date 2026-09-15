@@ -1,6 +1,7 @@
 package withdraw
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -29,7 +30,7 @@ type fakeNet struct {
 	builds int
 }
 
-func (f *fakeNet) Broadcast(rawHex, txid string) (string, error) {
+func (f *fakeNet) Broadcast(_ context.Context, rawHex, txid string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sent = append(f.sent, rawHex)
@@ -60,11 +61,11 @@ func newEngine(t *testing.T, store Store, spent *utxo.SpentSet, net *fakeNet, co
 	e := &Engine{
 		Store: store, Spent: spent, Broadcaster: net,
 		RequiredConfirmations: 3, ReservationTTL: time.Hour,
-		Select: func(amount, feeRate int64) ([]types.UTXO, error) {
+		Select: func(_ context.Context, amount, feeRate int64) ([]types.UTXO, error) {
 			sel, _, err := cs.SelectUTXOs(coins, amount+1000, 1, 1000, nil)
 			return sel, err
 		},
-		BuildSign: func(inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
+		BuildSign: func(_ context.Context, inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
 			net.mu.Lock()
 			net.builds++
 			net.mu.Unlock()
@@ -87,19 +88,19 @@ func coins() []types.UTXO {
 }
 
 func TestSubmitIsIdempotentAndConflictSafe(t *testing.T) {
-	e := newEngine(t, NewMemStore(), utxo.NewSpentSet(""), &fakeNet{mode: "ok"}, coins())
-	a, created, err := e.Submit("w1", dst, 1_000_000, 1000)
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	a, created, err := e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
 	if err != nil || !created {
 		t.Fatalf("first submit: %v created=%v", err, created)
 	}
-	b, created, err := e.Submit("w1", dst, 1_000_000, 1000)
+	b, created, err := e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
 	if err != nil || created || b.ID != a.ID {
 		t.Fatalf("second submit: %v created=%v", err, created)
 	}
-	if _, _, err := e.Submit("w1", dst, 2_000_000, 1000); !errors.Is(err, ErrConflict) {
+	if _, _, err := e.Submit(context.Background(), "w1", dst, 2_000_000, 1000); !errors.Is(err, ErrConflict) {
 		t.Errorf("same id, different amount accepted: %v", err)
 	}
-	if _, _, err := e.Submit("", dst, 1, 1); !errors.Is(err, ErrInvalidIntent) {
+	if _, _, err := e.Submit(context.Background(), "", dst, 1, 1); !errors.Is(err, ErrInvalidIntent) {
 		t.Errorf("empty id accepted: %v", err)
 	}
 }
@@ -107,14 +108,14 @@ func TestSubmitIsIdempotentAndConflictSafe(t *testing.T) {
 // Two withdrawals must never select the same input. The first reserves the
 // largest coin at build time; the second sees it as spent and takes the next.
 func TestBuildReservesInputsAgainstConcurrentWithdrawals(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	e := newEngine(t, NewMemStore(), spent, &fakeNet{mode: "ok"}, coins())
-	w1, _, _ := e.Submit("w1", dst, 2_000_000, 1000)
-	w2, _, _ := e.Submit("w2", dst, 2_000_000, 1000)
-	if err := e.Build(w1); err != nil {
+	w1, _, _ := e.Submit(context.Background(), "w1", dst, 2_000_000, 1000)
+	w2, _, _ := e.Submit(context.Background(), "w2", dst, 2_000_000, 1000)
+	if err := e.Build(context.Background(), w1); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Build(w2); err != nil {
+	if err := e.Build(context.Background(), w2); err != nil {
 		t.Fatal(err)
 	}
 	if w1.Inputs[0].TxID != txA || w2.Inputs[0].TxID != txB {
@@ -124,8 +125,8 @@ func TestBuildReservesInputsAgainstConcurrentWithdrawals(t *testing.T) {
 		t.Error("built intents' inputs are not reserved in the spent set")
 	}
 	// A third withdrawal that needs 2M finds only the 1M coin left.
-	w3, _, _ := e.Submit("w3", dst, 2_000_000, 1000)
-	if err := e.Build(w3); err == nil || w3.State != StateFailed {
+	w3, _, _ := e.Submit(context.Background(), "w3", dst, 2_000_000, 1000)
+	if err := e.Build(context.Background(), w3); err == nil || w3.State != StateFailed {
 		t.Errorf("third withdrawal should fail for insufficient funds, got err=%v state=%s", err, w3.State)
 	}
 }
@@ -135,23 +136,23 @@ func TestBuildReservesInputsAgainstConcurrentWithdrawals(t *testing.T) {
 // again for that intent.
 func TestLostReplyRetriesSameBytesAndNeverRebuilds(t *testing.T) {
 	net := &fakeNet{mode: "lost"}
-	e := newEngine(t, NewMemStore(), utxo.NewSpentSet(""), net, coins())
-	w, _, _ := e.Submit("w1", dst, 1_000_000, 1000)
-	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrUnknownOutcome) {
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), net, coins())
+	w, _, _ := e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, rpc.ErrUnknownOutcome) {
 		t.Fatalf("lost reply: %v, want ErrUnknownOutcome", err)
 	}
-	w, _, _ = e.Store.Get("w1")
+	w, _, _ = e.Store.Get(context.Background(), "w1")
 	if w.State != StateBuilt || w.Attempts != 1 || w.RawHex == "" {
 		t.Fatalf("after lost reply: %+v", w)
 	}
 	// Retry twice more while replies are still lost, then the network heals.
-	e.Process("w1")
-	e.Process("w1")
+	e.Process(context.Background(), "w1")
+	e.Process(context.Background(), "w1")
 	net.setMode("ok")
-	if _, err := e.Process("w1"); err != nil {
+	if _, err := e.Process(context.Background(), "w1"); err != nil {
 		t.Fatal(err)
 	}
-	w, _, _ = e.Store.Get("w1")
+	w, _, _ = e.Store.Get(context.Background(), "w1")
 	if w.State != StateBroadcast {
 		t.Fatalf("state %s, want broadcast", w.State)
 	}
@@ -181,10 +182,10 @@ func TestRecoverRebroadcastsPersistedBytes(t *testing.T) {
 	}
 	spentPath := filepath.Join(dir, "spent.json")
 	net := &fakeNet{mode: "lost"}
-	e := newEngine(t, store, utxo.NewSpentSet(spentPath), net, coins())
-	e.Submit("w1", dst, 1_000_000, 1000)
-	e.Process("w1") // built, broadcast lost
-	first, _, _ := store.Get("w1")
+	e := newEngine(t, store, utxo.NewSpentSet(spentPath, nil), net, coins())
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	e.Process(context.Background(), "w1") // built, broadcast lost
+	first, _, _ := store.Get(context.Background(), "w1")
 
 	// New process: fresh store, fresh spent set from disk, healed network. The
 	// builder in the new engine would produce DIFFERENT bytes; it must not run.
@@ -193,15 +194,15 @@ func TestRecoverRebroadcastsPersistedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	net2 := &fakeNet{mode: "ok"}
-	e2 := newEngine(t, store2, utxo.NewSpentSet(spentPath), net2, coins())
-	e2.BuildSign = func([]types.UTXO, string, int64, int64) (string, string, error) {
+	e2 := newEngine(t, store2, utxo.NewSpentSet(spentPath, nil), net2, coins())
+	e2.BuildSign = func(context.Context, []types.UTXO, string, int64, int64) (string, string, error) {
 		t.Fatal("Recover rebuilt a transaction that was already persisted")
 		return "", "", nil
 	}
-	if err := e2.Recover(); err != nil {
+	if err := e2.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	after, _, _ := store2.Get("w1")
+	after, _, _ := store2.Get(context.Background(), "w1")
 	if after.State != StateBroadcast || after.RawHex != first.RawHex || after.TxID != first.TxID {
 		t.Fatalf("recovered intent %+v differs from persisted %+v", after, first)
 	}
@@ -211,14 +212,14 @@ func TestRecoverRebroadcastsPersistedBytes(t *testing.T) {
 }
 
 func TestPermanentRejectionFailsAndReleasesInputs(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "reject"}
 	e := newEngine(t, NewMemStore(), spent, net, coins())
-	e.Submit("w1", dst, 1_000_000, 1000)
-	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrPermanent) {
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, rpc.ErrPermanent) {
 		t.Fatalf("rejection: %v", err)
 	}
-	w, _, _ := e.Store.Get("w1")
+	w, _, _ := e.Store.Get(context.Background(), "w1")
 	if w.State != StateFailed || w.TxID == "" {
 		t.Fatalf("rejected intent %+v: want failed with the transaction kept for the audit trail", w)
 	}
@@ -226,12 +227,12 @@ func TestPermanentRejectionFailsAndReleasesInputs(t *testing.T) {
 		t.Error("inputs of a rejected transaction must be released for the next withdrawal")
 	}
 	// Retrying a failed intent is refused; a new intent can use the coin.
-	if err := e.Broadcast(w); !errors.Is(err, ErrWrongState) {
+	if err := e.Broadcast(context.Background(), w); !errors.Is(err, ErrWrongState) {
 		t.Errorf("broadcast of a failed intent: %v", err)
 	}
 	net.setMode("ok")
-	e.Submit("w2", dst, 1_000_000, 1000)
-	w2, err := e.Process("w2")
+	e.Submit(context.Background(), "w2", dst, 1_000_000, 1000)
+	w2, err := e.Process(context.Background(), "w2")
 	if err != nil || w2.Inputs[0].TxID != txA {
 		t.Fatalf("released input not reusable: %v %+v", err, w2)
 	}
@@ -243,20 +244,20 @@ type failingStore struct {
 	failBuilt bool
 }
 
-func (f *failingStore) Put(in *Intent) error {
+func (f *failingStore) Put(_ context.Context, in *Intent) error {
 	if f.failBuilt && in.State == StateBuilt {
 		return errors.New("disk full")
 	}
-	return f.MemStore.Put(in)
+	return f.MemStore.Put(context.Background(), in)
 }
 
 func TestNothingIsBroadcastUnlessPersistedFirst(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "ok"}
 	store := &failingStore{MemStore: NewMemStore(), failBuilt: true}
 	e := newEngine(t, store, spent, net, coins())
-	e.Submit("w1", dst, 1_000_000, 1000)
-	_, err := e.Process("w1")
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	_, err := e.Process(context.Background(), "w1")
 	if err == nil {
 		t.Fatal("persist failure was not reported")
 	}
@@ -266,7 +267,7 @@ func TestNothingIsBroadcastUnlessPersistedFirst(t *testing.T) {
 	if spent.IsSpent(txA, 0) {
 		t.Error("reservation was not released after the persist failure")
 	}
-	w, _, _ := store.Get("w1")
+	w, _, _ := store.Get(context.Background(), "w1")
 	if w.State != StateCreated {
 		t.Errorf("intent state %s, want created (retryable)", w.State)
 	}
@@ -274,22 +275,22 @@ func TestNothingIsBroadcastUnlessPersistedFirst(t *testing.T) {
 
 type fakeConfirmer struct{ n int64 }
 
-func (f fakeConfirmer) Confirmations(string) (int64, error) { return f.n, nil }
+func (f fakeConfirmer) Confirmations(context.Context, string) (int64, error) { return f.n, nil }
 
 func TestConfirmationsCompleteTheIntent(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	e := newEngine(t, NewMemStore(), spent, &fakeNet{mode: "ok"}, coins())
-	e.Submit("w1", dst, 1_000_000, 1000)
-	w, err := e.Process("w1")
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w, err := e.Process(context.Background(), "w1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.Confirmer = fakeConfirmer{n: 2}
-	if err := e.UpdateConfirmations(w); err != nil || w.State != StateBroadcast || w.Confirmations != 2 {
+	if err := e.UpdateConfirmations(context.Background(), w); err != nil || w.State != StateBroadcast || w.Confirmations != 2 {
 		t.Fatalf("2 confs: %v %+v", err, w)
 	}
 	e.Confirmer = fakeConfirmer{n: 3}
-	if err := e.UpdateConfirmations(w); err != nil || w.State != StateConfirmed {
+	if err := e.UpdateConfirmations(context.Background(), w); err != nil || w.State != StateConfirmed {
 		t.Fatalf("3 confs: %v %+v", err, w)
 	}
 	spent.Prune() // confirmed entries age out later; still present now
@@ -305,21 +306,21 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	if err := s.Put(&Intent{ID: "b", State: StateBuilt, RawHex: "00", CreatedAt: now.Add(time.Second)}); err != nil {
+	if err := s.Put(context.Background(), &Intent{ID: "b", State: StateBuilt, RawHex: "00", CreatedAt: now.Add(time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Put(&Intent{ID: "a", State: StateBroadcast, CreatedAt: now}); err != nil {
+	if err := s.Put(context.Background(), &Intent{ID: "a", State: StateBroadcast, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := NewFileStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	all, _ := s2.List()
+	all, _ := s2.List(context.Background())
 	if len(all) != 2 || all[0].ID != "a" || all[1].ID != "b" {
 		t.Fatalf("list after reload: %+v", all)
 	}
-	built, _ := s2.List(StateBuilt)
+	built, _ := s2.List(context.Background(), StateBuilt)
 	if len(built) != 1 || built[0].RawHex != "00" {
 		t.Fatalf("filtered list: %+v", built)
 	}
@@ -354,39 +355,39 @@ func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := &Intent{ID: "w1", State: StateCreated, CreatedAt: time.Now().UTC()}
-	if err := s.Put(created); err != nil {
+	if err := s.Put(context.Background(), created); err != nil {
 		t.Fatal(err)
 	}
 	fix := breakStoreFile(t, path)
 
 	built := *created
 	built.State, built.RawHex, built.TxID = StateBuilt, "00", "t"
-	if err := s.Put(&built); err == nil {
+	if err := s.Put(context.Background(), &built); err == nil {
 		t.Fatal("a write onto a directory succeeded")
 	}
-	got, ok, _ := s.Get("w1")
+	got, ok, _ := s.Get(context.Background(), "w1")
 	if !ok || got.State != StateCreated || got.RawHex != "" {
 		t.Fatalf("after the failed Put, Get reports %+v; want the Created record", got)
 	}
-	if list, _ := s.List(StateBuilt); len(list) != 0 {
+	if list, _ := s.List(context.Background(), StateBuilt); len(list) != 0 {
 		t.Fatalf("List reports a Built intent whose save failed: %+v", list)
 	}
-	if err := s.Put(&Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err == nil {
+	if err := s.Put(context.Background(), &Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err == nil {
 		t.Fatal("a write onto a directory succeeded")
 	}
-	if _, ok, _ := s.Get("w2"); ok {
+	if _, ok, _ := s.Get(context.Background(), "w2"); ok {
 		t.Fatal("a record whose first save failed is reported")
 	}
 
 	fix()
-	if err := s.Put(&built); err != nil {
+	if err := s.Put(context.Background(), &built); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := NewFileStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	all, _ := s2.List()
+	all, _ := s2.List(context.Background())
 	if len(all) != 1 || all[0].ID != "w1" || all[0].State != StateBuilt {
 		t.Fatalf("reloaded store: %+v; want only w1, Built", all)
 	}
@@ -404,16 +405,16 @@ func TestFailedBuiltSaveIsNotBroadcastByTheNextProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "ok"}
 	e := newEngine(t, store, spent, net, coins())
-	if _, _, err := e.Submit("w1", dst, 1_000_000, 1000); err != nil {
+	if _, _, err := e.Submit(context.Background(), "w1", dst, 1_000_000, 1000); err != nil {
 		t.Fatal(err)
 	}
 	fix := breakStoreFile(t, path)
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		if _, err := e.Process("w1"); err == nil {
+		if _, err := e.Process(context.Background(), "w1"); err == nil {
 			t.Fatalf("attempt %d: persist failure was not reported", attempt)
 		}
 		if n := net.sentCount(); n != 0 {
@@ -422,14 +423,14 @@ func TestFailedBuiltSaveIsNotBroadcastByTheNextProcess(t *testing.T) {
 		if held := spent.ReservedIntents(); len(held) != 0 {
 			t.Fatalf("attempt %d: reservations %v kept after the failed save", attempt, held)
 		}
-		w, ok, err := store.Get("w1")
+		w, ok, err := store.Get(context.Background(), "w1")
 		if err != nil || !ok || w.State != StateCreated {
 			t.Fatalf("attempt %d: store reports %+v, %v; want w1 Created", attempt, w, err)
 		}
 	}
 
 	fix()
-	w, err := e.Process("w1")
+	w, err := e.Process(context.Background(), "w1")
 	if err != nil || w.State != StateBroadcast || net.sentCount() != 1 {
 		t.Fatalf("after the disk is back: %+v, %v, %d sent; want one broadcast", w, err, net.sentCount())
 	}
@@ -442,7 +443,7 @@ func TestFailedBuiltSaveIsNotBroadcastByTheNextProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, _ := reloaded.Get("w1"); !ok || got.State != StateBroadcast || got.RawHex != w.RawHex {
+	if got, ok, _ := reloaded.Get(context.Background(), "w1"); !ok || got.State != StateBroadcast || got.RawHex != w.RawHex {
 		t.Fatalf("file holds %+v; want the broadcast record", got)
 	}
 }
@@ -453,18 +454,18 @@ func TestFailedBuiltSaveIsNotBroadcastByTheNextProcess(t *testing.T) {
 // one's inputs; without renewal the spent set forgets them after the first
 // TTL and the two withdrawals share an input.
 func TestUnsettledBroadcastRenewsTheReservation(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "lost"}
 	e := newEngine(t, NewMemStore(), spent, net, coins())
 	e.ReservationTTL = 40 * time.Millisecond
-	e.Submit("w1", dst, 4_500_000, 1000) // only txA (5,000,000) covers it alone
-	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrUnknownOutcome) {
+	e.Submit(context.Background(), "w1", dst, 4_500_000, 1000) // only txA (5,000,000) covers it alone
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, rpc.ErrUnknownOutcome) {
 		t.Fatalf("first attempt: %v", err)
 	}
-	w1, _, _ := e.Store.Get("w1")
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
 	for i := 0; i < 3; i++ {
 		time.Sleep(30 * time.Millisecond) // inside the TTL each time, past it in total
-		if err := e.Broadcast(w1); !errors.Is(err, rpc.ErrUnknownOutcome) || errors.Is(err, ErrReservationLost) {
+		if err := e.Broadcast(context.Background(), w1); !errors.Is(err, rpc.ErrUnknownOutcome) || errors.Is(err, ErrReservationLost) {
 			t.Fatalf("retry %d: %v", i, err)
 		}
 	}
@@ -472,8 +473,8 @@ func TestUnsettledBroadcastRenewsTheReservation(t *testing.T) {
 		t.Fatal("reservation expired although the intent was retried inside every TTL")
 	}
 	net.setMode("ok")
-	e.Submit("w2", dst, 4_500_000, 1000)
-	w2, err := e.Process("w2")
+	e.Submit(context.Background(), "w2", dst, 4_500_000, 1000)
+	w2, err := e.Process(context.Background(), "w2")
 	if err == nil {
 		for _, o := range w2.Inputs {
 			if o.TxID == w1.Inputs[0].TxID && o.Vout == w1.Inputs[0].Vout {
@@ -486,7 +487,7 @@ func TestUnsettledBroadcastRenewsTheReservation(t *testing.T) {
 		t.Fatalf("w2 %+v, want failed for lack of free coins", w2)
 	}
 	// w1 still completes on its own bytes once the network heals.
-	if err := e.Broadcast(w1); err != nil {
+	if err := e.Broadcast(context.Background(), w1); err != nil {
 		t.Fatal(err)
 	}
 	if net.builds != 1 {
@@ -498,26 +499,26 @@ func TestUnsettledBroadcastRenewsTheReservation(t *testing.T) {
 // the retry, the retry must not release or fail the first intent (its bytes
 // may be in the mempool) and must say what happened.
 func TestRetryAfterLostReservationReportsAndHolds(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "lost"}
 	e := newEngine(t, NewMemStore(), spent, net, coins())
 	e.ReservationTTL = 20 * time.Millisecond
-	e.Submit("w1", dst, 4_500_000, 1000)
-	e.Process("w1")
-	w1, _, _ := e.Store.Get("w1")
+	e.Submit(context.Background(), "w1", dst, 4_500_000, 1000)
+	e.Process(context.Background(), "w1")
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
 	time.Sleep(40 * time.Millisecond) // no retry inside the TTL: the reservation lapses
 	net.setMode("ok")
-	e.Submit("w2", dst, 4_500_000, 1000)
-	w2, err := e.Process("w2")
+	e.Submit(context.Background(), "w2", dst, 4_500_000, 1000)
+	w2, err := e.Process(context.Background(), "w2")
 	if err != nil || w2.Inputs[0].TxID != w1.Inputs[0].TxID {
 		t.Fatalf("w2 should have taken the lapsed input: %v %+v", err, w2)
 	}
 	net.setMode("lost")
-	err = e.Broadcast(w1)
+	err = e.Broadcast(context.Background(), w1)
 	if !errors.Is(err, ErrReservationLost) || !errors.Is(err, rpc.ErrUnknownOutcome) {
 		t.Fatalf("retry after the input was taken: %v, want ErrReservationLost wrapping the broadcast error", err)
 	}
-	w1, _, _ = e.Store.Get("w1")
+	w1, _, _ = e.Store.Get(context.Background(), "w1")
 	if w1.State != StateBuilt || w1.RawHex == "" {
 		t.Fatalf("w1 %+v, want still Built with its bytes", w1)
 	}
@@ -531,16 +532,16 @@ func TestRetryAfterLostReservationReportsAndHolds(t *testing.T) {
 // node's txid, and mark the inputs spent so that they never expire back into
 // selection; the next withdrawal must not be able to select them.
 func TestTxIDMismatchHoldsInputsAndRecordsTheNodeTxID(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "mismatch"}
 	e := newEngine(t, NewMemStore(), spent, net, coins())
 	e.ReservationTTL = 20 * time.Millisecond // a mere reservation would lapse below
-	e.Submit("w1", dst, 4_500_000, 1000)
-	_, err := e.Process("w1")
+	e.Submit(context.Background(), "w1", dst, 4_500_000, 1000)
+	_, err := e.Process(context.Background(), "w1")
 	if !errors.Is(err, rpc.ErrTxIDMismatch) || errors.Is(err, rpc.ErrPermanent) {
 		t.Fatalf("mismatch: %v, want ErrTxIDMismatch and not ErrPermanent", err)
 	}
-	w1, _, _ := e.Store.Get("w1")
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
 	if w1.State != StateBuilt || w1.RawHex == "" || w1.NodeTxID != "node-"+w1.TxID {
 		t.Fatalf("after mismatch %+v: want Built, bytes kept, NodeTxID recorded", w1)
 	}
@@ -549,8 +550,8 @@ func TestTxIDMismatchHoldsInputsAndRecordsTheNodeTxID(t *testing.T) {
 		t.Fatal("inputs free after the TTL although the node accepted the transaction")
 	}
 	net.setMode("ok")
-	e.Submit("w2", dst, 4_500_000, 1000)
-	if w2, err := e.Process("w2"); err == nil || w2.State != StateFailed {
+	e.Submit(context.Background(), "w2", dst, 4_500_000, 1000)
+	if w2, err := e.Process(context.Background(), "w2"); err == nil || w2.State != StateFailed {
 		t.Fatalf("w2 %+v %v: must not build on inputs the node has already spent", w2, err)
 	}
 	// A retry sends nothing, even when the node would now answer "already in
@@ -558,15 +559,15 @@ func TestTxIDMismatchHoldsInputsAndRecordsTheNodeTxID(t *testing.T) {
 	// not become a Broadcast intent under a txid the node does not know.
 	net.setMode("ok")
 	sent := net.sentCount()
-	if err := e.Broadcast(w1); !errors.Is(err, ErrHeld) {
+	if err := e.Broadcast(context.Background(), w1); !errors.Is(err, ErrHeld) {
 		t.Fatalf("retry of a held intent: %v, want ErrHeld", err)
 	}
-	w1, _, _ = e.Store.Get("w1")
+	w1, _, _ = e.Store.Get(context.Background(), "w1")
 	if w1.State != StateBuilt || w1.Attempts != 1 || net.sentCount() != sent {
 		t.Fatalf("retry changed or sent something: %+v, sent %d", w1, net.sentCount()-sent)
 	}
 	// Recover leaves it alone too and reports it: no broadcast, ErrHeld.
-	if err := e.Recover(); !errors.Is(err, ErrHeld) {
+	if err := e.Recover(context.Background()); !errors.Is(err, ErrHeld) {
 		t.Fatalf("recover over a held intent: %v, want ErrHeld reported", err)
 	}
 	if net.sentCount() != sent {
@@ -581,17 +582,17 @@ func TestTxIDMismatchHoldsInputsAndRecordsTheNodeTxID(t *testing.T) {
 // still arm the hold.
 func TestTxIDMismatchWithoutANodeTxIDStillHolds(t *testing.T) {
 	net := &fakeNet{mode: "mismatch-blank"}
-	e := newEngine(t, NewMemStore(), utxo.NewSpentSet(""), net, coins())
-	e.Submit("w1", dst, 4_500_000, 1000)
-	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrTxIDMismatch) {
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), net, coins())
+	e.Submit(context.Background(), "w1", dst, 4_500_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, rpc.ErrTxIDMismatch) {
 		t.Fatalf("mismatch: %v", err)
 	}
-	w1, _, _ := e.Store.Get("w1")
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
 	if w1.NodeTxID == "" || w1.State != StateBuilt {
 		t.Fatalf("hold not armed: %+v", w1)
 	}
 	net.setMode("ok")
-	if err := e.Broadcast(w1); !errors.Is(err, ErrHeld) {
+	if err := e.Broadcast(context.Background(), w1); !errors.Is(err, ErrHeld) {
 		t.Fatalf("retry: %v, want ErrHeld", err)
 	}
 }
@@ -603,7 +604,7 @@ func failingSpentSet(t *testing.T) *utxo.SpentSet {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return utxo.NewSpentSet(filepath.Join(blocker, "spent.json"))
+	return utxo.NewSpentSet(filepath.Join(blocker, "spent.json"), nil)
 }
 
 // The spent set cannot be written. Build reserves nothing and sends nothing;
@@ -612,12 +613,12 @@ func TestBuildWithUnwritableSpentSetSendsNothing(t *testing.T) {
 	spent := failingSpentSet(t)
 	net := &fakeNet{mode: "ok"}
 	e := newEngine(t, NewMemStore(), spent, net, coins())
-	e.Submit("w1", dst, 1_000_000, 1000)
-	_, err := e.Process("w1")
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	_, err := e.Process(context.Background(), "w1")
 	if !errors.Is(err, utxo.ErrPersist) {
 		t.Fatalf("process: %v, want ErrPersist", err)
 	}
-	w1, _, _ := e.Store.Get("w1")
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
 	if w1.State != StateCreated || w1.RawHex != "" || net.sentCount() != 0 || net.builds != 0 {
 		t.Fatalf("something happened on an unwritable spent set: %+v, sent %d, built %d", w1, net.sentCount(), net.builds)
 	}
@@ -631,21 +632,21 @@ func TestBuildWithUnwritableSpentSetSendsNothing(t *testing.T) {
 // returned so the operator hears about it, this process refuses the inputs,
 // and Recover over the intent store re-marks them in a fresh spent set.
 func TestBroadcastWithUnwritableSpentSetReportsAndRecoverRemarks(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "ok"}
 	store := NewMemStore()
 	e := newEngine(t, store, spent, net, coins())
-	e.Submit("w1", dst, 1_000_000, 1000)
-	w1, _, _ := e.Store.Get("w1")
-	if err := e.Build(w1); err != nil {
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
+	if err := e.Build(context.Background(), w1); err != nil {
 		t.Fatal(err)
 	}
 	e.Spent = failingSpentSet(t) // the disk goes away after the build
-	err := e.Broadcast(w1)
+	err := e.Broadcast(context.Background(), w1)
 	if !errors.Is(err, utxo.ErrPersist) {
 		t.Fatalf("broadcast: %v, want ErrPersist reported", err)
 	}
-	w1, _, _ = store.Get("w1")
+	w1, _, _ = store.Get(context.Background(), "w1")
 	if w1.State != StateBroadcast || w1.TxID == "" {
 		t.Fatalf("intent %+v, want Broadcast with its txid: the payment is out", w1)
 	}
@@ -653,16 +654,16 @@ func TestBroadcastWithUnwritableSpentSetReportsAndRecoverRemarks(t *testing.T) {
 		t.Fatal("this process must keep refusing the inputs even though the write failed")
 	}
 	// Restart with an empty spent set: only the intent store knows the spend.
-	fresh := utxo.NewSpentSet("")
+	fresh := utxo.NewSpentSet("", nil)
 	e2 := newEngine(t, store, fresh, &fakeNet{mode: "ok"}, coins())
-	if err := e2.Recover(); err != nil {
+	if err := e2.Recover(context.Background()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
 	if !fresh.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
 		t.Fatal("Recover did not re-mark a Broadcast intent's inputs")
 	}
-	e2.Submit("w2", dst, 4_500_000, 1000) // only txA covers it; txA is w1's input
-	if w2, err := e2.Process("w2"); err == nil || w2.State != StateFailed {
+	e2.Submit(context.Background(), "w2", dst, 4_500_000, 1000) // only txA covers it; txA is w1's input
+	if w2, err := e2.Process(context.Background(), "w2"); err == nil || w2.State != StateFailed {
 		t.Fatalf("w2 %+v %v: built on an input the previous process spent", w2, err)
 	}
 }
@@ -672,16 +673,16 @@ func TestBroadcastWithUnwritableSpentSetReportsAndRecoverRemarks(t *testing.T) {
 func TestRecoverRemarksHeldIntentsAndReportsAFailedWrite(t *testing.T) {
 	store := NewMemStore()
 	net := &fakeNet{mode: "mismatch"}
-	e := newEngine(t, store, utxo.NewSpentSet(""), net, coins())
-	e.Submit("w1", dst, 4_500_000, 1000)
-	if _, err := e.Process("w1"); !errors.Is(err, rpc.ErrTxIDMismatch) {
+	e := newEngine(t, store, utxo.NewSpentSet("", nil), net, coins())
+	e.Submit(context.Background(), "w1", dst, 4_500_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, rpc.ErrTxIDMismatch) {
 		t.Fatalf("mismatch: %v", err)
 	}
-	w1, _, _ := store.Get("w1")
+	w1, _, _ := store.Get(context.Background(), "w1")
 
-	fresh := utxo.NewSpentSet("")
+	fresh := utxo.NewSpentSet("", nil)
 	e2 := newEngine(t, store, fresh, &fakeNet{mode: "ok"}, coins())
-	if err := e2.Recover(); !errors.Is(err, ErrHeld) {
+	if err := e2.Recover(context.Background()); !errors.Is(err, ErrHeld) {
 		t.Fatalf("recover: %v, want ErrHeld reported", err)
 	}
 	if !fresh.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
@@ -690,7 +691,7 @@ func TestRecoverRemarksHeldIntentsAndReportsAFailedWrite(t *testing.T) {
 
 	failing := failingSpentSet(t)
 	e3 := newEngine(t, store, failing, &fakeNet{mode: "ok"}, coins())
-	err := e3.Recover()
+	err := e3.Recover(context.Background())
 	if !errors.Is(err, utxo.ErrPersist) || !errors.Is(err, ErrHeld) {
 		t.Fatalf("recover on an unwritable set: %v, want both ErrPersist and ErrHeld", err)
 	}
@@ -711,25 +712,25 @@ func TestTransientSelectorErrorKeepsTheIntentCreated(t *testing.T) {
 		fmt.Errorf("getblockchaininfo: %w", rpc.ErrTransient),
 	}
 	for i, transient := range transients {
-		spent := utxo.NewSpentSet("")
+		spent := utxo.NewSpentSet("", nil)
 		net := &fakeNet{mode: "ok"}
 		e := newEngine(t, NewMemStore(), spent, net, coins())
 		realSelect := e.Select
 		remaining := 2
-		e.Select = func(amount, feeRate int64) ([]types.UTXO, error) {
+		e.Select = func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
 			if remaining > 0 {
 				remaining--
 				return nil, transient
 			}
-			return realSelect(amount, feeRate)
+			return realSelect(ctx, amount, feeRate)
 		}
-		e.Submit("w1", dst, 1_000_000, 1000)
+		e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
 		for attempt := 1; attempt <= 2; attempt++ {
-			_, err := e.Process("w1")
+			_, err := e.Process(context.Background(), "w1")
 			if !errors.Is(err, rpc.ErrTransient) || errors.Is(err, rpc.ErrPermanent) {
 				t.Fatalf("case %d attempt %d: %v, want the transient error back", i, attempt, err)
 			}
-			w, _, _ := e.Store.Get("w1")
+			w, _, _ := e.Store.Get(context.Background(), "w1")
 			if w.State != StateCreated || w.Attempts != attempt || w.LastError == "" || w.RawHex != "" || w.Inputs != nil {
 				t.Fatalf("case %d attempt %d: %+v, want Created with the attempt recorded and nothing built", i, attempt, w)
 			}
@@ -737,19 +738,19 @@ func TestTransientSelectorErrorKeepsTheIntentCreated(t *testing.T) {
 		if spent.IsSpent(txA, 0) || spent.IsSpent(txB, 0) || spent.IsSpent(txC, 0) || net.builds != 0 || net.sentCount() != 0 {
 			t.Fatalf("case %d: a transient selector error reserved, built or sent something", i)
 		}
-		w, err := e.Process("w1")
+		w, err := e.Process(context.Background(), "w1")
 		if err != nil || w.State != StateBroadcast || w.Attempts != 3 {
 			t.Fatalf("case %d: after the node caught up: %v %+v", i, err, w)
 		}
 	}
 	// The selector's own refusal is permanent: nothing the node does later
 	// changes the answer, so the intent fails and the caller learns now.
-	e := newEngine(t, NewMemStore(), utxo.NewSpentSet(""), &fakeNet{mode: "ok"}, coins())
-	e.Submit("w1", dst, 50_000_000, 1000)
-	if _, err := e.Process("w1"); err == nil || errors.Is(err, rpc.ErrTransient) {
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	e.Submit(context.Background(), "w1", dst, 50_000_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); err == nil || errors.Is(err, rpc.ErrTransient) {
 		t.Fatalf("insufficient funds: %v, want a permanent failure", err)
 	}
-	if w, _, _ := e.Store.Get("w1"); w.State != StateFailed {
+	if w, _, _ := e.Store.Get(context.Background(), "w1"); w.State != StateFailed {
 		t.Fatalf("insufficient funds left the intent %s, want failed", w.State)
 	}
 }
@@ -769,29 +770,29 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 		t.Fatal(err)
 	}
 	spentPath := filepath.Join(dir, "spent.json")
-	spent := utxo.NewSpentSet(spentPath)
+	spent := utxo.NewSpentSet(spentPath, nil)
 	e := newEngine(t, store, spent, &fakeNet{mode: "lost"}, coins())
 	// created: crash between Reserve (txA) and the Built save.
-	e.Submit("created", dst, 4_500_000, 1000)
+	e.Submit(context.Background(), "created", dst, 4_500_000, 1000)
 	if err := spent.Reserve([]types.UTXO{coins()[0]}, "created", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	// failed: the build failed and the release of txB never reached the disk.
-	e.Submit("failed", dst, 2_500_000, 1000)
+	e.Submit(context.Background(), "failed", dst, 2_500_000, 1000)
 	if err := spent.Reserve([]types.UTXO{coins()[1]}, "failed", time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	failed, _, _ := store.Get("failed")
+	failed, _, _ := store.Get(context.Background(), "failed")
 	failed.State = StateFailed
-	store.Put(failed)
+	store.Put(context.Background(), failed)
 	// ghost: an intent the store never saw (written by a process that lost its store).
 	if err := spent.Reserve([]types.UTXO{{TxID: txB, Vout: 7, Value: 1}}, "ghost", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	// built: a real Built intent on the one free coin, txC; broadcast reply lost.
-	e.Submit("built", dst, 500_000, 1000)
-	e.Process("built")
-	built, _, _ := store.Get("built")
+	e.Submit(context.Background(), "built", dst, 500_000, 1000)
+	e.Process(context.Background(), "built")
+	built, _, _ := store.Get(context.Background(), "built")
 	if built.State != StateBuilt || built.Inputs[0].TxID != txC {
 		t.Fatalf("setup: %+v", built)
 	}
@@ -803,18 +804,18 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fresh := utxo.NewSpentSet(spentPath)
+	fresh := utxo.NewSpentSet(spentPath, nil)
 	if got := fresh.ReservedIntents(); len(got) != 4 {
 		t.Fatalf("setup: reservations on disk %v, want built, created, failed, ghost", got)
 	}
 	net2 := &fakeNet{mode: "ok"}
 	e2 := newEngine(t, store2, fresh, net2, coins())
 	realBuildSign := e2.BuildSign
-	e2.BuildSign = func([]types.UTXO, string, int64, int64) (string, string, error) {
+	e2.BuildSign = func(context.Context, []types.UTXO, string, int64, int64) (string, string, error) {
 		t.Fatal("Recover built something")
 		return "", "", nil
 	}
-	err = e2.Recover()
+	err = e2.Recover(context.Background())
 	if !errors.Is(err, ErrUnknownReservation) || errors.Is(err, ErrHeld) || errors.Is(err, utxo.ErrPersist) {
 		t.Fatalf("recover: %v, want ErrUnknownReservation for ghost and neither ErrHeld nor ErrPersist", err)
 	}
@@ -831,21 +832,21 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	if !fresh.IsSpent(txC, 0) {
 		t.Fatal("the Built intent's input was released")
 	}
-	if b, _, _ := store2.Get("built"); b.State != StateBroadcast || len(net2.sent) != 1 || net2.sent[0] != built.RawHex {
+	if b, _, _ := store2.Get(context.Background(), "built"); b.State != StateBroadcast || len(net2.sent) != 1 || net2.sent[0] != built.RawHex {
 		t.Fatalf("built intent after recover: %+v sent %v", b, net2.sent)
 	}
-	if c, _, _ := store2.Get("created"); c.State != StateCreated {
+	if c, _, _ := store2.Get(context.Background(), "created"); c.State != StateCreated {
 		t.Fatalf("created intent is %s after recover; releasing its reservation must not change it", c.State)
 	}
 	// The released 5,000,000 coin is selectable again.
-	e2.Submit("next", dst, 4_500_000, 1000)
-	if w, err := e2.Process("next"); err != nil || w.Inputs[0].TxID != txA {
+	e2.Submit(context.Background(), "next", dst, 4_500_000, 1000)
+	if w, err := e2.Process(context.Background(), "next"); err != nil || w.Inputs[0].TxID != txA {
 		t.Fatalf("released input not reusable: %v %+v", err, w)
 	}
 	// The same file reloaded shows the releases were persisted: only ghost's
 	// reservation remains, and txA is spent under next's broadcast, not held
 	// for created.
-	reloaded := utxo.NewSpentSet(spentPath)
+	reloaded := utxo.NewSpentSet(spentPath, nil)
 	if got := reloaded.ReservedIntents(); len(got) != 1 || got[0] != "ghost" || !reloaded.IsSpent(txA, 0) || reloaded.IsSpent(txB, 0) {
 		t.Fatalf("on disk after recover: reservations %v, txA spent %v, txB spent %v", got, reloaded.IsSpent(txA, 0), reloaded.IsSpent(txB, 0))
 	}
@@ -857,17 +858,17 @@ type unreadableStore struct{ *MemStore }
 
 var errStoreDown = errors.New("database unreachable")
 
-func (u *unreadableStore) Get(string) (*Intent, bool, error) {
+func (u *unreadableStore) Get(context.Context, string) (*Intent, bool, error) {
 	return nil, false, errStoreDown
 }
 
 func TestRecoverKeepsReservationsWhenTheStoreCannotBeRead(t *testing.T) {
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	if err := spent.Reserve([]types.UTXO{coins()[0]}, "maybe-built", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	e := newEngine(t, &unreadableStore{NewMemStore()}, spent, &fakeNet{mode: "ok"}, coins())
-	err := e.Recover()
+	err := e.Recover(context.Background())
 	// The store's own error is what the operator must see; a read failure is
 	// not an unknown intent, so it must not be reported as one.
 	if !errors.Is(err, errStoreDown) || errors.Is(err, ErrUnknownReservation) {
@@ -884,25 +885,25 @@ func TestRecoverKeepsReservationsWhenTheStoreCannotBeRead(t *testing.T) {
 // says, with nothing exposed.
 type builtListFailingStore struct{ *MemStore }
 
-func (s *builtListFailingStore) List(states ...State) ([]*Intent, error) {
+func (s *builtListFailingStore) List(_ context.Context, states ...State) ([]*Intent, error) {
 	for _, st := range states {
 		if st == StateBuilt {
 			return nil, errors.New("database unreachable")
 		}
 	}
-	return s.MemStore.List(states...)
+	return s.MemStore.List(context.Background(), states...)
 }
 
 func TestRecoverNeverReleasesABuiltIntentsReservation(t *testing.T) {
 	store := &builtListFailingStore{NewMemStore()}
-	spent := utxo.NewSpentSet("")
+	spent := utxo.NewSpentSet("", nil)
 	e := newEngine(t, store, spent, &fakeNet{mode: "lost"}, coins())
-	e.Submit("w1", dst, 4_500_000, 1000)
-	e.Process("w1") // Built on txA, reply lost
-	if w, _, _ := store.Get("w1"); w.State != StateBuilt {
+	e.Submit(context.Background(), "w1", dst, 4_500_000, 1000)
+	e.Process(context.Background(), "w1") // Built on txA, reply lost
+	if w, _, _ := store.Get(context.Background(), "w1"); w.State != StateBuilt {
 		t.Fatalf("setup: %+v", w)
 	}
-	if err := e.Recover(); err == nil {
+	if err := e.Recover(context.Background()); err == nil {
 		t.Fatal("recover with a failing Built list returned nil")
 	}
 	if !spent.IsSpent(txA, 0) {

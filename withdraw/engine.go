@@ -28,6 +28,13 @@
 //	   ├──(selector transient: stay Created, attempt recorded, retry Build)
 //	   └──(cannot build)─┴──────────────────────► Failed
 //
+// Every method takes a context.Context. A context that ends is never a
+// verdict on a withdrawal: during Build it leaves the intent Created with
+// nothing reserved; during Broadcast it is a lost reply, so the intent stays
+// Built with its reservation renewed and Recover sends the same bytes after
+// a restart, exactly as for a timeout. Nothing a context can do releases a
+// Built intent's inputs, fails it, or builds a second transaction.
+//
 // Recover re-drives Built intents after a restart with the same bytes. It
 // never rebuilds. It also releases reservations held for intents that have
 // nothing built (a crash between the reservation and the Built save), so the
@@ -40,12 +47,14 @@
 package withdraw
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
@@ -95,34 +104,42 @@ type Intent struct {
 }
 
 // Store persists intents. Put must be durable before it returns: the engine
-// relies on "persisted, then broadcast" to make recovery safe.
+// relies on "persisted, then broadcast" to make recovery safe. The context
+// is the caller's; a database-backed store bounds its queries with it.
 type Store interface {
-	Get(id string) (*Intent, bool, error)
-	Put(intent *Intent) error
-	List(states ...State) ([]*Intent, error)
+	Get(ctx context.Context, id string) (*Intent, bool, error)
+	Put(ctx context.Context, intent *Intent) error
+	List(ctx context.Context, states ...State) ([]*Intent, error)
 }
 
 // Broadcaster sends a signed transaction and reports the outcome using the
-// rpc error kinds. *rpc.Client satisfies it.
+// rpc error kinds. *rpc.Client satisfies it. A context that ends during the
+// send must be reported as rpc.ErrUnknownOutcome or as the context's error,
+// never as rpc.ErrPermanent: the bytes may be in a mempool.
 type Broadcaster interface {
-	Broadcast(rawHex, txid string) (string, error)
+	Broadcast(ctx context.Context, rawHex, txid string) (string, error)
 }
 
 // Confirmer reports how many confirmations a transaction has (0 for mempool).
 // It is optional; without it intents stay in StateBroadcast.
 type Confirmer interface {
-	Confirmations(txid string) (int64, error)
+	Confirmations(ctx context.Context, txid string) (int64, error)
 }
 
 // Selector chooses inputs for an amount at a fee rate. It must honour the
 // engine's SpentSet (utxo.CoinSelector does) so reserved inputs are skipped.
-type Selector func(amount, feeRate int64) ([]types.UTXO, error)
+// An error that is rpc.ErrTransient, or the context's own error, leaves the
+// intent Created for a later Build; any other error fails it.
+type Selector func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error)
 
 // BuildSigner turns selected inputs into a signed transaction. tx.BuildAndSign
 // wrapped with the exchange's scripts and signer is the expected value; it
 // verifies every input against the node's rules before returning, so a
 // transaction the node would refuse fails Build and never reaches Broadcast.
-type BuildSigner func(inputs []types.UTXO, toAddress string, amount, feeRate int64) (rawHex, txid string, err error)
+// A signer that reaches another process honours the context; when it returns
+// the context's error nothing signed has reached the engine, the reservation
+// is released and the intent stays Created.
+type BuildSigner func(ctx context.Context, inputs []types.UTXO, toAddress string, amount, feeRate int64) (rawHex, txid string, err error)
 
 // Engine drives intents through the state machine.
 type Engine struct {
@@ -145,6 +162,10 @@ type Engine struct {
 	// default is long because Recover, not the clock, frees the reservations
 	// of intents that have nothing built.
 	ReservationTTL time.Duration
+
+	// Logger receives the conditions Recover finds and the release failures
+	// that are not returned. nil discards.
+	Logger *slog.Logger
 
 	mu sync.Mutex // serialises Build across intents so two cannot pick the same inputs between select and reserve
 }
@@ -186,6 +207,13 @@ const DefaultReservationTTL = 4 * time.Hour
 
 func (e *Engine) now() time.Time { return time.Now().UTC() }
 
+func (e *Engine) log() *slog.Logger { return logutil.Or(e.Logger) }
+
+// contextEnded reports whether err is, or wraps, a context's own error.
+func contextEnded(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func (e *Engine) reservationTTL() time.Duration {
 	if e.ReservationTTL > 0 {
 		return e.ReservationTTL
@@ -193,19 +221,19 @@ func (e *Engine) reservationTTL() time.Duration {
 	return DefaultReservationTTL
 }
 
-func (e *Engine) save(in *Intent) error {
+func (e *Engine) save(ctx context.Context, in *Intent) error {
 	in.UpdatedAt = e.now()
-	return e.Store.Put(in)
+	return e.Store.Put(ctx, in)
 }
 
 // Submit registers a withdrawal. Calling it again with the same id returns
 // the existing intent (created=false); with the same id and different
 // parameters it returns ErrConflict.
-func (e *Engine) Submit(id, address string, amount, feeRate int64) (intent *Intent, created bool, err error) {
+func (e *Engine) Submit(ctx context.Context, id, address string, amount, feeRate int64) (intent *Intent, created bool, err error) {
 	if id == "" || address == "" || amount <= 0 || feeRate <= 0 {
 		return nil, false, fmt.Errorf("%w: id=%q address=%q amount=%d feeRate=%d", ErrInvalidIntent, id, address, amount, feeRate)
 	}
-	if existing, ok, err := e.Store.Get(id); err != nil {
+	if existing, ok, err := e.Store.Get(ctx, id); err != nil {
 		return nil, false, err
 	} else if ok {
 		if existing.Address != address || existing.Amount != amount || existing.FeeRate != feeRate {
@@ -214,7 +242,7 @@ func (e *Engine) Submit(id, address string, amount, feeRate int64) (intent *Inte
 		return existing, false, nil
 	}
 	in := &Intent{ID: id, Address: address, Amount: amount, FeeRate: feeRate, State: StateCreated, CreatedAt: e.now()}
-	if err := e.save(in); err != nil {
+	if err := e.save(ctx, in); err != nil {
 		return nil, false, err
 	}
 	return in, true, nil
@@ -226,22 +254,26 @@ func (e *Engine) Submit(id, address string, amount, feeRate int64) (intent *Inte
 //
 // A selector error that is rpc.ErrTransient (the node behind its headers,
 // warming up, or unreachable) leaves the intent Created with the attempt
-// recorded and is returned for a later Build; nothing is reserved. Any other
-// selector error (insufficient funds, a wrong chain) fails the intent.
-func (e *Engine) Build(in *Intent) error {
+// recorded and is returned for a later Build; nothing is reserved. So does a
+// selector error returned once ctx has ended, whatever it says: the caller
+// stopped the attempt, and the intent is not judged on an attempt that was
+// stopped. Any other selector error (insufficient funds, a wrong chain) fails
+// the intent. A signer error is the same, except that the reservation taken
+// before signing is released.
+func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	if in.State != StateCreated {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	inputs, err := e.Select(in.Amount, in.FeeRate)
+	inputs, err := e.Select(ctx, in.Amount, in.FeeRate)
 	if err != nil {
 		err = fmt.Errorf("select inputs: %w", err)
-		if errors.Is(err, rpc.ErrTransient) {
-			return e.deferBuild(in, err)
+		if errors.Is(err, rpc.ErrTransient) || contextEnded(err) || ctx.Err() != nil {
+			return e.deferBuild(ctx, in, err)
 		}
-		return e.fail(in, err, false)
+		return e.fail(ctx, in, err, false)
 	}
 	if err := e.Spent.Reserve(inputs, in.ID, e.reservationTTL()); err != nil {
 		// Either another intent won the race for one of these inputs
@@ -249,12 +281,18 @@ func (e *Engine) Build(in *Intent) error {
 		// skips them now) or the spent set could not be written
 		// (utxo.ErrPersist; nothing is reserved and nothing is built until the
 		// disk is fixed). Not a failure of this intent.
-		return e.deferBuild(in, err)
+		return e.deferBuild(ctx, in, err)
 	}
-	rawHex, txid, err := e.BuildSign(inputs, in.Address, in.Amount, in.FeeRate)
+	rawHex, txid, err := e.BuildSign(ctx, inputs, in.Address, in.Amount, in.FeeRate)
 	if err != nil {
 		e.release(in)
-		return e.fail(in, fmt.Errorf("build and sign: %w", err), false)
+		err = fmt.Errorf("build and sign: %w", err)
+		if contextEnded(err) || ctx.Err() != nil {
+			// Nothing signed reached this process, so nothing can be on the
+			// network; the inputs are free again and the intent waits.
+			return e.deferBuild(ctx, in, err)
+		}
+		return e.fail(ctx, in, err, false)
 	}
 	in.RawHex, in.TxID = rawHex, txid
 	in.Inputs = in.Inputs[:0]
@@ -262,7 +300,7 @@ func (e *Engine) Build(in *Intent) error {
 		in.Inputs = append(in.Inputs, Outpoint{TxID: u.TxID, Vout: u.Vout, Value: u.Value, Address: u.Address})
 	}
 	in.State = StateBuilt
-	if err := e.save(in); err != nil {
+	if err := e.save(ctx, in); err != nil {
 		// Not durable, so it must not reach the network: release and report.
 		e.release(in)
 		in.State, in.RawHex, in.TxID, in.Inputs = StateCreated, "", "", nil
@@ -288,7 +326,12 @@ func (e *Engine) Build(in *Intent) error {
 // error is returned: the payment is out, this process refuses the inputs,
 // and Recover re-marks them from the intent store after a restart. Check
 // in.State when Broadcast returns an error.
-func (e *Engine) Broadcast(in *Intent) error {
+//
+// A context that ends during the send is a lost reply: the intent stays
+// Built, exactly as for an unknown outcome, whatever the Broadcaster wrapped
+// the context's error in. The check for it comes before the permanent branch
+// so no wrapping can turn a cancel into a failure and a release.
+func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	if in.State != StateBuilt {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
 	}
@@ -296,7 +339,7 @@ func (e *Engine) Broadcast(in *Intent) error {
 		return fmt.Errorf("%w: %s computed %s, node accepted %s", ErrHeld, in.ID, in.TxID, in.NodeTxID)
 	}
 	in.Attempts++
-	got, err := e.Broadcaster.Broadcast(in.RawHex, in.TxID)
+	got, err := e.Broadcaster.Broadcast(ctx, in.RawHex, in.TxID)
 	switch {
 	case err == nil:
 		in.State = StateBroadcast
@@ -306,10 +349,12 @@ func (e *Engine) Broadcast(in *Intent) error {
 			perr = fmt.Errorf("%s broadcast as %s, spent set not written: %w", in.ID, in.TxID, perr)
 			in.LastError = perr.Error()
 		}
-		if saveErr := e.save(in); saveErr != nil {
+		if saveErr := e.save(ctx, in); saveErr != nil {
 			return errors.Join(perr, saveErr)
 		}
 		return perr
+	case contextEnded(err):
+		return e.holdBuilt(ctx, in, err)
 	case errors.Is(err, rpc.ErrTxIDMismatch):
 		if got == "" {
 			// A Broadcaster that reports the kind without the node's txid
@@ -322,27 +367,27 @@ func (e *Engine) Broadcast(in *Intent) error {
 			err = errors.Join(err, perr)
 			in.LastError = err.Error()
 		}
-		if saveErr := e.save(in); saveErr != nil {
+		if saveErr := e.save(ctx, in); saveErr != nil {
 			return errors.Join(err, saveErr)
 		}
 		return err
 	case errors.Is(err, rpc.ErrPermanent):
 		e.release(in)
-		return e.fail(in, err, true)
+		return e.fail(ctx, in, err, true)
 	default:
 		// ErrUnknownOutcome or ErrTransient: the transaction may or may not be
 		// out. Keep the reservation, keep the bytes, report, retry later.
-		return e.holdBuilt(in, err)
+		return e.holdBuilt(ctx, in, err)
 	}
 }
 
 // deferBuild keeps a Created intent Created after a Build attempt that did
 // not settle it: the attempt and its cause are recorded and the cause is
 // returned for the caller to retry Build later. Nothing is reserved or built.
-func (e *Engine) deferBuild(in *Intent, cause error) error {
+func (e *Engine) deferBuild(ctx context.Context, in *Intent, cause error) error {
 	in.Attempts++
 	in.LastError = cause.Error()
-	if saveErr := e.save(in); saveErr != nil {
+	if saveErr := e.save(ctx, in); saveErr != nil {
 		return errors.Join(cause, saveErr)
 	}
 	return cause
@@ -352,7 +397,7 @@ func (e *Engine) deferBuild(in *Intent, cause error) error {
 // settle it: the reservation is renewed for another TTL so the inputs cannot
 // be selected by a later withdrawal while this one is unresolved, the cause
 // is recorded, and the cause is returned.
-func (e *Engine) holdBuilt(in *Intent, cause error) error {
+func (e *Engine) holdBuilt(ctx context.Context, in *Intent, cause error) error {
 	if rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {
 		// The reservation had expired and another withdrawal took an input.
 		// Do not release anything and do not fail this intent: its bytes may
@@ -360,7 +405,7 @@ func (e *Engine) holdBuilt(in *Intent, cause error) error {
 		cause = fmt.Errorf("%w: %v: %w", ErrReservationLost, rerr, cause)
 	}
 	in.LastError = cause.Error()
-	if saveErr := e.save(in); saveErr != nil {
+	if saveErr := e.save(ctx, in); saveErr != nil {
 		return errors.Join(cause, saveErr)
 	}
 	return cause
@@ -368,8 +413,8 @@ func (e *Engine) holdBuilt(in *Intent, cause error) error {
 
 // Process drives an intent from wherever it is to Broadcast in one call, or
 // returns the error that stopped it. Safe to call repeatedly.
-func (e *Engine) Process(id string) (*Intent, error) {
-	in, ok, err := e.Store.Get(id)
+func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
+	in, ok, err := e.Store.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -377,12 +422,12 @@ func (e *Engine) Process(id string) (*Intent, error) {
 		return nil, fmt.Errorf("%w: unknown intent %s", ErrInvalidIntent, id)
 	}
 	if in.State == StateCreated {
-		if err := e.Build(in); err != nil {
+		if err := e.Build(ctx, in); err != nil {
 			return in, err
 		}
 	}
 	if in.State == StateBuilt {
-		if err := e.Broadcast(in); err != nil {
+		if err := e.Broadcast(ctx, in); err != nil {
 			return in, err
 		}
 	}
@@ -403,14 +448,19 @@ func (e *Engine) Process(id string) (*Intent, error) {
 // them; each is logged and reported as ErrHeld so startup alerting sees it.
 // It attempts every intent and returns every error joined, so errors.Is
 // finds each kind.
-func (e *Engine) Recover() error {
+//
+// The passes over the spent set never touch the network and always run to
+// the end. The re-broadcast pass stops at the first Built intent once ctx
+// has ended: that intent and the rest stay Built, re-reserved, and are sent
+// by the next Recover. The context's error is among those returned.
+func (e *Engine) Recover(ctx context.Context) error {
 	var errs []error
 	note := func(err error) {
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	broadcast, err := e.Store.List(StateBroadcast)
+	broadcast, err := e.Store.List(ctx, StateBroadcast)
 	if err != nil {
 		return err
 	}
@@ -419,14 +469,14 @@ func (e *Engine) Recover() error {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
 	}
-	note(e.releaseOrphanReservations())
-	built, err := e.Store.List(StateBuilt)
+	note(e.releaseOrphanReservations(ctx))
+	built, err := e.Store.List(ctx, StateBuilt)
 	if err != nil {
 		return errors.Join(append(errs, err)...)
 	}
 	for _, in := range built {
 		if in.NodeTxID != "" {
-			log.Printf("[withdraw] recover %s: held, node accepted %s for computed %s; resolve by hand", in.ID, in.NodeTxID, in.TxID)
+			e.log().Warn("recover: intent held after a txid mismatch, resolve by hand", "intent", in.ID, "node_txid", in.NodeTxID, "txid", in.TxID)
 			if err := e.Spent.MarkBroadcastFor(e.inputs(in), in.NodeTxID, in.ID); err != nil {
 				note(fmt.Errorf("recover %s: %w", in.ID, err))
 			}
@@ -434,9 +484,13 @@ func (e *Engine) Recover() error {
 			continue
 		}
 		if err := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); err != nil {
-			log.Printf("[withdraw] recover %s: re-reserve: %v", in.ID, err)
+			e.log().Warn("recover: re-reserve failed", "intent", in.ID, "err", err)
 		}
-		if err := e.Broadcast(in); err != nil {
+		if err := ctx.Err(); err != nil {
+			note(fmt.Errorf("recover %s: not sent: %w", in.ID, err))
+			break
+		}
+		if err := e.Broadcast(ctx, in); err != nil {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
 	}
@@ -452,12 +506,12 @@ func (e *Engine) Recover() error {
 // (ErrUnknownReservation), as is one whose store read failed: a stale hold
 // is safe, a released input under a Built intent is not. Holds the Build
 // lock so an in-flight Build cannot look like an orphan.
-func (e *Engine) releaseOrphanReservations() error {
+func (e *Engine) releaseOrphanReservations(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	var errs []error
 	for _, id := range e.Spent.ReservedIntents() {
-		in, ok, err := e.Store.Get(id)
+		in, ok, err := e.Store.Get(ctx, id)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("recover %s: reservation kept, store read failed: %w", id, err))
 			continue
@@ -473,21 +527,21 @@ func (e *Engine) releaseOrphanReservations() error {
 			errs = append(errs, fmt.Errorf("recover %s: release orphan reservation: %w", id, err))
 			continue
 		}
-		log.Printf("[withdraw] recover %s: released the reservation of a %s intent, nothing built", id, in.State)
+		e.log().Info("recover: released the reservation of an intent with nothing built", "intent", id, "state", in.State)
 	}
 	return errors.Join(errs...)
 }
 
 // UpdateConfirmations refreshes a Broadcast intent's confirmation count and
 // marks it Confirmed at RequiredConfirmations. Requires a Confirmer.
-func (e *Engine) UpdateConfirmations(in *Intent) error {
+func (e *Engine) UpdateConfirmations(ctx context.Context, in *Intent) error {
 	if in.State != StateBroadcast {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
 	}
 	if e.Confirmer == nil {
 		return errors.New("withdraw: no Confirmer configured")
 	}
-	n, err := e.Confirmer.Confirmations(in.TxID)
+	n, err := e.Confirmer.Confirmations(ctx, in.TxID)
 	if err != nil {
 		return err
 	}
@@ -499,7 +553,7 @@ func (e *Engine) UpdateConfirmations(in *Intent) error {
 		// disk (spent inputs stay excluded; only pruning is delayed).
 		confirmErr = e.Spent.ConfirmSpentAll(e.inputs(in))
 	}
-	if err := e.save(in); err != nil {
+	if err := e.save(ctx, in); err != nil {
 		return errors.Join(confirmErr, err)
 	}
 	return confirmErr
@@ -510,17 +564,17 @@ func (e *Engine) UpdateConfirmations(in *Intent) error {
 // logged rather than returned.
 func (e *Engine) release(in *Intent) {
 	if err := e.Spent.Release(in.ID); err != nil {
-		log.Printf("[withdraw] %s: release reservation: %v", in.ID, err)
+		e.log().Warn("release reservation failed", "intent", in.ID, "err", err)
 	}
 }
 
-func (e *Engine) fail(in *Intent, cause error, keepTx bool) error {
+func (e *Engine) fail(ctx context.Context, in *Intent, cause error, keepTx bool) error {
 	in.State = StateFailed
 	in.LastError = cause.Error()
 	if !keepTx {
 		in.RawHex, in.TxID, in.Inputs = "", "", nil
 	}
-	if err := e.save(in); err != nil {
+	if err := e.save(ctx, in); err != nil {
 		return errors.Join(cause, err)
 	}
 	return cause
@@ -540,8 +594,8 @@ func (e *Engine) inputs(in *Intent) []types.UTXO {
 type RPCConfirmer struct{ Client *rpc.Client }
 
 // Confirmations implements Confirmer.
-func (c RPCConfirmer) Confirmations(txid string) (int64, error) {
-	raw, err := c.Client.Call("getrawtransaction", txid, true)
+func (c RPCConfirmer) Confirmations(ctx context.Context, txid string) (int64, error) {
+	raw, err := c.Client.Call(ctx, "getrawtransaction", txid, true)
 	if err == nil {
 		var v struct {
 			Confirmations int64 `json:"confirmations"`
@@ -552,7 +606,7 @@ func (c RPCConfirmer) Confirmations(txid string) (int64, error) {
 	} else if errors.Is(err, rpc.ErrTransient) {
 		return 0, err
 	}
-	out, err := c.Client.GetTxOut(txid, 0, true)
+	out, err := c.Client.GetTxOut(ctx, txid, 0, true)
 	if err != nil {
 		return 0, err
 	}

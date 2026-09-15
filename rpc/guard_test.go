@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -57,18 +58,18 @@ func (ct *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 // unknown outcome.
 func TestRemoteNodeRefusedUntilAllowed(t *testing.T) {
 	transport := &countingTransport{}
-	c := NewClient("https://10.0.0.5:33389", "u", "p")
+	c := NewClient("https://10.0.0.5:33389", "u", "p", nil)
 	c.client.Transport = transport
 
-	_, err := c.GetBlockCount()
+	_, err := c.GetBlockCount(context.Background())
 	if !errors.Is(err, ErrRemoteNode) || !errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) {
 		t.Fatalf("remote node: %v; want ErrRemoteNode (permanent)", err)
 	}
-	_, err = c.Broadcast("00", someTxID)
+	_, err = c.Broadcast(context.Background(), "00", someTxID)
 	if !errors.Is(err, ErrRemoteNode) || errors.Is(err, ErrUnknownOutcome) {
 		t.Fatalf("broadcast to a remote node: %v; want ErrRemoteNode, not an unknown outcome", err)
 	}
-	if err := c.RequireSynced(); !errors.Is(err, ErrRemoteNode) {
+	if err := c.RequireSynced(context.Background()); !errors.Is(err, ErrRemoteNode) {
 		t.Fatalf("RequireSynced on a remote node: %v; want ErrRemoteNode", err)
 	}
 	if n := atomic.LoadInt32(&transport.sent); n != 0 {
@@ -76,7 +77,7 @@ func TestRemoteNodeRefusedUntilAllowed(t *testing.T) {
 	}
 
 	c.AllowRemote = true
-	_, err = c.GetBlockCount()
+	_, err = c.GetBlockCount(context.Background())
 	if errors.Is(err, ErrRemoteNode) || !errors.Is(err, ErrTransient) {
 		t.Fatalf("with AllowRemote: %v; want the transport's failure (transient), not ErrRemoteNode", err)
 	}
@@ -92,26 +93,26 @@ func TestRemoteNodeRefusedUntilAllowed(t *testing.T) {
 // operator who did not intend a remote host learns that first.
 func TestPlaintextRemoteRefusedEvenWhenAllowed(t *testing.T) {
 	transport := &countingTransport{}
-	c := NewClient("http://10.0.0.5:33389", "u", "p")
+	c := NewClient("http://10.0.0.5:33389", "u", "p", nil)
 	c.client.Transport = transport
 
-	if _, err := c.GetBlockCount(); !errors.Is(err, ErrRemoteNode) || errors.Is(err, ErrPlaintextRemote) {
+	if _, err := c.GetBlockCount(context.Background()); !errors.Is(err, ErrRemoteNode) || errors.Is(err, ErrPlaintextRemote) {
 		t.Fatalf("plaintext remote without AllowRemote: %v; want ErrRemoteNode first", err)
 	}
 
 	c.AllowRemote = true
-	_, err := c.GetBlockCount()
+	_, err := c.GetBlockCount(context.Background())
 	if !errors.Is(err, ErrPlaintextRemote) || !errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) || errors.Is(err, ErrRemoteNode) {
 		t.Fatalf("plaintext remote with AllowRemote: %v; want ErrPlaintextRemote (permanent)", err)
 	}
-	_, err = c.Broadcast("00", someTxID)
+	_, err = c.Broadcast(context.Background(), "00", someTxID)
 	if !errors.Is(err, ErrPlaintextRemote) || errors.Is(err, ErrUnknownOutcome) {
 		t.Fatalf("broadcast over plaintext to a remote node: %v; want ErrPlaintextRemote, not an unknown outcome", err)
 	}
-	if err := c.RequireSynced(); !errors.Is(err, ErrPlaintextRemote) {
+	if err := c.RequireSynced(context.Background()); !errors.Is(err, ErrPlaintextRemote) {
 		t.Fatalf("RequireSynced over plaintext to a remote node: %v; want ErrPlaintextRemote", err)
 	}
-	if _, err := c.FeeRateShorsPerVB(6); !errors.Is(err, ErrPlaintextRemote) {
+	if _, err := c.FeeRateShorsPerVB(context.Background(), 6); !errors.Is(err, ErrPlaintextRemote) {
 		t.Fatalf("FeeRateShorsPerVB over plaintext to a remote node: %v; want ErrPlaintextRemote", err)
 	}
 	if n := atomic.LoadInt32(&transport.sent); n != 0 {
@@ -140,10 +141,10 @@ func TestSchemeAndHostCombinations(t *testing.T) {
 		{"http://user:pass@node.internal:33389", false, ErrPlaintextRemote},
 	} {
 		transport := &countingTransport{}
-		c := NewClient(tc.url, "u", "p")
+		c := NewClient(tc.url, "u", "p", nil)
 		c.client.Transport = transport
 		c.AllowRemote = true
-		_, err := c.GetBlockCount()
+		_, err := c.GetBlockCount(context.Background())
 		if tc.want != nil && !errors.Is(err, tc.want) {
 			t.Errorf("%s: %v; want %v", tc.url, err, tc.want)
 		}
@@ -171,8 +172,8 @@ func TestRedirectsAreNotFollowed(t *testing.T) {
 	}))
 	t.Cleanup(redirector.Close)
 
-	c := NewClient(redirector.URL, "u", "p")
-	n, err := c.GetBlockCount()
+	c := NewClient(redirector.URL, "u", "p", nil)
+	n, err := c.GetBlockCount(context.Background())
 	if err == nil || n == 99 {
 		t.Fatalf("redirect was followed: %d, %v", n, err)
 	}
@@ -190,7 +191,7 @@ func TestLoopbackNodeNeedsNoFlag(t *testing.T) {
 	if c.AllowRemote {
 		t.Fatal("test server client has AllowRemote set")
 	}
-	n, err := c.GetBlockCount()
+	n, err := c.GetBlockCount(context.Background())
 	if err != nil || n != 7 || len(*seen) != 1 {
 		t.Fatalf("loopback call: %d, %v, %d requests", n, err, len(*seen))
 	}

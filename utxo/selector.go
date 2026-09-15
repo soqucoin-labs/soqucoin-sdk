@@ -19,16 +19,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/internal/atomicfile"
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
-	"strings"
 )
 
 // MaxInputsPerTX is the hard cap on UTXO inputs per transaction.
@@ -127,21 +128,24 @@ type SpentSet struct {
 	mu       sync.Mutex
 	entries  map[SpentKey]SpentEntry
 	filePath string
+	log      *slog.Logger
 }
 
 // NewSpentSet creates a spent set. With an empty filePath it is in-memory
 // only. With a filePath it loads from disk and persists changes, but a file
 // that exists and cannot be read is logged and the set starts EMPTY, which
 // forgets every unconfirmed spend. Production code opens a file-backed set
-// with OpenSpentSet, which refuses that case.
-func NewSpentSet(filePath string) *SpentSet {
+// with OpenSpentSet, which refuses that case. logger receives load and
+// persist events; nil discards.
+func NewSpentSet(filePath string, logger *slog.Logger) *SpentSet {
 	ss := &SpentSet{
 		entries:  make(map[SpentKey]SpentEntry),
 		filePath: filePath,
+		log:      logutil.Or(logger),
 	}
 	if filePath != "" {
 		if err := ss.load(); err != nil {
-			log.Printf("[utxo] WARNING: %v; starting with an empty spent set", err)
+			ss.log.Warn("spent set unreadable, starting empty", "path", filePath, "err", err)
 		}
 	}
 	return ss
@@ -150,14 +154,16 @@ func NewSpentSet(filePath string) *SpentSet {
 // OpenSpentSet opens a file-backed spent set. A missing file is a first run
 // and is fine; a file that exists but cannot be read or parsed, or a
 // directory that cannot be created, is ErrSpentSetUnreadable, and the caller
-// must not start paying out on an empty set.
-func OpenSpentSet(filePath string) (*SpentSet, error) {
+// must not start paying out on an empty set. logger receives load and
+// persist events; nil discards.
+func OpenSpentSet(filePath string, logger *slog.Logger) (*SpentSet, error) {
 	if filePath == "" {
-		return nil, errors.New("utxo: OpenSpentSet needs a file path; use NewSpentSet(\"\") for an in-memory set")
+		return nil, errors.New("utxo: OpenSpentSet needs a file path; use NewSpentSet(\"\", nil) for an in-memory set")
 	}
 	ss := &SpentSet{
 		entries:  make(map[SpentKey]SpentEntry),
 		filePath: filePath,
+		log:      logutil.Or(logger),
 	}
 	if err := ss.load(); err != nil {
 		return nil, err
@@ -290,10 +296,7 @@ func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID s
 		}
 	}
 
-	if len(broadcastTxID) >= 12 {
-		log.Printf("[utxo] Spent set: added %d UTXOs from TX %s (total tracked: %d)",
-			len(inputs), shortID(broadcastTxID, 12), len(ss.entries))
-	}
+	ss.log.Info("spent set: inputs marked spent", "inputs", len(inputs), "txid", broadcastTxID, "tracked", len(ss.entries))
 
 	// The entries stay whatever persist says: the transaction is out and
 	// this process must keep refusing its inputs. The caller learns that a
@@ -362,7 +365,7 @@ func (ss *SpentSet) Prune() error {
 	}
 
 	if pruned > 0 {
-		log.Printf("[utxo] Spent set: pruned %d confirmed entries (remaining: %d)", pruned, len(ss.entries))
+		ss.log.Info("spent set: pruned confirmed entries", "pruned", pruned, "remaining", len(ss.entries))
 		return ss.persist()
 	}
 	return nil
@@ -423,7 +426,7 @@ func (ss *SpentSet) load() error {
 	data, err := os.ReadFile(ss.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[utxo] Spent set file not found (first run) — starting fresh")
+			ss.log.Info("spent set: no file yet, first run", "path", ss.filePath)
 			return nil
 		}
 		return fmt.Errorf("%w: %v", ErrSpentSetUnreadable, err)
@@ -449,8 +452,7 @@ func (ss *SpentSet) load() error {
 		loaded++
 	}
 
-	log.Printf("[utxo] Spent set loaded: %d entries from disk (%d expired, %d active)",
-		len(file.Entries), expired, loaded)
+	ss.log.Info("spent set loaded", "path", ss.filePath, "entries", len(file.Entries), "expired", expired, "active", loaded)
 	return nil
 }
 
@@ -631,14 +633,4 @@ func (cs *CoinSelector) SelectSmallestUTXOs(
 	}
 
 	return candidates, totalValue, nil
-}
-
-// shortID truncates an identifier for logging without panicking on short input.
-// Log formatting must never be able to crash the caller: these helpers sit on
-// error paths, and a panic there replaces a handled error with process death.
-func shortID(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

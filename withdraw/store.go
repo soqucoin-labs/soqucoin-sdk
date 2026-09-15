@@ -1,6 +1,7 @@
 package withdraw
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,7 +26,7 @@ type MemStore struct {
 func NewMemStore() *MemStore { return &MemStore{intents: map[string]*Intent{}} }
 
 // Get implements Store.
-func (m *MemStore) Get(id string) (*Intent, bool, error) {
+func (m *MemStore) Get(_ context.Context, id string) (*Intent, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	in, ok := m.intents[id]
@@ -37,7 +38,7 @@ func (m *MemStore) Get(id string) (*Intent, bool, error) {
 }
 
 // Put implements Store.
-func (m *MemStore) Put(in *Intent) error {
+func (m *MemStore) Put(_ context.Context, in *Intent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := *in
@@ -46,7 +47,7 @@ func (m *MemStore) Put(in *Intent) error {
 }
 
 // List implements Store.
-func (m *MemStore) List(states ...State) ([]*Intent, error) {
+func (m *MemStore) List(_ context.Context, states ...State) ([]*Intent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return filterSorted(m.intents, states), nil
@@ -57,7 +58,8 @@ func (m *MemStore) List(states ...State) ([]*Intent, error) {
 // place, then the directory is synced so the rename survives a power loss.
 // Suitable for a single process with modest volume; an exchange with a
 // database should implement Store over it instead and keep the same "durable
-// before broadcast" rule.
+// before broadcast" rule. The file stores ignore the context; a database
+// store bounds its queries with it.
 type FileStore struct {
 	mu      sync.Mutex
 	path    string
@@ -94,7 +96,7 @@ func NewFileStore(path string) (*FileStore, error) {
 }
 
 // Get implements Store.
-func (fs *FileStore) Get(id string) (*Intent, bool, error) {
+func (fs *FileStore) Get(_ context.Context, id string) (*Intent, bool, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	in, ok := fs.intents[id]
@@ -110,7 +112,7 @@ func (fs *FileStore) Get(id string) (*Intent, bool, error) {
 // fails the store keeps reporting the record it held before, so a caller that
 // treats the error as "not saved" and Get agree; the next successful Put
 // writes the whole store from memory again.
-func (fs *FileStore) Put(in *Intent) error {
+func (fs *FileStore) Put(_ context.Context, in *Intent) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	prev, had := fs.intents[in.ID]
@@ -143,7 +145,7 @@ func (fs *FileStore) write() error {
 }
 
 // List implements Store.
-func (fs *FileStore) List(states ...State) ([]*Intent, error) {
+func (fs *FileStore) List(_ context.Context, states ...State) ([]*Intent, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	return filterSorted(fs.intents, states), nil

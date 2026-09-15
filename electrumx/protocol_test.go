@@ -2,6 +2,7 @@ package electrumx
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,9 +131,9 @@ func firstParam(req request) string {
 
 func connect(t *testing.T, s *scriptedStub) *Client {
 	t.Helper()
-	c := NewClient(s.addr(), time.Hour)
+	c := NewClient(s.addr(), time.Hour, nil)
 	c.HRP = types.Stagenet.HRP
-	if err := c.Connect(); err != nil {
+	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	t.Cleanup(c.Stop)
@@ -159,11 +160,11 @@ func TestCallMatchesIDsAndRoutesNotifications(t *testing.T) {
 	})
 	c := connect(t, stub)
 
-	tip, err := c.GetTip()
+	tip, err := c.GetTip(context.Background())
 	if err != nil || tip != 100 {
 		t.Fatalf("GetTip: %d %v", tip, err)
 	}
-	res, err := c.Call("echo", []interface{}{})
+	res, err := c.Call(context.Background(), "echo", []interface{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +175,7 @@ func TestCallMatchesIDsAndRoutesNotifications(t *testing.T) {
 		t.Errorf("LastTip = %d, want 101 from the routed notification", got)
 	}
 	// The connection is still in sync: the next call gets its own reply.
-	res, err = c.Call("echo", []interface{}{})
+	res, err = c.Call(context.Background(), "echo", []interface{}{})
 	if err != nil || string(res) != `"real"` {
 		t.Fatalf("second call: %s %v", res, err)
 	}
@@ -217,7 +218,7 @@ func TestRefreshDoesNotShiftAddressesAcrossANotification(t *testing.T) {
 	if err := c.TrackAddresses([]string{a1, a2}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.RefreshAll(); err != nil {
+	if err := c.RefreshAll(context.Background()); err != nil {
 		t.Fatalf("RefreshAll: %v", err)
 	}
 	got1, got2 := c.GetUTXOs(a1), c.GetUTXOs(a2)
@@ -254,7 +255,7 @@ func TestMergeTakesFreshHeightAndValue(t *testing.T) {
 		mu.Lock()
 		height, value = h, v
 		mu.Unlock()
-		if err := c.RefreshAll(); err != nil {
+		if err := c.RefreshAll(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -293,7 +294,7 @@ func TestRefreshAllContinuesPastFailingAddress(t *testing.T) {
 	if err := c.TrackAddresses([]string{a1, a2}); err != nil {
 		t.Fatal(err)
 	}
-	err := c.RefreshAll()
+	err := c.RefreshAll(context.Background())
 	if err == nil || !strings.Contains(err.Error(), a1) {
 		t.Fatalf("error should name the failing address: %v", err)
 	}
@@ -328,7 +329,7 @@ func TestLastRefreshOfIsPerAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := time.Now()
-	if err := c.RefreshAll(); err == nil {
+	if err := c.RefreshAll(context.Background()); err == nil {
 		t.Fatal("expected the first pass to report the failing address")
 	}
 	if at, err := c.LastRefreshOf(a2); at.Before(before) || err != nil {
@@ -344,7 +345,7 @@ func TestLastRefreshOfIsPerAddress(t *testing.T) {
 	mu.Lock()
 	failFirst = false
 	mu.Unlock()
-	if err := c.RefreshAll(); err != nil {
+	if err := c.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if at, err := c.LastRefreshOf(a1); at.IsZero() || err != nil {
@@ -369,7 +370,7 @@ func TestTrackAddressesInfersAndEnforcesNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := NewClient("127.0.0.1:1", time.Hour)
+	c := NewClient("127.0.0.1:1", time.Hour, nil)
 	if err := c.TrackAddresses([]string{ssq}); err != nil {
 		t.Fatalf("infer: %v", err)
 	}
@@ -394,13 +395,13 @@ func TestTrackAddressesInfersAndEnforcesNetwork(t *testing.T) {
 // Calls before Connect and after Stop fail with a typed error instead of a
 // nil-pointer panic; Stop twice is a no-op.
 func TestNotConnectedAndIdempotentStop(t *testing.T) {
-	c := NewClient("127.0.0.1:1", time.Hour)
-	if _, err := c.Call("x", nil); !errors.Is(err, ErrNotConnected) {
+	c := NewClient("127.0.0.1:1", time.Hour, nil)
+	if _, err := c.Call(context.Background(), "x", nil); !errors.Is(err, ErrNotConnected) {
 		t.Errorf("call before Connect: %v", err)
 	}
 	c.Stop()
 	c.Stop()
-	if _, err := c.GetTip(); !errors.Is(err, ErrNotConnected) {
+	if _, err := c.GetTip(context.Background()); !errors.Is(err, ErrNotConnected) {
 		t.Errorf("call after Stop: %v", err)
 	}
 }
@@ -410,19 +411,19 @@ func TestConnectRejectsWrongGenesis(t *testing.T) {
 	stub := newScriptedStub(t, types.Mainnet.GenesisHash, func(req request) []string {
 		return []string{reply(req.ID, `null`)}
 	})
-	c := NewClient(stub.addr(), time.Hour)
+	c := NewClient(stub.addr(), time.Hour, nil)
 	c.HRP = types.Stagenet.HRP
-	err := c.Connect()
+	err := c.Connect(context.Background())
 	if !errors.Is(err, ErrGenesisMismatch) {
 		t.Fatalf("stagenet client accepted a mainnet indexer: %v", err)
 	}
-	if _, err := c.Call("x", nil); !errors.Is(err, ErrNotConnected) {
+	if _, err := c.Call(context.Background(), "x", nil); !errors.Is(err, ErrNotConnected) {
 		t.Errorf("a failed Connect must leave no usable connection: %v", err)
 	}
 	// Mainnet and regtest share an HRP, so a mainnet client accepts either.
-	c2 := NewClient(stub.addr(), time.Hour)
+	c2 := NewClient(stub.addr(), time.Hour, nil)
 	c2.HRP = types.Mainnet.HRP
-	if err := c2.Connect(); err != nil {
+	if err := c2.Connect(context.Background()); err != nil {
 		t.Fatalf("mainnet client refused a mainnet indexer: %v", err)
 	}
 	c2.Stop()
@@ -441,7 +442,7 @@ func TestReconnectConcurrentWithCallsIsSerialised(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				c.GetTip() // errors during a swap are acceptable; races are not
+				c.GetTip(context.Background()) // errors during a swap are acceptable; races are not
 			}
 		}()
 	}
@@ -449,13 +450,13 @@ func TestReconnectConcurrentWithCallsIsSerialised(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for j := 0; j < 5; j++ {
-			if err := c.Reconnect(); err != nil {
+			if err := c.Reconnect(context.Background()); err != nil {
 				t.Errorf("reconnect: %v", err)
 			}
 		}
 	}()
 	wg.Wait()
-	if tip, err := c.GetTip(); err != nil || tip != 7 {
+	if tip, err := c.GetTip(context.Background()); err != nil || tip != 7 {
 		t.Fatalf("after reconnects: %d %v", tip, err)
 	}
 }

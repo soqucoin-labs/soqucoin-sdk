@@ -21,7 +21,8 @@
 package main
 
 import (
-	"log"
+	"context"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -73,24 +74,26 @@ func requiredConfirmations(value int64) int64 {
 // credited a second time. In production, record the credit in the same
 // database transaction that moves the user's balance, keyed by txid:vout, or
 // a crash between the two will either double-credit or silently drop a deposit.
+//
+// The context is Scan's. A database-backed ledger passes it to every query.
 type memLedger struct {
 	mu       sync.Mutex
 	credited map[string]deposit.Deposit
 	final    map[string]bool
+	log      *slog.Logger
 }
 
 func key(txid string, vout uint32) string { return txid + ":" + string(rune('0'+vout)) }
 
-func (l *memLedger) Credit(d deposit.Deposit) error {
+func (l *memLedger) Credit(_ context.Context, d deposit.Deposit) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.credited[key(d.TxID, d.Vout)] = d
-	log.Printf("CREDIT %s:%d, %.8f SOQ to %s... (%d confirmations, node-verified)",
-		shortID(d.TxID, 12), d.Vout, float64(d.Value)/float64(types.ShorsPerSOQ), shortID(d.Address, 20), d.Confirmations)
+	l.log.Info("CREDIT", "txid", d.TxID, "vout", d.Vout, "shors", d.Value, "address", d.Address, "confirmations", d.Confirmations)
 	return nil
 }
 
-func (l *memLedger) IsCredited(txid string, vout uint32) (bool, error) {
+func (l *memLedger) IsCredited(_ context.Context, txid string, vout uint32) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	_, ok := l.credited[key(txid, vout)]
@@ -102,7 +105,7 @@ func (l *memLedger) IsCredited(txid string, vout uint32) (bool, error) {
 // wallet before it was final: the node reports a swept output and a
 // reorganised-away one the same way, gone, and Monitor would alarm the sweep
 // as a vanished deposit on every scan. This ledger never sweeps.
-func (l *memLedger) Pending() ([]deposit.Deposit, error) {
+func (l *memLedger) Pending(context.Context) ([]deposit.Deposit, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var out []deposit.Deposit
@@ -114,7 +117,7 @@ func (l *memLedger) Pending() ([]deposit.Deposit, error) {
 	return out, nil
 }
 
-func (l *memLedger) MarkFinal(txid string, vout uint32) error {
+func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.final[key(txid, vout)] = true
@@ -122,8 +125,18 @@ func (l *memLedger) MarkFinal(txid string, vout uint32) error {
 }
 
 func main() {
-	log.SetFlags(log.Ltime | log.Lmsgprefix)
-	log.SetPrefix("[exchange] ")
+	// One logger for the program and for every SDK component it builds; the
+	// SDK logs nothing unless it is given one.
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	fatal := func(msg string, err error) {
+		logger.Error(msg, "err", err)
+		os.Exit(1)
+	}
+
+	// The context ends on SIGINT or SIGTERM. Every network call below runs
+	// under it, so shutdown stops the polling and the scan loop together.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// In production, these come from your database (one per user).
 	depositAddresses := []string{
@@ -134,17 +147,17 @@ func main() {
 	// ── Indexer: discovery only ──
 	// The network is inferred from the addresses; mixed or undecodable
 	// addresses are refused here rather than silently never refreshed.
-	elx := electrumx.NewClient(electrumxHost, pollInterval)
+	elx := electrumx.NewClient(electrumxHost, pollInterval, logger)
 	elx.UseTLS() // the server sees every address you track; keep that off the wire in the clear
 	if err := elx.TrackAddresses(depositAddresses); err != nil {
-		log.Fatalf("track deposit addresses: %v", err)
+		fatal("track deposit addresses", err)
 	}
-	if err := elx.Connect(); err != nil { // verifies the server's genesis hash too
-		log.Fatalf("connect to ElectrumX at %s: %v", electrumxHost, err)
+	if err := elx.Connect(ctx); err != nil { // verifies the server's genesis hash too
+		fatal("connect to ElectrumX at "+electrumxHost, err)
 	}
 	defer elx.Stop()
-	elx.StartPolling()
-	log.Printf("tracking %d deposit addresses via %s", len(depositAddresses), electrumxHost)
+	elx.StartPolling(ctx)
+	logger.Info("tracking deposit addresses", "count", len(depositAddresses), "indexer", electrumxHost)
 
 	// ── Your node: the verdict ──
 	// The node must serve the chain the deposit addresses belong to;
@@ -153,52 +166,48 @@ func main() {
 	// against a regtest node set network = types.Regtest here.
 	network, err := address.NetworkOf(depositAddresses[0])
 	if err != nil {
-		log.Fatalf("deposit address network: %v", err)
+		fatal("deposit address network", err)
 	}
-	node := rpc.NewClient(nodeURL, os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"))
+	node := rpc.NewClient(nodeURL, os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"), logger)
 	node.Network = network
 
-	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}}
+	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}, log: logger}
 	monitor := &deposit.Monitor{
 		Cache:     elx,
 		Node:      node,
 		Network:   network,
 		Ledger:    ledger,
-		Addresses: func() []string { return depositAddresses },
+		Addresses: func(context.Context) []string { return depositAddresses },
 		Required:  requiredConfirmations,
 		OnAlert: func(kind deposit.AlertKind, msg string) {
 			// Every alert is a human's problem: page on it.
-			log.Printf("ALERT %s: %s", kind, msg)
+			logger.Error("ALERT", "kind", string(kind), "msg", msg)
 		},
+		Logger: logger,
 	}
 
-	go func() {
-		ticker := time.NewTicker(pollInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			credited, err := monitor.Scan()
-			if err != nil {
-				// deposit.ErrPaused while the node is syncing or the indexer is
-				// stale; nothing was credited. Node errors are returned as-is.
-				log.Printf("scan: %v", err)
-				continue
-			}
-			if len(credited) > 0 {
-				log.Printf("credited %d deposit(s) this pass", len(credited))
-			}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("stopping")
+			return
+		case <-ticker.C:
 		}
-	}()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-	log.Println("stopping")
-}
-
-// shortID truncates an identifier for display without panicking on short input.
-func shortID(s string, n int) string {
-	if len(s) <= n {
-		return s
+		// Each pass is bounded on its own, so one stalled node call cannot
+		// hold the loop past the poll interval.
+		passCtx, cancel := context.WithTimeout(ctx, pollInterval)
+		credited, err := monitor.Scan(passCtx)
+		cancel()
+		if err != nil {
+			// deposit.ErrPaused while the node is syncing or the indexer is
+			// stale; nothing was credited. Node errors are returned as-is.
+			logger.Warn("scan", "err", err)
+			continue
+		}
+		if len(credited) > 0 {
+			logger.Info("credited deposits this pass", "count", len(credited))
+		}
 	}
-	return s[:n]
 }
