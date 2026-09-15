@@ -145,10 +145,10 @@
       "id": "keystore-header-not-bound-into-the-aead",
       "file": "keys/keystore.go",
       "package": "./keys",
-      "test": "TestEveryHeaderFieldIsTamperEvident",
+      "test": "TestTheHeaderIsBoundIntoTheCiphertext",
       "find": "\taad, err := json.Marshal(ks)",
       "replace": "\taad, err := json.Marshal(ks.Version)",
-      "why": "The header is plaintext beside the ciphertext and is bound into the AEAD so an edit to it is a forgery. Without the binding the fields that do not feed the key derivation can be changed silently: the unencrypted public key list is what an operator reads to find the hot-wallet address, and swapping it sends a withdrawal to whoever edited the file."
+      "why": "The header is plaintext beside the ciphertext and is bound into the AEAD so that an edit to it is a forgery. Every individual field has a second guard, so removing the binding shows up nowhere in the refusals; what is lost is the property itself, that the file authenticates its own header rather than depending on five separate checks all remaining in place."
     },
     {
       "id": "keystore-version-1-opened-with-version-2-bound-data",
@@ -185,6 +185,24 @@
       "find": "\t\tVersion: keystoreVersion,",
       "replace": "\t\tVersion: keystoreVersionV1,",
       "why": "The header check runs on the way out as well as on the way in, so this package cannot write a file it would refuse to read. Without that, a writer and a reader that disagree produce a keystore nothing opens, and the disagreement surfaces on the next process start rather than at the save."
+    },
+    {
+      "id": "keystore-public-key-list-not-checked-against-the-keys",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestSwappedPublicKeyListIsRefused",
+      "find": "\t\tcase l.Address != k.Address:",
+      "replace": "\t\tcase k.Address != k.Address:",
+      "why": "The unencrypted public key list is what an operator or an external tool reads to find the address to send to. Version 2 binds it into the AEAD, but version 1 bound nothing, so this comparison against the decrypted records is the only thing that refuses a swapped address in a version 1 file, and a withdrawal goes to whoever edited it."
+    },
+    {
+      "id": "keystore-unknown-header-field-accepted",
+      "file": "keys/keys.go",
+      "package": "./keys",
+      "test": "TestUnknownHeaderFieldIsRefused",
+      "find": "\tdec.DisallowUnknownFields()",
+      "replace": "\t_ = dec",
+      "why": "What the AEAD binds is the canonical re-encoding of the fields this build knows. A field it does not know would be dropped on the way in and never authenticated, so the file would carry content the header's tamper-evidence does not cover."
     }
   ]
 }

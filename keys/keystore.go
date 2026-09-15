@@ -1,6 +1,7 @@
 package keys
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
@@ -13,9 +14,12 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
-// Keystore is the on-disk file. Everything outside Ciphertext is public and
-// is bound into the AEAD as additional data (headerAAD), so a header edited
-// after the file was written is refused as a forgery.
+// Keystore is the on-disk file. Everything outside Ciphertext is public. In
+// version 2 all of it is bound into the AEAD as additional data (headerAAD),
+// and load refuses a field it does not know, so a version 2 header edited
+// after the file was written is refused as a forgery. Version 1 bound none of
+// it, which is why load compares the public key list against the decrypted
+// records as well: that check holds for both formats.
 //
 // Version 1 (v0.3.6 and earlier) had no KDFParams and no additional data: its
 // Argon2id parameters were compiled into the reader, so changing them would
@@ -33,9 +37,9 @@ type Keystore struct {
 }
 
 // KDFParams are the Argon2id parameters the file was written with. They are
-// in the file so they can be raised without a format break, and they are
-// bound into the AEAD and floored below so that putting them in the file does
-// not hand an attacker who can write the file a way to weaken it.
+// in the file so they can be raised without a format break. They are bound
+// into the AEAD with the rest of the header, and held between a floor and a
+// ceiling whose separate reasons are given where those are declared.
 type KDFParams struct {
 	Time    uint32 `json:"t"`      // passes
 	Memory  uint32 `json:"m"`      // KiB
@@ -76,12 +80,21 @@ var defaultParams = KDFParams{Time: 3, Memory: 64 * 1024, Threads: 4, KeyLen: en
 // file carries no parameters; these are what it was written with.
 var v1Params = KDFParams{Time: 3, Memory: 64 * 1024, Threads: 4, KeyLen: encKeySize}
 
-// The floor and the ceiling on the parameters read from a file. The floor is
-// the downgrade guard: without it, moving the parameters into the header
-// would let whoever can write the file drop the work factor to nothing and
-// brute-force the passphrase offline at leisure. The ceiling is the other
-// direction, a header claiming 64 GiB of Argon2id memory is a memory bomb
-// against the process that opens it.
+// The floor and the ceiling on the parameters read from a file.
+//
+// The ceiling is load-bearing against a hostile file: check runs before
+// argon2.IDKey, so a header claiming 64 GiB of Argon2id memory is refused
+// rather than allocated by whatever opens the file.
+//
+// The floor is not, and it is worth writing down why, because the obvious
+// story for it is wrong. Editing the parameters down does not weaken a file:
+// they feed the derivation, so the edited file opens for no passphrase at
+// all, and an attacker guessing offline against their own copy would run
+// the parameters the file was really written with regardless of what its
+// header says. What the floor catches is a file that was legitimately
+// written weak, by an older writer, another implementation, or a future
+// configuration knob, and would otherwise open without a word while its
+// at-rest protection was worth far less than the operator believed.
 const (
 	minTime      = 3
 	maxTime      = 16
@@ -102,8 +115,8 @@ var (
 	ErrKeystoreHeader = errors.New("keys: keystore header rejected")
 
 	// ErrKDFParams marks Argon2id parameters outside the range this package
-	// accepts. Below the floor is the downgrade attack; above the ceiling is
-	// a memory bomb.
+	// accepts: below the floor, a file whose at-rest protection is worth less
+	// than its holder believes; above the ceiling, a memory bomb.
 	ErrKDFParams = errors.New("keys: keystore KDF parameters outside the accepted range")
 
 	// ErrKDFMismatch marks a keystore written under the other key source: a
@@ -115,7 +128,34 @@ var (
 	// ErrExternalKeySize marks a key handed to NewManagerWithKey that is not
 	// ExternalKeySize bytes.
 	ErrExternalKeySize = errors.New("keys: external key must be 32 bytes")
+
+	// ErrPubKeyList marks a keystore whose unencrypted public key list does
+	// not describe the keys the ciphertext holds. That list is what an
+	// operator or an external tool reads to find an address to send to, so a
+	// file where the two disagree is refused rather than served.
+	ErrPubKeyList = errors.New("keys: the keystore's public key list does not match the keys it holds")
 )
+
+// checkPubKeyList compares the file's unencrypted public key list against the
+// records that came out of the ciphertext. Version 2 binds the list into the
+// AEAD, so this is a second line there; version 1 bound nothing, so it is the
+// only line.
+func checkPubKeyList(listed []KeyPair, held []plaintextKey) error {
+	if len(listed) != len(held) {
+		return fmt.Errorf("%w: %d listed, %d held", ErrPubKeyList, len(listed), len(held))
+	}
+	for i, k := range held {
+		switch l := listed[i]; {
+		case l.Address != k.Address:
+			return fmt.Errorf("%w: entry %d lists %s, holds %s", ErrPubKeyList, i, l.Address, k.Address)
+		case !bytes.Equal(l.PublicKey, k.PublicKey):
+			return fmt.Errorf("%w: entry %d lists another public key for %s", ErrPubKeyList, i, k.Address)
+		case l.Index != k.Index:
+			return fmt.Errorf("%w: entry %d lists index %d, holds %d", ErrPubKeyList, i, l.Index, k.Index)
+		}
+	}
+	return nil
+}
 
 // check enforces the floor and the ceiling on parameters read from a file.
 // Every path that derives a key from Argon2id parameters goes through
@@ -181,11 +221,23 @@ func upgradeV1(ks *Keystore) error {
 }
 
 // headerAAD is the additional data the AEAD binds: every field of the file
-// except the ciphertext, in the encoding the file itself uses. It is derived
-// from the Keystore value rather than from a hand-written list of fields so
-// that a field added to the header later is bound without anyone having to
-// remember to bind it; TestHeaderAADBindsEveryHeaderField enumerates the
-// struct and fails if one is missing.
+// except the ciphertext, canonicalised by marshalling the Keystore value.
+//
+// The bound bytes are therefore a function of this struct's definition, and
+// that is a constraint on every later release, not a convenience. Add a field
+// to Keystore and the encoding changes, so a build carrying the new field
+// computes different additional data for a file written without it and every
+// version 2 keystore in existence stops opening. The field set of version 2
+// is frozen: a new header field means a new format version with its own
+// reader, and keeping the old one able to open old files.
+//
+// Two tests hold that line. TestHeaderAADIsFrozenForVersion2 pins the exact
+// bytes for a known header, and TestKeystoreFieldSetIsFrozen fails on any
+// change to the struct, so the decision is forced at the point of the edit
+// rather than discovered by an integrator whose keys have become unreadable.
+// load refuses unknown fields for the same reason: what is bound is the
+// canonical re-encoding of this field set, so a file carrying anything else
+// is not a file this reader can honestly authenticate.
 //
 // Version 1 wrote no additional data and is opened with none (aadFor). What
 // binding buys over version 1's accident: there, editing the salt produced a
@@ -253,6 +305,10 @@ func (m *Manager) deriveKey(ks *Keystore) ([]byte, error) {
 		// whole burden of never repeating on the nonce.
 		return hkdf.Key(sha256.New, m.extKey, ks.Salt, hkdfInfo, encKeySize)
 	default:
+		// Not reachable while kdfName returns one of the two constants and
+		// the comparison above has passed. Go needs the arm, and an
+		// unreachable arm that returns an error is the right thing to put
+		// in it.
 		return nil, fmt.Errorf("%w: unknown kdf %q", ErrKeystoreHeader, ks.KDF)
 	}
 }

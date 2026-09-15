@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -250,7 +251,7 @@ func TestKeySourceMismatchIsNamed(t *testing.T) {
 // Version 1 is passphrase-only, so a manager holding an external key is told
 // that rather than left to fail on the decryption.
 func TestV1KeystoreRefusedByAnExternalKeyManager(t *testing.T) {
-	path := copyFixture(t)
+	path := copyFixture(t, v1FixturePath)
 	if err := newManagerWithKey(t, path, testExternalKey(t, "vault key")).Load(); !errors.Is(err, ErrKDFMismatch) {
 		t.Errorf("external-key manager on a version 1 keystore: %v, want ErrKDFMismatch", err)
 	}
@@ -294,54 +295,97 @@ func TestKDFParamsOutsideTheRangeAreRefused(t *testing.T) {
 	}
 }
 
-// Every field of the header is bound into the AEAD, so an edit to any of them
-// is refused. The list below is the enumeration of the header's fields: the
-// last case checks it against the struct so a field added later cannot be
-// left off it.
+// Every field of the header is refused when it is edited, and this records
+// which mechanism does the refusing, because they are not the same strength
+// and only one case turns out to rest on the binding alone. Editing the salt
+// or the parameters changes the derived key; editing the nonce or the
+// ciphertext changes the message; the version and the KDF are read by the
+// header check; and the public key list is compared against the decrypted
+// records, which is the check that also covers version 1. What is left for
+// the additional data alone is a file that claims to be version 1 in order to
+// be opened with none. For a case marked byBinding the test proves the claim
+// rather than asserting it, by showing the edited header still passes the
+// header check and still derives the same key.
+//
+// The binding is therefore defence in depth for every field but that one.
+// That is worth keeping and worth stating: it makes "the header is
+// authenticated" one property of the format instead of a conclusion drawn
+// from five separate checks all staying in place.
+//
+// The declared field list is compared against the edit that was actually
+// made, so a case cannot claim to cover a field it leaves alone.
+const (
+	byHeaderCheck = "the header check"
+	byDerivedKey  = "a different derived key"
+	byMessage     = "a different message"
+	byListCheck   = "the public key list check"
+	byBinding     = "the bound header"
+)
+
 func TestEveryHeaderFieldIsTamperEvident(t *testing.T) {
 	covered := map[string]bool{}
 	for _, tc := range []struct {
-		field string
-		name  string
-		edit  func(h map[string]any)
-		wants error
+		fields []string
+		name   string
+		by     string
+		edit   func(h map[string]any)
+		wants  error
 	}{
-		{"version", "an unknown version", func(h map[string]any) { h["version"] = 3 }, ErrKeystoreVersion},
-		{"version", "claimed to be version 1", func(h map[string]any) {
+		{[]string{"version"}, "an unknown version", byHeaderCheck,
+			func(h map[string]any) { h["version"] = 3 }, ErrKeystoreVersion},
+		{[]string{"version", "kdfparams"}, "claimed to be version 1", byBinding, func(h map[string]any) {
 			h["version"] = 1
 			delete(h, "kdfparams")
 		}, nil},
-		{"kdf", "another key source", func(h map[string]any) {
+		{[]string{"kdf", "kdfparams"}, "another key source", byHeaderCheck, func(h map[string]any) {
 			h["kdf"] = KDFHKDFSHA256
 			delete(h, "kdfparams")
 		}, ErrKDFMismatch},
-		{"kdf", "an unknown kdf", func(h map[string]any) { h["kdf"] = "pbkdf2" }, ErrKeystoreHeader},
-		{"kdfparams", "parameters changed within the accepted range", func(h map[string]any) {
-			h["kdfparams"].(map[string]any)["t"] = maxTime
-		}, nil},
-		{"salt", "another salt", func(h map[string]any) { h["salt"] = flipFirstByte(t, h["salt"]) }, nil},
-		{"salt", "a short salt", func(h map[string]any) { h["salt"] = "" }, ErrKeystoreHeader},
-		{"nonce", "another nonce", func(h map[string]any) { h["nonce"] = flipFirstByte(t, h["nonce"]) }, nil},
-		{"nonce", "a short nonce", func(h map[string]any) { h["nonce"] = "" }, ErrKeystoreHeader},
-		{"ciphertext", "an edited ciphertext", func(h map[string]any) { h["ciphertext"] = flipFirstByte(t, h["ciphertext"]) }, nil},
-		{"pubkeys", "the operator's copy of the address swapped", func(h map[string]any) {
-			h["pubkeys"].([]any)[0].(map[string]any)["address"] = v1FixtureAddresses[0]
-		}, nil},
+		{[]string{"kdf"}, "an unknown kdf", byHeaderCheck,
+			func(h map[string]any) { h["kdf"] = "pbkdf2" }, ErrKeystoreHeader},
+		{[]string{"kdfparams"}, "parameters changed within the accepted range", byDerivedKey,
+			func(h map[string]any) { h["kdfparams"].(map[string]any)["t"] = maxTime }, nil},
+		{[]string{"salt"}, "another salt", byDerivedKey,
+			func(h map[string]any) { h["salt"] = flipFirstByte(t, h["salt"]) }, nil},
+		{[]string{"salt"}, "a short salt", byHeaderCheck,
+			func(h map[string]any) { h["salt"] = "" }, ErrKeystoreHeader},
+		{[]string{"nonce"}, "another nonce", byMessage,
+			func(h map[string]any) { h["nonce"] = flipFirstByte(t, h["nonce"]) }, nil},
+		{[]string{"nonce"}, "a short nonce", byHeaderCheck,
+			func(h map[string]any) { h["nonce"] = "" }, ErrKeystoreHeader},
+		{[]string{"ciphertext"}, "an edited ciphertext", byMessage,
+			func(h map[string]any) { h["ciphertext"] = flipFirstByte(t, h["ciphertext"]) }, nil},
+		{[]string{"pubkeys"}, "the operator's copy of the address swapped", byListCheck,
+			func(h map[string]any) {
+				h["pubkeys"].([]any)[0].(map[string]any)["address"] = v1FixtureAddresses[0]
+			}, nil},
 	} {
-		covered[tc.field] = true
+		for _, f := range tc.fields {
+			covered[f] = true
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "keys.enc")
-			saveOneKey(t, NewManager(path, "pw"))
-			editHeader(t, path, tc.edit)
 			m := NewManager(path, "pw")
-			err := m.Load()
+			saveOneKey(t, m)
+			before := readKeystore(t, path)
+
+			editHeader(t, path, tc.edit)
+			if got := changedFields(t, path, before); !reflect.DeepEqual(got, sorted(tc.fields)) {
+				t.Fatalf("the edit changed %v, the case declares %v", got, sorted(tc.fields))
+			}
+			if tc.by == byBinding {
+				assertRefusedOnlyByTheBinding(t, path, before, m)
+			}
+
+			loader := NewManager(path, "pw")
+			err := loader.Load()
 			if err == nil {
-				t.Fatal("Load accepted an edited keystore")
+				t.Fatalf("Load accepted an edited keystore (expected refusal by %s)", tc.by)
 			}
 			if tc.wants != nil && !errors.Is(err, tc.wants) {
 				t.Fatalf("Load: %v, want %v", err, tc.wants)
 			}
-			if m.KeyCount() != 0 {
+			if loader.KeyCount() != 0 {
 				t.Error("manager holds keys after a refused Load")
 			}
 		})
@@ -353,6 +397,87 @@ func TestEveryHeaderFieldIsTamperEvident(t *testing.T) {
 			t.Errorf("header field %q has no tamper case in this test", tag)
 		}
 	}
+}
+
+// assertRefusedOnlyByTheBinding establishes that nothing except the additional
+// data can be what refuses this edit: the edited header passes the header
+// check, and it derives the same encryption key as the file did before the
+// edit. Remove the binding and the file would open.
+func assertRefusedOnlyByTheBinding(t *testing.T, path string, before Keystore, m *Manager) {
+	t.Helper()
+	after := readKeystore(t, path)
+	normalise := func(ks Keystore) *Keystore {
+		if ks.Version == keystoreVersionV1 {
+			if err := upgradeV1(&ks); err != nil {
+				t.Fatalf("the edited header is not readable at all: %v", err)
+			}
+		}
+		return &ks
+	}
+	edited, original := normalise(after), normalise(before)
+	if err := checkHeader(edited); err != nil {
+		t.Fatalf("the edited header is refused by the header check, so this case does not test the binding: %v", err)
+	}
+	wantKey, err := m.deriveKey(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotKey, err := m.deriveKey(edited)
+	if err != nil {
+		t.Fatalf("the edited header derives no key, so this case does not test the binding: %v", err)
+	}
+	if !bytes.Equal(gotKey, wantKey) {
+		t.Fatal("the edited header derives a different key, so this case does not test the binding")
+	}
+}
+
+// changedFields is the sorted set of top-level header fields whose value
+// differs from before, so a case's declared field list is checked against the
+// edit it actually performed.
+func changedFields(t *testing.T, path string, before Keystore) []string {
+	t.Helper()
+	asMap := func(v any) map[string]any {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after map[string]any
+	if err := json.Unmarshal(data, &after); err != nil {
+		t.Fatal(err)
+	}
+	was := asMap(before)
+	names := map[string]bool{}
+	for k := range was {
+		names[k] = true
+	}
+	for k := range after {
+		names[k] = true
+	}
+	var changed []string
+	for k := range names {
+		a, _ := json.Marshal(was[k])
+		b, _ := json.Marshal(after[k])
+		if !bytes.Equal(a, b) {
+			changed = append(changed, k)
+		}
+	}
+	return sorted(changed)
+}
+
+func sorted(in []string) []string {
+	out := append([]string(nil), in...)
+	slices.Sort(out)
+	return out
 }
 
 // Reformatting the file changes no value, so it must still open: the bound
@@ -373,43 +498,32 @@ func TestReformattingTheFileKeepsItReadable(t *testing.T) {
 	}
 }
 
-// headerAAD is derived from the Keystore value rather than a hand-written
-// list, so that a field added to the header later is bound without anyone
-// remembering to bind it. This is the check that it stays that way.
-func TestHeaderAADBindsEveryHeaderField(t *testing.T) {
-	ks := Keystore{
+// The ciphertext value is the one thing not repeated in the bound data: the
+// AEAD already covers it as the message, and repeating it would double the
+// file. Which fields are bound, and in what encoding, is pinned by
+// TestHeaderAADIsFrozenForVersion2 against exact bytes; this is the one
+// property of headerAAD that a golden vector states less clearly than an
+// assertion.
+func TestTheCiphertextIsNotBoundAsWellAsSealed(t *testing.T) {
+	ciphertext := bytes.Repeat([]byte{3}, 64)
+	aad, err := headerAAD(Keystore{
 		Version:    keystoreVersion,
 		KDF:        KDFArgon2id,
 		KDFParams:  &KDFParams{Time: 3, Memory: 64 * 1024, Threads: 4, KeyLen: 32},
 		Salt:       bytes.Repeat([]byte{1}, saltSize),
 		Nonce:      bytes.Repeat([]byte{2}, nonceSize),
-		Ciphertext: bytes.Repeat([]byte{3}, 64),
+		Ciphertext: ciphertext,
 		PubKeys:    []KeyPair{{PublicKey: bytes.Repeat([]byte{4}, PublicKeySize), Address: v1FixtureAddresses[0]}},
-	}
-	aad, err := headerAAD(ks)
+	})
 	if err != nil {
 		t.Fatalf("headerAAD: %v", err)
 	}
-	typ := reflect.TypeFor[Keystore]()
-	for i := range typ.NumField() {
-		tag := jsonName(typ.Field(i))
-		if !strings.Contains(string(aad), `"`+tag+`"`) {
-			t.Errorf("header field %q is not in the bound data", tag)
-		}
-	}
-	// The ciphertext is the one field that is not bound: the AEAD covers it
-	// as the message, and repeating it here would double the file's size.
-	ct, err := json.Marshal(ks.Ciphertext)
+	ct, err := json.Marshal(ciphertext)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(aad, ct) {
 		t.Error("the ciphertext is in the bound data as well as in the message")
-	}
-	for _, p := range []string{`"t"`, `"m"`, `"p"`, `"keylen"`} {
-		if !strings.Contains(string(aad), p) {
-			t.Errorf("KDF parameter %s is not in the bound data", p)
-		}
 	}
 }
 
@@ -423,10 +537,22 @@ func TestSaveWritesAHeaderItWouldAccept(t *testing.T) {
 		"external key": newManagerWithKey(t, filepath.Join(dir, "ext.enc"), testExternalKey(t, "vault key")),
 	} {
 		t.Run(name, func(t *testing.T) {
-			saveOneKey(t, m)
+			addr, _ := saveOneKey(t, m)
 			ks := readKeystore(t, m.keyFile)
 			if err := checkHeader(&ks); err != nil {
-				t.Fatalf("Save wrote a header Load refuses: %v", err)
+				t.Fatalf("Save wrote a header the header check refuses: %v", err)
+			}
+			// The header check is run by Save on the same values, so the
+			// assertion above cannot fire on its own. Reading the file back
+			// through a fresh manager is what makes the claim in the name
+			// true: it exercises the parser, the unknown-field refusal, the
+			// derivation and the AEAD against bytes that went to disk.
+			reader := readerFor(t, name, m.keyFile)
+			if err := reader.Load(); err != nil {
+				t.Fatalf("Save wrote a keystore Load refuses: %v", err)
+			}
+			if !reader.HasKey(addr) {
+				t.Error("the reloaded keystore does not hold the key that was saved")
 			}
 		})
 	}
@@ -540,7 +666,7 @@ func TestV1KeystoreYieldsTheSameKeysAndAddresses(t *testing.T) {
 // Reading a version 1 file does not rewrite it; the next Save does, in
 // version 2, under the same passphrase, and the keys come back unchanged.
 func TestV1KeystoreIsRewrittenAsV2OnTheNextSave(t *testing.T) {
-	path := copyFixture(t)
+	path := copyFixture(t, v1FixturePath)
 
 	m := NewManager(path, v1FixturePassphrase)
 	if err := m.Load(); err != nil {
@@ -602,7 +728,7 @@ func TestMalformedV1HeaderIsRefused(t *testing.T) {
 		{"no kdf at all", func(h map[string]any) { delete(h, "kdf") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			path := copyFixture(t)
+			path := copyFixture(t, v1FixturePath)
 			editHeader(t, path, tc.edit)
 			m := NewManager(path, v1FixturePassphrase)
 			if err := m.Load(); !errors.Is(err, ErrKeystoreHeader) {
@@ -615,15 +741,15 @@ func TestMalformedV1HeaderIsRefused(t *testing.T) {
 	}
 }
 
-// copyFixture puts a writable copy of the version 1 fixture in a temporary
+// copyFixture puts a writable copy of a committed fixture in a temporary
 // directory, so a test that saves over it does not edit the committed file.
-func copyFixture(t *testing.T) string {
+func copyFixture(t *testing.T, fixture string) string {
 	t.Helper()
-	data, err := os.ReadFile(v1FixturePath)
+	data, err := os.ReadFile(fixture)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	path := filepath.Join(t.TempDir(), "keystore-v1.json")
+	path := filepath.Join(t.TempDir(), filepath.Base(fixture))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write fixture copy: %v", err)
 	}
@@ -679,4 +805,257 @@ func flipFirstByte(t *testing.T, v any) string {
 // jsonName is the name a struct field is written under in the keystore file.
 func jsonName(f reflect.StructField) string {
 	return strings.Split(f.Tag.Get("json"), ",")[0]
+}
+
+// The bound data is a function of the Keystore struct's definition, so the
+// version 2 field set is frozen: adding a field changes the canonical
+// encoding and every version 2 keystore already written stops opening under
+// the new build. This test fails on any change to the struct, so that
+// decision is taken at the edit rather than discovered by an integrator whose
+// keys have become unreadable. A new header field means a new format version.
+func TestKeystoreFieldSetIsFrozen(t *testing.T) {
+	want := []struct{ name, tag, typ string }{
+		{"Version", "version", "int"},
+		{"KDF", "kdf", "string"},
+		{"KDFParams", "kdfparams,omitempty", "*keys.KDFParams"},
+		{"Salt", "salt", "[]uint8"},
+		{"Nonce", "nonce", "[]uint8"},
+		{"Ciphertext", "ciphertext", "[]uint8"},
+		{"PubKeys", "pubkeys", "[]keys.KeyPair"},
+	}
+	typ := reflect.TypeFor[Keystore]()
+	if typ.NumField() != len(want) {
+		t.Fatalf("Keystore has %d fields, want %d; see the comment on headerAAD", typ.NumField(), len(want))
+	}
+	for i, w := range want {
+		f := typ.Field(i)
+		if f.Name != w.name || f.Tag.Get("json") != w.tag || f.Type.String() != w.typ {
+			t.Errorf("field %d is %s %s `json:%q`, want %s %s `json:%q`",
+				i, f.Name, f.Type, f.Tag.Get("json"), w.name, w.typ, w.tag)
+		}
+	}
+}
+
+// The exact bytes the AEAD binds for a known version 2 header. A change here
+// is a change to the format, whatever produced it: a renamed tag, a reordered
+// field, a different encoding of a byte slice. Paired with
+// TestKeystoreFieldSetIsFrozen and the committed version 2 fixture, this is
+// what keeps a later release able to open the files this one wrote.
+func TestHeaderAADIsFrozenForVersion2(t *testing.T) {
+	ks := Keystore{
+		Version:    keystoreVersion,
+		KDF:        KDFArgon2id,
+		KDFParams:  &KDFParams{Time: 3, Memory: 65536, Threads: 4, KeyLen: 32},
+		Salt:       bytes.Repeat([]byte{0xA1}, saltSize),
+		Nonce:      bytes.Repeat([]byte{0xB2}, nonceSize),
+		Ciphertext: bytes.Repeat([]byte{0xC3}, 8),
+		PubKeys:    []KeyPair{},
+	}
+	const want = `{"version":2,"kdf":"argon2id","kdfparams":{"t":3,"m":65536,"p":4,"keylen":32},` +
+		`"salt":"oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE=",` +
+		`"nonce":"srKysrKysrKysrKy","ciphertext":null,"pubkeys":[]}`
+	got, err := headerAAD(ks)
+	if err != nil {
+		t.Fatalf("headerAAD: %v", err)
+	}
+	if string(got) != want {
+		t.Errorf("version 2 bound data changed.\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// A field this build does not know is refused rather than dropped. Dropping it
+// would leave it in the file unauthenticated while the header claimed to be
+// tamper-evident.
+func TestUnknownHeaderFieldIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.enc")
+	saveOneKey(t, NewManager(path, "pw"))
+	editHeader(t, path, func(h map[string]any) { h["note"] = "added after the fact" })
+
+	m := NewManager(path, "pw")
+	if err := m.Load(); err == nil {
+		t.Fatal("Load accepted a keystore carrying an unknown field")
+	}
+	if m.KeyCount() != 0 {
+		t.Error("manager holds keys after a refused Load")
+	}
+}
+
+// The attack this closes for version 1, which bound nothing: the unencrypted
+// list is what an operator reads to find the address to send to, so swapping
+// an address in it sends a withdrawal to whoever edited the file. Version 2
+// refuses the edit at the AEAD; version 1 has only this check, so the test
+// runs against both.
+func TestSwappedPublicKeyListIsRefused(t *testing.T) {
+	other, err := GenerateKeyForNetwork("ssq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		path func(t *testing.T) (string, *Manager)
+		edit func(h map[string]any)
+	}{
+		{"version 1, the address swapped", v1Keystore,
+			func(h map[string]any) { h["pubkeys"].([]any)[0].(map[string]any)["address"] = other.Address }},
+		{"version 1, an entry dropped", v1Keystore,
+			func(h map[string]any) { h["pubkeys"] = h["pubkeys"].([]any)[:1] }},
+		{"version 1, the index rewritten", v1Keystore,
+			func(h map[string]any) { h["pubkeys"].([]any)[1].(map[string]any)["index"] = 7 }},
+		{"version 2, the address swapped", v2Keystore,
+			func(h map[string]any) { h["pubkeys"].([]any)[0].(map[string]any)["address"] = other.Address }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, m := tc.path(t)
+			editHeader(t, path, tc.edit)
+			if err := m.Load(); err == nil {
+				t.Fatal("Load accepted a keystore whose public key list does not match its keys")
+			}
+			if m.KeyCount() != 0 {
+				t.Error("manager holds keys after a refused Load")
+			}
+		})
+	}
+}
+
+// v1Keystore is a writable copy of the committed version 1 fixture and a
+// manager for it; v2Keystore is a freshly written version 2 keystore and a
+// manager for it. Both return a manager that has not loaded yet.
+func v1Keystore(t *testing.T) (string, *Manager) {
+	t.Helper()
+	path := copyFixture(t, v1FixturePath)
+	return path, NewManager(path, v1FixturePassphrase)
+}
+
+func v2Keystore(t *testing.T) (string, *Manager) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "keys.enc")
+	writer := NewManager(path, "pw")
+	for _, label := range []string{"list check 0", "list check 1"} {
+		seed := sha256.Sum256([]byte(label))
+		kp, err := FromSeed("ssq", seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Save(); err != nil {
+		t.Fatal(err)
+	}
+	return path, NewManager(path, "pw")
+}
+
+// The committed version 2 keystore, written by this release. Every other
+// version 2 test saves and loads inside one binary, so the bound data is
+// self-consistent by construction and a change to the format would go
+// unnoticed. This one is a file from outside the running build, which is the
+// only shape that catches it. If this test fails, a keystore an integrator
+// already holds has stopped opening.
+const (
+	v2FixturePath       = "testdata/keystore-v2.json"
+	v2FixturePassphrase = "fixture passphrase, not a secret"
+)
+
+var v2FixtureLabels = []string{
+	"soqucoin-sdk keystore v2 fixture 0",
+	"soqucoin-sdk keystore v2 fixture 1",
+}
+
+var v2FixtureAddresses = []string{
+	"ssq1pdyjusanmt7wmr20enheql9afnwymxsmj02e36044mwgwk0msc6nsf3ndns",
+	"ssq1pqc55t04la8nr0k6xf6zwxylr4eapeycuwls67p0rjxy55jss56ls0gtp52",
+}
+
+func TestV2KeystoreFromAnEarlierBuildStillOpens(t *testing.T) {
+	on := readKeystore(t, v2FixturePath)
+	if on.Version != keystoreVersion {
+		t.Fatalf("fixture version = %d, want %d", on.Version, keystoreVersion)
+	}
+	if on.KDF != KDFArgon2id || on.KDFParams == nil || *on.KDFParams != defaultParams {
+		t.Fatalf("fixture kdf = %q params = %+v", on.KDF, on.KDFParams)
+	}
+
+	m := NewManager(v2FixturePath, v2FixturePassphrase)
+	if err := m.Load(); err != nil {
+		t.Fatalf("Load of the version 2 fixture: %v", err)
+	}
+	if got := m.GetAddresses(); !reflect.DeepEqual(got, v2FixtureAddresses) {
+		t.Fatalf("addresses = %v, want %v", got, v2FixtureAddresses)
+	}
+	for i, label := range v2FixtureLabels {
+		want, err := FromSeed("ssq", sha256.Sum256([]byte(label)))
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		if want.Address != v2FixtureAddresses[i] {
+			t.Fatalf("seed %d derives %s, want %s", i, want.Address, v2FixtureAddresses[i])
+		}
+		got, err := m.ExportPrivateKey(want.Address)
+		if err != nil {
+			t.Fatalf("ExportPrivateKey %s: %v", want.Address, err)
+		}
+		if !bytes.Equal(got, want.PrivateKey) {
+			t.Errorf("key %d from the version 2 fixture is not the key the seed derives", i)
+		}
+	}
+}
+
+// readerFor is a second manager for a keystore written by one of the two key
+// sources in TestSaveWritesAHeaderItWouldAccept.
+func readerFor(t *testing.T, source, path string) *Manager {
+	t.Helper()
+	if source == "external key" {
+		return newManagerWithKey(t, path, testExternalKey(t, "vault key"))
+	}
+	return NewManager(path, "pw")
+}
+
+// The binding is in force in the file Save writes, checked against the
+// ciphertext itself rather than inferred from a refusal that another guard
+// might also produce: the sealed message opens under the header's additional
+// data, and under nothing else.
+func TestTheHeaderIsBoundIntoTheCiphertext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.enc")
+	m := NewManager(path, "pw")
+	saveOneKey(t, m)
+	ks := readKeystore(t, path)
+
+	open := func(aad []byte) error {
+		key, err := m.deriveKey(&ks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gcm, err := openAEAD(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = gcm.Open(nil, ks.Nonce, ks.Ciphertext, aad)
+		return err
+	}
+
+	aad, err := headerAAD(ks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := open(aad); err != nil {
+		t.Fatalf("the ciphertext does not open under the header it was written with: %v", err)
+	}
+	if err := open(nil); err == nil {
+		t.Error("the ciphertext opens with no additional data; the header is not bound")
+	}
+
+	altered := ks
+	altered.PubKeys = append([]KeyPair(nil), ks.PubKeys...)
+	altered.PubKeys[0].Address = v1FixtureAddresses[0]
+	other, err := headerAAD(altered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(other, aad) {
+		t.Fatal("changing the public key list did not change the bound data")
+	}
+	if err := open(other); err == nil {
+		t.Error("the ciphertext opens under an altered header; the header is not bound")
+	}
 }

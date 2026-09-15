@@ -867,7 +867,7 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
 | `electrumx` | **85.9%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
 | `tx` | **80.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
-| `keys` | **87.8%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
+| `keys` | **89.0%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **82.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `resilience` | **62.1%** | Circuit breaker transitions and classification, reconciler against the node |
 

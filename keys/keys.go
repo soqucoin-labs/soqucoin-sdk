@@ -67,21 +67,25 @@ func (k KeyPair) String() string {
 // a KeyPair where a struct dump can reach it that way.
 func (k KeyPair) Format(f fmt.State, verb rune) { io.WriteString(f, k.String()) }
 
-// plaintextKeys is the decrypted inner structure.
+// plaintextKey is one decrypted record. plaintextKeys is what the ciphertext
+// holds.
+type plaintextKey struct {
+	PrivateKey []byte `json:"sk"`
+	PublicKey  []byte `json:"pk"`
+	Address    string `json:"addr"`
+	Index      uint32 `json:"index"`
+}
+
 type plaintextKeys struct {
-	Keys []struct {
-		PrivateKey []byte `json:"sk"`
-		PublicKey  []byte `json:"pk"`
-		Address    string `json:"addr"`
-		Index      uint32 `json:"index"`
-	} `json:"keys"`
+	Keys []plaintextKey `json:"keys"`
 }
 
 // Manager manages Dilithium keypairs with encrypted storage.
 //
 // Exactly one of passwd and extKey is the key source: NewManager sets passwd
-// and leaves extKey nil, NewManagerWithKey the reverse. deriveKey is the only
-// reader of either.
+// and leaves extKey nil, NewManagerWithKey the reverse. kdfName is the one
+// place that decides which of the two a manager holds, and deriveKey the one
+// place either is read as a secret.
 type Manager struct {
 	mu      sync.RWMutex
 	keys    []KeyPair
@@ -266,8 +270,14 @@ func (m *Manager) load(create bool) error {
 		return m.saveLocked()
 	}
 
+	// Unknown fields are refused rather than dropped. What the AEAD binds is
+	// the canonical re-encoding of the fields this build knows (headerAAD),
+	// so a field it does not know would sit in the file unauthenticated while
+	// the header claimed to be tamper-evident.
 	var ks Keystore
-	if err := json.Unmarshal(data, &ks); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ks); err != nil {
 		return fmt.Errorf("parse keystore: %w", err)
 	}
 
@@ -322,6 +332,16 @@ func (m *Manager) load(create bool) error {
 		}
 	}
 
+	// The unencrypted public key list is the part of the file an operator or
+	// an external tool reads, and it is the part that decides where money is
+	// sent. Version 2 binds it into the AEAD, but version 1 bound nothing, so
+	// checking it against the decrypted records here is the one test that
+	// holds for both formats. A list that disagrees with the keys is refused:
+	// whichever of the two is wrong, the file is not describing itself.
+	if err := checkPubKeyList(ks.PubKeys, pk.Keys); err != nil {
+		return err
+	}
+
 	m.keys = make([]KeyPair, len(pk.Keys))
 	for i, k := range pk.Keys {
 		m.keys[i] = KeyPair{
@@ -345,19 +365,13 @@ func (m *Manager) Save() error {
 // saveLocked is Save with the lock held by the caller.
 func (m *Manager) saveLocked() error {
 	// Serialize key material
+	// plaintextKey is KeyPair's fields under the tags the ciphertext uses, so
+	// the conversion is the whole mapping. A field added to either type stops
+	// it compiling, which is the point at which the two formats should be
+	// thought about rather than kept in step by hand.
 	pk := plaintextKeys{}
 	for _, k := range m.keys {
-		pk.Keys = append(pk.Keys, struct {
-			PrivateKey []byte `json:"sk"`
-			PublicKey  []byte `json:"pk"`
-			Address    string `json:"addr"`
-			Index      uint32 `json:"index"`
-		}{
-			PrivateKey: k.PrivateKey,
-			PublicKey:  k.PublicKey,
-			Address:    k.Address,
-			Index:      k.Index,
-		})
+		pk.Keys = append(pk.Keys, plaintextKey(k))
 	}
 
 	// A version 2 header for this manager's key source, with a fresh salt and

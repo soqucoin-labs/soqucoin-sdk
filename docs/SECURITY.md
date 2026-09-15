@@ -126,19 +126,29 @@ non-pointer, and a `KeyPair` behind an unexported struct field. Do not hold a
 A version 2 keystore carries its own KDF identifier and, for Argon2id, the
 parameters it was written with (time 3, 64 MiB memory, 4 threads, a 32-byte
 derived key). They are in the file so they can be raised later without a format
-break; putting them there is only safe with the two rules below.
+break; putting them there is only safe with the rules below.
 
-- **A floor and a ceiling.** Parameters weaker than the defaults are refused
-  (`keys.ErrKDFParams`), so nobody can weaken a keystore by editing its header
-  and then guess the passphrase cheaply offline. A header claiming more memory
-  than a gigabyte is refused for the other reason: it is a memory bomb aimed at
-  whatever opens the file.
+- **A ceiling, against a hostile file.** A header claiming more memory than a
+  gigabyte is refused before Argon2id is asked to run with it, so it cannot be
+  used as a memory bomb against whatever opens the file.
+- **A floor, against a weak one.** Parameters below time 3, 64 MiB and a
+  32-byte derived key are refused (`keys.ErrKDFParams`). This is not a defence
+  against someone editing your header: the parameters feed the derivation, so
+  an edited file simply stops opening, and anyone guessing offline against a
+  stolen copy would use the parameters it was really written with. What the
+  floor catches is a file that was legitimately written weak, and would
+  otherwise open without a word while its protection was worth less than you
+  believed.
 - **The header is authenticated.** Everything in the file except the
   ciphertext is bound into AES-GCM as additional data: the version, the KDF and
   its parameters, the salt, the nonce, and the unencrypted list of public keys
-  and addresses. An edit to any of it is refused as a forgery. That is what
-  protects the address list an operator reads out of the file to find the
-  hot-wallet address.
+  and addresses. A field this release does not recognise is refused rather than
+  ignored, so there is nothing in the file the binding does not cover.
+- **The address list is checked against the keys.** The unencrypted list is
+  what you read to find an address to send to, so it is compared with the
+  records that come out of the ciphertext, and a file where the two disagree is
+  refused (`keys.ErrPubKeyList`). Version 1 authenticated nothing, so on a
+  version 1 keystore this check carries that list on its own.
 
 Version 1 keystores, written by v0.3.6 and earlier, are read as before and
 rewritten as version 2 by the next `Save`. Nothing is required of you; opening
