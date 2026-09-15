@@ -128,12 +128,20 @@ func (r *Reconciler) Start(ctx context.Context) {
 		case <-r.stopCh:
 			return
 		}
+		// A timer and the context can be ready together and select picks
+		// either; a run must not start once the context has ended.
+		if ctx.Err() != nil {
+			return
+		}
 		r.Run(ctx)
 		ticker := time.NewTicker(r.cfg.Interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
 				r.Run(ctx)
 			case <-ctx.Done():
 				return
@@ -154,6 +162,10 @@ func (r *Reconciler) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
 // was not found wrong, and a shutdown must not page the operator or halt the
 // next start. A run the context ends after it has recorded a mismatch alerts
 // and trips like any other: what it found is real whatever ended it.
+//
+// Whether the context ended is read from ctx itself, not from the error
+// chain: a source or node cut off by the cancel may report the failure in
+// its own words, without wrapping the context's error.
 func (r *Reconciler) Run(ctx context.Context) Report {
 	rep := r.reconcile(ctx)
 	if r.OnReport != nil {
@@ -163,7 +175,7 @@ func (r *Reconciler) Run(ctx context.Context) Report {
 		r.log.Info("reconciliation clean", "outpoints", rep.Checked, "node_total_shors", rep.NodeTotal)
 		return rep
 	}
-	if len(rep.Findings) == 0 && (errors.Is(rep.Incomplete, context.Canceled) || errors.Is(rep.Incomplete, context.DeadlineExceeded)) {
+	if len(rep.Findings) == 0 && (ctx.Err() != nil || errors.Is(rep.Incomplete, context.Canceled) || errors.Is(rep.Incomplete, context.DeadlineExceeded)) {
 		r.log.Warn("reconciliation not completed: the context ended", "err", rep.Incomplete)
 		return rep
 	}

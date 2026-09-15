@@ -250,9 +250,9 @@ func TestFailedWriteClosesTheConnection(t *testing.T) {
 	c := connect(t, stub)
 
 	// The write fails; the deadline before it succeeded.
-	c.connMu.Lock()
+	c.lockConnBlocking()
 	c.conn = failingWriteConn{c.conn}
-	c.connMu.Unlock()
+	c.unlockConn()
 	if _, err := c.Call(context.Background(), "anything", []interface{}{}); !errors.Is(err, errWriteCut) {
 		t.Fatalf("write on the failing connection: %v, want the write error", err)
 	}
@@ -267,9 +267,9 @@ func TestFailedWriteClosesTheConnection(t *testing.T) {
 	}
 
 	// The socket refuses a deadline: closed underneath the client.
-	c.connMu.Lock()
+	c.lockConnBlocking()
 	c.conn.Close()
-	c.connMu.Unlock()
+	c.unlockConn()
 	if _, err := c.Call(context.Background(), "anything", []interface{}{}); err == nil {
 		t.Fatal("a call on a closed socket succeeded")
 	}

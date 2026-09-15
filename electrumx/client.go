@@ -25,7 +25,8 @@
 //	balance := client.GetBalance(1, tipHeight)
 //
 // Every method that reaches the server takes a context.Context first. A call
-// whose context ends returns ctx.Err() at once: the connection deadline is
+// whose context ends returns ctx.Err() at once, whether it is waiting for the
+// connection behind another call or holds it: the connection deadline is
 // moved to now so the blocked write or read returns. A call cut short while
 // waiting for a reply that has not begun to arrive leaves the connection
 // usable, and the reply, if it arrives later, carries an id the next call
@@ -64,12 +65,16 @@ import (
 // and provides battle-tested UTXO caching with merge-based refresh
 // (Defense 12) that preserves spend-pending state across poll cycles.
 type Client struct {
-	mu           sync.RWMutex
-	utxos        map[string][]types.UTXO // address -> UTXOs
-	host         string
-	conn         net.Conn      // guarded by connMu
-	reader       *bufio.Reader // guarded by connMu
-	connMu       sync.Mutex    // PF-018b: Serializes all TCP I/O and connection replacement
+	mu     sync.RWMutex
+	utxos  map[string][]types.UTXO // address -> UTXOs
+	host   string
+	conn   net.Conn      // guarded by connSem
+	reader *bufio.Reader // guarded by connSem
+	// connSem is a one-slot semaphore: PF-018b, it serializes all TCP I/O and
+	// connection replacement. A channel rather than a mutex so that a caller
+	// queued behind a stalled exchange leaves the queue when its own context
+	// ends (lockConn) instead of waiting out the other call's deadline.
+	connSem      chan struct{}
 	reqID        atomic.Int64
 	lastTip      atomic.Int64 // latest height seen in a headers.subscribe reply or notification
 	addresses    []string
@@ -185,8 +190,29 @@ func NewClient(host string, pollInterval time.Duration, logger *slog.Logger) *Cl
 		host:         host,
 		pollInterval: pollInterval,
 		stopCh:       make(chan struct{}),
+		connSem:      make(chan struct{}, 1),
 	}
 }
+
+// lockConn takes the connection semaphore or returns ctx.Err() when the
+// context ends first. The caller must release with unlockConn on success.
+func (c *Client) lockConn(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.connSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// lockConnBlocking takes the connection semaphore without a context: for
+// Stop, which must close the socket whatever else is happening.
+func (c *Client) lockConnBlocking() { c.connSem <- struct{}{} }
+
+func (c *Client) unlockConn() { <-c.connSem }
 
 // dial opens the transport. Keepalive is set on the TCP connection underneath
 // any TLS layer, so it survives the wrapping.
@@ -234,8 +260,10 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 // NAT/firewall timeouts silently kill the connection after ~4h on DigitalOcean
 // droplets. TCP keepalive at 30s prevents this.
 //
-// The connection is replaced under connMu, the same lock every call holds, so
-// a Reconnect from the polling goroutine can never race a caller mid-request.
+// The connection is replaced under the connection lock, the same lock every
+// call holds, so a Reconnect from the polling goroutine can never race a
+// caller mid-request. A context that ends while a call holds the lock ends
+// Connect too, and the new connection is closed unused.
 // After the version handshake the server's genesis hash is checked against the
 // chains the client's HRP belongs to (see verifyGenesisLocked): an indexer for
 // the wrong chain would otherwise report "no deposits" forever.
@@ -245,8 +273,11 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	if err := c.lockConn(ctx); err != nil {
+		conn.Close()
+		return err
+	}
+	defer c.unlockConn()
 
 	if c.conn != nil {
 		c.conn.Close()
@@ -332,9 +363,13 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (j
 }
 
 func (c *Client) call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
-	// PF-018b FIX: Serialize TCP I/O.
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	// PF-018b FIX: Serialize TCP I/O. A caller whose context ends while
+	// another call holds the connection returns here, not after that call's
+	// deadline.
+	if err := c.lockConn(ctx); err != nil {
+		return nil, err
+	}
+	defer c.unlockConn()
 	return c.callLocked(ctx, method, params)
 }
 
@@ -342,7 +377,7 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (j
 // it first.
 const callDeadline = 30 * time.Second
 
-// callLocked performs one request/reply exchange. Caller holds connMu.
+// callLocked performs one request/reply exchange. Caller holds the connection lock.
 //
 // The reply is identified by id, never by position. Lines carrying a method
 // are server notifications (headers.subscribe pushes one at every new block)
@@ -379,7 +414,7 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 	}
 
 	// One deadline covers the write and the read: a stalled peer must not be
-	// able to hold connMu, and every other caller behind it, forever. The
+	// able to hold the connection, and every caller behind it, forever. The
 	// context ends the exchange through the same deadline, moved to now when
 	// the context is done; it is not copied into the deadline up front,
 	// because the socket's timer and the context's timer would then fire
@@ -391,17 +426,26 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	// If the context ends while the call is in flight the callback moves the
-	// deadline to now. On return the callback is stopped, or, when it has
-	// already started, waited for: connMu is still held here, so it cannot
-	// run after the next call has set its own deadline.
+	// deadline to now. A socket that refuses the deadline is closed instead,
+	// which returns the blocked read the same way, and is dropped once the
+	// exchange has returned. On return the callback is stopped, or, when it
+	// has already started, waited for: the connection lock is still held
+	// here, so it cannot run after the next call has set its own deadline.
 	fired := make(chan struct{})
+	var closedByCtx atomic.Bool
 	stop := context.AfterFunc(ctx, func() {
 		defer close(fired)
-		conn.SetDeadline(time.Now())
+		if err := conn.SetDeadline(time.Now()); err != nil {
+			closedByCtx.Store(true)
+			conn.Close()
+		}
 	})
 	defer func() {
 		if !stop() {
 			<-fired
+		}
+		if closedByCtx.Load() && c.conn == conn {
+			c.dropLocked()
 		}
 	}()
 	// ctxErr reports the context's error in place of the deadline error the
@@ -458,7 +502,7 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 	return nil, fmt.Errorf("electrumx: no reply to request %d within %d lines", id, maxSkippedLines)
 }
 
-// dropLocked closes and forgets the connection. Caller holds connMu. The next
+// dropLocked closes and forgets the connection. Caller holds the connection lock. The next
 // call returns ErrNotConnected until Reconnect, or the polling loop, dials again.
 func (c *Client) dropLocked() {
 	if c.conn != nil {
@@ -549,8 +593,9 @@ func (c *Client) TrackAddresses(addresses []string) error {
 // 5-minute MaxCacheAge, about 300 seconds divided by the round trip.
 //
 // When ctx ends mid-pass the pass stops there: the addresses reached keep
-// their new records, the rest keep their old ones, and the error names the
-// first address not refreshed.
+// their new records, the rest keep their old ones, and the error names one
+// address, the one whose call was cut short or, between calls, the first not
+// attempted.
 func (c *Client) RefreshAll(ctx context.Context) error {
 	c.mu.RLock()
 	addrs := make([]string, len(c.addresses))
@@ -577,6 +622,12 @@ func (c *Client) RefreshAll(ctx context.Context) error {
 			c.refreshed[addr] = rec
 		}
 		c.mu.Unlock()
+		// A context that ended during this address's call is already named
+		// through its error; the pass stops here rather than naming the next
+		// address as well.
+		if err != nil && ctx.Err() != nil {
+			break
+		}
 	}
 	err := errors.Join(errs...)
 
@@ -731,6 +782,11 @@ func (c *Client) StartPolling(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
+				// The tick and the context can be ready together and select
+				// picks either; no refresh starts once the context has ended.
+				if ctx.Err() != nil {
+					return
+				}
 				if err := c.RefreshAll(ctx); err != nil {
 					consecutiveErrors++
 					c.log.Warn("refresh failed", "consecutive", consecutiveErrors, "err", err)
@@ -759,8 +815,8 @@ func (c *Client) StartPolling(ctx context.Context) {
 // more than once; calls after Stop return ErrNotConnected.
 func (c *Client) Stop() {
 	c.stopOnce.Do(func() { close(c.stopCh) })
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	c.lockConnBlocking()
+	defer c.unlockConn()
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil

@@ -923,7 +923,7 @@ if you go lower than the relay floor.
 // Ask the node for an estimate at a 6-block target. The result is already in
 // shors per vByte, rounded up, and clamped to [types.RecommendedFeeRate,
 // tx.MaxFeeRateShorsPerVB], so it is a rate the builders accept.
-est, err := rpcClient.FeeRateShorsPerVB(6)
+est, err := rpcClient.FeeRateShorsPerVB(ctx, 6)
 if err != nil {
     return err // rpc.ErrTransient, rpc.ErrPermanent, or types.ErrAmountFormat for a reply without a numeric fee rate
 }
@@ -959,7 +959,7 @@ small, _, err := selector.SelectSmallestUTXOs(elx.GetAllUTXOs(), utxo.MaxInputsP
 if errors.Is(err, utxo.ErrNoCandidates) {
     return nil // nothing final to consolidate
 }
-verified, err := node.VerifyAndFilterUTXOs(small, elx.EvictUTXO, elx.SetAssetType) // Defense 11
+verified, err := node.VerifyAndFilterUTXOs(ctx, small, elx.EvictUTXO, elx.SetAssetType) // Defense 11
 // ...
 sweep, err := tx.BuildSignedSweep(verified, hotWalletSPK, feeRate, keystore)
 ```
