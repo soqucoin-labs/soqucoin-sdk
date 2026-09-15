@@ -41,6 +41,14 @@ mutants:
 branch:
 	python3 scripts/check-branch.py
 
+# mutants rewrites a source file in place for the length of one test run, so
+# nothing else may read the tree at the same time. Under `make -j` the
+# prerequisites below would otherwise run against mutated source and report a
+# result about code nobody wrote. GNU Make before 4.4 ignores the prerequisites
+# of .NOTPARALLEL and serialises the whole file, which is the intent here
+# anyway: every target is one checker and there is nothing to overlap.
+.NOTPARALLEL:
+
 # What a pull request passes before it opens. The integration harness is not
 # here because it needs a soqucoind build; run `make integration` as well.
 gates: test race docs lint mutants branch

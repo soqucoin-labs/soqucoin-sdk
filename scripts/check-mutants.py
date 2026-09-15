@@ -7,7 +7,9 @@ script:
 
   1. runs the test unmutated and requires it to pass, so a test that is already
      red cannot be scored as catching anything;
-  2. applies the mutation;
+  2. applies the mutation, having first established that an entry whose line
+     is absent is absent because the branch does not carry the mechanism at
+     all, and not because the line was reworded out from under it;
   3. runs the test again and requires it to have run and to fail: a mutated
      tree that does not build proves nothing, so that is a failure, not a catch;
   4. puts the file back.
@@ -115,6 +117,27 @@ def _on_signal(signum, _frame):
     sys.exit(128 + signum)
 
 
+def test_is_present(package: str, test: str, tags: str = "") -> tuple[bool, str]:
+    """Whether the named test exists, without running it.
+
+    This is what tells a genuinely inapplicable entry from a broken one. An
+    entry whose `find` text is absent means either that the branch does not
+    carry the mechanism yet, or that the line was reworded and the entry now
+    pins nothing. The test travels with the mechanism on the same branch, so
+    its presence separates the two. Fails closed: an error listing tests is
+    reported, never read as an absence.
+    """
+    cmd = ["go", "test"]
+    if tags:
+        cmd += ["-tags", tags]
+    cmd += [package, "-list", f"^{test}$"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+    output = (proc.stdout + proc.stderr).strip()
+    if proc.returncode != 0:
+        return False, output
+    return any(line.strip() == test for line in proc.stdout.splitlines()), output
+
+
 def run_test(package: str, test: str, tags: str = "") -> tuple[bool, bool, str]:
     """Return (ran, passed, output).
 
@@ -137,16 +160,38 @@ def run_test(package: str, test: str, tags: str = "") -> tuple[bool, bool, str]:
 def check(entry: dict) -> tuple[str, str]:
     """Return (status, message) where status is ok, fail or skip."""
     path = ROOT / entry["file"]
-    if not path.exists():
-        return "skip", f"{entry['file']} is not on this branch"
-    original = path.read_text()
     find, replace = entry["find"], entry["replace"]
+    # A missing file is the same question as a missing line, and gets the same
+    # answer: inapplicable only if the test that pins it is also absent.
+    original = path.read_text() if path.exists() else ""
     occurrences = original.count(find)
     if occurrences == 0:
-        # The manifest is shared by branches that stack. An entry for a
-        # mechanism a branch does not carry yet is not a failure here; it
-        # starts running on the branch that introduces the line.
-        return "skip", f"the line is not in {entry['file']} on this branch"
+        # The manifest is shared by branches that stack, so an entry for a
+        # mechanism a branch does not carry yet is not a failure. But a line
+        # that was reworded or deleted is, and both look the same from here.
+        # The test that pins the line is on the same branch as the line, so
+        # its presence tells them apart.
+        present, listing = test_is_present(
+            entry["package"], entry["test"], entry.get("tags", ""))
+        missing = "is not on this branch" if not path.exists() else \
+            "no longer holds the line this entry pins"
+        if present:
+            return "fail", (
+                f"{entry['test']} is on this branch but {entry['file']} "
+                f"{missing}, so this entry pins nothing. Update the entry to "
+                "the code as it now reads, or remove it with the mechanism."
+                f"\n  looked for: {find!r}"
+            )
+        if listing and "no test files" not in listing and "\n" in listing:
+            return "fail", (
+                f"cannot tell whether {entry['test']} is on this branch:\n"
+                f"{listing[-400:]}"
+            )
+        return "skip", (
+            f"neither {entry['file']}'s line nor {entry['test']} is on this "
+            "branch" if path.exists() else
+            f"neither {entry['file']} nor {entry['test']} is on this branch"
+        )
     if occurrences > 1:
         return "fail", (
             f"the text to mutate occurs {occurrences} times in {entry['file']}; "

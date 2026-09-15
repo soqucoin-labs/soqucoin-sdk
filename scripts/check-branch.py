@@ -42,13 +42,28 @@ def git(*args: str) -> str:
 
 
 def numstat(rev_range: str) -> dict[str, tuple[int, int]]:
-    """Return {path: (added, removed)} for a diff range."""
+    """Return {path: (added, removed)} for a diff range.
+
+    Read from `-z` output because the plain form renders a detected rename as
+    one record with a combined path, `dir/{old.go => new.go}`. That string is
+    not a path and does not end in `.go`, so every line of a renamed file would
+    be dropped from the budget: a rewrite carried in on a rename would measure
+    zero. Under `-z` a rename is `added TAB removed TAB NUL old NUL new NUL`,
+    and the new path is the one the change lands on.
+    """
     out: dict[str, tuple[int, int]] = {}
-    for line in git("diff", "--numstat", *DIFF, rev_range).splitlines():
-        parts = line.split("\t")
+    fields = git("diff", "--numstat", "-z", *DIFF, rev_range).split("\0")
+    i = 0
+    while i < len(fields):
+        record, i = fields[i], i + 1
+        parts = record.split("\t")
         if len(parts) != 3:
             continue
         added, removed, path = parts
+        if path == "":
+            if i + 1 >= len(fields):
+                break
+            path, i = fields[i + 1], i + 2
         if added == "-" or removed == "-":
             continue  # binary
         out[path] = (int(added), int(removed))
@@ -66,7 +81,8 @@ def patch(rev_range: str, *paths: str) -> str:
 
 def touched(rev_range: str) -> set[str]:
     """Every path in a diff, including the ones numstat reports as binary."""
-    return set(git("diff", "--name-only", *DIFF, rev_range).splitlines())
+    return {p for p in git("diff", "--name-only", "-z", *DIFF,
+                           rev_range).split("\0") if p}
 
 
 def is_non_test_go(path: str) -> bool:
