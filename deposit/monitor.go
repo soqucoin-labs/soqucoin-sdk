@@ -132,15 +132,17 @@ type Monitor struct {
 
 	now func() time.Time
 
-	// final is the set of outpoints the ledger has called credited and final,
-	// keyed by outpoint and holding the address, so IsCredited is not asked
-	// again about an output that can neither be un-credited nor reorganised
-	// away. Entries come only from the ledger's own answers: MarkFinal
-	// succeeded, or IsCredited said credited and the outpoint was absent from
-	// the same scan's Pending. The indexer's word never adds one. An entry is
-	// removed when its address was scanned and the outpoint is no longer in
-	// the cache (spent or swept); a restart empties the set and the ledger is
-	// asked again.
+	// final is the set of outpoints known credited and past the node's
+	// horizon, keyed by outpoint and holding the address, so IsCredited is not
+	// asked again about an output that can neither be un-credited nor
+	// reorganised away. An entry needs the ledger's word that the outpoint is
+	// credited (MarkFinal succeeded, or IsCredited said so) and the node's
+	// word that it is final (gettxout confirmations past MaxReorgDepth). The
+	// indexer's word never adds one, and absence from Pending is not taken as
+	// finality: the Ledger contract lets Pending leave out outputs the
+	// exchange spent. An entry is removed when its address was scanned and the
+	// outpoint is no longer in the cache (spent or swept); a restart empties
+	// the set and the node is asked once more per outpoint.
 	finalMu sync.Mutex
 	final   map[string]string
 }
@@ -315,7 +317,6 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	var staleErr error
 	scanned := make(map[string]bool, len(addrs)) // addresses this pass read the cache for
 	seen := make(map[string]bool)                // outpoints the cache listed for them
-	defer func() { m.pruneFinal(scanned, seen) }()
 	for _, addr := range addrs {
 		if perAddress != nil {
 			at, err := perAddress.LastRefreshOf(addr)
@@ -345,7 +346,7 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 				continue
 			}
 			if m.isFinal(u.TxID, u.Vout) {
-				continue // the ledger has called it credited and final; nothing to ask
+				continue // credited by the ledger's word, final by the node's; nothing to ask
 			}
 			done, err := m.Ledger.IsCredited(ctx, u.TxID, u.Vout)
 			if err != nil {
@@ -355,9 +356,22 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 				return credited, err
 			}
 			if done {
-				// Credited and not pending is final by the ledger's contract.
+				// Credited. It enters the final set once the node, not the
+				// indexer, puts it past the horizon: one gettxout per outpoint
+				// per process, in place of one ledger query per scan. An
+				// outpoint still in Pending is marked final by recheckPending
+				// when its turn comes.
 				if !pending[outpointKey(u.TxID, u.Vout)] {
-					m.markFinal(u.TxID, u.Vout, addr)
+					out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
+					if err != nil {
+						if ended(ctx, err) {
+							return credited, err
+						}
+						continue // asked again next scan; the credit stands
+					}
+					if out != nil && out.Confirmations > types.MaxReorgDepth {
+						m.markFinal(u.TxID, u.Vout, addr)
+					}
 				}
 				continue
 			}
@@ -385,6 +399,9 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			return nil, fmt.Errorf("%w: indexer cache stale for every address", ErrPaused)
 		}
 	}
+	// Only a pass that read every scanned address to the end knows which
+	// outpoints are gone; a pass cut short prunes nothing.
+	m.pruneFinal(scanned, seen)
 	return credited, nil
 }
 
@@ -456,7 +473,6 @@ func (m *Monitor) recheckPending(ctx context.Context, tip int64) (map[string]boo
 				return nil, err
 			}
 			m.markFinal(d.TxID, d.Vout, d.Address)
-			delete(keys, outpointKey(d.TxID, d.Vout))
 		}
 	}
 	return keys, nil

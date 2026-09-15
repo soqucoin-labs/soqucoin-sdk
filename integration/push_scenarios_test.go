@@ -98,10 +98,20 @@ func TestReconnectResubscribesAndPicksUpTheGap(t *testing.T) {
 		t.Fatalf("initial scan: %v %+v", err, got)
 	}
 	sh := idx.scripthash(f.dep)
+	subsBefore := idx.count("blockchain.scripthash.subscribe", sh)
 
+	// The indexer goes down: connections are refused until it is back, so
+	// the deposit is mined while no client is connected and no notification
+	// can reach it.
+	idx.setPaused(true)
 	idx.closeClients()
-	f.mineDepositAndBury(t, idx, f.dep) // nobody is connected; the state moves without a notification
-	waitUntil(t, "the re-subscription", func() bool { return idx.count("blockchain.scripthash.subscribe", sh) == 2 })
+	waitUntil(t, "no client connected", func() bool { return idx.connCount() == 0 })
+	f.mineDepositAndBury(t, idx, f.dep)
+	if n := idx.count("blockchain.scripthash.subscribe", sh); n != subsBefore {
+		t.Fatalf("a subscription was made while the indexer was down: %d -> %d", subsBefore, n)
+	}
+	idx.setPaused(false)
+	waitUntil(t, "the re-subscription", func() bool { return idx.count("blockchain.scripthash.subscribe", sh) == subsBefore+1 })
 	waitUntil(t, "the deposit mined during the gap to reach the cache", func() bool { return len(elx.GetUTXOs(f.dep)) == 2 })
 	got, err := m.Scan(context.Background())
 	if err != nil || len(got) != 1 {

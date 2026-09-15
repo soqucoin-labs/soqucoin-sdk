@@ -155,6 +155,7 @@ func TestUnknownOrMalformedNotificationIsIgnored(t *testing.T) {
 	stub := newPushStub(t)
 	a1 := craftAddr(t, 0x11)
 	sh1 := scripthashOf(t, a1)
+	stub.set(sh1, "s0", `[]`) // a real status, so a malformed one read as empty would look like a change
 	c, _ := startClient(t, stub, a1)
 	waitFor(t, "the first refresh", func() bool { return stub.count("blockchain.scripthash.listunspent", sh1) == 1 })
 
@@ -163,6 +164,8 @@ func TestUnknownOrMalformedNotificationIsIgnored(t *testing.T) {
 		scripthashNotification(other, "s1"),
 		`{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":["only-one-param"]}`,
 		`{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":[42,"s1"]}`,
+		`{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":["`+sh1+`",42]}`,
+		`{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":["`+sh1+`",{"a":1}]}`,
 		`{"jsonrpc":"2.0","method":"something.else","params":[]}`,
 	)
 	// Give the reader time to process; nothing should follow.
@@ -343,9 +346,10 @@ func TestPingAdvancesOnlyCleanRecords(t *testing.T) {
 	if at3, _ := c.LastRefreshOf(a3); !at3.IsZero() {
 		t.Fatal("a record whose attempt failed advanced on the ping")
 	}
-	// Once the pending change is refreshed, a2 is clean again.
-	if err := c.pass(context.Background(), false); err != nil {
-		t.Fatal(err)
+	// Once the pending change is refreshed, a2 is clean again. a3, still
+	// failing, stays marked and the pass names it.
+	if err := c.pass(context.Background(), false); err == nil || !strings.Contains(err.Error(), a3) || strings.Contains(err.Error(), a2) {
+		t.Fatalf("pass after the change: %v, want a3's failure alone", err)
 	}
 	at2 = mustAt(t, c, a2)
 	time.Sleep(10 * time.Millisecond)
@@ -355,7 +359,27 @@ func TestPingAdvancesOnlyCleanRecords(t *testing.T) {
 	if at := mustAt(t, c, a2); !at.After(at2) {
 		t.Fatal("a record advanced by its listunspent did not advance on the next ping")
 	}
-	_ = sh1
+
+	// The guard that matters most: a1 was clean; the indexer then starts
+	// refusing it with no notification pending. Its record carries the
+	// error, and no ping advances it again until a listunspent succeeds.
+	stub.mu.Lock()
+	stub.failList[sh1] = true
+	stub.mu.Unlock()
+	at1 = mustAt(t, c, a1)
+	if err := c.pass(context.Background(), true); err == nil || !strings.Contains(err.Error(), a1) {
+		t.Fatalf("full pass with a1 failing: %v", err)
+	}
+	if at, rerr := c.LastRefreshOf(a1); rerr == nil || !at.Equal(at1) {
+		t.Fatalf("a1 after the refused listunspent: at %v err %v, want the old moment and the error", at, rerr)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := c.ping(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if at, _ := c.LastRefreshOf(a1); !at.Equal(at1) {
+		t.Fatal("a ping advanced an address the indexer refuses to answer for")
+	}
 }
 
 func mustAt(t *testing.T, c *Client, addr string) time.Time {

@@ -389,10 +389,13 @@ faulty or lying indexer can do with a notification is what it could do with a po
 timers back the subscriptions. The reconcile interval given to `electrumx.NewClient` is a full
 `listunspent` pass over every address whatever the statuses say: the safety net for a notification
 the server never sent, so a dropped notification delays a deposit by at most that interval plus
-your scan period. `PingInterval` (60 seconds by default) is a `server.ping` that keeps the session
-alive on the server's side and, on yours, advances the freshness of every subscribed address with no
-change pending, so a quiet address never reads stale. `MaxCacheAge` on `deposit.Monitor` (5 minutes
-by default) must exceed `PingInterval`.
+your scan period. `PingInterval` (60 seconds by default) is a `server.ping` that keeps the server
+from closing an idle connection and, on your side, advances the freshness of every subscribed address
+with no change pending. The ping runs on its own goroutine beside any pass in progress
+(`electrumx/subscribe.go`, `pingLoop`), so a long reconcile does not age the addresses it has not
+reached. A quiet address reads fresh for as long as the server answers pings; when the connection is
+lost, no ping is answered and every address ages out within `MaxCacheAge`. `MaxCacheAge` on
+`deposit.Monitor` (5 minutes by default) must exceed `PingInterval` with room for one missed ping.
 
 `deposit.Monitor` judges freshness per address (`LastRefreshOf`, `deposit/monitor.go`,
 `AddressFreshness`): an address the indexer has not answered for within `MaxCacheAge` is skipped and
@@ -402,9 +405,11 @@ Monitor pauses only when every address is stale. The costs, each cited to the co
 - Steady state: one `listunspent` per changed address (`subscribe.go`, `pass`). A block that pays N
   tracked addresses costs N calls, in sequence, on one connection.
 - Reconnect: one `subscribe` per address (`pass`), plus one `listunspent` per address whose status
-  changed while the client was away; an unchanged address costs the subscribe call alone
-  (`subscribe`, the status comparison).
-- Reconcile: one `listunspent` per address (`RefreshAll`); the interval must exceed the pass.
+  changed while the client was away; an unchanged address whose record is clean costs the
+  subscribe call alone (`subscribe`, the status comparison). A connection that dies after every
+  handshake is redialled on a backoff from one second to a minute (`run`, `after`), not in a loop.
+- Reconcile: one `listunspent` per address (`subscribe.go`, `pass` with `full` set, through
+  `client.go`, `refresh`); the interval must exceed the pass.
 - The client's own cost per address, over loopback against a server that answers at once, is
   44 µs for one subscribe and one listunspent (about 22,700 addresses per second), measured by
   `BenchmarkSubscribeAndRefreshPerAddress` in `electrumx/bench_test.go`; from a notification to the

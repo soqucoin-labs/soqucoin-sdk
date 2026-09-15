@@ -37,6 +37,7 @@ type fakeIndexer struct {
 
 	mu                sync.Mutex
 	conns             map[net.Conn]*indexerConn
+	pauseAccepts      bool // accepted connections are closed at once: the indexer is down
 	dropNotifications bool
 	failList          map[string]bool // scripthash -> listunspent answers an error
 	counts            map[string]int  // method+" "+scripthash
@@ -89,6 +90,20 @@ func (f *fakeIndexer) count(method, sh string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.counts[method+" "+sh]
+}
+
+// setPaused makes the indexer refuse service: connections are accepted and
+// closed at once, so the client's reconnects fail until it is unpaused.
+func (f *fakeIndexer) setPaused(paused bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pauseAccepts = paused
+}
+
+func (f *fakeIndexer) connCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.conns)
 }
 
 func (f *fakeIndexer) setDrop(drop bool) {
@@ -171,10 +186,17 @@ func (f *fakeIndexer) serve() {
 		if err != nil {
 			return
 		}
-		ic := &indexerConn{conn: conn, subs: map[string]string{}}
 		f.mu.Lock()
-		f.conns[conn] = ic
+		paused := f.pauseAccepts
+		if !paused {
+			f.conns[conn] = &indexerConn{conn: conn, subs: map[string]string{}}
+		}
+		ic := f.conns[conn]
 		f.mu.Unlock()
+		if paused {
+			conn.Close()
+			continue
+		}
 		go f.handle(ic)
 	}
 }

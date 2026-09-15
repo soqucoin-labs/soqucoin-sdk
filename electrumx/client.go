@@ -78,11 +78,12 @@ type Client struct {
 	// the queue when its own context ends. gen counts connections; a reader
 	// goroutine and every pending call belong to one generation. liveGen
 	// mirrors gen for readers that hold mu, not connSem.
-	conn    net.Conn
-	reader  *bufio.Reader
-	gen     uint64
-	connSem chan struct{}
-	liveGen atomic.Uint64
+	conn     net.Conn
+	reader   *bufio.Reader
+	gen      uint64
+	connDone chan struct{} // closed by the reader when this connection is lost
+	connSem  chan struct{}
+	liveGen  atomic.Uint64
 
 	// pending pairs each in-flight request id with its waiting call.
 	pendMu  sync.Mutex
@@ -244,7 +245,7 @@ func NewClient(host string, reconcileInterval time.Duration, logger *slog.Logger
 // a mainnet deployment that forgets to set HRP gets an error at startup rather
 // than a cache that refreshes nothing for the life of the process.
 func (c *Client) TrackAddresses(addresses []string) error {
-	hrp := c.HRP
+	hrp := c.hrp()
 	for _, a := range addresses {
 		n, err := address.NetworkOf(a)
 		if err != nil {
@@ -288,6 +289,14 @@ func (c *Client) TrackAddresses(addresses []string) error {
 	return nil
 }
 
+// hrp reads the network prefix under the lock TrackAddresses writes it under,
+// since TrackAddresses may run while Start's refresher is making calls.
+func (c *Client) hrp() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.HRP
+}
+
 // RefreshAll fetches UTXOs for all tracked addresses: one
 // blockchain.scripthash.listunspent per address, in sequence, on the one
 // connection, each under the 30-second call deadline. Start makes this pass
@@ -307,25 +316,32 @@ func (c *Client) RefreshAll(ctx context.Context) error {
 	c.mu.RLock()
 	addrs := append([]string(nil), c.addresses...)
 	c.mu.RUnlock()
-	return c.refresh(ctx, addrs, true)
+	_, err := c.refresh(ctx, addrs, true)
+	return err
 }
 
-// refresh makes one listunspent per address in addrs. When full, the result
-// is recorded as the last full pass for LastRefresh.
-func (c *Client) refresh(ctx context.Context, addrs []string, full bool) error {
+// refresh makes one listunspent per address in addrs and returns the
+// addresses not refreshed: those whose call failed and those not attempted
+// because the pass stopped. When full, the result is recorded as the last
+// full pass for LastRefresh.
+func (c *Client) refresh(ctx context.Context, addrs []string, full bool) ([]string, error) {
 	var errs []error
-	for _, addr := range addrs {
+	var failed []string
+	for i, addr := range addrs {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
+			failed = append(failed, addrs[i:]...)
 			break
 		}
 		err := c.refreshAddress(ctx, addr)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
+			failed = append(failed, addr)
 			// A context that ended during this address's call is already
 			// named through its error; so is a lost connection, which every
 			// later call would report the same way. The pass stops here.
 			if ctx.Err() != nil || errIsConnection(err) {
+				failed = append(failed, addrs[i+1:]...)
 				break
 			}
 		}
@@ -339,7 +355,7 @@ func (c *Client) refresh(ctx context.Context, addrs []string, full bool) error {
 		}
 		c.mu.Unlock()
 	}
-	return err
+	return failed, err
 }
 
 // LastRefresh reports when every tracked address last refreshed successfully
@@ -386,7 +402,7 @@ func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
 //  2. Removes UTXOs that ElectrumX no longer reports (confirmed spent)
 //  3. Adds new UTXOs that appeared since last refresh (change outputs, new coinbases)
 func (c *Client) refreshAddress(ctx context.Context, addr string) error {
-	scriptHash, err := address.AddressToScriptHash(c.HRP, addr)
+	scriptHash, err := address.AddressToScriptHash(c.hrp(), addr)
 	if err != nil {
 		return fmt.Errorf("address to script hash: %w", err)
 	}
@@ -473,24 +489,32 @@ func (c *Client) recordRefresh(addr string, gen, seqBefore uint64, err error) {
 
 // recordRefreshLocked records one listunspent attempt. Caller holds mu. A
 // success makes the set known current as of now on connection gen and clears
-// the change flag unless a notification arrived while the call was in
-// flight, in which case the reply may predate the change and the flag stands
-// for the next pass. TrackAddresses may have dropped the address during the
-// call; then nothing is recorded.
+// the change flag, unless a notification arrived while the call was in
+// flight: then the reply may predate the change, so neither the moment nor
+// the flag moves, and the next pass refreshes the address again.
+// TrackAddresses may have dropped the address during the call; then nothing
+// is recorded.
 func (c *Client) recordRefreshLocked(addr string, gen, seqBefore uint64, err error) {
 	if !c.trackedSet[addr] {
 		return
 	}
 	rec := c.refreshed[addr]
-	rec.err = err
-	if err == nil {
+	if !endedErr(err) {
+		// A context that ended says nothing about the indexer; the previous
+		// verdict stands and no alert follows from a shutdown.
+		rec.err = err
+	}
+	if err == nil && rec.seq == seqBefore {
 		rec.at = time.Now()
 		rec.gen = gen
-		if rec.seq == seqBefore {
-			rec.dirty = false
-		}
+		rec.dirty = false
 	}
 	c.refreshed[addr] = rec
+}
+
+// endedErr reports an error that is, or wraps, a context ending.
+func endedErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // GetBalance returns the total confirmed and unconfirmed balance across all tracked addresses.
@@ -671,7 +695,7 @@ func (c *Client) GetTip(ctx context.Context) (int64, error) {
 
 // GetHistory fetches transaction history for an address.
 func (c *Client) GetHistory(ctx context.Context, addr string) ([]TxHistoryEntry, error) {
-	scriptHash, err := address.AddressToScriptHash(c.HRP, addr)
+	scriptHash, err := address.AddressToScriptHash(c.hrp(), addr)
 	if err != nil {
 		return nil, fmt.Errorf("address to script hash: %w", err)
 	}

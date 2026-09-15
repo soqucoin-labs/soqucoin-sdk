@@ -2,6 +2,7 @@ package electrumx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -29,11 +30,15 @@ import (
 const callDeadline = 30 * time.Second
 
 // pendingCall is one caller waiting for the reply to one id on one connection
-// generation. The channel holds one reply and is closed, never sent on, when
-// that connection is lost.
+// generation. ch holds one reply and is closed, never sent on, when that
+// connection is lost. done is the generation's own channel, closed by the
+// reader the moment it cannot read, before any lock is taken: a waiter that
+// holds the connection lock through its wait (Connect's handshake) learns of
+// the loss from it at once.
 type pendingCall struct {
-	ch  chan incoming
-	gen uint64
+	ch   chan incoming
+	gen  uint64
+	done chan struct{}
 }
 
 // lockConn takes the connection semaphore or returns ctx.Err() when the
@@ -124,6 +129,11 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 	defer c.unlockConn()
+	if c.stopped() {
+		// A Stop that raced the dial stands: the client is not reopened.
+		conn.Close()
+		return ErrNotConnected
+	}
 
 	if c.conn != nil {
 		c.conn.Close()
@@ -132,6 +142,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	gen := c.gen
 	c.liveGen.Store(gen)
 	c.conn = conn
+	c.connDone = make(chan struct{})
 	// PF-018 FIX: Use 4MB buffer instead of default 4KB.
 	// ElectrumX responses for addresses with 18,000+ UTXOs can exceed
 	// 2MB. The default bufio.NewReader (4KB) panics on buffer growth
@@ -139,7 +150,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	// 4MB accommodates ~50,000 UTXOs with margin.
 	reader := bufio.NewReaderSize(conn, 4*1024*1024)
 	c.reader = reader
-	go c.readLoop(gen, conn, reader)
+	go c.readLoop(gen, conn, reader, c.connDone)
 	c.log.Info("connected", "host", c.host, "tls", c.TLSConfig != nil)
 
 	fail := func(err error) error {
@@ -169,12 +180,13 @@ func (c *Client) Connect(ctx context.Context) error {
 // the client's addresses belong to. Skipped only while the HRP is still unknown
 // (before TrackAddresses), in which case TrackAddresses is the gate.
 func (c *Client) verifyGenesisLocked(ctx context.Context) error {
-	if c.HRP == "" {
+	hrp := c.hrp()
+	if hrp == "" {
 		return nil
 	}
-	want := types.GenesisHashesForHRP(c.HRP)
+	want := types.GenesisHashesForHRP(hrp)
 	if len(want) == 0 {
-		return fmt.Errorf("%w: no known chain uses HRP %q", ErrNetworkMismatch, c.HRP)
+		return fmt.Errorf("%w: no known chain uses HRP %q", ErrNetworkMismatch, hrp)
 	}
 	raw, err := c.callLocked(ctx, "server.features", []interface{}{})
 	if err != nil {
@@ -192,7 +204,7 @@ func (c *Client) verifyGenesisLocked(ctx context.Context) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("%w: server genesis %s, client HRP %q expects one of %v", ErrGenesisMismatch, features.Genesis, c.HRP, want)
+	return fmt.Errorf("%w: server genesis %s, client HRP %q expects one of %v", ErrGenesisMismatch, features.Genesis, hrp, want)
 }
 
 // Reconnect closes the current connection and establishes a new one. The
@@ -244,12 +256,12 @@ func (c *Client) callGen(ctx context.Context, method string, params interface{})
 		c.unlockConn()
 		return nil, 0, ErrNotConnected
 	}
-	id, ch, err := c.sendLocked(ctx, conn, gen, method, params)
+	id, p, err := c.sendLocked(ctx, conn, gen, method, params)
 	c.unlockConn()
 	if err != nil {
 		return nil, gen, err
 	}
-	raw, err := c.await(ctx, id, ch, method)
+	raw, err := c.await(ctx, id, p, method)
 	return raw, gen, err
 }
 
@@ -259,11 +271,11 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 	if c.conn == nil {
 		return nil, ErrNotConnected
 	}
-	id, ch, err := c.sendLocked(ctx, c.conn, c.gen, method, params)
+	id, p, err := c.sendLocked(ctx, c.conn, c.gen, method, params)
 	if err != nil {
 		return nil, err
 	}
-	return c.await(ctx, id, ch, method)
+	return c.await(ctx, id, p, method)
 }
 
 // sendLocked registers the pending id and writes one request line. Caller
@@ -275,28 +287,28 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 // cut short by moving the write deadline to now. A socket that refuses that
 // deadline is closed instead. Either way a write that did not complete leaves
 // part of a line on the wire, and the connection is dropped.
-func (c *Client) sendLocked(ctx context.Context, conn net.Conn, gen uint64, method string, params interface{}) (int64, chan incoming, error) {
+func (c *Client) sendLocked(ctx context.Context, conn net.Conn, gen uint64, method string, params interface{}) (int64, pendingCall, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, nil, err
+		return 0, pendingCall{}, err
 	}
 	id := c.reqID.Add(1)
 	data, err := json.Marshal(request{ID: id, Method: method, Params: params})
 	if err != nil {
-		return 0, nil, fmt.Errorf("marshal request: %w", err)
+		return 0, pendingCall{}, fmt.Errorf("marshal request: %w", err)
 	}
 	// ElectrumX uses newline-delimited JSON
 	data = append(data, '\n')
 
-	ch := make(chan incoming, 1)
+	p := pendingCall{ch: make(chan incoming, 1), gen: gen, done: c.connDone}
 	c.pendMu.Lock()
-	c.pending[id] = pendingCall{ch: ch, gen: gen}
+	c.pending[id] = p
 	c.pendMu.Unlock()
 
 	if err := conn.SetWriteDeadline(time.Now().Add(callDeadline)); err != nil {
 		// A socket that refuses a deadline is closed or broken underneath.
 		c.unregister(id)
 		c.dropLocked()
-		return 0, nil, fmt.Errorf("set deadline: %w", err)
+		return 0, pendingCall{}, fmt.Errorf("set deadline: %w", err)
 	}
 	fired := make(chan struct{})
 	var closedByCtx atomic.Bool
@@ -320,25 +332,24 @@ func (c *Client) sendLocked(ctx context.Context, conn net.Conn, gen uint64, meth
 		if cerr := ctx.Err(); cerr != nil {
 			werr = cerr
 		}
-		return 0, nil, fmt.Errorf("write request: %w", werr)
+		return 0, pendingCall{}, fmt.Errorf("write request: %w", werr)
 	}
 	if closedByCtx.Load() {
 		// The line went out whole and the socket was then closed by the
 		// callback; the reader will fail this call's wait.
 		c.dropLocked()
 	}
-	return id, ch, nil
+	return id, p, nil
 }
 
-// await waits for the reply to id, the context, or the call deadline.
-func (c *Client) await(ctx context.Context, id int64, ch chan incoming, method string) (json.RawMessage, error) {
+// await waits for the reply to id, the loss of its connection, Stop, the
+// context, or the call deadline. Stop is watched because Connect waits here
+// holding the connection lock Stop needs: a shutdown must not wait for a
+// silent server's call deadline.
+func (c *Client) await(ctx context.Context, id int64, p pendingCall, method string) (json.RawMessage, error) {
 	timer := time.NewTimer(callDeadline)
 	defer timer.Stop()
-	select {
-	case in, ok := <-ch:
-		if !ok {
-			return nil, fmt.Errorf("%w: the connection was lost before the reply to %s", ErrNotConnected, method)
-		}
+	deliver := func(in incoming) (json.RawMessage, error) {
 		if len(in.Error) > 0 && string(in.Error) != "null" {
 			return nil, fmt.Errorf("electrumx error: %s", string(in.Error))
 		}
@@ -346,6 +357,33 @@ func (c *Client) await(ctx context.Context, id int64, ch chan incoming, method s
 			c.recordTip(in.Result)
 		}
 		return in.Result, nil
+	}
+	lostErr := func() error {
+		if err := ctx.Err(); err != nil {
+			return err // the context ended too; it is what the caller asked for
+		}
+		return fmt.Errorf("%w: the connection was lost before the reply to %s", ErrNotConnected, method)
+	}
+	select {
+	case in, ok := <-p.ch:
+		if !ok {
+			return nil, lostErr()
+		}
+		return deliver(in)
+	case <-p.done:
+		c.unregister(id)
+		// A reply that arrived just before the loss is still a reply.
+		select {
+		case in, ok := <-p.ch:
+			if ok {
+				return deliver(in)
+			}
+		default:
+		}
+		return nil, lostErr()
+	case <-c.stopCh:
+		c.unregister(id)
+		return nil, ErrNotConnected
 	case <-ctx.Done():
 		c.unregister(id)
 		return nil, ctx.Err()
@@ -367,20 +405,22 @@ func (c *Client) unregister(id int64) {
 // server notifications and are dispatched; lines carrying an id are replies
 // and are handed to the waiting call, or dropped when no call waits (the call
 // was cancelled or timed out). A line that does not parse means the stream is
-// no longer known to be at a line boundary: the connection is closed, which
-// ends this loop through the read error on the next iteration.
-func (c *Client) readLoop(gen uint64, conn net.Conn, r *bufio.Reader) {
+// no longer known to be at a line boundary: the connection is reported lost
+// at once, every waiter fails, and nothing buffered behind it is delivered.
+func (c *Client) readLoop(gen uint64, conn net.Conn, r *bufio.Reader, done chan struct{}) {
 	for {
 		line, err := r.ReadBytes('\n')
 		if err != nil {
-			c.lost(gen, err)
+			c.lost(gen, done, err)
 			return
 		}
 		var in incoming
 		if err := json.Unmarshal(line, &in); err != nil {
+			// Lines already buffered behind this one are not delivered: the
+			// connection is reported lost here, so every waiter fails now.
 			c.log.Warn("unparseable line from the server; dropping the connection", "err", err)
-			conn.Close()
-			continue
+			c.lost(gen, done, fmt.Errorf("unparseable line: %w", err))
+			return
 		}
 		if in.Method != "" {
 			c.handleNotification(gen, in)
@@ -392,30 +432,29 @@ func (c *Client) readLoop(gen uint64, conn net.Conn, r *bufio.Reader) {
 		}
 		c.pendMu.Lock()
 		p, ok := c.pending[*in.ID]
-		if ok {
+		if ok && p.gen == gen {
 			delete(c.pending, *in.ID)
 		}
 		c.pendMu.Unlock()
-		if !ok {
-			c.log.Debug("discarding a reply with no waiter", "id", *in.ID)
+		if !ok || p.gen != gen {
+			// No waiter, or a waiter on another connection: a reply on this
+			// stream never satisfies a request made on a different one.
+			c.log.Debug("discarding a reply with no waiter on this connection", "id", *in.ID)
 			continue
 		}
 		p.ch <- in
 	}
 }
 
-// lost is the reader's report that its connection can no longer be read. Every
-// call waiting on that generation is failed, the connection is dropped if it
-// is still the current one, and Start is woken to reconnect. A read error on
-// a connection Connect or Stop has already replaced or closed is not news.
-//
-// The waiters are failed before the lock is taken as well as after: Connect
-// holds the lock through its handshake, and a connection that dies then must
-// fail the handshake's wait at once rather than after the call deadline. The
-// pass after the lock catches a call registered in between, which wrote to a
-// dead socket and would otherwise wait out its deadline.
-func (c *Client) lost(gen uint64, err error) {
-	c.failPending(gen)
+// lost is the reader's report that its connection can no longer be read. The
+// generation's done channel is closed first, with no lock: every waiter on it,
+// including Connect holding the connection lock through its handshake, returns
+// at once. Then the connection is dropped if it is still the current one, the
+// waiters registered since are failed, and Start is woken to reconnect. A read
+// error on a connection Connect or Stop has already replaced or closed is not
+// news.
+func (c *Client) lost(gen uint64, done chan struct{}, err error) {
+	close(done)
 	c.lockConnBlocking()
 	if c.gen == gen && c.conn != nil {
 		c.log.Warn("connection lost", "host", c.host, "err", err)
@@ -458,6 +497,9 @@ func (c *Client) dropLocked() {
 // names an address only through the client's own scripthash map, so a server
 // cannot name an address the client did not compute. Anything else is ignored.
 func (c *Client) handleNotification(gen uint64, in incoming) {
+	if gen != c.liveGen.Load() {
+		return // from a connection already replaced or dropped
+	}
 	switch in.Method {
 	case "blockchain.headers.subscribe":
 		var params []json.RawMessage
@@ -476,20 +518,29 @@ func (c *Client) handleNotification(gen uint64, in incoming) {
 			c.log.Debug("ignoring a malformed scripthash notification")
 			return
 		}
-		c.noteChange(gen, sh, parseStatus(params[1]))
+		status, ok := parseStatus(params[1])
+		if !ok {
+			c.log.Debug("ignoring a scripthash notification whose status is neither a string nor null")
+			return
+		}
+		c.noteChange(gen, sh, status)
 	default:
 		c.log.Debug("ignoring a notification", "method", in.Method)
 	}
 }
 
-// parseStatus reads a scripthash status: a hex string, or null for an address
-// with no history, which is read as the empty string.
-func parseStatus(raw json.RawMessage) string {
+// parseStatus reads a scripthash status: a string, or null for an address
+// with no history, which is read as the empty string. Anything else is not a
+// status and is reported as such rather than mistaken for either.
+func parseStatus(raw json.RawMessage) (string, bool) {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return "", true
+	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return ""
+		return "", false
 	}
-	return s
+	return s, true
 }
 
 func (c *Client) recordTip(header json.RawMessage) {

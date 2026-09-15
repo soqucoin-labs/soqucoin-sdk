@@ -76,9 +76,9 @@ func TestCallsRunConcurrentlyOnOneConnection(t *testing.T) {
 	}
 }
 
-// A pass cut short during one address's call names that address alone. The
-// address carries the error in its record; the addresses after it are not
-// attempted and their records are untouched.
+// A pass cut short during one address's call names that address alone in the
+// returned error. No record takes the context's error: a shutdown says
+// nothing about the indexer. The addresses after it are not attempted.
 func TestRefreshAllCutMidCallNamesTheAddressItStoppedAt(t *testing.T) {
 	a1, a2 := craftAddr(t, 0x11), craftAddr(t, 0x22)
 	var mu sync.Mutex
@@ -109,8 +109,8 @@ func TestRefreshAllCutMidCallNamesTheAddressItStoppedAt(t *testing.T) {
 	if msg := err.Error(); !strings.Contains(msg, a1) || strings.Contains(msg, a2) {
 		t.Fatalf("error should name the address whose call was cut and no other: %s", msg)
 	}
-	if _, rerr := c.LastRefreshOf(a1); rerr == nil {
-		t.Error("the address whose call was cut carries no error")
+	if at, rerr := c.LastRefreshOf(a1); rerr != nil || !at.IsZero() {
+		t.Errorf("the address whose call was cut took the context's error into its record: at %v err %v", at, rerr)
 	}
 	if at, rerr := c.LastRefreshOf(a2); rerr != nil || !at.IsZero() {
 		t.Errorf("the address after the cut was touched: at %v err %v", at, rerr)
