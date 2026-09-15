@@ -31,6 +31,51 @@
       "find": "case out.Coinbase && out.Confirmations < m.network().CoinbaseMaturity:",
       "replace": "case out.Coinbase && out.Confirmations < -1:",
       "why": "A coinbase output is real but unspendable until maturity. Crediting it early hands out a balance the node will refuse to spend, and it is not an indexer disagreement, so it must not alarm either."
+    },
+    {
+      "id": "deposit-final-set-without-the-node-depth",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestSweptOutputAbsentFromPendingIsNotFinal",
+      "find": "if out != nil && out.Confirmations > types.MaxReorgDepth {",
+      "replace": "if out != nil {",
+      "why": "An entry is final only when the node has buried the outpoint past MaxReorgDepth. The Ledger contract says Pending may leave out swept outputs, so 'credited and not pending' is not finality: without the depth test a swept credit inside the horizon is recorded final and a reversal after a reorganisation is never re-credited."
+    },
+    {
+      "id": "electrumx-reconcile-tick-dropped-during-backoff",
+      "file": "electrumx/refreshpolicy.go",
+      "package": "./electrumx",
+      "test": "TestRefreshPolicyHoldsItsProperties",
+      "find": "\t\t\tp.pendingFull = true",
+      "replace": "\t\t\t_ = p.pendingFull",
+      "why": "A reconcile tick that lands during a backoff must be deferred and made up, not dropped. The full pass is the only safety net against a notification the server never sent, so dropping the tick lets one permanently refused address starve it for the life of the process."
+    },
+    {
+      "id": "electrumx-application-error-keeps-the-timeout-count",
+      "file": "electrumx/refreshpolicy.go",
+      "package": "./electrumx",
+      "test": "TestRefreshPolicyHoldsItsProperties",
+      "find": "\t\tp.consecutive = 0\n\t\treturn r",
+      "replace": "\t\treturn r",
+      "why": "Only two reply timeouts in a row may rebuild the connection. A reply that arrived, even an error, breaks the run; without the reset a timeout, one refused address and another timeout rebuild a healthy connection."
+    },
+    {
+      "id": "electrumx-utxo-cache-not-pruned-on-untrack",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestUntrackingAnAddressRemovesItsCoinsFromEveryView",
+      "find": "\tpruneTo(c.utxos, c.trackedSet)",
+      "replace": "\t_ = c.utxos",
+      "why": "An address that leaves the tracked set must leave the money views with it. The UTXO cache is what GetBalance, GetAllUTXOs and the selector read, so an unpruned entry keeps a retired address's coins spendable."
+    },
+    {
+      "id": "electrumx-inflight-refresh-commits-for-an-untracked-address",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestARefreshForAnUntrackedAddressWritesNothing",
+      "find": "\tif !c.trackedSet[addr] {\n\t\t// TrackAddresses dropped the address while this listunspent was in\n\t\t// flight; committing now would put an untracked address's outputs\n\t\t// back into the cache the balance and the selector read.\n\t\treturn nil\n\t}\n\tc.utxos[addr] = merged",
+      "replace": "\tc.utxos[addr] = merged",
+      "why": "A listunspent already in flight when TrackAddresses drops its address must not commit, or it undoes the pruning above and makes the output selectable again."
     }
   ]
 }
