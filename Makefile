@@ -37,8 +37,12 @@ lint:
 mutants:
 	python3 scripts/check-mutants.py
 
-# The branch is current with main and the change is one mechanism.
+# The branch is current with main and the change is one mechanism. The size
+# override is a line in the pull request body, which does not exist yet on a
+# local run, so ALLOW_LARGE_DIFF=1 stands in for it here and the fixtures check
+# that the refusals it does not cover still hold.
 branch:
+	python3 scripts/check-branch-selftest.py
 	python3 scripts/check-branch.py
 
 # mutants rewrites a source file in place for the length of one test run, so

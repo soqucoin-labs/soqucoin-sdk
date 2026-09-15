@@ -93,8 +93,15 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
+      # The body arrives as an environment variable and never as shell text:
+      # an author controls it, and interpolating it into `run:` would put that
+      # text in the runner's shell.
       - name: Branch is current and one mechanism
-        run: python3 scripts/check-branch.py
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 scripts/check-branch-selftest.py
+          python3 scripts/check-branch.py
 
   secrets:
     runs-on: ubuntu-latest

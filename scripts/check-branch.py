@@ -13,19 +13,31 @@ miss.
    diff that will land (two dot, against main's tip). When the two differ, the
    branch is behind and part of what is on screen is already on main.
 
-2. The change is one mechanism, measured in lines of non-test Go. Set
-   ALLOW_LARGE_DIFF=1 to override, and say in the pull request body why the
-   change is not separable.
+2. The change is one mechanism, measured in lines of non-test Go. The override
+   is a line in the pull request body, `ALLOW_LARGE_DIFF: <why it is not
+   separable>`. It lives there for two reasons: the reviewer reads the reason
+   where the reason applies, and CI can read it too, which an environment
+   variable set on a developer's machine cannot. Before the pull request
+   exists there is no body, so a local run takes ALLOW_LARGE_DIFF=1 and prints
+   what the body will have to carry. A marker with no reason behind it fails.
 
 Exit status is 0 when every check passes, 1 otherwise.
 """
 
 import argparse
 import os
+import pathlib
+import re
 import subprocess
 import sys
 
 DEFAULT_MAX_LINES = 600
+
+# The size override, as it appears in a pull request body. A marker on its own
+# records that the author reached the gate. The reason after it is what a
+# reviewer can weigh, so a line with nothing behind it fails.
+OVERRIDE = re.compile(r"^ALLOW_LARGE_DIFF:[ \t]*(\S.*)$", re.MULTILINE)
+MIN_REASON_CHARS = 40
 
 
 # Paths unquoted, and no user diff driver or textconv between the gate and the
@@ -130,15 +142,38 @@ def check_current(base: str) -> list[str]:
     return lines
 
 
-def check_size(base: str, max_lines: int) -> list[str]:
-    """One mechanism per pull request, measured in non-test Go."""
+def check_size(base: str, max_lines: int, body: str | None) -> list[str]:
+    """One mechanism per pull request, measured in non-test Go.
+
+    `body` is the pull request body when one exists (CI passes it through the
+    PR_BODY environment variable, a local run through --body-file) and None
+    otherwise. When it exists it is the only thing that can override the
+    budget: the environment variable is for the run that happens before the
+    pull request does.
+    """
     two = numstat(f"{base}..HEAD")
     total = sum(a + r for p, (a, r) in two.items() if is_non_test_go(p))
     if total <= max_lines:
         return []
-    if os.environ.get("ALLOW_LARGE_DIFF") == "1":
+    if body is not None:
+        m = OVERRIDE.search(body)
+        reason = m.group(1).strip() if m else ""
+        if len(reason) >= MIN_REASON_CHARS:
+            print(f"note: {total} lines of non-test Go, over the {max_lines} "
+                  f"budget; the body gives a reason: {reason}")
+            return []
+        if m:
+            return [
+                f"{total} lines of non-test Go, over the {max_lines} budget, and the "
+                "body's ALLOW_LARGE_DIFF line carries no reason.",
+                f"  say in at least {MIN_REASON_CHARS} characters why the change "
+                "does not separate.",
+            ]
+    elif os.environ.get("ALLOW_LARGE_DIFF") == "1":
         print(f"note: {total} lines of non-test Go, over the {max_lines} budget; "
-              "ALLOW_LARGE_DIFF=1 set, say why in the pull request body")
+              "ALLOW_LARGE_DIFF=1 set. The pull request body must carry "
+              "`ALLOW_LARGE_DIFF: <why it is not separable>` or this check fails "
+              "in CI.")
         return []
     biggest = sorted(
         ((a + r, p) for p, (a, r) in two.items() if is_non_test_go(p)), reverse=True
@@ -146,7 +181,7 @@ def check_size(base: str, max_lines: int) -> list[str]:
     return [
         f"{total} lines of non-test Go, over the {max_lines} budget: split before opening.",
         "  largest: " + ", ".join(f"{p} ({n})" for n, p in biggest[:5]),
-        "  override with ALLOW_LARGE_DIFF=1 and say in the body why it is not separable.",
+        "  or put `ALLOW_LARGE_DIFF: <why it is not separable>` in the pull request body.",
     ]
 
 
@@ -154,7 +189,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="origin/main")
     ap.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
+    ap.add_argument("--body-file", help="the pull request body; CI passes PR_BODY instead")
     args = ap.parse_args()
+
+    body = os.environ.get("PR_BODY")
+    if args.body_file:
+        body = pathlib.Path(args.body_file).read_text()
 
     try:
         git("rev-parse", "--verify", args.base)
@@ -162,7 +202,7 @@ def main() -> int:
         print(f"check-branch: {args.base} not found; fetch it first", file=sys.stderr)
         return 1
 
-    problems = check_current(args.base) + check_size(args.base, args.max_lines)
+    problems = check_current(args.base) + check_size(args.base, args.max_lines, body)
     if not problems:
         print(f"check-branch: OK (current with {args.base}, within the line budget)")
         return 0
