@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
@@ -269,5 +270,173 @@ func TestRecoverStopsSendingOnceTheContextEnds(t *testing.T) {
 	}
 	if net2.sentCount() != 2 {
 		t.Fatalf("second recover sent %d, want 2", net2.sentCount())
+	}
+}
+
+// ctxStore is a Store that honours its context, as a database-backed store
+// does: a Get, Put or List under an ended context fails with its error.
+type ctxStore struct{ *MemStore }
+
+func (s ctxStore) Get(ctx context.Context, id string) (*Intent, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	return s.MemStore.Get(ctx, id)
+}
+
+func (s ctxStore) Put(ctx context.Context, in *Intent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.MemStore.Put(ctx, in)
+}
+
+func (s ctxStore) List(ctx context.Context, states ...State) ([]*Intent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.MemStore.List(ctx, states...)
+}
+
+// The record of what the network did must land even when the caller's context
+// has ended by the time it is written. Here the node accepts the bytes under
+// another txid and the caller's context ends in the same instant; the store
+// honours contexts. The hold (NodeTxID) must reach the store, or a restart
+// would re-send an intent the operator has to resolve by hand.
+func TestStateRecordsAreWrittenAfterTheContextEnds(t *testing.T) {
+	store := ctxStore{NewMemStore()}
+	spent := utxo.NewSpentSet("", nil)
+	e := newEngine(t, store, spent, &fakeNet{mode: "ok"}, coins())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.Broadcaster = broadcastFunc(func(ctx context.Context, rawHex, txid string) (string, error) {
+		cancel() // the reply and the cancel arrive together
+		return "node-" + txid, fmt.Errorf("broadcast: %w: node returned txid %s", rpc.ErrTxIDMismatch, "node-"+txid)
+	})
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	in, _, _ := store.Get(context.Background(), "w1")
+	if err := e.Build(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	err := e.Broadcast(ctx, in)
+	if !errors.Is(err, rpc.ErrTxIDMismatch) || errors.Is(err, context.Canceled) {
+		t.Fatalf("mismatch with a cancel: %v; the save must not have failed on the context", err)
+	}
+	persisted, _, _ := store.Get(context.Background(), "w1")
+	if persisted.State != StateBuilt || persisted.NodeTxID != "node-"+in.TxID {
+		t.Fatalf("persisted %+v; the hold was lost to the caller's cancel", persisted)
+	}
+	// And a lost reply's attempt record lands the same way.
+	e2 := newEngine(t, ctxStore{NewMemStore()}, utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	e2.Broadcaster = broadcastFunc(func(ctx context.Context, rawHex, txid string) (string, error) {
+		cancel2()
+		return "", ctx.Err()
+	})
+	e2.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	in2, err := e2.Process(ctx2, "w1")
+	if !errors.Is(err, context.Canceled) || in2.State != StateBuilt {
+		t.Fatalf("cancelled broadcast: %v %s", err, in2.State)
+	}
+	p2, _, _ := e2.Store.Get(context.Background(), "w1")
+	if p2.Attempts != 1 || p2.LastError == "" {
+		t.Fatalf("attempt record lost to the cancel: %+v", p2)
+	}
+}
+
+// Recover's repair passes run whatever the caller's context says; only the
+// re-send loop stops. With a store that honours contexts and a Recover
+// called under an ended context, every Broadcast intent's inputs are still
+// re-marked and the orphan reservation is still released.
+func TestRecoverRepairsTheSpentSetUnderAnEndedContext(t *testing.T) {
+	mem := NewMemStore()
+	spent := utxo.NewSpentSet("", nil)
+	e := newEngine(t, ctxStore{mem}, spent, &fakeNet{mode: "ok"}, coins())
+	e.Submit(context.Background(), "sent", dst, 1_000_000, 1000)
+	sent, err := e.Process(context.Background(), "sent")
+	if err != nil || sent.State != StateBroadcast {
+		t.Fatalf("setup: %v %+v", err, sent)
+	}
+	// A Created intent holding a reservation: the previous process stopped
+	// between reserving and persisting Built.
+	e.Submit(context.Background(), "orphan", dst, 1_000_000, 1000)
+	if err := spent.Reserve([]types.UTXO{coins()[1]}, "orphan", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	// New process: an empty spent set, the same store, an ended context.
+	spent2 := utxo.NewSpentSet("", nil)
+	if err := spent2.Reserve([]types.UTXO{coins()[1]}, "orphan", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	e2 := newEngine(t, ctxStore{mem}, spent2, &fakeNet{mode: "ok"}, coins())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = e2.Recover(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("recover: %v", err)
+	}
+	if !spent2.IsSpent(sent.Inputs[0].TxID, sent.Inputs[0].Vout) {
+		t.Fatal("a Broadcast intent's inputs were not re-marked because the context had ended")
+	}
+	if spent2.IsSpent(coins()[1].TxID, coins()[1].Vout) {
+		t.Fatal("the orphan reservation was not released because the context had ended")
+	}
+}
+
+// The context checks in Build and Broadcast also cover an error that carries
+// a context error from somewhere else: a selector or a remote signer with a
+// per-call deadline of its own, or a Broadcaster reporting one, while the
+// caller's context is still live. Deleting the errors.Is checks and keeping
+// only ctx.Err() would fail these.
+func TestForeignContextErrorsAreTransient(t *testing.T) {
+	// Selector's own deadline: stays Created.
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	realSelect := e.Select
+	first := true
+	e.Select = func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
+		if first {
+			first = false
+			return nil, fmt.Errorf("indexer: %w", context.DeadlineExceeded)
+		}
+		return realSelect(ctx, amount, feeRate)
+	}
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	if in, err := e.Process(context.Background(), "w1"); err == nil || in.State != StateCreated {
+		t.Fatalf("selector deadline: %v %s, want Created", err, in.State)
+	}
+	if in, err := e.Process(context.Background(), "w1"); err != nil || in.State != StateBroadcast {
+		t.Fatalf("retry: %v %s", err, in.State)
+	}
+
+	// Signer's own deadline: reservation released, stays Created.
+	e = newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	realSign := e.BuildSign
+	first = true
+	e.BuildSign = func(ctx context.Context, inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
+		if first {
+			first = false
+			return "", "", fmt.Errorf("hsm: %w", context.DeadlineExceeded)
+		}
+		return realSign(ctx, inputs, to, amount, feeRate)
+	}
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	if in, err := e.Process(context.Background(), "w1"); err == nil || in.State != StateCreated || e.Spent.IsSpent(txA, 0) {
+		t.Fatalf("signer deadline: %v %s reserved=%v, want Created and released", err, in.State, e.Spent.IsSpent(txA, 0))
+	}
+	if in, err := e.Process(context.Background(), "w1"); err != nil || in.State != StateBroadcast {
+		t.Fatalf("retry: %v %s", err, in.State)
+	}
+
+	// Broadcaster's own deadline: held Built, reservation kept.
+	e = newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	e.Broadcaster = broadcastFunc(func(context.Context, string, string) (string, error) {
+		return "", fmt.Errorf("node: %w", context.DeadlineExceeded)
+	})
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	in, err := e.Process(context.Background(), "w1")
+	if !errors.Is(err, context.DeadlineExceeded) || in.State != StateBuilt || !e.Spent.IsSpent(in.Inputs[0].TxID, in.Inputs[0].Vout) {
+		t.Fatalf("broadcaster deadline: %v %s", err, in.State)
 	}
 }

@@ -244,7 +244,7 @@ What a context that ends does to a withdrawal, state by state
 | In the selector or the signer, intent Created | Stays Created, attempt recorded, nothing reserved or built | The node has said nothing about the payment; an interrupted attempt is not a verdict |
 | In `Broadcast`, intent Built | Stays Built, reservation renewed, `rpc.ErrUnknownOutcome` carrying the context's error | The node may hold the transaction; only the same bytes may go out again |
 | In `UpdateConfirmations` | Error returned, no state change | |
-| In `Recover` | The passes over the spent set finish; the re-send loop stops at the first Built intent and reports it | Every Built intent is sent by the next `Recover` |
+| In `Recover` | The passes that repair the spent set run to the end whatever the context says; the re-send loop stops at the first Built intent and reports it | Every Built intent is sent by the next `Recover` |
 
 `rpc.Client.Broadcast` treats a context ending during the send as a lost reply: the resolution
 lookup runs on the same, ended, context and reports nothing, and the outcome stays unknown. It is
@@ -252,18 +252,35 @@ never a rejection. Nothing a context can do releases a Built intent's inputs, fa
 builds a second transaction. The harness proves it against the node: scenario 9 hands the
 broadcast to the node through a proxy that never returns the reply, cancels, restarts, and pays once.
 
-`electrumx.Client`: a call whose context ends returns `ctx.Err()` at once and the connection
-stays usable; a reply that arrives later carries an id the next call discards. A context
-deadline shorter than the 30-second call deadline bounds the exchange.
+The context governs what the engine asks of the network and how long it waits for a store read.
+It does not govern the writes: every `withdraw.Store.Put` is made under
+`context.WithoutCancel(ctx)`, because the record of what the network just did (a broadcast
+accepted, a txid the node disagreed on, a lost reply's attempt) must land whether or not the
+caller is still waiting; so are the reads `Recover` makes to repair the spent set. A
+database-backed `Store` bounds `Put` with its own timeout. `deposit.Monitor.Scan` returns a
+context error plainly, from whichever node or ledger call it ended, never as `ErrPaused` and
+never as an alert: a shutdown is not an indexer lying.
+
+`electrumx.Client`: a call whose context ends returns `ctx.Err()` at once. Cut short while
+reading, the connection stays usable and the late reply is discarded by id; cut short while
+writing, the connection is closed, since part of a line may be on the wire, and the next call
+returns `ErrNotConnected` until `Reconnect` or the polling loop restores it. A context deadline
+shorter than the 30-second call deadline bounds the exchange.
+
+`resilience`: a reconciliation run the context ends is `Incomplete` and reported, but it neither
+alerts nor trips the breaker, and `CircuitBreaker.RecordResult` treats `context.Canceled` as a
+per-request error that does not count; `context.DeadlineExceeded` counts.
 
 Every component takes a `*log/slog.Logger` in its constructor (`rpc.NewClient`,
 `electrumx.NewClient`, `utxo.OpenSpentSet`, `resilience.NewCircuitBreaker`, `NewAlerter`,
 `NewReconciler`) or as a `Logger` field (`withdraw.Engine`, `deposit.Monitor`). Nil discards
 everything; the SDK writes nothing to the process's default logger. Levels: `Info` for
-connections, refreshes and spent-set writes; `Warn` for a reorg seen in the cache, a refresh
-that failed, a reservation that could not be renewed, and, on `deposit.Monitor`, every alert
-when `OnAlert` is nil; `Error` for a circuit breaker opening and a panic in the polling
-goroutine. Identifiers are logged whole as attributes, never truncated into the message.
+connections, refreshes, spent-set writes and clean reconciliations; `Warn` for a reorg seen in
+the cache, a refresh that failed, a reservation that could not be renewed, a reconciliation the
+context ended, a webhook the server did not accept, and, on `deposit.Monitor`, every alert when
+`OnAlert` is nil; `Error` for a circuit breaker opening, a reconciliation that found a mismatch
+or could not complete, a webhook that could not be sent, and a panic in the polling goroutine.
+Identifiers are logged whole, as attributes or in the message, never truncated.
 
 ---
 

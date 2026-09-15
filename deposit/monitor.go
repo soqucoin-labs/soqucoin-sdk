@@ -174,6 +174,14 @@ func (m *Monitor) network() types.Network {
 	return n
 }
 
+// ended reports whether err is the context's own doing: the context has ended,
+// or err is or wraps a context error. Such an error is returned from Scan as
+// it is; it is never an alert, because the node and the ledger have said
+// nothing about themselves.
+func ended(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func (m *Monitor) maxCacheAge() time.Duration {
 	if m.MaxCacheAge > 0 {
 		return m.MaxCacheAge
@@ -191,8 +199,10 @@ type chainChecker interface {
 // ErrPaused (wrapped with the reason) when crediting was not safe. A node on
 // the wrong chain is returned as rpc.ErrWrongChain, a permanent error, not as
 // a pause. Other errors from the node are returned as-is; the pass credits
-// nothing in that case. A context that ends mid-pass is one of those: the
-// deposits credited before it are credited, the rest wait for the next pass.
+// nothing in that case. A context that ends mid-pass is returned as its own
+// error, never as a pause and never as an alert: the deposits credited
+// before it are credited and returned with it, the rest wait for the next
+// pass.
 func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	// 1. The node must serve this Monitor's chain and must have caught up.
 	//    During initial block download the finality horizon is not enforced
@@ -202,7 +212,7 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			m.alert(AlertNodeWrongChain, "%v", err)
 			return nil, err
 		}
-		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if ended(ctx, err) {
 			// The caller ended the pass; the node has said nothing about
 			// itself, so this is neither a pause nor an alert.
 			return nil, err
@@ -275,18 +285,25 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			}
 			done, err := m.Ledger.IsCredited(ctx, u.TxID, u.Vout)
 			if err != nil {
-				m.alert(AlertLedgerError, "IsCredited %s:%d: %v", u.TxID, u.Vout, err)
+				if !ended(ctx, err) {
+					m.alert(AlertLedgerError, "IsCredited %s:%d: %v", u.TxID, u.Vout, err)
+				}
 				return credited, err
 			}
 			if done {
 				continue
 			}
-			d, ok := m.verifyWithNode(ctx, addr, wantHex, u, confs)
+			d, ok, err := m.verifyWithNode(ctx, addr, wantHex, u, confs)
+			if err != nil {
+				return credited, err
+			}
 			if !ok {
 				continue
 			}
 			if err := m.Ledger.Credit(ctx, d); err != nil {
-				m.alert(AlertLedgerError, "Credit %s:%d: %v", u.TxID, u.Vout, err)
+				if !ended(ctx, err) {
+					m.alert(AlertLedgerError, "Credit %s:%d: %v", u.TxID, u.Vout, err)
+				}
 				return credited, err
 			}
 			credited = append(credited, d)
@@ -305,11 +322,16 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 // verifyWithNode asks the exchange's own node for the exact output and
 // requires agreement on existence, value, destination script, confirmation
 // depth and coinbase maturity. Any disagreement is alarmed and not credited.
-func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u types.UTXO, confs int64) (Deposit, bool) {
+// A lookup ended by the context is returned as that error, unalarmed: the
+// node has not disagreed, it has not been asked.
+func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u types.UTXO, confs int64) (Deposit, bool, error) {
 	out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 	if err != nil {
+		if ended(ctx, err) {
+			return Deposit{}, false, err
+		}
 		m.alert(AlertIndexerMismatch, "%s:%d for %s: node lookup failed: %v", u.TxID, u.Vout, addr, err)
-		return Deposit{}, false
+		return Deposit{}, false, nil
 	}
 	switch {
 	case out == nil:
@@ -326,9 +348,9 @@ func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u ty
 		return Deposit{
 			TxID: u.TxID, Vout: u.Vout, Address: addr, Value: u.Value, Height: u.Height,
 			Confirmations: out.Confirmations, CreditedAt: m.clock(),
-		}, true
+		}, true, nil
 	}
-	return Deposit{}, false
+	return Deposit{}, false, nil
 }
 
 // recheckPending confirms every credited, non-final deposit still exists on
@@ -338,7 +360,9 @@ func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u ty
 func (m *Monitor) recheckPending(ctx context.Context, tip int64) error {
 	pending, err := m.Ledger.Pending(ctx)
 	if err != nil {
-		m.alert(AlertLedgerError, "Pending: %v", err)
+		if !ended(ctx, err) {
+			m.alert(AlertLedgerError, "Pending: %v", err)
+		}
 		return err
 	}
 	for _, d := range pending {
@@ -355,7 +379,9 @@ func (m *Monitor) recheckPending(ctx context.Context, tip int64) error {
 		}
 		if out.Confirmations > types.MaxReorgDepth {
 			if err := m.Ledger.MarkFinal(ctx, d.TxID, d.Vout); err != nil {
-				m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
+				if !ended(ctx, err) {
+					m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
+				}
 				return err
 			}
 		}

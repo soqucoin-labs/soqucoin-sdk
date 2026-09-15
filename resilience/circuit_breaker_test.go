@@ -1,6 +1,7 @@
 package resilience
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -214,5 +215,24 @@ func TestTxIDMismatchCountsAsSystemic(t *testing.T) {
 	}
 	if cb.Allow() == nil {
 		t.Fatal("breaker did not open on a txid mismatch")
+	}
+}
+
+// A cancelled context is the operator's own stop signal, not a failure of
+// the system: it neither counts nor resets. A deadline that expired counts.
+func TestContextCanceledIsNotAFailure(t *testing.T) {
+	cb := NewCircuitBreaker(2, time.Minute, nil)
+	for i := 0; i < 5; i++ {
+		if cb.RecordResult(fmt.Errorf("process: %w", context.Canceled)) {
+			t.Fatal("a cancelled context changed the breaker")
+		}
+	}
+	if st, n, _, _ := cb.State(); st != CircuitClosed || n != 0 {
+		t.Fatalf("after five cancels: %s %d", st, n)
+	}
+	cb.RecordResult(fmt.Errorf("node: %w", context.DeadlineExceeded))
+	cb.RecordResult(fmt.Errorf("node: %w", context.DeadlineExceeded))
+	if st, _, _, _ := cb.State(); st != CircuitOpen {
+		t.Fatalf("two deadlines: %s, want OPEN", st)
 	}
 }

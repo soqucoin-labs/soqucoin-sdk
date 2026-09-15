@@ -260,3 +260,36 @@ func TestTripOpensImmediately(t *testing.T) {
 		t.Errorf("transitions %v", transitions)
 	}
 }
+
+// A run the context ends is Incomplete and reported, but it is not a mismatch:
+// no alert, no trip. A shutdown mid-run must not page or halt the next start.
+func TestRunEndedByTheContextDoesNotTripOrAlert(t *testing.T) {
+	src := &fakeSource{utxos: []types.UTXO{{TxID: "a", Vout: 0, Value: 10}}}
+	node := &fakeNode{outs: map[string]*rpc.TxOut{"a:0": {Value: 10}}}
+	cb := NewCircuitBreaker(3, time.Minute, nil)
+	cfg := DefaultReconciliationConfig()
+	r := NewReconciler(src, node, cb, cfg, nil)
+	alerted := false
+	r.OnAlert = func(string) { alerted = true }
+	reported := false
+	r.OnReport = func(Report) { reported = true }
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	src.refreshErr = fmt.Errorf("refresh: %w", ctx.Err())
+	rep := r.Run(ctx)
+	if rep.Incomplete == nil || !errors.Is(rep.Incomplete, context.Canceled) {
+		t.Fatalf("report %+v, want Incomplete with the context's error", rep)
+	}
+	if !reported || alerted {
+		t.Fatalf("reported=%v alerted=%v, want reported and not alerted", reported, alerted)
+	}
+	if st, _, _, _ := cb.State(); st != CircuitClosed {
+		t.Fatalf("breaker %s after a run the context ended, want CLOSED", st)
+	}
+	// The control: the same Incomplete report under a live context trips it.
+	src.refreshErr = errors.New("indexer down")
+	r.Run(context.Background())
+	if st, _, _, _ := cb.State(); st != CircuitOpen || !alerted {
+		t.Fatalf("breaker %s alerted=%v after a real incomplete run, want OPEN and alerted", st, alerted)
+	}
+}

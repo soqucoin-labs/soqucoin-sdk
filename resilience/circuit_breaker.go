@@ -22,6 +22,7 @@
 package resilience
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -104,12 +105,15 @@ type CircuitBreaker struct {
 // malformed address, an amount below the floor, insufficient funds or a
 // node rejection of one transaction says nothing about whether the next
 // withdrawal can succeed; feeding such errors to the breaker lets an
-// unauthenticated user halt every withdrawal with three bad requests.
+// unauthenticated user halt every withdrawal with three bad requests. A
+// cancelled context is the caller's own stop signal and says nothing about
+// the system either; a deadline that expired does, and counts.
 func (cb *CircuitBreaker) perRequest(err error) bool {
 	if err == nil {
 		return false
 	}
 	builtin := []error{
+		context.Canceled,
 		rpc.ErrPermanent,
 		soqaddr.ErrInvalidChecksum, soqaddr.ErrInvalidLength, soqaddr.ErrInvalidHRP,
 		soqaddr.ErrInvalidChar, soqaddr.ErrUnsupportedWitnessVersion, soqaddr.ErrInvalidVersion,

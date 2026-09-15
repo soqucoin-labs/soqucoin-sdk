@@ -26,10 +26,13 @@
 //
 // Every method that reaches the server takes a context.Context first. A call
 // whose context ends returns ctx.Err() at once: the connection deadline is
-// moved to now so the blocked read returns, and the reply, if it arrives
-// later, carries an id the next call discards. The connection stays usable.
-// Methods that read the cache (GetUTXOs, GetBalance, LastRefresh and the
-// rest) take no context; they never block on the network.
+// moved to now so the blocked write or read returns. A call cut short while
+// reading leaves the connection usable, and the reply, if it arrives later,
+// carries an id the next call discards; a call cut short while writing
+// closes the connection, since part of a line may be on the wire, and the
+// next call returns ErrNotConnected until Reconnect or the polling loop
+// restores it. Methods that read the cache (GetUTXOs, GetBalance,
+// LastRefresh and the rest) take no context; they never block on the network.
 //
 // Copyright (c) 2025-2026 Soqucoin Labs Inc. MIT License.
 package electrumx
@@ -348,8 +351,11 @@ const callDeadline = 30 * time.Second
 //
 // The context ends the exchange the same way the deadline does: when it is
 // done the connection deadline is moved to now, the blocked write or read
-// returns, and ctx.Err() is reported. A reply that arrives afterwards is a
-// stale id and is discarded by the next call, so the stream stays in step.
+// returns, and ctx.Err() is reported. A read cut short leaves the stream in
+// step: the reply, if it arrives, is a stale id the next call discards. A
+// write cut short does not, since part of a line may be on the wire, so a
+// failed write closes the connection; the next call returns ErrNotConnected
+// and Reconnect, or the polling loop, restores it.
 func (c *Client) callLocked(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	if c.conn == nil {
 		return nil, ErrNotConnected
@@ -377,10 +383,24 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 	// together and the read could return before ctx.Err() is set.
 	conn := c.conn
 	if err := conn.SetDeadline(time.Now().Add(callDeadline)); err != nil {
+		// A socket that refuses a deadline is closed or broken underneath.
+		c.dropLocked()
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
-	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
-	defer stop()
+	// If the context ends while the call is in flight the callback moves the
+	// deadline to now. On return the callback is stopped, or, when it has
+	// already started, waited for: connMu is still held here, so it cannot
+	// run after the next call has set its own deadline.
+	fired := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(fired)
+		conn.SetDeadline(time.Now())
+	})
+	defer func() {
+		if !stop() {
+			<-fired
+		}
+	}()
 	// ctxErr reports the context's error in place of the deadline error the
 	// connection produced when the context is what ended the exchange.
 	ctxErr := func(err error) error {
@@ -393,6 +413,8 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 	// ElectrumX uses newline-delimited JSON
 	data = append(data, '\n')
 	if _, err := conn.Write(data); err != nil {
+		// Part of the line may have gone out; the stream cannot be trusted.
+		c.dropLocked()
 		return nil, fmt.Errorf("write request: %w", ctxErr(err))
 	}
 
@@ -426,6 +448,16 @@ func (c *Client) callLocked(ctx context.Context, method string, params interface
 		return in.Result, nil
 	}
 	return nil, fmt.Errorf("electrumx: no reply to request %d within %d lines", id, maxSkippedLines)
+}
+
+// dropLocked closes and forgets the connection. Caller holds connMu. The next
+// call returns ErrNotConnected until Reconnect, or the polling loop, dials again.
+func (c *Client) dropLocked() {
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.conn = nil
+	c.reader = nil
 }
 
 // handleNotification consumes a server push. Only the headers subscription is

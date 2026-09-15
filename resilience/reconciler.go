@@ -148,9 +148,10 @@ func (r *Reconciler) Start(ctx context.Context) {
 func (r *Reconciler) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
 
 // Run performs one reconciliation and returns its report. It also alerts and,
-// when configured, trips the breaker. A context that ends mid-run makes the
-// run Incomplete, which is a finding like any other: a book that could not
-// be checked is not known to match.
+// when configured, trips the breaker. A run the context ends is Incomplete
+// and is returned and reported through OnReport, but it neither alerts nor
+// trips the breaker: the book was not checked, it was not found wrong, and a
+// shutdown must not page the operator or halt the next start.
 func (r *Reconciler) Run(ctx context.Context) Report {
 	rep := r.reconcile(ctx)
 	if r.OnReport != nil {
@@ -158,6 +159,10 @@ func (r *Reconciler) Run(ctx context.Context) Report {
 	}
 	if rep.Clean() {
 		r.log.Info("reconciliation clean", "outpoints", rep.Checked, "node_total_shors", rep.NodeTotal)
+		return rep
+	}
+	if rep.Incomplete != nil && (ctx.Err() != nil || errors.Is(rep.Incomplete, context.Canceled) || errors.Is(rep.Incomplete, context.DeadlineExceeded)) {
+		r.log.Warn("reconciliation not completed: the context ended", "err", rep.Incomplete)
 		return rep
 	}
 	msg := r.describe(rep)
@@ -183,7 +188,7 @@ func (r *Reconciler) describe(rep Report) string {
 			msg += fmt.Sprintf("; and %d more", len(rep.Findings)-5)
 			break
 		}
-		msg += fmt.Sprintf("; %s:%d %s", shortID(f.TxID, 12), f.Vout, f.Reason)
+		msg += fmt.Sprintf("; %s:%d %s", f.TxID, f.Vout, f.Reason)
 	}
 	return msg
 }
@@ -214,7 +219,7 @@ func (r *Reconciler) reconcile(ctx context.Context) Report {
 		rep.CacheTotal += u.Value
 		out, err := r.node.GetTxOut(ctx, u.TxID, u.Vout, true)
 		if err != nil {
-			rep.Incomplete = fmt.Errorf("gettxout %s:%d: %w", shortID(u.TxID, 12), u.Vout, err)
+			rep.Incomplete = fmt.Errorf("gettxout %s:%d: %w", u.TxID, u.Vout, err)
 			return rep
 		}
 		switch {
@@ -234,12 +239,4 @@ func (r *Reconciler) reconcile(ctx context.Context) Report {
 		rep.Findings = append(rep.Findings, Finding{Reason: fmt.Sprintf("totals differ by %d shors", rep.CacheTotal-rep.NodeTotal)})
 	}
 	return rep
-}
-
-// shortID truncates an identifier for logging without panicking on short input.
-func shortID(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

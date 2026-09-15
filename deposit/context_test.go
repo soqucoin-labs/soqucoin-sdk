@@ -29,8 +29,8 @@ func (n *ctxNode) GetTxOut(ctx context.Context, txid string, vout uint32, mem bo
 	return n.fakeNode.GetTxOut(ctx, txid, vout, mem)
 }
 
-// A context that ends before or during a scan credits nothing and marks
-// nothing final; the error is the node's, not a pause.
+// A context that has ended before the scan credits nothing and marks nothing
+// final; the error is the context's, not a pause and not an alert.
 func TestScanUnderAnEndedContextCreditsNothing(t *testing.T) {
 	m, cache, node, led, al, a := setup(t)
 	m.Node = &ctxNode{*node}
@@ -49,7 +49,9 @@ func TestScanUnderAnEndedContextCreditsNothing(t *testing.T) {
 	if len(led.credited) != 0 {
 		t.Fatal("a deposit was credited under an ended context")
 	}
-	_ = al
+	if len(al.kinds) != 0 {
+		t.Fatalf("an ended context raised alerts %v", al.kinds)
+	}
 	// The next scan with a live context credits it once.
 	got, err = m.Scan(context.Background())
 	if err != nil || len(got) != 1 {
@@ -78,5 +80,85 @@ func TestNilOnAlertLogsThroughTheLogger(t *testing.T) {
 	m.Logger = nil
 	if _, err := m.Scan(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// cancellingNode ends the context on its nth GetTxOut and then answers as
+// the node would once its context has ended.
+type cancellingNode struct {
+	fakeNode
+	cancel context.CancelFunc
+	onCall int
+	calls  int
+}
+
+func (n *cancellingNode) GetTxOut(ctx context.Context, txid string, vout uint32, mem bool) (*rpc.TxOut, error) {
+	n.calls++
+	if n.calls == n.onCall {
+		n.cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return n.fakeNode.GetTxOut(ctx, txid, vout, mem)
+}
+
+// The context ends in the middle of the credit loop, at the node lookup for
+// the second of three candidates. The first is credited and returned with
+// the error, the other two are not, no alert is raised, and the error is the
+// context's: a shutdown or a slow node is not an indexer lying. The next scan
+// with a live context credits the rest once.
+func TestContextEndingMidScanIsReturnedNotAlarmed(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Node = &cancellingNode{fakeNode: *node, cancel: cancel, onCall: 2}
+	for i, tx := range []string{txA, txB, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"} {
+		cache.utxos[a] = append(cache.utxos[a], types.UTXO{TxID: tx, Vout: uint32(i), Value: 150_000_000, Height: 900, Address: a})
+		node.outs[key(tx, uint32(i))] = txout(t, a, 150_000_000, 101, false)
+	}
+	got, err := m.Scan(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("scan cancelled mid-loop: %v, want the context's error", err)
+	}
+	if errors.Is(err, ErrPaused) {
+		t.Errorf("reported as a pause: %v", err)
+	}
+	if len(got) != 1 || len(led.credited) != 1 {
+		t.Fatalf("credited %d and returned %d, want the one verified before the cancel", len(led.credited), len(got))
+	}
+	if len(al.kinds) != 0 {
+		t.Fatalf("a cancelled lookup raised alerts %v; it is not an indexer mismatch", al.kinds)
+	}
+	m.Node = node
+	got, err = m.Scan(context.Background())
+	if err != nil || len(got) != 2 || len(led.credited) != 3 {
+		t.Fatalf("scan after: %v %d credited now %d", err, len(got), len(led.credited))
+	}
+}
+
+// ledgerCancel is a Ledger whose IsCredited ends the context and reports it.
+type ledgerCancel struct {
+	*fakeLedger
+	cancel context.CancelFunc
+}
+
+func (l *ledgerCancel) IsCredited(ctx context.Context, txid string, vout uint32) (bool, error) {
+	l.cancel()
+	return false, ctx.Err()
+}
+
+// The same for the ledger: a database query ended by the context is the
+// context's error, not AlertLedgerError.
+func TestLedgerContextErrorIsNotALedgerAlert(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Ledger = &ledgerCancel{fakeLedger: led, cancel: cancel}
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 150_000_000, Height: 900, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 150_000_000, 101, false)
+	_, err := m.Scan(ctx)
+	if !errors.Is(err, context.Canceled) || len(al.kinds) != 0 {
+		t.Fatalf("ledger cancel: %v alerts %v", err, al.kinds)
 	}
 }

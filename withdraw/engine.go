@@ -35,6 +35,13 @@
 // a restart, exactly as for a timeout. Nothing a context can do releases a
 // Built intent's inputs, fails it, or builds a second transaction.
 //
+// The context governs what the engine asks of the network and how long it
+// waits for the store to answer a read. It does not govern the writes: every
+// Store.Put is made under context.WithoutCancel(ctx), because the record of
+// what just happened must land whether or not the caller is still waiting,
+// and so are the reads Recover makes to repair the spent set. A Store bounds
+// its own writes with a timeout of its own.
+//
 // Recover re-drives Built intents after a restart with the same bytes. It
 // never rebuilds. It also releases reservations held for intents that have
 // nothing built (a crash between the reservation and the Built save), so the
@@ -104,8 +111,12 @@ type Intent struct {
 }
 
 // Store persists intents. Put must be durable before it returns: the engine
-// relies on "persisted, then broadcast" to make recovery safe. The context
-// is the caller's; a database-backed store bounds its queries with it.
+// relies on "persisted, then broadcast" to make recovery safe. Get and List
+// receive the caller's context; Put receives one that does not end when the
+// caller's does (context.WithoutCancel), since the engine calls it to record
+// what the network has already done, and a record cut short by the caller is
+// a Built intent the store thinks is Created, or a held intent it thinks is
+// sendable. A database-backed store bounds Put with its own timeout.
 type Store interface {
 	Get(ctx context.Context, id string) (*Intent, bool, error)
 	Put(ctx context.Context, intent *Intent) error
@@ -221,9 +232,12 @@ func (e *Engine) reservationTTL() time.Duration {
 	return DefaultReservationTTL
 }
 
+// save writes the intent. The write is not bound to the caller's context: it
+// records a fact, often one the network already knows, and must land whether
+// or not the caller is still waiting. Values on ctx are kept.
 func (e *Engine) save(ctx context.Context, in *Intent) error {
 	in.UpdatedAt = e.now()
-	return e.Store.Put(ctx, in)
+	return e.Store.Put(context.WithoutCancel(ctx), in)
 }
 
 // Submit registers a withdrawal. Calling it again with the same id returns
@@ -449,10 +463,13 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 // It attempts every intent and returns every error joined, so errors.Is
 // finds each kind.
 //
-// The passes over the spent set never touch the network and always run to
-// the end. The re-broadcast pass stops at the first Built intent once ctx
-// has ended: that intent and the rest stay Built, re-reserved, and are sent
-// by the next Recover. The context's error is among those returned.
+// The passes that repair the spent set never touch the network and are not
+// cut short by the caller's context: their store reads run under
+// context.WithoutCancel(ctx), so a Recover started with an ended context
+// still re-marks every Broadcast intent's inputs and releases the orphan
+// reservations. The re-broadcast pass stops at the first Built intent once
+// ctx has ended: that intent and the rest stay Built, re-reserved, and are
+// sent by the next Recover. The context's error is among those returned.
 func (e *Engine) Recover(ctx context.Context) error {
 	var errs []error
 	note := func(err error) {
@@ -460,7 +477,8 @@ func (e *Engine) Recover(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
-	broadcast, err := e.Store.List(ctx, StateBroadcast)
+	repair := context.WithoutCancel(ctx)
+	broadcast, err := e.Store.List(repair, StateBroadcast)
 	if err != nil {
 		return err
 	}
@@ -469,8 +487,8 @@ func (e *Engine) Recover(ctx context.Context) error {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
 	}
-	note(e.releaseOrphanReservations(ctx))
-	built, err := e.Store.List(ctx, StateBuilt)
+	note(e.releaseOrphanReservations(repair))
+	built, err := e.Store.List(repair, StateBuilt)
 	if err != nil {
 		return errors.Join(append(errs, err)...)
 	}

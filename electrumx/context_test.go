@@ -3,6 +3,7 @@ package electrumx
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,11 +110,17 @@ func TestCallHonoursTheContextDeadline(t *testing.T) {
 	}
 }
 
-// RefreshAll under an ended context refreshes nothing more and names the
-// address it stopped at; records for the addresses already refreshed stand.
+// RefreshAll under an ended context sends nothing and stops at the first
+// address, naming only that one: it does not attempt the rest and fail each.
+// Records for addresses already refreshed stand.
 func TestRefreshAllStopsAtTheContext(t *testing.T) {
 	a1, a2 := craftAddr(t, 0x11), craftAddr(t, 0x22)
+	var calls int
+	var mu sync.Mutex
 	stub := newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
+		mu.Lock()
+		calls++
+		mu.Unlock()
 		return []string{reply(req.ID, `[]`)}
 	})
 	c := connect(t, stub)
@@ -125,6 +132,15 @@ func TestRefreshAllStopsAtTheContext(t *testing.T) {
 	err := c.RefreshAll(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("RefreshAll under an ended context: %v", err)
+	}
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d requests reached the server under an ended context", n)
+	}
+	if msg := err.Error(); !strings.Contains(msg, a1) || strings.Contains(msg, a2) {
+		t.Fatalf("error should name the address it stopped at and no other: %s", msg)
 	}
 	if at, _ := c.LastRefreshOf(a1); !at.IsZero() {
 		t.Error("an address was refreshed under an ended context")
@@ -163,18 +179,47 @@ func TestPollingStopsWithTheContext(t *testing.T) {
 	c.StartPolling(ctx)
 	time.Sleep(120 * time.Millisecond)
 	cancel()
-	time.Sleep(60 * time.Millisecond)
+	// A refresh in flight at the cancel may still complete; after that the
+	// count must stand still. A loop still running at 20 ms would add about
+	// ten in the second window.
+	time.Sleep(100 * time.Millisecond)
 	mu.Lock()
 	n := calls
 	mu.Unlock()
 	if n < 2 {
 		t.Fatalf("polling made %d refreshes in 120 ms at a 20 ms interval", n)
 	}
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	mu.Lock()
 	after := calls
 	mu.Unlock()
-	if after != n {
+	if after > n+1 {
 		t.Fatalf("polling continued after its context ended: %d then %d refreshes", n, after)
+	}
+}
+
+// A failed write closes the connection: part of a line may be on the wire and
+// the stream cannot be trusted. The next call reports ErrNotConnected and a
+// Reconnect restores service.
+func TestFailedWriteClosesTheConnection(t *testing.T) {
+	stub := newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
+		return []string{reply(req.ID, `null`)}
+	})
+	c := connect(t, stub)
+	// Close the socket underneath the client, so the next write fails.
+	c.connMu.Lock()
+	c.conn.Close()
+	c.connMu.Unlock()
+	if _, err := c.Call(context.Background(), "anything", []interface{}{}); err == nil {
+		t.Fatal("a write on a closed socket succeeded")
+	}
+	if _, err := c.Call(context.Background(), "anything", []interface{}{}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("after a failed write: %v, want ErrNotConnected", err)
+	}
+	if err := c.Reconnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Call(context.Background(), "anything", []interface{}{}); err != nil {
+		t.Fatalf("after reconnect: %v", err)
 	}
 }

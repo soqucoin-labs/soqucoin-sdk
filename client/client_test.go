@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,8 +14,6 @@ import (
 
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
-
-func init() { log.SetOutput(io.Discard) } // the package logs each queued payment
 
 // capture is what a request to the fake signer looked like.
 type capture struct {
