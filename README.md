@@ -206,6 +206,10 @@ A throwaway regtest node, the real `deposit` and `withdraw` packages, nine end-t
 about forty-five seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
 each scenario proves.
 
+`SOQUCOIND` must be a runnable binary. In an autotools build tree that is `src/soqucoind`, the
+wrapper that resolves the uninstalled shared libraries, and not `src/.libs/soqucoind`, which does
+not load outside it.
+
 ## Documentation
 
 - **[Quick Start](docs/QUICK_START.md)**: Generate an address, check balance, send SOQ in 5 minutes

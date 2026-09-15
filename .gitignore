@@ -4,3 +4,6 @@ dist/
 *.test
 *.out
 vendor/
+
+# check-mutants.py writes this while a file is mutated; never commit one
+.check-mutants-recovery.json
