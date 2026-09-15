@@ -9,7 +9,7 @@ Step-by-step guide for listing Soqucoin (SOQ) on your exchange.
 To support SOQ deposits and withdrawals, your exchange needs to:
 
 1. **Generate deposit addresses**: one unique address per user
-2. **Monitor deposits**: track UTXOs via ElectrumX polling
+2. **Monitor deposits**: track UTXOs through ElectrumX subscriptions, credit through your node
 3. **Process withdrawals**: build, sign, and broadcast transactions
 4. **Confirm transactions**: wait for sufficient block confirmations
 
@@ -236,7 +236,7 @@ the interfaces you implement for them (`withdraw.Store`, `withdraw.Broadcaster`,
 none; they never block. The one network call without a context is the webhook post of
 `resilience.Alerter`, which is fire-and-forget on its own goroutine with a ten-second timeout.
 The context is how a process bounds a call and how it shuts down:
-`electrumx.Client.StartPolling` and `resilience.Reconciler.Start` end with it.
+`electrumx.Client.Start` and `resilience.Reconciler.Start` end with it.
 
 What a context that ends does to a withdrawal, state by state
 (`withdraw/engine.go`, `rpc/client.go`):
@@ -267,12 +267,13 @@ context for that. `deposit.Ledger` follows the same rule: `IsCredited` and `Pend
 returns a context error plainly, from whichever node or ledger read it ended, never as
 `ErrPaused` and never as an alert: a shutdown is not an indexer lying.
 
-`electrumx.Client`: a call whose context ends returns `ctx.Err()` at once. Cut short before
-any byte of the reply arrived, the connection stays usable and the late reply is discarded by
-id; cut short while writing, or after part of a reply line was read, the connection is closed,
-since the stream is no longer known to be at a line boundary, and the next call returns
-`ErrNotConnected` until `Reconnect` or the polling loop restores it. A context deadline
-shorter than the 30-second call deadline bounds the exchange.
+`electrumx.Client`: calls run concurrently on the one connection, and a call whose context
+ends returns `ctx.Err()` at once, whether it is waiting to write or waiting for its reply. Its
+reply, if it arrives later, finds no waiter and is dropped; replies are paired with calls by id,
+never by position. A call cut short while writing closes the connection, since part of a line
+may be on the wire, and the next call returns `ErrNotConnected` until `Reconnect` or `Start`'s
+refresher restores it. A context deadline shorter than the 30-second call deadline bounds the
+exchange.
 
 `resilience`: a reconciliation run the context ends before it found anything is `Incomplete`
 and reported, but it neither alerts nor trips the breaker; a run that had already recorded a
@@ -288,7 +289,7 @@ connections, cache evictions, spent-set writes and clean reconciliations; `Warn`
 the cache, a refresh that failed, a reservation that could not be renewed, a reconciliation the
 context ended, a webhook the server did not accept, and, on `deposit.Monitor`, every alert when
 `OnAlert` is nil; `Error` for a circuit breaker opening, a reconciliation that found a mismatch
-or could not complete, a webhook that could not be sent, and a panic in the polling goroutine.
+or could not complete, a webhook that could not be sent, and a panic in the refresher goroutine.
 Identifiers are logged whole, as attributes or in the message, never truncated.
 
 ---
@@ -379,23 +380,48 @@ horizon is not enforced during initial download) or while the indexer has stoppe
 outage looks exactly like "no deposits"), and it re-verifies every credited deposit until it passes
 the horizon so a reorganisation that removes one is alarmed rather than missed.
 
-**How many addresses one indexer client keeps fresh.** `electrumx.Client.RefreshAll`
-(`electrumx/client.go`) makes one `blockchain.scripthash.listunspent` call per tracked address, in
-sequence, on one connection, each under the 30-second call deadline (`callLocked`), so a pass takes
-the sum of the round trips. `deposit.Monitor` skips an address whose last successful refresh is
-older than `MaxCacheAge`, 5 minutes by default (`deposit/monitor.go`, `AddressFreshness`), and
-pauses only when every address is stale. The ceiling on one client is therefore
+**How the indexer client keeps addresses fresh.** `electrumx.Client.Start` subscribes to every
+tracked address (`blockchain.scripthash.subscribe`, `electrumx/subscribe.go`); when the server
+reports an address's history changed, the client makes one `blockchain.scripthash.listunspent` for
+that address and merges the reply into the cache. A notification writes nothing to the cache by
+itself: only a `listunspent` reply does, and credit still needs your node's `gettxout`, so what a
+faulty or lying indexer can do with a notification is what it could do with a poll reply. Two
+timers back the subscriptions. The reconcile interval given to `electrumx.NewClient` is a full
+`listunspent` pass over every address whatever the statuses say: the safety net for a notification
+the server never sent, so a dropped notification delays a deposit by at most that interval plus
+your scan period. `PingInterval` (60 seconds by default) is a `server.ping` that keeps the server
+from closing an idle connection and, on your side, advances the freshness of every subscribed address
+with no change pending. The ping runs on its own goroutine beside any pass in progress
+(`electrumx/subscribe.go`, `pingLoop`), so a long reconcile does not age the addresses it has not
+reached. A quiet address reads fresh for as long as the server answers pings; when the connection is
+lost, no ping is answered and every address ages out within `MaxCacheAge`. `MaxCacheAge` on
+`deposit.Monitor` (5 minutes by default) must exceed `PingInterval` with room for one missed ping.
 
-    addresses x round trip per call  <  MaxCacheAge
+`deposit.Monitor` judges freshness per address (`LastRefreshOf`, `deposit/monitor.go`,
+`AddressFreshness`): an address the indexer has not answered for within `MaxCacheAge` is skipped and
+alarmed once per pass with the count, its deposits wait for the pass that reaches it, and the
+Monitor pauses only when every address is stale. The costs, each cited to the code that pays it:
 
-which at a 5 ms round trip gives about 60,000 addresses and at 50 ms about 6,000, and the poll
-interval given to `electrumx.NewClient` must also stay well inside `MaxCacheAge`, since an
-address's age when `Scan` reads it is up to the poll interval when a pass is shorter than the
-interval, and up to the pass duration otherwise. Measure
-the round trip on your own indexer and size against it, or run one client per block of addresses. A pass
-that skips any address raises one `AlertCacheStale` with the count; the deposits at those addresses
-wait for the next pass that reaches them, they are not lost. In v0.3.5 one failed call marked the
-whole pass stale and paused every credit until a pass succeeded for every address.
+- Steady state: one `listunspent` per changed address (`subscribe.go`, `pass`). A block that pays N
+  tracked addresses costs N calls, in sequence, on one connection.
+- Reconnect: one `subscribe` per address (`pass`), plus one `listunspent` per address whose status
+  changed while the client was away; an unchanged address whose record is clean costs the
+  subscribe call alone (`subscribe`, the status comparison). A connection that dies after every
+  handshake is redialled on a backoff from one second to a minute (`run`, `after`), not in a loop.
+- Reconcile: one `listunspent` per address (`subscribe.go`, `pass` with `full` set, through
+  `client.go`, `refresh`); the interval must exceed the pass.
+- The client's own cost per address, over loopback against a server that answers at once, is
+  44 µs for one subscribe and one listunspent (about 22,700 addresses per second), measured by
+  `BenchmarkSubscribeAndRefreshPerAddress` in `electrumx/bench_test.go`; from a notification to the
+  `listunspent` it asks for, between 26 and 46 µs across runs at the benchtime the file names
+  (`BenchmarkNotificationToRefresh`, `-benchtime 1000x`). Your indexer's round trip is
+  added to each call, so a reconnect over 60,000 addresses at a 5 ms round trip is about five minutes
+  of subscribe calls, during which the addresses not yet re-subscribed keep their last records and
+  age toward `MaxCacheAge`. Run one client per block of addresses if that ramp is too long.
+
+Before v0.4 the client polled every address every 15 seconds, so one client kept at most
+`MaxCacheAge` divided by the round trip addresses fresh; in v0.3.5 one failed call marked the whole
+pass stale and paused every credit until a pass succeeded for every address.
 
 ```go
 package main
@@ -480,7 +506,7 @@ func main() {
 	// The indexer. Over anything but a private network, use TLS: the server
 	// sees every address you track. The network is inferred from the
 	// addresses; mixed or undecodable addresses are refused.
-	elx := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second, logger)
+	elx := electrumx.NewClient("electrumx.example.com:50002", 10*time.Minute, logger) // the reconcile interval
 	elx.UseTLS()
 	if err := elx.TrackAddresses(depositAddresses); err != nil {
 		log.Fatalf("track addresses: %v", err)
@@ -489,7 +515,7 @@ func main() {
 		log.Fatalf("connect: %v", err)
 	}
 	defer elx.Stop()
-	elx.StartPolling(ctx) // ends with ctx or Stop
+	elx.Start(ctx) // subscribes, refreshes on push, reconciles, pings; ends with ctx or Stop
 
 	// Your own node. Nothing is credited on the indexer's word alone.
 	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass", logger)
@@ -627,7 +653,7 @@ func main() {
 	}
 
 	// Indexer and node.
-	elx := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second, logger)
+	elx := electrumx.NewClient("electrumx.example.com:50002", 10*time.Minute, logger) // the reconcile interval
 	elx.UseTLS()
 	if err := elx.TrackAddresses([]string{hotWallet}); err != nil {
 		log.Fatalf("track: %v", err)
@@ -636,7 +662,7 @@ func main() {
 		log.Fatalf("connect: %v", err)
 	}
 	defer elx.Stop()
-	elx.StartPolling(ctx)
+	elx.Start(ctx)
 	node := rpc.NewClient("http://127.0.0.1:33389", "rpcuser", "rpcpass", logger)
 	node.Network = types.Mainnet
 
@@ -838,22 +864,24 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | `utxo` | **94.3%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
 | `rpc` | **85.0%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
-| `deposit` | **84.0%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **77.4%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
+| `electrumx` | **85.9%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
 | `tx` | **80.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **85.8%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **82.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `resilience` | **62.1%** | Circuit breaker transitions and classification, reconciler against the node |
 
 Also passes under the race detector (`go test -race`), which matters for `electrumx` because its
-UTXO cache is shared between the polling goroutine and caller threads.
+UTXO cache is shared between the reader goroutine, the refresher and caller threads.
 
 **Where the coverage is thin, and why.** These numbers are reported rather than rounded up:
 
 - **`resilience` (62.1%)**: the breaker and the reconciler are covered against fakes; the Slack
   alerter's HTTP path is not, and it is an operational convenience rather than part of the money path.
-- **`electrumx` (77.4%)**: the protocol path is driven by a scripted fake server, including the
-  notification-in-front-of-reply case. The long-running polling loop's timing is not unit-tested.
+- **`electrumx`**: the protocol path is driven by a scripted fake server, including the
+  notification-in-front-of-reply case, pushed changes, a reconnect and a dropped notification
+  covered by the reconcile. The refresher's timers are exercised at short intervals, not at the
+  production defaults.
 
 **What the tests deliberately target.** Rather than chasing a percentage, they pin the invariants
 whose failure is silent: transaction ID byte-order reversal, per-input BIP143 sighash separation,

@@ -73,8 +73,8 @@
       "file": "electrumx/client.go",
       "package": "./electrumx",
       "test": "TestARefreshForAnUntrackedAddressWritesNothing",
-      "find": "\tif !c.trackedSet[addr] {\n\t\t// TrackAddresses dropped the address while this listunspent was in\n\t\t// flight; committing now would put an untracked address's outputs\n\t\t// back into the cache the balance and the selector read.\n\t\treturn nil\n\t}\n\tc.utxos[addr] = merged",
-      "replace": "\tc.utxos[addr] = merged",
+      "find": "\tif !c.trackedSet[addr] {\n\t\t// TrackAddresses dropped the address while this listunspent was in\n\t\t// flight; committing now would put an untracked address's outputs\n\t\t// back into the cache the balance and the selector read.\n\t\treturn 0, false\n\t}",
+      "replace": "\tif false {\n\t\treturn 0, false\n\t}",
       "why": "A listunspent already in flight when TrackAddresses drops its address must not commit, or it undoes the pruning above and makes the output selectable again."
     },
     {
@@ -86,6 +86,51 @@
       "find": "\tif got[0] == 'f' {\n\t\treturn \"0\" + got[1:]\n\t}",
       "replace": "",
       "why": "The lying broadcaster must hand the engine a txid that is not the real one. Replacing the first character with a fixed 'f' returns the input unchanged for the one real txid in sixteen that already starts with 'f', and scenario 8 then fails, because it requires a node txid that differs from the engine's own and was handed two that are equal. A spurious failure in one run in sixteen, not a vacuous pass."
+    },
+    {
+      "id": "electrumx-late-refresh-commits-over-a-newer-one",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestALateListunspentReplyDoesNotRestoreAnOlderSet",
+      "find": "\tif ticket < c.refreshed[addr].commit {",
+      "replace": "\tif false {",
+      "why": "Two refreshes of one address can be in flight at once and their replies can arrive in either order. Without the ticket order the older reply commits last, and because the merge drops every output its own reply does not list, a deposit the newer reply found leaves the cache while the record dates the set current."
+    },
+    {
+      "id": "electrumx-tip-from-a-replaced-connection",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestATipFromAReplacedConnectionIsNotRecorded",
+      "find": "\tif live := c.liveGen.Load(); gen != live {",
+      "replace": "\tif live := c.liveGen.Load(); gen != live && false {",
+      "why": "A headers reply buffered on a connection that has since been replaced still answers its caller. Recording its tip moves the height backwards, past the newer one the replacing connection recorded in its handshake."
+    },
+    {
+      "id": "electrumx-empty-pass-counts-as-a-clean-pass",
+      "file": "electrumx/refreshpolicy.go",
+      "package": "./electrumx",
+      "test": "TestAPassThatMadeNoCallIsNotAnOutcome",
+      "find": "\tif err == nil && !made {",
+      "replace": "\tif false {",
+      "why": "The pass that follows the first ping timeout has nothing to refresh whenever no address has a change pending. Counted as a clean pass it resets the reply-timeout count, so the second timeout counts as the first and a server that has stopped answering while holding the connection open is never replaced."
+    },
+    {
+      "id": "electrumx-subscribe-commits-from-a-replaced-connection",
+      "file": "electrumx/subscribe.go",
+      "package": "./electrumx",
+      "test": "TestASubscribeReplyFromAReplacedConnectionCommitsNothing",
+      "find": "\tif live := c.liveGen.Load(); gen != live {",
+      "replace": "\tif live := c.liveGen.Load(); gen != live && false {",
+      "why": "A subscribe reply from a connection that has been replaced records a status that was true when the server wrote it and dates the address's freshness now, on a connection that carries no subscription for it."
+    },
+    {
+      "id": "electrumx-write-failure-not-a-lost-connection",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestAFailedWriteReportsALostConnection",
+      "find": "\treturn fmt.Errorf(\"%w: %w\", ErrNotConnected, err)",
+      "replace": "\treturn err",
+      "why": "A write that fails on a live context means the socket is gone and dropLocked has forgotten it. Reported as a plain error the refresher classifies it as one the server chose to send, which never rebuilds the connection, and waits out a backoff before finding out through the next call."
     }
   ]
 }

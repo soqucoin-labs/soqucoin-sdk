@@ -28,7 +28,7 @@ type scriptedStub struct {
 	genesis string
 }
 
-func newScriptedStub(t *testing.T, genesis string, handler func(req request) []string) *scriptedStub {
+func newScriptedStub(t testing.TB, genesis string, handler func(req request) []string) *scriptedStub {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -48,6 +48,36 @@ func newScriptedStub(t *testing.T, genesis string, handler func(req request) []s
 }
 
 func (s *scriptedStub) addr() string { return s.ln.Addr().String() }
+
+// push writes unsolicited lines to every connection: server notifications.
+func (s *scriptedStub) push(lines ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.conns {
+		for _, l := range lines {
+			c.Write([]byte(l + "\n"))
+		}
+	}
+}
+
+// closeConns drops every connection from the server side.
+func (s *scriptedStub) closeConns() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.conns {
+		c.Close()
+	}
+	s.conns = nil
+}
+
+// scripthashNotification is the server's push for a changed address.
+func scripthashNotification(sh, status string) string {
+	st := "null"
+	if status != "" {
+		st = fmt.Sprintf("%q", status)
+	}
+	return fmt.Sprintf(`{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":[%q,%s]}`, sh, st)
+}
 
 func (s *scriptedStub) serve() {
 	for {
@@ -76,6 +106,13 @@ func (s *scriptedStub) serve() {
 					out = []string{reply(req.ID, `"ElectrumX 1.16"`)}
 				case "server.features":
 					out = []string{reply(req.ID, fmt.Sprintf(`{"genesis_hash":%q}`, s.genesis))}
+				case "blockchain.headers.subscribe":
+					// Connect subscribes to headers; a handler that does not
+					// script the reply gets a default tip, so "returns nil"
+					// keeps meaning "hold the reply" for every other method.
+					if out = s.handler(req); out == nil {
+						out = []string{reply(req.ID, `{"height":1,"hex":"00"}`)}
+					}
 				default:
 					out = s.handler(req)
 				}

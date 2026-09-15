@@ -68,7 +68,10 @@ func (s *electrumStub) serve() {
 				if err := dec.Decode(&req); err != nil {
 					return
 				}
-				resp := response{ID: req.ID, Result: json.RawMessage(`"ElectrumX 1.16"`)}
+				resp := struct {
+					ID     int64           `json:"id"`
+					Result json.RawMessage `json:"result"`
+				}{ID: req.ID, Result: json.RawMessage(`"ElectrumX 1.16"`)}
 				b, _ := json.Marshal(resp)
 				if _, err := c.Write(append(b, '\n')); err != nil {
 					return
