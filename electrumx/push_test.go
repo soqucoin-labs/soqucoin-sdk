@@ -138,12 +138,18 @@ func TestNotificationWritesNothingUntilListunspentAnswers(t *testing.T) {
 	stub.failList[sh1] = true // the first listunspent after the change fails; nothing lands
 	stub.mu.Unlock()
 	stub.push(scripthashNotification(sh1, "s1"))
-	waitFor(t, "the listunspent the notification asked for", func() bool { return stub.count("blockchain.scripthash.listunspent", sh1) >= 2 })
+	// Wait on the effect, not on the call. The stub counts the call as it
+	// answers, and the client writes the record only once the reply has been
+	// read, so waiting for the count races that window and fails under load.
+	waitFor(t, "the failed listunspent to reach the record", func() bool {
+		_, err := c.LastRefreshOf(a1)
+		return err != nil
+	})
+	if n := stub.count("blockchain.scripthash.listunspent", sh1); n < 2 {
+		t.Fatalf("the notification did not ask for a listunspent: %d calls", n)
+	}
 	if len(c.GetUTXOs(a1)) != 0 {
 		t.Fatal("a notification changed the cache without a listunspent reply")
-	}
-	if _, err := c.LastRefreshOf(a1); err == nil {
-		t.Fatal("the failed listunspent left no error on the record")
 	}
 
 	// Now the reply lands, on the next notification.
