@@ -83,15 +83,15 @@ fmt.Println("Address:", kp.Address)
 Monitor deposits via ElectrumX:
 
 ```go
-client := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second)
+client := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second, logger) // nil logs nothing
 client.UseTLS()
 if err := client.TrackAddresses([]string{depositAddr}); err != nil { // network inferred, mixed refused
     log.Fatal(err)
 }
-if err := client.Connect(); err != nil { // verifies the server's genesis hash
+if err := client.Connect(ctx); err != nil { // verifies the server's genesis hash
     log.Fatal(err)
 }
-client.StartPolling()
+client.StartPolling(ctx) // ends with ctx or Stop
 
 // Credit through deposit.Monitor, which checks every candidate against your
 // own node before crediting; see docs/EXCHANGE_INTEGRATION.md Step 2. The
@@ -107,7 +107,7 @@ selector := utxo.NewCoinSelector(spentSet)
 inputs, total, err := selector.SelectUTXOs(allUTXOs, amount+fee, 1, tipHeight, nil)
 
 // 2. Verify on-chain (Defense 11)
-verified, err := rpcClient.VerifyAndFilterUTXOs(inputs, elxClient.EvictUTXO, nil)
+verified, err := rpcClient.VerifyAndFilterUTXOs(ctx, inputs, elxClient.EvictUTXO, nil)
 
 // 3. Build, sign, verify and serialize in one call. feeRate is shors per vByte;
 //    use types.RecommendedFeeRate (1000). The builder measures the real weight,
@@ -119,9 +119,10 @@ rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, t
 
 // 4. Broadcast with a known outcome: a lost reply is resolved against the
 //    node, "already in chain" is success, and rpc.ErrUnknownOutcome means
-//    retry THESE bytes, never rebuild. withdraw.Engine does all of this
-//    durably; use it for real withdrawals (Step 3 of the exchange guide).
-sentTxID, err := rpcClient.Broadcast(rawTx, txid)
+//    retry THESE bytes, never rebuild; a context that ends mid-send is
+//    reported the same way. withdraw.Engine does all of this durably; use
+//    it for real withdrawals (Step 3 of the exchange guide).
+sentTxID, err := rpcClient.Broadcast(ctx, rawTx, txid)
 
 // 5. Mark spent (Defense 12). A failed write is an alert: the payment is out.
 if err := spentSet.MarkBroadcast(verified, sentTxID); err != nil {
@@ -201,8 +202,8 @@ it is stated plainly, with the reason, in
 SOQUCOIND=/path/to/soqucoind make integration
 ```
 
-A throwaway regtest node, the real `deposit` and `withdraw` packages, six end-to-end scenarios,
-about thirty seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
+A throwaway regtest node, the real `deposit` and `withdraw` packages, nine end-to-end scenarios,
+about forty-five seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
 each scenario proves.
 
 ## Documentation

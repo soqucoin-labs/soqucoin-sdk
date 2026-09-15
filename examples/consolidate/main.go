@@ -36,12 +36,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -68,18 +70,23 @@ func main() {
 	regtest := flag.Bool("regtest", false, "the node is a regtest node (the sq address prefix is shared with mainnet)")
 	flag.Parse()
 
-	log.SetFlags(log.Ltime | log.Lmsgprefix)
-	log.SetPrefix("[consolidate] ")
-
-	if err := run(config{
+	// Ctrl-C ends the context. A broadcast interrupted by it reports
+	// rpc.ErrUnknownOutcome; the next run filters the spent inputs out.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := run(ctx, config{
 		keystorePath: *keystorePath, to: *to, rpcURL: *rpcURL,
 		elxHost: *elxHost, elxTLS: *elxTLS,
 		maxInputs: *maxInputs, minConf: *minConf, feeRate: *feeRate,
 		spentSetPath: *spentSetPath, dryRun: *dryRun, regtest: *regtest,
 	}); err != nil {
-		log.Fatalf("%v", err)
+		logger.Error("consolidation failed", "err", err)
+		os.Exit(1)
 	}
 }
+
+// logger is shared by the program and the SDK components it builds.
+var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 type config struct {
 	keystorePath, to, rpcURL, elxHost string
@@ -90,7 +97,7 @@ type config struct {
 	dryRun, regtest                   bool
 }
 
-func run(cfg config) error {
+func run(ctx context.Context, cfg config) error {
 	switch {
 	case cfg.keystorePath == "":
 		return errors.New("-keystore is required")
@@ -114,7 +121,7 @@ func run(cfg config) error {
 		}
 		network = types.Regtest
 	}
-	log.Printf("Network: %s", network.Name)
+	logger.Info("network", "name", network.Name)
 
 	passphrase := os.Getenv("SOQ_KEYSTORE_PASSPHRASE")
 	if passphrase == "" {
@@ -132,9 +139,9 @@ func run(cfg config) error {
 	if cfg.rpcURL == "" {
 		cfg.rpcURL = fmt.Sprintf("http://127.0.0.1:%d", network.RPCPort)
 	}
-	node := rpc.NewClient(cfg.rpcURL, os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"))
+	node := rpc.NewClient(cfg.rpcURL, os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"), logger)
 	node.Network = network // refuse a node on another chain
-	if err := node.RequireSynced(); err != nil {
+	if err := node.RequireSynced(ctx); err != nil {
 		return err
 	}
 
@@ -146,7 +153,7 @@ func run(cfg config) error {
 	if !cfg.elxTLS && !loopbackHost(cfg.elxHost) {
 		return fmt.Errorf("electrumx %s is not on this machine; pass -electrumx-tls", cfg.elxHost)
 	}
-	elx := electrumx.NewClient(cfg.elxHost, 15*time.Second)
+	elx := electrumx.NewClient(cfg.elxHost, 15*time.Second, logger)
 	elx.HRP = network.HRP
 	if cfg.elxTLS {
 		elx.UseTLS()
@@ -154,22 +161,22 @@ func run(cfg config) error {
 	if err := elx.TrackAddresses(addresses); err != nil {
 		return fmt.Errorf("track keystore addresses: %w", err)
 	}
-	if err := elx.Connect(); err != nil {
+	if err := elx.Connect(ctx); err != nil {
 		return fmt.Errorf("connect to electrumx %s: %w", cfg.elxHost, err)
 	}
 	defer elx.Stop()
-	if err := elx.RefreshAll(); err != nil {
+	if err := elx.RefreshAll(ctx); err != nil {
 		return fmt.Errorf("refresh: %w", err)
 	}
 
 	// A spent-set file that exists but cannot be read must stop the run.
-	spent, err := utxo.OpenSpentSet(cfg.spentSetPath)
+	spent, err := utxo.OpenSpentSet(cfg.spentSetPath, logger)
 	if err != nil {
 		return fmt.Errorf("spent set: %w", err)
 	}
 	selector := utxo.NewCoinSelector(spent)
 
-	feeRate, err := feeRateFor(node, cfg.feeRate)
+	feeRate, err := feeRateFor(ctx, node, cfg.feeRate)
 	if err != nil {
 		return err
 	}
@@ -177,23 +184,23 @@ func run(cfg config) error {
 	// rate is a smaller consolidation, not a failed run.
 	maxInputs := cfg.maxInputs
 	if cap := inputsWithinFeeCap(feeRate); cap < maxInputs {
-		log.Printf("at %d shors/vB the fee cap allows %d inputs, not %d", feeRate, cap, maxInputs)
+		logger.Info("fee cap limits the inputs", "fee_rate", feeRate, "allowed", cap, "asked", maxInputs)
 		maxInputs = cap
 	}
 
-	tip, err := node.GetBlockCount()
+	tip, err := node.GetBlockCount(ctx)
 	if err != nil {
 		return fmt.Errorf("block count: %w", err)
 	}
 	selected, total, err := selector.SelectSmallestUTXOs(elx.GetAllUTXOs(), maxInputs, cfg.minConf, tip, nil)
 	if errors.Is(err, utxo.ErrNoCandidates) {
-		log.Printf("nothing to consolidate: no output has %d confirmations", cfg.minConf)
+		logger.Info("nothing to consolidate: no output has enough confirmations", "min_confirmations", cfg.minConf)
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("select: %w", err)
 	}
-	log.Printf("selected %d outputs totalling %s SOQ at %d or more confirmations", len(selected), soq(total), cfg.minConf)
+	logger.Info("selected outputs", "count", len(selected), "total_soq", soq(total), "min_confirmations", cfg.minConf)
 
 	// An output worth less than the fee it adds is left where it is: spending
 	// it costs more than it is worth at this rate.
@@ -205,27 +212,27 @@ func run(cfg config) error {
 		}
 	}
 	if skipped := len(selected) - len(economic); skipped > 0 {
-		log.Printf("left %d outputs worth less than the %s SOQ each costs to spend at %d shors/vB", skipped, soq(perInput), feeRate)
+		logger.Info("left outputs worth less than they cost to spend", "count", skipped, "cost_soq", soq(perInput), "fee_rate", feeRate)
 	}
 	if len(economic) == 0 || (len(economic) == 1 && economic[0].Address == cfg.to) {
-		log.Printf("nothing to consolidate")
+		logger.Info("nothing to consolidate")
 		return nil
 	}
 
 	// Defense 11: the indexer's cache can be stale. Each input is confirmed
 	// unspent on the node before it is signed over.
-	verified, err := node.VerifyAndFilterUTXOs(economic, elx.EvictUTXO, elx.SetAssetType)
+	verified, err := node.VerifyAndFilterUTXOs(ctx, economic, elx.EvictUTXO, elx.SetAssetType)
 	if err != nil {
 		return fmt.Errorf("verify inputs: %w", err)
 	}
 	if len(verified) < len(economic) {
-		log.Printf("%d inputs the node no longer has were dropped", len(economic)-len(verified))
+		logger.Info("dropped inputs the node no longer has", "count", len(economic)-len(verified))
 	}
 	if len(verified) == 0 {
 		return errors.New("no spendable outputs remain after verification")
 	}
 	if len(verified) == 1 && verified[0].Address == cfg.to {
-		log.Printf("nothing to consolidate: one output, already at the destination")
+		logger.Info("nothing to consolidate: one output, already at the destination")
 		return nil
 	}
 	destSPK, err := address.ScriptFor(cfg.to)
@@ -241,7 +248,7 @@ func run(cfg config) error {
 	}
 	base := (int64(tx.TxOverheadWeight+tx.EstimatedOutputWeight)+3)/4 + tx.FeeMarginVBytes
 	if in <= perInput*int64(len(verified))+base*feeRate+tx.MinOutputValue(destSPK) {
-		log.Printf("nothing to consolidate: %d outputs worth %s SOQ do not cover the fee and the relay floor", len(verified), soq(in))
+		logger.Info("nothing to consolidate: the outputs do not cover the fee and the relay floor", "count", len(verified), "total_soq", soq(in))
 		return nil
 	}
 
@@ -251,43 +258,42 @@ func run(cfg config) error {
 	}
 	rawHex, txid := transaction.SerializeHex(), transaction.TxID()
 	out := transaction.Outputs[0].Value
-	log.Printf("built %s: %d inputs, %s SOQ in, %s SOQ out, fee %s SOQ, %d vB",
-		txid, len(verified), soq(in), soq(out), soq(in-out), transaction.VSize())
+	logger.Info("built", "txid", txid, "inputs", len(verified), "in_soq", soq(in), "out_soq", soq(out), "fee_soq", soq(in-out), "vbytes", transaction.VSize())
 
 	if cfg.dryRun {
-		log.Printf("DRY RUN: not broadcast, nothing recorded")
+		logger.Info("dry run: not broadcast, nothing recorded")
 		return nil
 	}
 
 	// Broadcast with a known outcome: a lost reply is resolved against the
 	// node, "already in chain" is success, a node txid other than ours is
 	// refused. Only then are the inputs recorded as spent.
-	if _, err := node.Broadcast(rawHex, txid); err != nil {
+	if _, err := node.Broadcast(ctx, rawHex, txid); err != nil {
 		return fmt.Errorf("broadcast: %w", err)
 	}
 	if err := spent.MarkBroadcast(verified, txid); err != nil {
-		log.Printf("ALERT %s broadcast, spent set not written: %v", txid, err)
+		logger.Error("ALERT: broadcast, spent set not written", "txid", txid, "err", err)
 	}
-	log.Printf("broadcast %s", txid)
+	logger.Info("broadcast", "txid", txid)
 	return nil
 }
 
 // feeRateFor returns the flag's rate, or the node's estimate at a 6-block
 // target, clamped to the range the builders accept and logged when the node
 // had no estimate.
-func feeRateFor(node *rpc.Client, flagRate int64) (int64, error) {
+func feeRateFor(ctx context.Context, node *rpc.Client, flagRate int64) (int64, error) {
 	if flagRate < 0 {
 		return 0, fmt.Errorf("-fee-rate %d: must be 0 (ask the node) or a positive rate", flagRate)
 	}
 	if flagRate > 0 {
 		return flagRate, nil
 	}
-	est, err := node.FeeRateShorsPerVB(6)
+	est, err := node.FeeRateShorsPerVB(ctx, 6)
 	if err != nil {
 		return 0, fmt.Errorf("fee estimate: %w", err)
 	}
 	if est.Fallback {
-		log.Printf("node has no fee estimate; using the floor, %d shors/vB", est.Rate)
+		logger.Warn("node has no fee estimate, using the floor", "fee_rate", est.Rate)
 	}
 	return est.Rate, nil
 }

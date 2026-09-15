@@ -4,9 +4,9 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,8 +14,6 @@ import (
 
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
-
-func init() { log.SetOutput(io.Discard) } // the package logs each queued payment
 
 // capture is what a request to the fake signer looked like.
 type capture struct {
@@ -52,7 +50,7 @@ func signerServer(t *testing.T, health int, reply map[string]struct {
 		_, _ = w.Write([]byte(rep.body))
 	}))
 	t.Cleanup(srv.Close)
-	return NewClient(Config{URL: srv.URL, APIToken: "tok-abc"}), &seen
+	return NewClient(Config{URL: srv.URL, APIToken: "tok-abc"}, nil), &seen
 }
 
 type reply = struct {
@@ -70,12 +68,12 @@ func okSend(txid string) reply {
 
 func TestNewClientDefaultsFeeRate(t *testing.T) {
 	for _, in := range []int64{0, -1, -1000} {
-		c := NewClient(Config{URL: "http://x", FeeRate: in})
+		c := NewClient(Config{URL: "http://x", FeeRate: in}, nil)
 		if c.config.FeeRate != types.RecommendedFeeRate {
 			t.Errorf("FeeRate %d became %d, want the %d shors/vB default", in, c.config.FeeRate, types.RecommendedFeeRate)
 		}
 	}
-	c := NewClient(Config{URL: "http://x", FeeRate: 25})
+	c := NewClient(Config{URL: "http://x", FeeRate: 25}, nil)
 	if c.config.FeeRate != 25 {
 		t.Errorf("explicit FeeRate = %d, want 25 preserved", c.config.FeeRate)
 	}
@@ -85,7 +83,7 @@ func TestNewClientDefaultsFeeRate(t *testing.T) {
 
 func TestSendSendsBearerTokenAndJSON(t *testing.T) {
 	c, seen := signerServer(t, 200, map[string]reply{"/api/v1/send": okSend(fakeTxID)})
-	if _, err := c.Send("ssq1pdest", 150_000); err != nil {
+	if _, err := c.Send(context.Background(), "ssq1pdest", 150_000); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if len(*seen) != 1 {
@@ -119,7 +117,7 @@ func TestSendSendsBearerTokenAndJSON(t *testing.T) {
 
 func TestSendReturnsTxID(t *testing.T) {
 	c, _ := signerServer(t, 200, map[string]reply{"/api/v1/send": okSend(fakeTxID)})
-	got, err := c.Send("ssq1pdest", 1)
+	got, err := c.Send(context.Background(), "ssq1pdest", 1)
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -134,7 +132,7 @@ func TestSendSurfacesServerError(t *testing.T) {
 	c, _ := signerServer(t, 200, map[string]reply{
 		"/api/v1/send": {400, `{"error":"insufficient funds"}`},
 	})
-	txid, err := c.Send("ssq1pdest", 999_999_999_999)
+	txid, err := c.Send(context.Background(), "ssq1pdest", 999_999_999_999)
 	if err == nil {
 		t.Fatal("a 400 response was reported as success")
 	}
@@ -150,14 +148,14 @@ func TestSendSurfacesNonJSONError(t *testing.T) {
 	c, _ := signerServer(t, 200, map[string]reply{
 		"/api/v1/send": {502, "<html>bad gateway</html>"},
 	})
-	if _, err := c.Send("ssq1pdest", 1); err == nil {
+	if _, err := c.Send(context.Background(), "ssq1pdest", 1); err == nil {
 		t.Error("a non-JSON 502 was accepted as success")
 	}
 }
 
 func TestSendFailsWhenSignerUnreachable(t *testing.T) {
-	c := NewClient(Config{URL: "http://127.0.0.1:1", APIToken: "t"})
-	if _, err := c.Send("ssq1pdest", 1); err == nil {
+	c := NewClient(Config{URL: "http://127.0.0.1:1", APIToken: "t"}, nil)
+	if _, err := c.Send(context.Background(), "ssq1pdest", 1); err == nil {
 		t.Error("unreachable signer did not error")
 	}
 }
@@ -167,19 +165,19 @@ func TestSendFailsWhenSignerUnreachable(t *testing.T) {
 func TestHealthCheck(t *testing.T) {
 	t.Run("healthy", func(t *testing.T) {
 		c, _ := signerServer(t, 200, nil)
-		if err := c.HealthCheck(); err != nil {
+		if err := c.HealthCheck(context.Background()); err != nil {
 			t.Errorf("HealthCheck: %v", err)
 		}
 	})
 	t.Run("unhealthy status is an error", func(t *testing.T) {
 		c, _ := signerServer(t, 503, nil)
-		if err := c.HealthCheck(); err == nil {
+		if err := c.HealthCheck(context.Background()); err == nil {
 			t.Error("HTTP 503 reported as healthy")
 		}
 	})
 	t.Run("unreachable is an error", func(t *testing.T) {
-		c := NewClient(Config{URL: "http://127.0.0.1:1"})
-		if err := c.HealthCheck(); err == nil {
+		c := NewClient(Config{URL: "http://127.0.0.1:1"}, nil)
+		if err := c.HealthCheck(context.Background()); err == nil {
 			t.Error("unreachable signer reported as healthy")
 		}
 	})
@@ -204,7 +202,7 @@ func TestSendManyRoundsRatherThanTruncates(t *testing.T) {
 	}
 	for soq, wantSat := range cases {
 		c, seen := signerServer(t, 200, map[string]reply{"/api/v1/sendmany": okSend(fakeTxID)})
-		if _, err := c.SendMany(map[string]float64{"ssq1pdest": soq}); err != nil {
+		if _, err := c.SendMany(context.Background(), map[string]float64{"ssq1pdest": soq}); err != nil {
 			t.Fatalf("%.8f SOQ: SendMany: %v", soq, err)
 		}
 		var req SendManyRequest
@@ -221,7 +219,7 @@ func TestSendManyRoundsRatherThanTruncates(t *testing.T) {
 func TestSendManyHealthChecksBeforeSending(t *testing.T) {
 	t.Run("healthy signer proceeds", func(t *testing.T) {
 		c, seen := signerServer(t, 200, map[string]reply{"/api/v1/sendmany": okSend(fakeTxID)})
-		if _, err := c.SendMany(map[string]float64{"ssq1pdest": 1}); err != nil {
+		if _, err := c.SendMany(context.Background(), map[string]float64{"ssq1pdest": 1}); err != nil {
 			t.Fatalf("SendMany: %v", err)
 		}
 		if len(*seen) != 2 || (*seen)[0].path != "/health" {
@@ -231,7 +229,7 @@ func TestSendManyHealthChecksBeforeSending(t *testing.T) {
 	// If the signer is down, no batch should be attempted at all.
 	t.Run("unhealthy signer sends nothing", func(t *testing.T) {
 		c, seen := signerServer(t, 503, map[string]reply{"/api/v1/sendmany": okSend(fakeTxID)})
-		if _, err := c.SendMany(map[string]float64{"ssq1pdest": 1}); err == nil {
+		if _, err := c.SendMany(context.Background(), map[string]float64{"ssq1pdest": 1}); err == nil {
 			t.Fatal("SendMany proceeded despite a failed health check")
 		}
 		for _, s := range *seen {
@@ -244,10 +242,10 @@ func TestSendManyHealthChecksBeforeSending(t *testing.T) {
 
 func TestSendManyRejectsEmptyBatch(t *testing.T) {
 	c, seen := signerServer(t, 200, nil)
-	if _, err := c.SendMany(nil); err == nil {
+	if _, err := c.SendMany(context.Background(), nil); err == nil {
 		t.Error("nil batch accepted")
 	}
-	if _, err := c.SendMany(map[string]float64{}); err == nil {
+	if _, err := c.SendMany(context.Background(), map[string]float64{}); err == nil {
 		t.Error("empty batch accepted")
 	}
 	if len(*seen) != 0 {
@@ -260,7 +258,7 @@ func TestSendManyRejectsEmptyBatch(t *testing.T) {
 func TestSendManyFiltersNonPositiveAmounts(t *testing.T) {
 	t.Run("mixed batch drops the bad entries", func(t *testing.T) {
 		c, seen := signerServer(t, 200, map[string]reply{"/api/v1/sendmany": okSend(fakeTxID)})
-		_, err := c.SendMany(map[string]float64{
+		_, err := c.SendMany(context.Background(), map[string]float64{
 			"ssq1pgood": 2.5,
 			"ssq1pzero": 0,
 			"ssq1pneg":  -1.25,
@@ -282,7 +280,7 @@ func TestSendManyFiltersNonPositiveAmounts(t *testing.T) {
 	})
 	t.Run("all-bad batch errors and sends nothing", func(t *testing.T) {
 		c, seen := signerServer(t, 200, map[string]reply{"/api/v1/sendmany": okSend(fakeTxID)})
-		if _, err := c.SendMany(map[string]float64{"a": 0, "b": -5}); err == nil {
+		if _, err := c.SendMany(context.Background(), map[string]float64{"a": 0, "b": -5}); err == nil {
 			t.Error("a batch with no valid recipients reported success")
 		}
 		for _, s := range *seen {
@@ -297,7 +295,7 @@ func TestSendManySurfacesServerError(t *testing.T) {
 	c, _ := signerServer(t, 200, map[string]reply{
 		"/api/v1/sendmany": {400, `{"error":"txn-mempool-conflict"}`},
 	})
-	txid, err := c.SendMany(map[string]float64{"ssq1pdest": 1})
+	txid, err := c.SendMany(context.Background(), map[string]float64{"ssq1pdest": 1})
 	if err == nil {
 		t.Fatal("a 400 batch response was reported as success")
 	}
@@ -326,8 +324,8 @@ func TestSendManyCarriesFeeRate(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(Config{URL: srv.URL, APIToken: "t", FeeRate: 33})
-	if _, err := c.SendMany(map[string]float64{"ssq1pdest": 1}); err != nil {
+	c := NewClient(Config{URL: srv.URL, APIToken: "t", FeeRate: 33}, nil)
+	if _, err := c.SendMany(context.Background(), map[string]float64{"ssq1pdest": 1}); err != nil {
 		t.Fatalf("SendMany: %v", err)
 	}
 }

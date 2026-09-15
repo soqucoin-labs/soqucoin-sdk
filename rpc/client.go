@@ -19,17 +19,19 @@ package rpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
@@ -67,6 +69,7 @@ type Client struct {
 	user     string
 	password string
 	client   *http.Client
+	log      *slog.Logger
 }
 
 // NewClient creates a new soqucoind RPC client.
@@ -75,15 +78,23 @@ type Client struct {
 //   - url: Full URL including port (e.g., "http://127.0.0.1:33389" on mainnet)
 //   - user: RPC username from soqucoin.conf
 //   - password: RPC password from soqucoin.conf
+//   - logger: where the client reports skipped inputs; nil discards
 //
 // Set Network afterwards for any chain other than mainnet, and AllowRemote,
 // with an https:// URL, for a node that is not on this machine:
 //
-//	c := rpc.NewClient(url, user, password)
+//	c := rpc.NewClient(url, user, password, logger)
 //	c.Network = types.Stagenet
-func NewClient(url, user, password string) *Client {
+//
+// Every method that reaches the node takes a context.Context first. The
+// request is bound to it, so cancelling the context ends the exchange; the
+// per-request timeout (SetTimeout, 30 s by default) remains the backstop for
+// a context without a deadline. A context that ends during Broadcast is a
+// lost reply and is reported as ErrUnknownOutcome, never as a rejection.
+func NewClient(url, user, password string, logger *slog.Logger) *Client {
 	host, loopback := hostOf(url)
 	return &Client{
+		log:      logutil.Or(logger),
 		url:      url,
 		host:     host,
 		scheme:   schemeOf(url),
@@ -237,7 +248,7 @@ func (c *Client) SetTimeout(d time.Duration) { c.client.Timeout = d }
 // Call sends a JSON-RPC request and returns the raw result. For a URL whose
 // host is not loopback it returns, with nothing sent, ErrRemoteNode unless
 // AllowRemote is set, then ErrPlaintextRemote unless the scheme is https.
-func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, error) {
+func (c *Client) Call(ctx context.Context, method string, params ...interface{}) (json.RawMessage, error) {
 	if c.remote && !c.AllowRemote {
 		return nil, fmt.Errorf("%w: host %q", ErrRemoteNode, c.host)
 	}
@@ -260,7 +271,7 @@ func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, er
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", c.url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -301,12 +312,12 @@ func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, er
 // the reply was lost, and a caller that rebuilds with other inputs pays the
 // recipient twice. Prefer Broadcast, which resolves that case against the
 // node using the transaction id the builder already knows.
-func (c *Client) SendRawTransaction(rawTxHex string) (string, error) {
-	result, err := c.Call("sendrawtransaction", rawTxHex)
+func (c *Client) SendRawTransaction(ctx context.Context, rawTxHex string) (string, error) {
+	result, err := c.Call(ctx, "sendrawtransaction", rawTxHex)
 	if err != nil {
 		var te *transportError
 		if errors.As(err, &te) {
-			return "", fmt.Errorf("sendrawtransaction: %w: %v", ErrUnknownOutcome, err)
+			return "", fmt.Errorf("sendrawtransaction: %w: %w", ErrUnknownOutcome, err)
 		}
 		return "", fmt.Errorf("sendrawtransaction: %w", err)
 	}
@@ -335,11 +346,11 @@ func (c *Client) SendRawTransaction(rawTxHex string) (string, error) {
 // already accepted the transaction, so the result is ErrTxIDMismatch carrying
 // the node's txid, not ErrPermanent: the inputs are spent and nothing may be
 // rebuilt on them.
-func (c *Client) Broadcast(rawTxHex, txid string) (string, error) {
+func (c *Client) Broadcast(ctx context.Context, rawTxHex, txid string) (string, error) {
 	if txid == "" {
 		return "", fmt.Errorf("broadcast: %w: txid is required", ErrPermanent)
 	}
-	result, err := c.Call("sendrawtransaction", rawTxHex)
+	result, err := c.Call(ctx, "sendrawtransaction", rawTxHex)
 	if err == nil {
 		var got string
 		if err := json.Unmarshal(result, &got); err != nil {
@@ -357,17 +368,19 @@ func (c *Client) Broadcast(rawTxHex, txid string) (string, error) {
 	if !errors.As(err, &te) {
 		return "", fmt.Errorf("broadcast: %w", err)
 	}
-	// Reply lost. Resolve against the node before reporting anything.
-	known, lookupErr := c.knowsTransaction(txid)
+	// Reply lost. Resolve against the node before reporting anything. When the
+	// context has ended the lookup ends with it and the outcome stays unknown;
+	// the caller keeps the bytes and sends them again (withdraw.Engine.Recover).
+	known, lookupErr := c.knowsTransaction(ctx, txid)
 	if lookupErr == nil && known {
 		return txid, nil
 	}
-	return "", fmt.Errorf("broadcast of %s: %w: %v", txid, ErrUnknownOutcome, err)
+	return "", fmt.Errorf("broadcast of %s: %w: %w", txid, ErrUnknownOutcome, err)
 }
 
 // knowsTransaction reports whether the node has txid in its mempool or chain.
-func (c *Client) knowsTransaction(txid string) (bool, error) {
-	if _, err := c.Call("getrawtransaction", txid); err == nil {
+func (c *Client) knowsTransaction(ctx context.Context, txid string) (bool, error) {
+	if _, err := c.Call(ctx, "getrawtransaction", txid); err == nil {
 		return true, nil
 	} else if errors.Is(err, ErrTransient) {
 		return false, err
@@ -375,7 +388,7 @@ func (c *Client) knowsTransaction(txid string) (bool, error) {
 	// Without -txindex the node finds a mined transaction only through its UTXO
 	// set, so once every output is spent getrawtransaction reports nothing;
 	// gettxout on the first output is the last cheap check before "unknown".
-	out, err := c.GetTxOut(txid, 0, true)
+	out, err := c.GetTxOut(ctx, txid, 0, true)
 	if err != nil {
 		return false, err
 	}
@@ -389,8 +402,8 @@ func (c *Client) knowsTransaction(txid string) (bool, error) {
 // BEFORE signing. A nil result means "spent" ONLY on a node that has caught
 // up; a node in initial block download or behind its headers has not seen
 // recent outputs yet. Call RequireSynced first, as VerifyAndFilterUTXOs does.
-func (c *Client) GetTxOut(txid string, vout uint32, includeMempool bool) (*TxOut, error) {
-	result, err := c.Call("gettxout", txid, vout, includeMempool)
+func (c *Client) GetTxOut(ctx context.Context, txid string, vout uint32, includeMempool bool) (*TxOut, error) {
+	result, err := c.Call(ctx, "gettxout", txid, vout, includeMempool)
 	if err != nil {
 		return nil, fmt.Errorf("gettxout: %w", err)
 	}
@@ -449,8 +462,8 @@ type ScriptPubKey struct {
 }
 
 // GetBlockCount returns the current chain tip height.
-func (c *Client) GetBlockCount() (int64, error) {
-	result, err := c.Call("getblockcount")
+func (c *Client) GetBlockCount(ctx context.Context) (int64, error) {
+	result, err := c.Call(ctx, "getblockcount")
 	if err != nil {
 		return 0, fmt.Errorf("getblockcount: %w", err)
 	}
@@ -495,12 +508,12 @@ type FeeEstimate struct {
 // the floor and Fallback is set; log it, since a node that never has an
 // estimate is not seeing the mempool. An error is the node's (ErrTransient or
 // ErrPermanent) or a reply without a numeric fee rate (types.ErrAmountFormat).
-func (c *Client) FeeRateShorsPerVB(confTarget int) (FeeEstimate, error) {
+func (c *Client) FeeRateShorsPerVB(ctx context.Context, confTarget int) (FeeEstimate, error) {
 	floor, ceiling := types.RecommendedFeeRate, tx.MaxFeeRateShorsPerVB
 	if ceiling < floor {
 		return FeeEstimate{}, fmt.Errorf("%w: tx.MaxFeeRateShorsPerVB %d is below types.RecommendedFeeRate %d", ErrPermanent, ceiling, floor)
 	}
-	result, err := c.Call("estimatesmartfee", confTarget)
+	result, err := c.Call(ctx, "estimatesmartfee", confTarget)
 	if err != nil {
 		return FeeEstimate{}, fmt.Errorf("estimatesmartfee: %w", err)
 	}
@@ -539,8 +552,8 @@ func (c *Client) FeeRateShorsPerVB(confTarget int) (FeeEstimate, error) {
 // Deprecated: use FeeRateShorsPerVB, which returns the unit the builders
 // take, clamps to their range and reports the fallback. This method returns
 // 0.01 SOQ/kB without saying so when the node has no estimate.
-func (c *Client) EstimateSmartFee(confTarget int) (float64, error) {
-	result, err := c.Call("estimatesmartfee", confTarget)
+func (c *Client) EstimateSmartFee(ctx context.Context, confTarget int) (float64, error) {
+	result, err := c.Call(ctx, "estimatesmartfee", confTarget)
 	if err != nil {
 		return 0, fmt.Errorf("estimatesmartfee: %w", err)
 	}
@@ -561,8 +574,8 @@ func (c *Client) EstimateSmartFee(confTarget int) (float64, error) {
 }
 
 // DecodeRawTransaction parses a raw transaction hex string.
-func (c *Client) DecodeRawTransaction(rawTxHex string) (json.RawMessage, error) {
-	result, err := c.Call("decoderawtransaction", rawTxHex)
+func (c *Client) DecodeRawTransaction(ctx context.Context, rawTxHex string) (json.RawMessage, error) {
+	result, err := c.Call(ctx, "decoderawtransaction", rawTxHex)
 	if err != nil {
 		return nil, fmt.Errorf("decoderawtransaction: %w", err)
 	}
@@ -570,8 +583,8 @@ func (c *Client) DecodeRawTransaction(rawTxHex string) (json.RawMessage, error) 
 }
 
 // GetBlockHash returns the block hash for a given height.
-func (c *Client) GetBlockHash(height int64) (string, error) {
-	result, err := c.Call("getblockhash", height)
+func (c *Client) GetBlockHash(ctx context.Context, height int64) (string, error) {
+	result, err := c.Call(ctx, "getblockhash", height)
 	if err != nil {
 		return "", fmt.Errorf("getblockhash: %w", err)
 	}
@@ -585,8 +598,8 @@ func (c *Client) GetBlockHash(height int64) (string, error) {
 
 // GetBlock returns the full block data for a given hash.
 // verbosity: 0=hex, 1=object, 2=object+tx details
-func (c *Client) GetBlock(hash string, verbosity int) (json.RawMessage, error) {
-	result, err := c.Call("getblock", hash, verbosity)
+func (c *Client) GetBlock(ctx context.Context, hash string, verbosity int) (json.RawMessage, error) {
+	result, err := c.Call(ctx, "getblock", hash, verbosity)
 	if err != nil {
 		return nil, fmt.Errorf("getblock: %w", err)
 	}
@@ -594,8 +607,8 @@ func (c *Client) GetBlock(hash string, verbosity int) (json.RawMessage, error) {
 }
 
 // GetBlockchainInfo returns chain state info (chain name, blocks, headers, etc.)
-func (c *Client) GetBlockchainInfo() (*BlockchainInfo, error) {
-	result, err := c.Call("getblockchaininfo")
+func (c *Client) GetBlockchainInfo(ctx context.Context) (*BlockchainInfo, error) {
+	result, err := c.Call(ctx, "getblockchaininfo")
 	if err != nil {
 		return nil, fmt.Errorf("getblockchaininfo: %w", err)
 	}
@@ -626,8 +639,8 @@ type BlockchainInfo struct {
 // When Network is set it also returns ErrWrongChain (permanent) if the node
 // reports a chain other than Network.ChainID. That is a deployment error, not
 // a condition to wait out.
-func (c *Client) RequireSynced() error {
-	info, err := c.GetBlockchainInfo()
+func (c *Client) RequireSynced(ctx context.Context) error {
+	info, err := c.GetBlockchainInfo(ctx)
 	if err != nil {
 		return err
 	}
@@ -646,8 +659,8 @@ func (c *Client) RequireSynced() error {
 // passes. deposit.Monitor calls it with its own Network so that its maturity
 // rule and the node it asks are on the same chain even when Client.Network
 // was left unset.
-func (c *Client) RequireChain(chainID string) error {
-	info, err := c.GetBlockchainInfo()
+func (c *Client) RequireChain(ctx context.Context, chainID string) error {
+	info, err := c.GetBlockchainInfo(ctx)
 	if err != nil {
 		return err
 	}
@@ -680,8 +693,8 @@ func (c *Client) network() types.Network {
 //
 // This is the critical pre-signing check that prevents stale UTXO failures.
 // Always call this for each UTXO before building a transaction.
-func (c *Client) VerifyUTXO(txid string, vout uint32) (exists bool, assetType uint8, err error) {
-	txout, err := c.GetTxOut(txid, vout, true)
+func (c *Client) VerifyUTXO(ctx context.Context, txid string, vout uint32) (exists bool, assetType uint8, err error) {
+	txout, err := c.GetTxOut(ctx, txid, vout, true)
 	if err != nil {
 		return false, 0, err
 	}
@@ -700,6 +713,7 @@ func (c *Client) VerifyUTXO(txid string, vout uint32) (exists bool, assetType ui
 //
 // This is the production-hardened pattern from soq-signer/signer.go.
 func (c *Client) VerifyAndFilterUTXOs(
+	ctx context.Context,
 	utxos []types.UTXO,
 	evictFn func(txid string, vout uint32),
 	setAssetTypeFn func(txid string, vout uint32, assetType uint8),
@@ -710,19 +724,19 @@ func (c *Client) VerifyAndFilterUTXOs(
 	// Eviction is only sound on a node that has caught up: on a syncing node a
 	// nil gettxout means "not seen yet", and evicting on it would drain the
 	// cache of live outputs and stall withdrawals with "no spendable UTXOs".
-	if err := c.RequireSynced(); err != nil {
+	if err := c.RequireSynced(ctx); err != nil {
 		return nil, err
 	}
 
 	var verified []types.UTXO
 
 	for _, u := range utxos {
-		txout, err := c.GetTxOut(u.TxID, u.Vout, true)
+		txout, err := c.GetTxOut(ctx, u.TxID, u.Vout, true)
 		if err != nil {
-			return nil, fmt.Errorf("verify UTXO %s:%d: %w", shortID(u.TxID, 12), u.Vout, err)
+			return nil, fmt.Errorf("verify UTXO %s:%d: %w", u.TxID, u.Vout, err)
 		}
 		if txout == nil {
-			log.Printf("[rpc] Defense 11: UTXO %s:%d is STALE (gettxout=null), skipping", shortID(u.TxID, 12), u.Vout)
+			c.log.Info("input skipped: not in the node's UTXO set", "txid", u.TxID, "vout", u.Vout)
 			if evictFn != nil {
 				evictFn(u.TxID, u.Vout)
 			}
@@ -732,8 +746,8 @@ func (c *Client) VerifyAndFilterUTXOs(
 		// (consensus: nCoinbaseMaturity of this client's Network). Keep it in
 		// the cache, leave it out of this selection.
 		if maturity := c.network().CoinbaseMaturity; txout.Coinbase && txout.Confirmations < maturity {
-			log.Printf("[rpc] UTXO %s:%d is an immature coinbase (%d of %d confirmations), skipping",
-				shortID(u.TxID, 12), u.Vout, txout.Confirmations, maturity)
+			c.log.Info("input skipped: immature coinbase", "txid", u.TxID, "vout", u.Vout,
+				"confirmations", txout.Confirmations, "maturity", maturity)
 			continue
 		}
 
@@ -747,14 +761,4 @@ func (c *Client) VerifyAndFilterUTXOs(
 	}
 
 	return verified, nil
-}
-
-// shortID truncates an identifier for logging without panicking on short input.
-// Log formatting must never be able to crash the caller: these helpers sit on
-// error paths, and a panic there replaces a handled error with process death.
-func shortID(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

@@ -11,13 +11,16 @@
 // addresses, and drives the real deposit and withdraw packages against the
 // real node: deposit credit with node cross-check, a withdrawal built, signed,
 // broadcast and confirmed, a lost broadcast reply survived without a second
-// transaction, two withdrawals that cannot share an input, refused inputs, and
-// a reorganisation that removes a credited deposit. The indexer role is played
+// transaction, two withdrawals that cannot share an input, refused inputs, a
+// reorganisation that removes a credited deposit, retries past the reservation
+// TTL, a txid mismatch, and a broadcast cancelled while the node holds the
+// reply. The indexer role is played
 // by a small in-test block scanner so the harness needs no ElectrumX; the
 // ElectrumX fork is exercised by the electrumx package's protocol tests.
 package integration
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -83,12 +86,12 @@ func startNode(t *testing.T) *node {
 		t.Fatalf("start soqucoind: %v", err)
 	}
 	n := &node{t: t, dir: dir, cmd: cmd, port: rpcPort,
-		rpc: rpc.NewClient(fmt.Sprintf("http://127.0.0.1:%d", rpcPort), "it", "it")}
+		rpc: rpc.NewClient(fmt.Sprintf("http://127.0.0.1:%d", rpcPort), "it", "it", nil)}
 	n.rpc.Network = types.Regtest
 	t.Cleanup(n.stop)
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		if _, err := n.rpc.GetBlockCount(); err == nil {
+		if _, err := n.rpc.GetBlockCount(context.Background()); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -96,14 +99,14 @@ func startNode(t *testing.T) *node {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	if g, _ := n.rpc.GetBlockHash(0); g != types.Regtest.GenesisHash {
+	if g, _ := n.rpc.GetBlockHash(context.Background(), 0); g != types.Regtest.GenesisHash {
 		t.Fatalf("node genesis %s is not the regtest genesis %s", g, types.Regtest.GenesisHash)
 	}
 	return n
 }
 
 func (n *node) stop() {
-	n.rpc.Call("stop")
+	n.rpc.Call(context.Background(), "stop")
 	done := make(chan struct{})
 	go func() { n.cmd.Wait(); close(done) }()
 	select {
@@ -115,7 +118,7 @@ func (n *node) stop() {
 
 func (n *node) mine(to string, blocks int) []string {
 	n.t.Helper()
-	raw, err := n.rpc.Call("generatetoaddress", blocks, to)
+	raw, err := n.rpc.Call(context.Background(), "generatetoaddress", blocks, to)
 	if err != nil {
 		n.t.Fatalf("generatetoaddress: %v", err)
 	}
@@ -125,7 +128,7 @@ func (n *node) mine(to string, blocks int) []string {
 }
 
 func (n *node) height() int64 {
-	h, err := n.rpc.GetBlockCount()
+	h, err := n.rpc.GetBlockCount(context.Background())
 	if err != nil {
 		n.t.Fatal(err)
 	}
@@ -162,10 +165,10 @@ func okey(txid string, vout uint32) string { return fmt.Sprintf("%s:%d", txid, v
 
 // RefreshAll rescans from the first block whose hash changed (a reorg) or from
 // where it left off.
-func (s *scanner) RefreshAll() error {
+func (s *scanner) RefreshAll(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tip, err := s.node.rpc.GetBlockCount()
+	tip, err := s.node.rpc.GetBlockCount(ctx)
 	if err != nil {
 		s.lastErr = err
 		return err
@@ -173,7 +176,7 @@ func (s *scanner) RefreshAll() error {
 	// Detect a reorg: walk back until a scanned hash still matches.
 	from := s.scanned + 1
 	for h := s.scanned; h >= 1; h-- {
-		hash, err := s.node.rpc.GetBlockHash(h)
+		hash, err := s.node.rpc.GetBlockHash(ctx, h)
 		if err != nil {
 			s.lastErr = err
 			return err
@@ -190,12 +193,12 @@ func (s *scanner) RefreshAll() error {
 		from = 1
 	}
 	for h := from; h <= tip; h++ {
-		hash, err := s.node.rpc.GetBlockHash(h)
+		hash, err := s.node.rpc.GetBlockHash(ctx, h)
 		if err != nil {
 			s.lastErr = err
 			return err
 		}
-		raw, err := s.node.rpc.GetBlock(hash, 2)
+		raw, err := s.node.rpc.GetBlock(ctx, hash, 2)
 		if err != nil {
 			s.lastErr = err
 			return err

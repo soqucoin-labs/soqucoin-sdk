@@ -53,8 +53,11 @@ Connect to ElectrumX to monitor UTXOs and balances:
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
@@ -62,28 +65,33 @@ import (
 )
 
 func main() {
+	// Every call that reaches the network takes a context; every component
+	// takes a logger, nil to log nothing.
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
 	// Connect to ElectrumX (plaintext is acceptable only on localhost or a
 	// private network; call client.UseTLS() otherwise). The network is
 	// inferred from the addresses you track.
-	client := electrumx.NewClient("localhost:50001", 15*time.Second)
+	client := electrumx.NewClient("localhost:50001", 15*time.Second, logger)
 	myAddr := "ssq1p..."
 	if err := client.TrackAddresses([]string{myAddr}); err != nil {
 		log.Fatal(err)
 	}
-	if err := client.Connect(); err != nil {
+	if err := client.Connect(ctx); err != nil {
 		log.Fatal(err)
 	}
 	defer client.Stop()
 
 	// Fetch UTXOs
-	if err := client.RefreshAll(); err != nil {
+	if err := client.RefreshAll(ctx); err != nil {
 		log.Fatal(err)
 	}
 
 	// Balance at 30 confirmations, the floor for small amounts in the
 	// confirmation table (docs/EXCHANGE_INTEGRATION.md, Step 4). An error here
 	// decides the money question, so it is not discarded.
-	tipHeight, err := client.GetTip()
+	tipHeight, err := client.GetTip(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -106,8 +114,10 @@ Build, sign, and broadcast using the full defense stack:
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"time"
 
@@ -121,11 +131,14 @@ import (
 )
 
 func main() {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
 	// 1. Connect to ElectrumX and soqucoind RPC
-	elx := electrumx.NewClient("localhost:50001", 15*time.Second)
+	elx := electrumx.NewClient("localhost:50001", 15*time.Second, logger)
 	defer elx.Stop()
 
-	rpcClient := rpc.NewClient("http://127.0.0.1:28332", "rpcuser", "rpcpass")
+	rpcClient := rpc.NewClient("http://127.0.0.1:28332", "rpcuser", "rpcpass", logger)
 	rpcClient.Network = types.Stagenet // port 28332 is a stagenet node; RequireSynced checks the chain
 
 	// 2. Open the keystore holding the key for myAddr, and track the address.
@@ -141,22 +154,22 @@ func main() {
 	if err := elx.TrackAddresses([]string{myAddr}); err != nil {
 		log.Fatal("track:", err)
 	}
-	if err := elx.Connect(); err != nil {
+	if err := elx.Connect(ctx); err != nil {
 		log.Fatal("connect:", err)
 	}
-	if err := elx.RefreshAll(); err != nil {
+	if err := elx.RefreshAll(ctx); err != nil {
 		log.Fatal("refresh:", err)
 	}
 
 	// 3. Create a persistent spent set (prevents UTXO re-selection across restarts)
-	spentSet, err := utxo.OpenSpentSet("/tmp/my_wallet_spent_set.json")
+	spentSet, err := utxo.OpenSpentSet("/tmp/my_wallet_spent_set.json", logger)
 	if err != nil {
 		log.Fatal("spent set:", err) // a file that exists but cannot be read must not start empty
 	}
 	selector := utxo.NewCoinSelector(spentSet)
 
 	// 4. Select UTXOs for the payment
-	tipHeight, err := rpcClient.GetBlockCount()
+	tipHeight, err := rpcClient.GetBlockCount(ctx)
 	if err != nil {
 		log.Fatal("tip:", err)
 	}
@@ -175,7 +188,7 @@ func main() {
 	fmt.Printf("Selected %d UTXOs totaling %.4f SOQ\n", len(selected), float64(total)/1e8)
 
 	// 5. Defense 11: Verify each UTXO is still unspent on-chain
-	verified, err := rpcClient.VerifyAndFilterUTXOs(selected, elx.EvictUTXO, elx.SetAssetType)
+	verified, err := rpcClient.VerifyAndFilterUTXOs(ctx, selected, elx.EvictUTXO, elx.SetAssetType)
 	if err != nil {
 		log.Fatal("UTXO verification failed:", err)
 	}
@@ -208,8 +221,9 @@ func main() {
 	//    node, "already in chain" is success, and a node txid that differs from
 	//    ours is refused. rpc.ErrUnknownOutcome means the transaction MAY be
 	//    out: retry these same bytes, never rebuild (withdraw.Engine does this
-	//    durably for real withdrawals).
-	txid, err := rpcClient.Broadcast(rawTxHex, builtTxID)
+	//    durably for real withdrawals). A context that ends during the send
+	//    is reported the same way, as an unknown outcome, never a rejection.
+	txid, err := rpcClient.Broadcast(ctx, rawTxHex, builtTxID)
 	if err != nil {
 		log.Fatal("Broadcast failed:", err)
 	}
@@ -259,11 +273,11 @@ For production systems (exchanges, pools, services), add these layers:
 ```go
 import "github.com/soqucoin-labs/soqucoin-sdk/resilience"
 
-// Circuit breaker, halt after 3 failures, 15 min cooldown
-cb := resilience.NewCircuitBreaker(3, 15*time.Minute)
+// Circuit breaker, halt after 3 failures, 15 min cooldown; logger nil discards
+cb := resilience.NewCircuitBreaker(3, 15*time.Minute, logger)
 
 // Webhook alerter, Slack notifications on CB state changes
-alerter := resilience.NewAlerter(os.Getenv("ALERT_WEBHOOK_URL"))
+alerter := resilience.NewAlerter(os.Getenv("ALERT_WEBHOOK_URL"), logger)
 alerter.WireToCircuitBreaker(cb)
 
 // Always check before processing payments:

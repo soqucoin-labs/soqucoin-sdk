@@ -234,8 +234,9 @@ mutation does not apply. The property you should still enforce is agreement:
 // Broadcast reports a node txid that differs from the one the SDK computed as
 // rpc.ErrTxIDMismatch (the payment is out; hold the inputs, investigate),
 // resolves a lost reply against the node, and reports "already in chain" as
-// success. rpc.ErrUnknownOutcome means retry these bytes, never rebuild.
-txid, err := rpcClient.Broadcast(rawHex, builtTxID)
+// success. rpc.ErrUnknownOutcome means retry these bytes, never rebuild. A
+// context that ends during the send is an unknown outcome too.
+txid, err := rpcClient.Broadcast(ctx, rawHex, builtTxID)
 if err != nil {
     return err
 }
@@ -259,9 +260,9 @@ The client speaks plaintext by default, because the common deployment is a serve
 on localhost. Enable TLS for anything else:
 
 ```go
-client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second)
+client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second, logger)
 client.UseTLS()
-if err := client.Connect(); err != nil {
+if err := client.Connect(ctx); err != nil {
     return err
 }
 ```
@@ -271,9 +272,9 @@ the system roots. For a private CA or a pinned certificate, set `TLSConfig`
 directly instead of calling `UseTLS`:
 
 ```go
-client := electrumx.NewClient("electrum.internal:50002", 15*time.Second)
+client := electrumx.NewClient("electrum.internal:50002", 15*time.Second, logger)
 client.TLSConfig = &tls.Config{RootCAs: myPool, MinVersion: tls.VersionTLS13}
-if err := client.Connect(); err != nil {
+if err := client.Connect(ctx); err != nil {
     return err
 }
 ```
@@ -294,7 +295,7 @@ default.
 ### soqucoind RPC
 
 ```go
-rpcClient := rpc.NewClient("http://127.0.0.1:33389", rpcUser, rpcPassword)
+rpcClient := rpc.NewClient("http://127.0.0.1:33389", rpcUser, rpcPassword, logger)
 ```
 
 Every request carries the RPC password in a Basic Auth header. The client refuses a
@@ -326,7 +327,7 @@ redirect to `https://` fails as a transport error instead of being followed.
   in plaintext.
 
 ```go
-node := rpc.NewClient("https://node.internal:33389", rpcUser, rpcPassword)
+node := rpc.NewClient("https://node.internal:33389", rpcUser, rpcPassword, logger)
 node.AllowRemote = true // the host is not loopback, and that is intended
 ```
 

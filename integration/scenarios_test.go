@@ -3,9 +3,18 @@
 package integration
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,12 +36,15 @@ type memLedger struct {
 func newLedger() *memLedger {
 	return &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}}
 }
-func (l *memLedger) Credit(d deposit.Deposit) error { l.credited[okey(d.TxID, d.Vout)] = d; return nil }
-func (l *memLedger) IsCredited(txid string, vout uint32) (bool, error) {
+func (l *memLedger) Credit(_ context.Context, d deposit.Deposit) error {
+	l.credited[okey(d.TxID, d.Vout)] = d
+	return nil
+}
+func (l *memLedger) IsCredited(_ context.Context, txid string, vout uint32) (bool, error) {
 	_, ok := l.credited[okey(txid, vout)]
 	return ok, nil
 }
-func (l *memLedger) Pending() ([]deposit.Deposit, error) {
+func (l *memLedger) Pending(_ context.Context) ([]deposit.Deposit, error) {
 	var out []deposit.Deposit
 	for k, d := range l.credited {
 		if !l.final[k] {
@@ -41,7 +53,7 @@ func (l *memLedger) Pending() ([]deposit.Deposit, error) {
 	}
 	return out, nil
 }
-func (l *memLedger) MarkFinal(txid string, vout uint32) error {
+func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error {
 	l.final[okey(txid, vout)] = true
 	return nil
 }
@@ -71,7 +83,7 @@ func setup(t *testing.T) *fixture {
 	n.mine(dep, 1) // one deposit worth of coinbase to the deposit address, buried below
 	n.mine(hot, int(types.Regtest.CoinbaseMaturity)+5)
 	f.scan = newScanner(n, hot, dep)
-	if err := f.scan.RefreshAll(); err != nil {
+	if err := f.scan.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	return f
@@ -81,7 +93,7 @@ func (f *fixture) monitor(t *testing.T, led *memLedger, required int64) *deposit
 	return &deposit.Monitor{
 		Network: types.Regtest, // coinbase maturity 60; every harness deposit is a coinbase
 		Cache:   f.scan, Node: f.n.rpc, Ledger: led,
-		Addresses: func() []string { return []string{f.dep} },
+		Addresses: func(context.Context) []string { return []string{f.dep} },
 		Required:  func(int64) int64 { return required },
 		OnAlert: func(k deposit.AlertKind, m string) {
 			f.alerts = append(f.alerts, k)
@@ -101,11 +113,11 @@ func (f *fixture) engine(t *testing.T, store withdraw.Store, spent *utxo.SpentSe
 		Store: store, Spent: spent, Broadcaster: bc,
 		Confirmer:             withdraw.RPCConfirmer{Client: f.n.rpc},
 		RequiredConfirmations: 3, ReservationTTL: time.Minute,
-		Select: func(amount, feeRate int64) ([]types.UTXO, error) {
-			if err := f.n.rpc.RequireSynced(); err != nil {
+		Select: func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
+			if err := f.n.rpc.RequireSynced(ctx); err != nil {
 				return nil, err
 			}
-			if err := f.scan.RefreshAll(); err != nil {
+			if err := f.scan.RefreshAll(ctx); err != nil {
 				return nil, err
 			}
 			// Every coin in the harness is a coinbase, so require maturity here;
@@ -115,9 +127,9 @@ func (f *fixture) engine(t *testing.T, store withdraw.Store, spent *utxo.SpentSe
 			if err != nil {
 				return nil, err
 			}
-			return f.n.rpc.VerifyAndFilterUTXOs(selected, nil, nil)
+			return f.n.rpc.VerifyAndFilterUTXOs(ctx, selected, nil, nil)
 		},
-		BuildSign: func(inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
+		BuildSign: func(_ context.Context, inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
 			spk, err := address.ScriptFor(to)
 			if err != nil {
 				return "", "", err
@@ -132,7 +144,7 @@ func TestDepositCreditedAfterNodeCrossCheck(t *testing.T) {
 	f := setup(t)
 	led := newLedger()
 	m := f.monitor(t, led, 30)
-	got, err := m.Scan()
+	got, err := m.Scan(context.Background())
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -142,7 +154,7 @@ func TestDepositCreditedAfterNodeCrossCheck(t *testing.T) {
 	if got[0].Value != 500_000*types.ShorsPerSOQ {
 		t.Errorf("value %d, want the regtest coinbase reward", got[0].Value)
 	}
-	if again, _ := m.Scan(); len(again) != 0 {
+	if again, _ := m.Scan(context.Background()); len(again) != 0 {
 		t.Fatal("deposit credited twice")
 	}
 	if len(f.alerts) != 0 {
@@ -158,10 +170,10 @@ func TestWithdrawalEndToEnd(t *testing.T) {
 	spent := openSpent(t, filepath.Join(t.TempDir(), "spent.json"))
 	e := f.engine(t, withdraw.NewMemStore(), spent, f.n.rpc)
 	amount := 1_000 * types.ShorsPerSOQ
-	if _, _, err := e.Submit("wd-1", recipient, amount, types.RecommendedFeeRate); err != nil {
+	if _, _, err := e.Submit(context.Background(), "wd-1", recipient, amount, types.RecommendedFeeRate); err != nil {
 		t.Fatal(err)
 	}
-	in, err := e.Process("wd-1")
+	in, err := e.Process(context.Background(), "wd-1")
 	if err != nil {
 		t.Fatalf("process: %v (state %s, last error %s)", err, in.State, in.LastError)
 	}
@@ -169,11 +181,11 @@ func TestWithdrawalEndToEnd(t *testing.T) {
 		t.Fatalf("state %s", in.State)
 	}
 	// The node has it in its mempool under the txid the SDK computed.
-	if _, err := f.n.rpc.Call("getmempoolentry", in.TxID); err != nil {
+	if _, err := f.n.rpc.Call(context.Background(), "getmempoolentry", in.TxID); err != nil {
 		t.Fatalf("node does not have %s in its mempool: %v", in.TxID, err)
 	}
 	f.n.mine(f.hot, 3)
-	if err := e.UpdateConfirmations(in); err != nil {
+	if err := e.UpdateConfirmations(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
 	if in.State != withdraw.StateConfirmed || in.Confirmations < 3 {
@@ -181,7 +193,7 @@ func TestWithdrawalEndToEnd(t *testing.T) {
 	}
 	// Recipient sees exactly the amount; the scanner sees the change.
 	rs := newScanner(f.n, recipient)
-	if err := rs.RefreshAll(); err != nil {
+	if err := rs.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	got := rs.GetUTXOs(recipient)
@@ -198,9 +210,9 @@ type lossyBroadcaster struct {
 	sent  int
 }
 
-func (l *lossyBroadcaster) Broadcast(raw, txid string) (string, error) {
+func (l *lossyBroadcaster) Broadcast(ctx context.Context, raw, txid string) (string, error) {
 	l.sent++
-	got, err := l.inner.Broadcast(raw, txid)
+	got, err := l.inner.Broadcast(ctx, raw, txid)
 	if l.drop {
 		l.drop = false
 		return "", errors.Join(rpc.ErrUnknownOutcome, errors.New("harness dropped the reply"))
@@ -215,12 +227,12 @@ type downBroadcaster struct {
 	failures int
 }
 
-func (d *downBroadcaster) Broadcast(raw, txid string) (string, error) {
+func (d *downBroadcaster) Broadcast(ctx context.Context, raw, txid string) (string, error) {
 	if d.failures > 0 {
 		d.failures--
 		return "", fmt.Errorf("broadcast: %w: harness node down", rpc.ErrTransient)
 	}
-	return d.inner.Broadcast(raw, txid)
+	return d.inner.Broadcast(ctx, raw, txid)
 }
 
 // lyingBroadcaster relays to the real node and then reports a different txid,
@@ -228,8 +240,8 @@ func (d *downBroadcaster) Broadcast(raw, txid string) (string, error) {
 // serialization. The payment is really in the node's mempool.
 type lyingBroadcaster struct{ inner *rpc.Client }
 
-func (l lyingBroadcaster) Broadcast(raw, txid string) (string, error) {
-	got, err := l.inner.Broadcast(raw, txid)
+func (l lyingBroadcaster) Broadcast(ctx context.Context, raw, txid string) (string, error) {
+	got, err := l.inner.Broadcast(ctx, raw, txid)
 	if err != nil {
 		return got, err
 	}
@@ -246,8 +258,8 @@ func TestLostBroadcastReplyNeverPaysTwice(t *testing.T) {
 	lb := &lossyBroadcaster{inner: f.n.rpc, drop: true}
 	e := f.engine(t, store, spent, lb)
 	amount := 700 * types.ShorsPerSOQ
-	e.Submit("wd-lost", recipient, amount, types.RecommendedFeeRate)
-	in, err := e.Process("wd-lost")
+	e.Submit(context.Background(), "wd-lost", recipient, amount, types.RecommendedFeeRate)
+	in, err := e.Process(context.Background(), "wd-lost")
 	if !errors.Is(err, rpc.ErrUnknownOutcome) || in.State != withdraw.StateBuilt {
 		t.Fatalf("lost reply: err=%v state=%s", err, in.State)
 	}
@@ -255,20 +267,20 @@ func TestLostBroadcastReplyNeverPaysTwice(t *testing.T) {
 	// SAME bytes; the node reports the duplicate as already known.
 	store2, _ := withdraw.NewFileStore(filepath.Join(dir, "intents.json"))
 	e2 := f.engine(t, store2, openSpent(t, filepath.Join(dir, "spent.json")), f.n.rpc)
-	e2.BuildSign = func([]types.UTXO, string, int64, int64) (string, string, error) {
+	e2.BuildSign = func(context.Context, []types.UTXO, string, int64, int64) (string, string, error) {
 		t.Fatal("recovery rebuilt a transaction")
 		return "", "", nil
 	}
-	if err := e2.Recover(); err != nil {
+	if err := e2.Recover(context.Background()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	after, _, _ := store2.Get("wd-lost")
+	after, _, _ := store2.Get(context.Background(), "wd-lost")
 	if after.State != withdraw.StateBroadcast || after.TxID != in.TxID {
 		t.Fatalf("recovered %+v", after)
 	}
 	f.n.mine(f.hot, 2)
 	rs := newScanner(f.n, recipient)
-	rs.RefreshAll()
+	rs.RefreshAll(context.Background())
 	if got := rs.GetUTXOs(recipient); len(got) != 1 || got[0].Value != amount {
 		t.Fatalf("recipient has %+v; a lost reply must never produce a second payment", got)
 	}
@@ -282,14 +294,14 @@ func TestConcurrentWithdrawalsNeverShareInputs(t *testing.T) {
 	_, r2 := newKey(t)
 	spent := openSpent(t, filepath.Join(t.TempDir(), "spent.json"))
 	e := f.engine(t, withdraw.NewMemStore(), spent, f.n.rpc)
-	e.Submit("a", r1, 400_000*types.ShorsPerSOQ, types.RecommendedFeeRate)
-	e.Submit("b", r2, 400_000*types.ShorsPerSOQ, types.RecommendedFeeRate)
-	a, _, _ := e.Store.Get("a")
-	b, _, _ := e.Store.Get("b")
-	if err := e.Build(a); err != nil {
+	e.Submit(context.Background(), "a", r1, 400_000*types.ShorsPerSOQ, types.RecommendedFeeRate)
+	e.Submit(context.Background(), "b", r2, 400_000*types.ShorsPerSOQ, types.RecommendedFeeRate)
+	a, _, _ := e.Store.Get(context.Background(), "a")
+	b, _, _ := e.Store.Get(context.Background(), "b")
+	if err := e.Build(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Build(b); err != nil {
+	if err := e.Build(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
 	seen := map[string]bool{}
@@ -300,10 +312,10 @@ func TestConcurrentWithdrawalsNeverShareInputs(t *testing.T) {
 		}
 		seen[k] = true
 	}
-	if err := e.Broadcast(a); err != nil {
+	if err := e.Broadcast(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Broadcast(b); err != nil {
+	if err := e.Broadcast(context.Background(), b); err != nil {
 		t.Fatalf("second withdrawal rejected although it holds different inputs: %v", err)
 	}
 	f.n.mine(f.hot, 1)
@@ -316,29 +328,29 @@ func TestConcurrentWithdrawalsNeverShareInputs(t *testing.T) {
 func TestRefusedInputsNeverReachTheNode(t *testing.T) {
 	f := setup(t)
 	_, recipient := newKey(t)
-	e := f.engine(t, withdraw.NewMemStore(), utxo.NewSpentSet(""), f.n.rpc)
+	e := f.engine(t, withdraw.NewMemStore(), utxo.NewSpentSet("", nil), f.n.rpc)
 
 	// A v5 (USDSOQ authority) address is not a payment destination.
 	prog := make([]byte, 32)
 	v5, _ := address.Encode(types.Regtest.HRP, 5, prog)
-	e.Submit("v5", v5, types.ShorsPerSOQ, types.RecommendedFeeRate)
-	if in, err := e.Process("v5"); err == nil || in.State != withdraw.StateFailed {
+	e.Submit(context.Background(), "v5", v5, types.ShorsPerSOQ, types.RecommendedFeeRate)
+	if in, err := e.Process(context.Background(), "v5"); err == nil || in.State != withdraw.StateFailed {
 		t.Fatalf("v5 destination accepted: %v %+v", err, in)
 	}
 	// Below the node's relay floor.
-	e.Submit("dust", recipient, 100_000, types.RecommendedFeeRate)
-	if in, err := e.Process("dust"); !errors.Is(err, tx.ErrBelowDust) || in.State != withdraw.StateFailed {
+	e.Submit(context.Background(), "dust", recipient, 100_000, types.RecommendedFeeRate)
+	if in, err := e.Process(context.Background(), "dust"); !errors.Is(err, tx.ErrBelowDust) || in.State != withdraw.StateFailed {
 		t.Fatalf("sub-floor amount accepted: %v %+v", err, in)
 	}
 	// A fee-rate typo.
-	e.Submit("typo", recipient, types.ShorsPerSOQ, 9_000_000)
-	if in, err := e.Process("typo"); !errors.Is(err, tx.ErrFeeTooHigh) || in.State != withdraw.StateFailed {
+	e.Submit(context.Background(), "typo", recipient, types.ShorsPerSOQ, 9_000_000)
+	if in, err := e.Process(context.Background(), "typo"); !errors.Is(err, tx.ErrFeeTooHigh) || in.State != withdraw.StateFailed {
 		t.Fatalf("fee-rate typo accepted: %v %+v", err, in)
 	}
-	if n, _ := f.n.rpc.Call("getmempoolinfo"); n == nil {
+	if n, _ := f.n.rpc.Call(context.Background(), "getmempoolinfo"); n == nil {
 		t.Fatal("node unreachable")
 	}
-	raw, _ := f.n.rpc.Call("getrawmempool")
+	raw, _ := f.n.rpc.Call(context.Background(), "getrawmempool")
 	if string(raw) != "[]" {
 		t.Fatalf("something reached the node's mempool: %s", raw)
 	}
@@ -353,26 +365,26 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	f := setup(t)
 	led := newLedger()
 	m := f.monitor(t, led, 30)
-	got, err := m.Scan()
+	got, err := m.Scan(context.Background())
 	if err != nil || len(got) != 1 {
 		t.Fatalf("initial credit: %v %+v", err, got)
 	}
-	depositBlock, err := f.n.rpc.GetBlockHash(got[0].Height)
+	depositBlock, err := f.n.rpc.GetBlockHash(context.Background(), got[0].Height)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.n.rpc.Call("invalidateblock", depositBlock); err != nil {
+	if _, err := f.n.rpc.Call(context.Background(), "invalidateblock", depositBlock); err != nil {
 		t.Fatalf("invalidateblock: %v", err)
 	}
 	f.n.mine(f.hot, int(types.Regtest.CoinbaseMaturity)+10) // a longer chain without the deposit
-	if err := f.scan.RefreshAll(); err != nil {
+	if err := f.scan.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if left := f.scan.GetUTXOs(f.dep); len(left) != 0 {
 		t.Fatalf("scanner still shows the reorganised deposit: %+v", left)
 	}
 	f.alerts = nil
-	if _, err := m.Scan(); err != nil {
+	if _, err := m.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	found := false
@@ -385,7 +397,7 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 		t.Fatalf("credited deposit reorganised away without an alarm; alerts %v", f.alertMsgs)
 	}
 	// And the book is not credited a second time for anything.
-	if again, _ := m.Scan(); len(again) != 0 {
+	if again, _ := m.Scan(context.Background()); len(again) != 0 {
 		t.Fatalf("credited after the reorg: %+v", again)
 	}
 }
@@ -402,19 +414,19 @@ func TestRetriesPastTheReservationTTLKeepTheInputs(t *testing.T) {
 	e := f.engine(t, withdraw.NewMemStore(), spent, down)
 	e.ReservationTTL = 3 * time.Second    // b's selection below must complete well inside one TTL
 	amount := 400_000 * types.ShorsPerSOQ // each takes most of the hot balance; two need disjoint coins
-	e.Submit("a", r1, amount, types.RecommendedFeeRate)
-	a, err := e.Process("a")
+	e.Submit(context.Background(), "a", r1, amount, types.RecommendedFeeRate)
+	a, err := e.Process(context.Background(), "a")
 	if !errors.Is(err, rpc.ErrTransient) || a.State != withdraw.StateBuilt {
 		t.Fatalf("node down: err=%v state=%s", err, a.State)
 	}
 	for i := 0; i < 2; i++ {
 		time.Sleep(2 * time.Second) // inside each TTL, past the first one in total
-		if err := e.Broadcast(a); !errors.Is(err, rpc.ErrTransient) || errors.Is(err, withdraw.ErrReservationLost) {
+		if err := e.Broadcast(context.Background(), a); !errors.Is(err, rpc.ErrTransient) || errors.Is(err, withdraw.ErrReservationLost) {
 			t.Fatalf("retry %d: %v", i, err)
 		}
 	}
-	e.Submit("b", r2, amount, types.RecommendedFeeRate)
-	b, err := e.Process("b")
+	e.Submit(context.Background(), "b", r2, amount, types.RecommendedFeeRate)
+	b, err := e.Process(context.Background(), "b")
 	if err != nil {
 		t.Fatalf("b: %v", err)
 	}
@@ -425,12 +437,12 @@ func TestRetriesPastTheReservationTTLKeepTheInputs(t *testing.T) {
 			}
 		}
 	}
-	if err := e.Broadcast(a); err != nil { // the node is back
+	if err := e.Broadcast(context.Background(), a); err != nil { // the node is back
 		t.Fatalf("a after the node returned: %v", err)
 	}
 	f.n.mine(f.hot, 1)
 	for _, in := range []*withdraw.Intent{a, b} {
-		if n, err := e.Confirmer.Confirmations(in.TxID); err != nil || n != 1 {
+		if n, err := e.Confirmer.Confirmations(context.Background(), in.TxID); err != nil || n != 1 {
 			t.Fatalf("%s: confirmations %d, %v", in.ID, n, err)
 		}
 	}
@@ -447,8 +459,8 @@ func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
 	e := f.engine(t, withdraw.NewMemStore(), spent, lyingBroadcaster{inner: f.n.rpc})
 	e.ReservationTTL = 50 * time.Millisecond // spent inputs must not depend on a reservation
 	amount := 400_000 * types.ShorsPerSOQ
-	e.Submit("a", r1, amount, types.RecommendedFeeRate)
-	a, err := e.Process("a")
+	e.Submit(context.Background(), "a", r1, amount, types.RecommendedFeeRate)
+	a, err := e.Process(context.Background(), "a")
 	if !errors.Is(err, rpc.ErrTxIDMismatch) || errors.Is(err, rpc.ErrPermanent) {
 		t.Fatalf("mismatch: %v", err)
 	}
@@ -461,7 +473,7 @@ func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
 		}
 	}
 	// The real transaction is in the node's mempool under the SDK's txid.
-	if n, err := e.Confirmer.Confirmations(a.TxID); err != nil || n != 0 {
+	if n, err := e.Confirmer.Confirmations(context.Background(), a.TxID); err != nil || n != 0 {
 		t.Fatalf("node does not hold %s in its mempool: %d %v", a.TxID, n, err)
 	}
 	time.Sleep(100 * time.Millisecond) // past the TTL: the inputs stay spent
@@ -472,8 +484,8 @@ func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
 	}
 	// A second withdrawal of the same size cannot reuse those inputs.
 	e.Broadcaster = f.n.rpc
-	e.Submit("b", r2, amount, types.RecommendedFeeRate)
-	if b, err := e.Process("b"); err == nil {
+	e.Submit(context.Background(), "b", r2, amount, types.RecommendedFeeRate)
+	if b, err := e.Process(context.Background(), "b"); err == nil {
 		for _, x := range a.Inputs {
 			for _, y := range b.Inputs {
 				if x.TxID == y.TxID && x.Vout == y.Vout {
@@ -483,7 +495,7 @@ func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
 		}
 	}
 	f.n.mine(f.hot, 1)
-	if n, err := e.Confirmer.Confirmations(a.TxID); err != nil || n != 1 {
+	if n, err := e.Confirmer.Confirmations(context.Background(), a.TxID); err != nil || n != 1 {
 		t.Fatalf("a's payment did not confirm: %d %v", n, err)
 	}
 }
@@ -491,9 +503,133 @@ func TestTxIDMismatchNeverReleasesSpentInputs(t *testing.T) {
 // openSpent opens a file-backed spent set the way production code must.
 func openSpent(t *testing.T, path string) *utxo.SpentSet {
 	t.Helper()
-	ss, err := utxo.OpenSpentSet(path)
+	ss, err := utxo.OpenSpentSet(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return ss
+}
+
+// holdingProxy sits between the SDK and the node. It forwards every request
+// and, for the first sendrawtransaction, delivers the request to the node,
+// signals that the node has answered, and never returns the reply: the shape
+// of a network that drops the reply after the node has accepted the
+// transaction, or of a caller that gives up at that instant.
+type holdingProxy struct {
+	srv      *httptest.Server
+	accepted chan struct{}
+	held     atomic.Bool
+}
+
+func newHoldingProxy(t *testing.T, nodeURL string) *holdingProxy {
+	t.Helper()
+	target, err := url.Parse(nodeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &holdingProxy{accepted: make(chan struct{}, 1)}
+	rp := httputil.NewSingleHostReverseProxy(target)
+	director := rp.Director
+	rp.Director = func(r *http.Request) {
+		director(r)
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		if strings.Contains(string(body), `"sendrawtransaction"`) && p.held.CompareAndSwap(false, true) {
+			r.Header.Set("X-Harness-Hold", "1")
+		}
+	}
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if resp.Request.Header.Get("X-Harness-Hold") != "1" {
+			return nil
+		}
+		p.accepted <- struct{}{}
+		<-resp.Request.Context().Done()
+		return resp.Request.Context().Err()
+	}
+	rp.ErrorHandler = func(http.ResponseWriter, *http.Request, error) {}
+	p.srv = httptest.NewServer(rp)
+	t.Cleanup(p.srv.Close)
+	return p
+}
+
+// 9. The caller's context ends while the node is holding the reply to the
+// broadcast. The node has the transaction; the SDK does not know it. The
+// intent stays Built with its reservation; a restart with a live context
+// sends the same bytes, the node reports them as already known, and the
+// recipient is paid exactly once.
+func TestCancelledBroadcastPaysOnce(t *testing.T) {
+	f := setup(t)
+	_, recipient := newKey(t)
+	dir := t.TempDir()
+	proxy := newHoldingProxy(t, fmt.Sprintf("http://127.0.0.1:%d", f.n.port))
+	viaProxy := rpc.NewClient(proxy.srv.URL, "it", "it", nil)
+	viaProxy.Network = types.Regtest
+	store, _ := withdraw.NewFileStore(filepath.Join(dir, "intents.json"))
+	spent := openSpent(t, filepath.Join(dir, "spent.json"))
+	e := f.engine(t, store, spent, viaProxy)
+	amount := 600 * types.ShorsPerSOQ
+	if _, _, err := e.Submit(context.Background(), "wd-cancel", recipient, amount, types.RecommendedFeeRate); err != nil {
+		t.Fatal(err)
+	}
+	in, _, _ := store.Get(context.Background(), "wd-cancel")
+	// Built under a live context, so the cancel below can touch only the send.
+	if err := e.Build(context.Background(), in); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.Broadcast(ctx, in) }()
+	select {
+	case <-proxy.accepted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the node never answered the broadcast")
+	}
+	cancel()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Broadcast did not return after its context was cancelled")
+	}
+	if !errors.Is(err, rpc.ErrUnknownOutcome) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled broadcast: %v, want ErrUnknownOutcome carrying context.Canceled", err)
+	}
+	if errors.Is(err, rpc.ErrPermanent) || in.State != withdraw.StateBuilt {
+		t.Fatalf("cancelled broadcast: state %s, err %v; the intent must stay Built", in.State, err)
+	}
+	for _, o := range in.Inputs {
+		if !spent.IsSpent(o.TxID, o.Vout) {
+			t.Fatalf("input %s:%d released while the payment sits in the mempool", o.TxID, o.Vout)
+		}
+	}
+	// The node already holds the payment the SDK does not know about.
+	if _, err := f.n.rpc.Call(context.Background(), "getmempoolentry", in.TxID); err != nil {
+		t.Fatalf("node does not have %s in its mempool: %v", in.TxID, err)
+	}
+
+	// "Restart": a new engine over the same files, straight to the node.
+	store2, _ := withdraw.NewFileStore(filepath.Join(dir, "intents.json"))
+	e2 := f.engine(t, store2, openSpent(t, filepath.Join(dir, "spent.json")), f.n.rpc)
+	e2.BuildSign = func(context.Context, []types.UTXO, string, int64, int64) (string, string, error) {
+		t.Fatal("recovery rebuilt a transaction after a cancelled broadcast")
+		return "", "", nil
+	}
+	if err := e2.Recover(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	after, _, _ := store2.Get(context.Background(), "wd-cancel")
+	if after.State != withdraw.StateBroadcast || after.TxID != in.TxID || after.RawHex != in.RawHex {
+		t.Fatalf("recovered %+v, want Broadcast under the same txid and bytes", after)
+	}
+	f.n.mine(f.hot, 2)
+	rs := newScanner(f.n, recipient)
+	if err := rs.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := rs.GetUTXOs(recipient); len(got) != 1 || got[0].Value != amount {
+		t.Fatalf("recipient has %+v; a cancelled broadcast must never produce a second payment", got)
+	}
 }

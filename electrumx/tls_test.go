@@ -15,6 +15,7 @@
 package electrumx
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -90,9 +91,9 @@ func TestConnectNegotiatesTLSWhenConfigured(t *testing.T) {
 	cert, pool := selfSigned(t)
 	stub := newStub(t, &tls.Config{Certificates: []tls.Certificate{cert}})
 
-	c := NewClient(stub.addr(), time.Second)
+	c := NewClient(stub.addr(), time.Second, nil)
 	c.TLSConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
-	if err := c.Connect(); err != nil {
+	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect over TLS: %v", err)
 	}
 	defer c.Stop()
@@ -107,8 +108,8 @@ func TestConnectNegotiatesTLSWhenConfigured(t *testing.T) {
 
 func TestConnectStaysPlaintextWhenNotConfigured(t *testing.T) {
 	stub := newStub(t, nil)
-	c := NewClient(stub.addr(), time.Second)
-	if err := c.Connect(); err != nil {
+	c := NewClient(stub.addr(), time.Second, nil)
+	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	defer c.Stop()
@@ -124,15 +125,15 @@ func TestReconnectDoesNotDowngradeToPlaintext(t *testing.T) {
 	cert, pool := selfSigned(t)
 	stub := newStub(t, &tls.Config{Certificates: []tls.Certificate{cert}})
 
-	c := NewClient(stub.addr(), time.Second)
+	c := NewClient(stub.addr(), time.Second, nil)
 	c.TLSConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
-	if err := c.Connect(); err != nil {
+	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	defer c.Stop()
 	<-stub.handshak
 
-	if err := c.Reconnect(); err != nil {
+	if err := c.Reconnect(context.Background()); err != nil {
 		t.Fatalf("Reconnect: %v", err)
 	}
 	if wasTLS := <-stub.handshak; !wasTLS {
@@ -149,9 +150,9 @@ func TestUseTLSRejectsUntrustedCertificate(t *testing.T) {
 	cert, _ := selfSigned(t)
 	stub := newStub(t, &tls.Config{Certificates: []tls.Certificate{cert}})
 
-	c := NewClient(stub.addr(), time.Second)
+	c := NewClient(stub.addr(), time.Second, nil)
 	c.UseTLS() // system roots only; the stub's cert is not among them
-	err := c.Connect()
+	err := c.Connect(context.Background())
 	if err == nil {
 		c.Stop()
 		t.Fatal("UseTLS accepted a certificate signed by an untrusted CA")
@@ -167,9 +168,9 @@ func TestUseTLSRejectsUntrustedCertificate(t *testing.T) {
 // fall through.
 func TestTLSToPlaintextServerFails(t *testing.T) {
 	stub := newStub(t, nil)
-	c := NewClient(stub.addr(), time.Second)
+	c := NewClient(stub.addr(), time.Second, nil)
 	c.UseTLS()
-	if err := c.Connect(); err == nil {
+	if err := c.Connect(context.Background()); err == nil {
 		c.Stop()
 		t.Fatal("TLS client connected to a plaintext server")
 	}

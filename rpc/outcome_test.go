@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -47,7 +48,7 @@ func TestErrorKinds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		c, _ := rpcServer(t, func(string, []interface{}) string { return rpcErr(tc.code, "x") })
-		_, err := c.GetBlockCount()
+		_, err := c.GetBlockCount(context.Background())
 		if err == nil {
 			t.Fatalf("code %d: no error", tc.code)
 		}
@@ -68,8 +69,8 @@ func TestErrorKinds(t *testing.T) {
 }
 
 func TestUnreachableNodeIsTransient(t *testing.T) {
-	c := NewClient("http://127.0.0.1:1", "u", "p")
-	_, err := c.GetBlockCount()
+	c := NewClient("http://127.0.0.1:1", "u", "p", nil)
+	_, err := c.GetBlockCount(context.Background())
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("unreachable node: %v, want ErrTransient", err)
 	}
@@ -85,9 +86,9 @@ func TestSendRawTransactionTimeoutIsUnknownOutcome(t *testing.T) {
 		time.Sleep(300 * time.Millisecond) // longer than the client timeout below
 	}))
 	t.Cleanup(srv.Close)
-	c := NewClient(srv.URL, "u", "p")
+	c := NewClient(srv.URL, "u", "p", nil)
 	c.SetTimeout(50 * time.Millisecond)
-	_, err := c.SendRawTransaction("00")
+	_, err := c.SendRawTransaction(context.Background(), "00")
 	if !errors.Is(err, ErrUnknownOutcome) {
 		t.Fatalf("timed-out broadcast reported as %v; a caller treating this as failure pays twice", err)
 	}
@@ -119,14 +120,14 @@ func TestBroadcastResolvesLostReplyAgainstTheNode(t *testing.T) {
 			}
 		}))
 		t.Cleanup(srv.Close)
-		c := NewClient(srv.URL, "u", "p")
+		c := NewClient(srv.URL, "u", "p", nil)
 		c.SetTimeout(50 * time.Millisecond)
 		return c
 	}
 
 	t.Run("node knows the tx: success", func(t *testing.T) {
 		c := mk(true)
-		txid, err := c.Broadcast("00", someTxID)
+		txid, err := c.Broadcast(context.Background(), "00", someTxID)
 		if err != nil || txid != someTxID {
 			t.Fatalf("Broadcast: %s %v; the node had the transaction, this is a success", txid, err)
 		}
@@ -136,7 +137,7 @@ func TestBroadcastResolvesLostReplyAgainstTheNode(t *testing.T) {
 	})
 	t.Run("node does not know it: still unknown, never a rejection", func(t *testing.T) {
 		c := mk(false)
-		_, err := c.Broadcast("00", someTxID)
+		_, err := c.Broadcast(context.Background(), "00", someTxID)
 		if !errors.Is(err, ErrUnknownOutcome) {
 			t.Fatalf("got %v, want ErrUnknownOutcome", err)
 		}
@@ -153,7 +154,7 @@ func TestBroadcastAlreadyInChainIsSuccess(t *testing.T) {
 		}
 		return ok(`null`)
 	})
-	txid, err := c.Broadcast("00", someTxID)
+	txid, err := c.Broadcast(context.Background(), "00", someTxID)
 	if err != nil || txid != someTxID {
 		t.Fatalf("already-in-chain reported as failure: %s %v", txid, err)
 	}
@@ -163,7 +164,7 @@ func TestBroadcastRejectionIsPermanent(t *testing.T) {
 	c, _ := rpcServer(t, func(method string, _ []interface{}) string {
 		return rpcErr(CodeVerifyRejected, "min relay fee not met")
 	})
-	_, err := c.Broadcast("00", someTxID)
+	_, err := c.Broadcast(context.Background(), "00", someTxID)
 	if !errors.Is(err, ErrPermanent) {
 		t.Fatalf("rejection: %v, want ErrPermanent", err)
 	}
@@ -179,7 +180,7 @@ func TestBroadcastReportsTxIDMismatchAsItsOwnKind(t *testing.T) {
 	c, _ := rpcServer(t, func(method string, _ []interface{}) string {
 		return ok(`"` + someTxID + `"`)
 	})
-	got, err := c.Broadcast("00", "not-the-same")
+	got, err := c.Broadcast(context.Background(), "00", "not-the-same")
 	if !errors.Is(err, ErrTxIDMismatch) {
 		t.Fatalf("node/caller txid disagreement not surfaced: %v", err)
 	}
@@ -206,7 +207,7 @@ func TestVerifyAndFilterRefusesWhileNodeIsSyncing(t *testing.T) {
 			}
 			return ok(`null`) // every output "spent" on this lagging node
 		})
-		_, err := c.VerifyAndFilterUTXOs([]types.UTXO{{TxID: someTxID, Vout: 0}},
+		_, err := c.VerifyAndFilterUTXOs(context.Background(), []types.UTXO{{TxID: someTxID, Vout: 0}},
 			func(string, uint32) { evicted++ }, nil)
 		if !errors.Is(err, ErrNodeSyncing) || !errors.Is(err, ErrTransient) {
 			t.Errorf("%s: got %v, want ErrNodeSyncing (transient)", info, err)
@@ -231,7 +232,7 @@ func TestVerifyAndFilterSkipsImmatureCoinbaseWithoutEvicting(t *testing.T) {
 		}
 		return ok(`null`)
 	})
-	got, err := c.VerifyAndFilterUTXOs([]types.UTXO{{TxID: "young", Vout: 0}, {TxID: "old", Vout: 0}},
+	got, err := c.VerifyAndFilterUTXOs(context.Background(), []types.UTXO{{TxID: "young", Vout: 0}, {TxID: "old", Vout: 0}},
 		func(string, uint32) { evicted++ }, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -258,7 +259,7 @@ func TestTxOutValueIsExactShors(t *testing.T) {
 		c, _ := rpcServer(t, func(method string, _ []interface{}) string {
 			return ok(`{"bestblock":"00","confirmations":3,"value":` + tc.raw + `,"scriptPubKey":{"hex":"5120aa"},"coinbase":false,"assettype":0}`)
 		})
-		out, err := c.GetTxOut(someTxID, 0, true)
+		out, err := c.GetTxOut(context.Background(), someTxID, 0, true)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.raw, err)
 		}
@@ -278,7 +279,7 @@ func TestTxOutRefusesNonDecimalValue(t *testing.T) {
 		`{"confirmations":3,"scriptPubKey":{"hex":"51"}}`,
 	} {
 		c, _ := rpcServer(t, func(string, []interface{}) string { return ok(body) })
-		out, err := c.GetTxOut(someTxID, 0, true)
+		out, err := c.GetTxOut(context.Background(), someTxID, 0, true)
 		if !errors.Is(err, types.ErrAmountFormat) {
 			t.Errorf("%s: got %+v, %v; want ErrAmountFormat", body, out, err)
 		}
@@ -325,7 +326,7 @@ func TestVerifyAndFilterAppliesTheNetworkMaturityAtTheBoundary(t *testing.T) {
 			return ok(`null`)
 		})
 		cl.Network = c.network
-		got, err := cl.VerifyAndFilterUTXOs([]types.UTXO{{TxID: someTxID, Vout: 0}},
+		got, err := cl.VerifyAndFilterUTXOs(context.Background(), []types.UTXO{{TxID: someTxID, Vout: 0}},
 			func(string, uint32) { evicted++ }, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
@@ -365,7 +366,7 @@ func TestRequireSyncedRefusesANodeOnAnotherChain(t *testing.T) {
 			return ok(`null`) // every output "spent", should the check be skipped
 		})
 		cl.Network = c.network
-		err := cl.RequireSynced()
+		err := cl.RequireSynced(context.Background())
 		if !c.refuse {
 			if err != nil {
 				t.Errorf("%s: %v", c.name, err)
@@ -375,7 +376,7 @@ func TestRequireSyncedRefusesANodeOnAnotherChain(t *testing.T) {
 		if !errors.Is(err, ErrWrongChain) || !errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) {
 			t.Errorf("%s: got %v, want ErrWrongChain (permanent, not transient)", c.name, err)
 		}
-		_, verr := cl.VerifyAndFilterUTXOs([]types.UTXO{{TxID: someTxID, Vout: 0}},
+		_, verr := cl.VerifyAndFilterUTXOs(context.Background(), []types.UTXO{{TxID: someTxID, Vout: 0}},
 			func(string, uint32) { evicted++ }, nil)
 		if !errors.Is(verr, ErrWrongChain) {
 			t.Errorf("%s: VerifyAndFilterUTXOs got %v, want ErrWrongChain", c.name, verr)
@@ -393,13 +394,13 @@ func TestRequireChainHoldsTheNodeToTheGivenChain(t *testing.T) {
 	cl, _ := rpcServer(t, func(method string, _ []interface{}) string {
 		return ok(`{"chain":"regtest","blocks":1000,"headers":1000,"initialblockdownload":false}`)
 	})
-	if err := cl.RequireChain(types.Regtest.ChainID); err != nil {
+	if err := cl.RequireChain(context.Background(), types.Regtest.ChainID); err != nil {
 		t.Errorf("regtest node, regtest wanted: %v", err)
 	}
-	if err := cl.RequireChain(""); err != nil {
+	if err := cl.RequireChain(context.Background(), ""); err != nil {
 		t.Errorf("empty chain id must pass: %v", err)
 	}
-	err := cl.RequireChain(types.Mainnet.ChainID)
+	err := cl.RequireChain(context.Background(), types.Mainnet.ChainID)
 	if !errors.Is(err, ErrWrongChain) || !errors.Is(err, ErrPermanent) {
 		t.Errorf("regtest node, mainnet wanted: got %v, want ErrWrongChain", err)
 	}

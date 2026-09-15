@@ -12,28 +12,42 @@
 //
 // Usage:
 //
-//	client := electrumx.NewClient("host:50001", 15*time.Second)
-//	if err := client.Connect(); err != nil {
-//	    log.Fatal(err)
+//	client := electrumx.NewClient("host:50001", 15*time.Second, logger)
+//	if err := client.Connect(ctx); err != nil {
+//	    return err
 //	}
 //	defer client.Stop()
 //
 //	client.TrackAddresses([]string{"ssq1abc..."})
-//	client.StartPolling()
+//	client.StartPolling(ctx)
 //
 //	utxos := client.GetUTXOs("ssq1abc...")
 //	balance := client.GetBalance(1, tipHeight)
+//
+// Every method that reaches the server takes a context.Context first. A call
+// whose context ends returns ctx.Err() at once, whether it is waiting for the
+// connection behind another call or holds it: the connection deadline is
+// moved to now so the blocked write or read returns. A call cut short while
+// waiting for a reply that has not begun to arrive leaves the connection
+// usable, and the reply, if it arrives later, carries an id the next call
+// discards; a call cut short while writing, or after part of a reply line
+// has been read, closes the connection, since the stream is no longer known
+// to be at a line boundary, and the next call returns ErrNotConnected until
+// Reconnect or the polling loop restores it. Methods that read the cache
+// (GetUTXOs, GetBalance, LastRefresh and the rest) take no context; they
+// never block on the network.
 //
 // Copyright (c) 2025-2026 Soqucoin Labs Inc. MIT License.
 package electrumx
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -41,6 +55,7 @@ import (
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
@@ -50,18 +65,23 @@ import (
 // and provides battle-tested UTXO caching with merge-based refresh
 // (Defense 12) that preserves spend-pending state across poll cycles.
 type Client struct {
-	mu           sync.RWMutex
-	utxos        map[string][]types.UTXO // address -> UTXOs
-	host         string
-	conn         net.Conn      // guarded by connMu
-	reader       *bufio.Reader // guarded by connMu
-	connMu       sync.Mutex    // PF-018b: Serializes all TCP I/O and connection replacement
+	mu     sync.RWMutex
+	utxos  map[string][]types.UTXO // address -> UTXOs
+	host   string
+	conn   net.Conn      // guarded by connSem
+	reader *bufio.Reader // guarded by connSem
+	// connSem is a one-slot semaphore: PF-018b, it serializes all TCP I/O and
+	// connection replacement. A channel rather than a mutex so that a caller
+	// queued behind a stalled exchange leaves the queue when its own context
+	// ends (lockConn) instead of waiting out the other call's deadline.
+	connSem      chan struct{}
 	reqID        atomic.Int64
 	lastTip      atomic.Int64 // latest height seen in a headers.subscribe reply or notification
 	addresses    []string
 	pollInterval time.Duration
 	stopCh       chan struct{}
 	stopOnce     sync.Once
+	log          *slog.Logger
 
 	lastRefreshAt  time.Time                // guarded by mu: last time EVERY tracked address refreshed
 	lastRefreshErr error                    // guarded by mu: error of the last RefreshAll, nil on success
@@ -99,9 +119,9 @@ type Client struct {
 // This is the setting an exchange should use for any ElectrumX server it does
 // not reach over a private network.
 //
-//	client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second)
+//	client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second, logger)
 //	client.UseTLS()
-//	client.Connect()
+//	client.Connect(ctx)
 //
 // For a private CA or a pinned certificate, set TLSConfig directly instead.
 func (c *Client) UseTLS() {
@@ -161,33 +181,53 @@ const maxSkippedLines = 64
 // Parameters:
 //   - host: ElectrumX TCP address (e.g., "localhost:50001")
 //   - pollInterval: How often to refresh UTXOs (recommended: 15s for production)
-func NewClient(host string, pollInterval time.Duration) *Client {
+//   - logger: where connection events, reorgs and polling errors go; nil discards
+func NewClient(host string, pollInterval time.Duration, logger *slog.Logger) *Client {
 	return &Client{
+		log:          logutil.Or(logger),
 		utxos:        make(map[string][]types.UTXO),
 		refreshed:    make(map[string]refreshRecord),
 		host:         host,
 		pollInterval: pollInterval,
 		stopCh:       make(chan struct{}),
+		connSem:      make(chan struct{}, 1),
 	}
 }
+
+// lockConn takes the connection semaphore or returns ctx.Err() when the
+// context ends first. The caller must release with unlockConn on success.
+func (c *Client) lockConn(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.connSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// lockConnBlocking takes the connection semaphore without a context: for
+// Stop, which must close the socket whatever else is happening.
+func (c *Client) lockConnBlocking() { c.connSem <- struct{}{} }
+
+func (c *Client) unlockConn() { <-c.connSem }
 
 // dial opens the transport. Keepalive is set on the TCP connection underneath
 // any TLS layer, so it survives the wrapping.
 //
 // The TLS handshake carries its own deadline. Without one a server that accepts
 // the TCP connection and then stalls would hang Connect indefinitely, which is
-// exactly how a reconnect loop wedges.
-func (c *Client) dial() (net.Conn, error) {
-	raw, err := net.DialTimeout("tcp", c.host, 10*time.Second)
+// exactly how a reconnect loop wedges. Both the dial and the handshake end
+// early when ctx ends.
+func (c *Client) dial(ctx context.Context) (net.Conn, error) {
+	// F5: TCP keepalive at 30 s, so an idle connection survives NAT and
+	// firewall timeouts between polls.
+	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	raw, err := dialer.DialContext(ctx, "tcp", c.host)
 	if err != nil {
 		return nil, fmt.Errorf("connect to electrumx %s: %w", c.host, err)
-	}
-
-	// F5: Enable TCP keepalive to prevent broken pipe after idle periods.
-	if tcpConn, ok := raw.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		log.Printf("[electrumx] TCP keepalive enabled (30s interval)")
 	}
 
 	if c.TLSConfig == nil {
@@ -204,18 +244,11 @@ func (c *Client) dial() (net.Conn, error) {
 	}
 
 	tlsConn := tls.Client(raw, cfg)
-	if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("electrumx %s: set handshake deadline: %w", c.host, err)
-	}
-	if err := tlsConn.Handshake(); err != nil {
+	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("electrumx %s: tls handshake: %w", c.host, err)
-	}
-	// Clear the handshake deadline; per-call timeouts govern from here.
-	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("electrumx %s: clear handshake deadline: %w", c.host, err)
 	}
 	return tlsConn, nil
 }
@@ -227,19 +260,24 @@ func (c *Client) dial() (net.Conn, error) {
 // NAT/firewall timeouts silently kill the connection after ~4h on DigitalOcean
 // droplets. TCP keepalive at 30s prevents this.
 //
-// The connection is replaced under connMu, the same lock every call holds, so
-// a Reconnect from the polling goroutine can never race a caller mid-request.
+// The connection is replaced under the connection lock, the same lock every
+// call holds, so a Reconnect from the polling goroutine can never race a
+// caller mid-request. A context that ends while a call holds the lock ends
+// Connect too, and the new connection is closed unused.
 // After the version handshake the server's genesis hash is checked against the
 // chains the client's HRP belongs to (see verifyGenesisLocked): an indexer for
 // the wrong chain would otherwise report "no deposits" forever.
-func (c *Client) Connect() error {
-	conn, err := c.dial()
+func (c *Client) Connect(ctx context.Context) error {
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return err
 	}
 
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	if err := c.lockConn(ctx); err != nil {
+		conn.Close()
+		return err
+	}
+	defer c.unlockConn()
 
 	if c.conn != nil {
 		c.conn.Close()
@@ -251,11 +289,7 @@ func (c *Client) Connect() error {
 	// in Go 1.26's bufio.ReadSlice when response > 4KB.
 	// 4MB accommodates ~50,000 UTXOs with margin.
 	c.reader = bufio.NewReaderSize(conn, 4*1024*1024)
-	if c.TLSConfig != nil {
-		log.Printf("[electrumx] Connected to ElectrumX at %s over TLS", c.host)
-	} else {
-		log.Printf("[electrumx] Connected to ElectrumX at %s in plaintext", c.host)
-	}
+	c.log.Info("connected", "host", c.host, "tls", c.TLSConfig != nil)
 
 	fail := func(err error) error {
 		conn.Close()
@@ -265,13 +299,13 @@ func (c *Client) Connect() error {
 	}
 
 	// Server version handshake
-	resp, err := c.callLocked("server.version", []interface{}{"soqucoin-sdk/1.0", "1.4"})
+	resp, err := c.callLocked(ctx, "server.version", []interface{}{"soqucoin-sdk/1.0", "1.4"})
 	if err != nil {
 		return fail(fmt.Errorf("electrumx handshake: %w", err))
 	}
-	log.Printf("[electrumx] Server version: %s", string(resp))
+	c.log.Info("server version", "host", c.host, "version", string(resp))
 
-	if err := c.verifyGenesisLocked(); err != nil {
+	if err := c.verifyGenesisLocked(ctx); err != nil {
 		return fail(err)
 	}
 	return nil
@@ -280,7 +314,7 @@ func (c *Client) Connect() error {
 // verifyGenesisLocked refuses a server that indexes a chain other than the one
 // the client's addresses belong to. Skipped only while the HRP is still unknown
 // (before TrackAddresses), in which case TrackAddresses is the gate.
-func (c *Client) verifyGenesisLocked() error {
+func (c *Client) verifyGenesisLocked(ctx context.Context) error {
 	if c.HRP == "" {
 		return nil
 	}
@@ -288,7 +322,7 @@ func (c *Client) verifyGenesisLocked() error {
 	if len(want) == 0 {
 		return fmt.Errorf("%w: no known chain uses HRP %q", ErrNetworkMismatch, c.HRP)
 	}
-	raw, err := c.callLocked("server.features", []interface{}{})
+	raw, err := c.callLocked(ctx, "server.features", []interface{}{})
 	if err != nil {
 		return fmt.Errorf("electrumx server.features: %w", err)
 	}
@@ -308,12 +342,12 @@ func (c *Client) verifyGenesisLocked() error {
 }
 
 // Reconnect closes the existing connection and re-establishes it.
-func (c *Client) Reconnect() error {
-	log.Printf("[electrumx] Reconnecting to ElectrumX at %s...", c.host)
-	if err := c.Connect(); err != nil {
+func (c *Client) Reconnect(ctx context.Context) error {
+	c.log.Info("reconnecting", "host", c.host)
+	if err := c.Connect(ctx); err != nil {
 		return fmt.Errorf("reconnect failed: %w", err)
 	}
-	log.Printf("[electrumx] Reconnected successfully")
+	c.log.Info("reconnected", "host", c.host)
 	return nil
 }
 
@@ -324,18 +358,26 @@ func (c *Client) Reconnect() error {
 // consolidation) call this concurrently. Without the connection mutex,
 // concurrent writes corrupt the TCP stream, and concurrent reads corrupt
 // bufio's internal buffer → panic: slice bounds out of range.
-func (c *Client) Call(method string, params interface{}) (json.RawMessage, error) {
-	return c.call(method, params)
+func (c *Client) Call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+	return c.call(ctx, method, params)
 }
 
-func (c *Client) call(method string, params interface{}) (json.RawMessage, error) {
-	// PF-018b FIX: Serialize TCP I/O.
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-	return c.callLocked(method, params)
+func (c *Client) call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+	// PF-018b FIX: Serialize TCP I/O. A caller whose context ends while
+	// another call holds the connection returns here, not after that call's
+	// deadline.
+	if err := c.lockConn(ctx); err != nil {
+		return nil, err
+	}
+	defer c.unlockConn()
+	return c.callLocked(ctx, method, params)
 }
 
-// callLocked performs one request/reply exchange. Caller holds connMu.
+// callDeadline bounds one request/reply exchange when the context does not end
+// it first.
+const callDeadline = 30 * time.Second
+
+// callLocked performs one request/reply exchange. Caller holds the connection lock.
 //
 // The reply is identified by id, never by position. Lines carrying a method
 // are server notifications (headers.subscribe pushes one at every new block)
@@ -343,9 +385,21 @@ func (c *Client) call(method string, params interface{}) (json.RawMessage, error
 // request that timed out and are discarded. Before this, a notification was
 // returned as the reply to whatever call happened to read it, and every later
 // reply was off by one: listunspent for address A stored under address B.
-func (c *Client) callLocked(method string, params interface{}) (json.RawMessage, error) {
+//
+// The context ends the exchange the same way the deadline does: when it is
+// done the connection deadline is moved to now, the blocked write or read
+// returns, and ctx.Err() is reported. A read cut short before any byte of a
+// line arrived leaves the stream in step: the reply, if it arrives, is a
+// stale id the next call discards. A write cut short, or a read cut short
+// with part of a line consumed, does not, so the connection is closed; the
+// next call returns ErrNotConnected and Reconnect, or the polling loop,
+// restores it.
+func (c *Client) callLocked(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	if c.conn == nil {
 		return nil, ErrNotConnected
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	id := c.reqID.Add(1)
 	req := request{
@@ -360,21 +414,66 @@ func (c *Client) callLocked(method string, params interface{}) (json.RawMessage,
 	}
 
 	// One deadline covers the write and the read: a stalled peer must not be
-	// able to hold connMu, and every other caller behind it, forever.
-	if err := c.conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	// able to hold the connection, and every caller behind it, forever. The
+	// context ends the exchange through the same deadline, moved to now when
+	// the context is done; it is not copied into the deadline up front,
+	// because the socket's timer and the context's timer would then fire
+	// together and the read could return before ctx.Err() is set.
+	conn := c.conn
+	if err := conn.SetDeadline(time.Now().Add(callDeadline)); err != nil {
+		// A socket that refuses a deadline is closed or broken underneath.
+		c.dropLocked()
 		return nil, fmt.Errorf("set deadline: %w", err)
+	}
+	// If the context ends while the call is in flight the callback moves the
+	// deadline to now. A socket that refuses the deadline is closed instead,
+	// which returns the blocked read the same way, and is dropped once the
+	// exchange has returned. On return the callback is stopped, or, when it
+	// has already started, waited for: the connection lock is still held
+	// here, so it cannot run after the next call has set its own deadline.
+	fired := make(chan struct{})
+	var closedByCtx atomic.Bool
+	stop := context.AfterFunc(ctx, func() {
+		defer close(fired)
+		if err := conn.SetDeadline(time.Now()); err != nil {
+			closedByCtx.Store(true)
+			conn.Close()
+		}
+	})
+	defer func() {
+		if !stop() {
+			<-fired
+		}
+		if closedByCtx.Load() && c.conn == conn {
+			c.dropLocked()
+		}
+	}()
+	// ctxErr reports the context's error in place of the deadline error the
+	// connection produced when the context is what ended the exchange.
+	ctxErr := func(err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return err
 	}
 
 	// ElectrumX uses newline-delimited JSON
 	data = append(data, '\n')
-	if _, err := c.conn.Write(data); err != nil {
-		return nil, fmt.Errorf("write request: %w", err)
+	if _, err := conn.Write(data); err != nil {
+		// Part of the line may have gone out; the stream cannot be trusted.
+		c.dropLocked()
+		return nil, fmt.Errorf("write request: %w", ctxErr(err))
 	}
 
 	for skipped := 0; skipped < maxSkippedLines; skipped++ {
 		line, err := c.reader.ReadBytes('\n')
 		if err != nil {
-			return nil, fmt.Errorf("read response: %w", err)
+			if len(line) > 0 {
+				// Part of a line was consumed; the rest would be read as the
+				// start of the next reply. The stream cannot be trusted.
+				c.dropLocked()
+			}
+			return nil, fmt.Errorf("read response: %w", ctxErr(err))
 		}
 		var in incoming
 		if err := json.Unmarshal(line, &in); err != nil {
@@ -385,11 +484,11 @@ func (c *Client) callLocked(method string, params interface{}) (json.RawMessage,
 			continue
 		}
 		if in.ID == nil {
-			log.Printf("[electrumx] discarding line with neither id nor method")
+			c.log.Warn("discarding a line with neither id nor method")
 			continue
 		}
 		if *in.ID != id {
-			log.Printf("[electrumx] discarding stale reply id=%d while waiting for id=%d", *in.ID, id)
+			c.log.Debug("discarding a stale reply", "got_id", *in.ID, "want_id", id)
 			continue
 		}
 		if len(in.Error) > 0 && string(in.Error) != "null" {
@@ -401,6 +500,16 @@ func (c *Client) callLocked(method string, params interface{}) (json.RawMessage,
 		return in.Result, nil
 	}
 	return nil, fmt.Errorf("electrumx: no reply to request %d within %d lines", id, maxSkippedLines)
+}
+
+// dropLocked closes and forgets the connection. Caller holds the connection lock. The next
+// call returns ErrNotConnected until Reconnect, or the polling loop, dials again.
+func (c *Client) dropLocked() {
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.conn = nil
+	c.reader = nil
 }
 
 // handleNotification consumes a server push. Only the headers subscription is
@@ -482,7 +591,12 @@ func (c *Client) TrackAddresses(addresses []string) error {
 // as stale once its last successful refresh is older than its MaxCacheAge,
 // which puts a ceiling on the addresses one client can keep fresh: at a
 // 5-minute MaxCacheAge, about 300 seconds divided by the round trip.
-func (c *Client) RefreshAll() error {
+//
+// When ctx ends mid-pass the pass stops there: the addresses reached keep
+// their new records, the rest keep their old ones, and the error names one
+// address, the one whose call was cut short or, between calls, the first not
+// attempted.
+func (c *Client) RefreshAll(ctx context.Context) error {
 	c.mu.RLock()
 	addrs := make([]string, len(c.addresses))
 	copy(addrs, c.addresses)
@@ -490,7 +604,11 @@ func (c *Client) RefreshAll() error {
 
 	var errs []error
 	for _, addr := range addrs {
-		err := c.refreshAddress(addr)
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
+			break
+		}
+		err := c.refreshAddress(ctx, addr)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
 		}
@@ -504,6 +622,12 @@ func (c *Client) RefreshAll() error {
 			c.refreshed[addr] = rec
 		}
 		c.mu.Unlock()
+		// A context that ended during this address's call is already named
+		// through its error; the pass stops here rather than naming the next
+		// address as well.
+		if err != nil && ctx.Err() != nil {
+			break
+		}
 	}
 	err := errors.Join(errs...)
 
@@ -548,13 +672,13 @@ func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
 //  1. Preserves SpentPending and AssetType flags on UTXOs that still appear
 //  2. Removes UTXOs that ElectrumX no longer reports (confirmed spent)
 //  3. Adds new UTXOs that appeared since last poll (change outputs, new coinbases)
-func (c *Client) refreshAddress(addr string) error {
+func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 	scriptHash, err := address.AddressToScriptHash(c.HRP, addr)
 	if err != nil {
 		return fmt.Errorf("address to script hash: %w", err)
 	}
 
-	result, err := c.call("blockchain.scripthash.listunspent", []interface{}{scriptHash})
+	result, err := c.call(ctx, "blockchain.scripthash.listunspent", []interface{}{scriptHash})
 	if err != nil {
 		return fmt.Errorf("listunspent: %w", err)
 	}
@@ -595,8 +719,7 @@ func (c *Client) refreshAddress(addr string) error {
 			// wrongly injected change output, because the amount is committed
 			// into the sighash and a stale one makes every spend fail.
 			if u.Height > 0 && fresh.Height == 0 {
-				log.Printf("[electrumx] REORG: %s:%d left height %d and is back in the mempool",
-					shortID(u.TxID, 12), u.Vout, u.Height)
+				c.log.Warn("reorg: a confirmed output is back in the mempool", "txid", u.TxID, "vout", u.Vout, "height", u.Height)
 			}
 			u.Height = fresh.Height
 			u.Value = fresh.Value
@@ -624,13 +747,14 @@ func (c *Client) refreshAddress(addr string) error {
 	return nil
 }
 
-// StartPolling begins periodic UTXO refresh in a goroutine.
+// StartPolling begins periodic UTXO refresh in a goroutine. The goroutine
+// ends when ctx ends or Stop is called; every refresh it makes runs under ctx.
 //
 // Production lesson: The polling goroutine includes panic recovery
 // and auto-reconnect. Without this, a bufio panic kills the entire
 // process. With recovery, the goroutine logs the panic, reconnects,
 // and resumes polling.
-func (c *Client) StartPolling() {
+func (c *Client) StartPolling(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(c.pollInterval)
 		defer ticker.Stop()
@@ -638,19 +762,19 @@ func (c *Client) StartPolling() {
 		// PF-018 FIX: Recover from panics in the polling goroutine.
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[electrumx] PANIC in polling goroutine (recovered): %v", r)
-				log.Printf("[electrumx] Attempting reconnect after panic...")
-				if reconErr := c.Reconnect(); reconErr != nil {
-					log.Printf("[electrumx] Post-panic reconnect failed: %v", reconErr)
+				c.log.Error("panic in the polling goroutine, reconnecting", "panic", r)
+				if reconErr := c.Reconnect(ctx); reconErr != nil {
+					c.log.Error("reconnect after panic failed", "err", reconErr)
 				}
-				// Restart polling after recovery
-				c.StartPolling()
+				if ctx.Err() == nil {
+					c.StartPolling(ctx)
+				}
 			}
 		}()
 
 		// Initial refresh
-		if err := c.RefreshAll(); err != nil {
-			log.Printf("[electrumx] Initial refresh error: %v", err)
+		if err := c.RefreshAll(ctx); err != nil {
+			c.log.Warn("initial refresh failed", "err", err)
 		}
 
 		consecutiveErrors := 0
@@ -658,15 +782,19 @@ func (c *Client) StartPolling() {
 		for {
 			select {
 			case <-ticker.C:
-				if err := c.RefreshAll(); err != nil {
+				// The tick and the context can be ready together and select
+				// picks either; no refresh starts once the context has ended.
+				if ctx.Err() != nil {
+					return
+				}
+				if err := c.RefreshAll(ctx); err != nil {
 					consecutiveErrors++
-					log.Printf("[electrumx] Refresh error (%d consecutive): %v", consecutiveErrors, err)
+					c.log.Warn("refresh failed", "consecutive", consecutiveErrors, "err", err)
 
 					// F5: Auto-reconnect after 2 consecutive failures
-					if consecutiveErrors >= 2 {
-						log.Printf("[electrumx] Connection appears dead, attempting reconnect...")
-						if reconErr := c.Reconnect(); reconErr != nil {
-							log.Printf("[electrumx] Reconnect failed: %v (will retry next poll)", reconErr)
+					if consecutiveErrors >= 2 && ctx.Err() == nil {
+						if reconErr := c.Reconnect(ctx); reconErr != nil {
+							c.log.Warn("reconnect failed, retrying at the next poll", "err", reconErr)
 						} else {
 							consecutiveErrors = 0
 						}
@@ -674,6 +802,8 @@ func (c *Client) StartPolling() {
 				} else {
 					consecutiveErrors = 0
 				}
+			case <-ctx.Done():
+				return
 			case <-c.stopCh:
 				return
 			}
@@ -685,8 +815,8 @@ func (c *Client) StartPolling() {
 // more than once; calls after Stop return ErrNotConnected.
 func (c *Client) Stop() {
 	c.stopOnce.Do(func() { close(c.stopCh) })
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	c.lockConnBlocking()
+	defer c.unlockConn()
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
@@ -783,7 +913,7 @@ func (c *Client) EvictUTXO(txid string, vout uint32) {
 		for i, u := range utxos {
 			if u.TxID == txid && u.Vout == vout {
 				c.utxos[addr] = append(utxos[:i], utxos[i+1:]...)
-				log.Printf("[electrumx] Evicted stale UTXO %s:%d from cache", shortID(txid, 12), vout)
+				c.log.Info("evicted a stale output from the cache", "txid", txid, "vout", vout)
 				return
 			}
 		}
@@ -818,11 +948,7 @@ func (c *Client) AddChangeUTXO(txid string, vout uint32, value int64, addr strin
 	}
 
 	c.utxos[addr] = append(c.utxos[addr], changeUTXO)
-	// Previously this whole log was skipped when either identifier was short,
-	// which silently dropped the diagnostic for exactly the inputs most likely to
-	// be wrong. shortID keeps the line and truncates safely instead.
-	log.Printf("[electrumx] Added change UTXO %s:%d (%d shors) for %s...",
-		shortID(txid, 12), vout, value, shortID(addr, 20))
+	c.log.Info("added a change output to the cache", "txid", txid, "vout", vout, "value", value, "address", addr)
 }
 
 // SetAssetType stamps the asset type on a cached UTXO. Called by Defense 11
@@ -859,8 +985,8 @@ func (c *Client) UTXOCount() int {
 }
 
 // GetTip fetches the current chain tip height from ElectrumX.
-func (c *Client) GetTip() (int64, error) {
-	result, err := c.call("blockchain.headers.subscribe", []interface{}{})
+func (c *Client) GetTip(ctx context.Context) (int64, error) {
+	result, err := c.call(ctx, "blockchain.headers.subscribe", []interface{}{})
 	if err != nil {
 		return 0, fmt.Errorf("get tip: %w", err)
 	}
@@ -875,13 +1001,13 @@ func (c *Client) GetTip() (int64, error) {
 }
 
 // GetHistory fetches transaction history for an address.
-func (c *Client) GetHistory(addr string) ([]TxHistoryEntry, error) {
+func (c *Client) GetHistory(ctx context.Context, addr string) ([]TxHistoryEntry, error) {
 	scriptHash, err := address.AddressToScriptHash(c.HRP, addr)
 	if err != nil {
 		return nil, fmt.Errorf("address to script hash: %w", err)
 	}
 
-	result, err := c.call("blockchain.scripthash.get_history", []interface{}{scriptHash})
+	result, err := c.call(ctx, "blockchain.scripthash.get_history", []interface{}{scriptHash})
 	if err != nil {
 		return nil, fmt.Errorf("get_history: %w", err)
 	}
@@ -900,8 +1026,8 @@ type TxHistoryEntry struct {
 }
 
 // BroadcastTx broadcasts a raw transaction hex via ElectrumX.
-func (c *Client) BroadcastTx(rawTxHex string) (string, error) {
-	result, err := c.call("blockchain.transaction.broadcast", []interface{}{rawTxHex})
+func (c *Client) BroadcastTx(ctx context.Context, rawTxHex string) (string, error) {
+	result, err := c.call(ctx, "blockchain.transaction.broadcast", []interface{}{rawTxHex})
 	if err != nil {
 		return "", fmt.Errorf("broadcast: %w", err)
 	}
@@ -911,14 +1037,4 @@ func (c *Client) BroadcastTx(rawTxHex string) (string, error) {
 		return "", fmt.Errorf("parse broadcast result: %w", err)
 	}
 	return txid, nil
-}
-
-// shortID truncates an identifier for logging without panicking on short input.
-// Log formatting must never be able to crash the caller: these helpers sit on
-// error paths, and a panic there replaces a handled error with process death.
-func shortID(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

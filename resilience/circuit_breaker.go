@@ -22,13 +22,15 @@
 package resilience
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
 	soqaddr "github.com/soqucoin-labs/soqucoin-sdk/address"
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 )
@@ -81,6 +83,7 @@ type CircuitBreaker struct {
 
 	lastFailure time.Time
 	lastSuccess time.Time
+	log         *slog.Logger
 
 	// Stats for monitoring
 	TotalFailures  int64
@@ -102,12 +105,15 @@ type CircuitBreaker struct {
 // malformed address, an amount below the floor, insufficient funds or a
 // node rejection of one transaction says nothing about whether the next
 // withdrawal can succeed; feeding such errors to the breaker lets an
-// unauthenticated user halt every withdrawal with three bad requests.
+// unauthenticated user halt every withdrawal with three bad requests. A
+// cancelled context is the caller's own stop signal and says nothing about
+// the system either; a deadline that expired does, and counts.
 func (cb *CircuitBreaker) perRequest(err error) bool {
 	if err == nil {
 		return false
 	}
 	builtin := []error{
+		context.Canceled,
 		rpc.ErrPermanent,
 		soqaddr.ErrInvalidChecksum, soqaddr.ErrInvalidLength, soqaddr.ErrInvalidHRP,
 		soqaddr.ErrInvalidChar, soqaddr.ErrUnsupportedWitnessVersion, soqaddr.ErrInvalidVersion,
@@ -157,7 +163,7 @@ func (cb *CircuitBreaker) Trip(err error) {
 	}
 	n := cb.consecutiveFailures
 	cb.mu.Unlock()
-	log.Printf("[circuit-breaker] %s → OPEN (tripped: %v)", prev, err)
+	cb.logger().Error("circuit breaker tripped open", "from", prev.String(), "err", err)
 	if prev != CircuitOpen && cb.OnStateChange != nil {
 		cb.OnStateChange(prev.String(), "OPEN", n, err.Error())
 	}
@@ -168,13 +174,19 @@ func (cb *CircuitBreaker) Trip(err error) {
 // Parameters:
 //   - maxFailures: consecutive failures before tripping (recommended: 3)
 //   - cooldown: duration to wait before probing (recommended: 15-30 min)
-func NewCircuitBreaker(maxFailures int, cooldown time.Duration) *CircuitBreaker {
+//   - logger: where transitions and counted failures go; nil discards
+func NewCircuitBreaker(maxFailures int, cooldown time.Duration, logger *slog.Logger) *CircuitBreaker {
 	return &CircuitBreaker{
 		state:            CircuitClosed,
 		maxFailures:      maxFailures,
 		cooldownDuration: cooldown,
+		log:              logutil.Or(logger),
 	}
 }
+
+// logger returns the injected logger, or a discarding one for a breaker
+// built as a literal.
+func (cb *CircuitBreaker) logger() *slog.Logger { return logutil.Or(cb.log) }
 
 // Allow checks if an operation should proceed.
 // Returns nil if allowed, or an error explaining why it's blocked.
@@ -190,7 +202,7 @@ func (cb *CircuitBreaker) Allow() error {
 		if time.Since(cb.lastFailure) >= cb.cooldownDuration {
 			cb.state = CircuitHalfOpen
 			cb.probing = true
-			log.Printf("[circuit-breaker] Transitioning OPEN → HALF-OPEN (cooldown elapsed, allowing ONE probe)")
+			cb.logger().Info("circuit breaker half-open: cooldown elapsed, one probe allowed")
 			return nil
 		}
 		remaining := cb.cooldownDuration - time.Since(cb.lastFailure)
@@ -223,7 +235,7 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Unlock()
 
 	if previousState != CircuitClosed {
-		log.Printf("[circuit-breaker] %s → CLOSED (operation succeeded)", previousState)
+		cb.logger().Info("circuit breaker closed", "from", previousState.String())
 		if cb.OnStateChange != nil {
 			cb.OnStateChange(previousState.String(), "CLOSED", 0, "")
 		}
@@ -256,10 +268,10 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 	cb.mu.Unlock()
 
 	if !tripped {
-		log.Printf("[circuit-breaker] Failure %d/%d: %v", n, cb.maxFailures, err)
+		cb.logger().Warn("circuit breaker counted a failure", "failures", n, "max", cb.maxFailures, "err", err)
 		return
 	}
-	log.Printf("[circuit-breaker] %s → OPEN (%d consecutive failures: %v, cooling down %v)", from, n, err, cb.cooldownDuration)
+	cb.logger().Error("circuit breaker open", "from", from, "failures", n, "err", err, "cooldown", cb.cooldownDuration)
 	if cb.OnStateChange != nil {
 		cb.OnStateChange(from, "OPEN", n, err.Error())
 	}
@@ -279,5 +291,5 @@ func (cb *CircuitBreaker) Reset() {
 	cb.state = CircuitClosed
 	cb.consecutiveFailures = 0
 	cb.probing = false
-	log.Printf("[circuit-breaker] Manually reset to CLOSED")
+	cb.logger().Info("circuit breaker reset to closed")
 }

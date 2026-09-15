@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -48,7 +49,7 @@ func TestFeeRateShorsPerVBConvertsAndClamps(t *testing.T) {
 			FeeEstimate{Rate: 1000, Fallback: true}},
 	} {
 		c, params := feeServer(t, tc.reply)
-		got, err := c.FeeRateShorsPerVB(6)
+		got, err := c.FeeRateShorsPerVB(context.Background(), 6)
 		if err != nil {
 			t.Errorf("%s: %v", tc.name, err)
 			continue
@@ -74,14 +75,14 @@ func TestFeeRateShorsPerVBHonoursTheOperatorsCap(t *testing.T) {
 
 	tx.MaxFeeRateShorsPerVB = 5000
 	c, _ := feeServer(t, `{"feerate":0.20000000,"blocks":6}`)
-	got, err := c.FeeRateShorsPerVB(6)
+	got, err := c.FeeRateShorsPerVB(context.Background(), 6)
 	if err != nil || got != (FeeEstimate{Rate: 5000, NodeRate: 20_000, Blocks: 6, Clamped: true}) {
 		t.Fatalf("tightened cap: %+v, %v", got, err)
 	}
 
 	tx.MaxFeeRateShorsPerVB = types.RecommendedFeeRate - 1
 	c, params := feeServer(t, `{"feerate":0.02000000,"blocks":6}`)
-	_, err = c.FeeRateShorsPerVB(6)
+	_, err = c.FeeRateShorsPerVB(context.Background(), 6)
 	if !errors.Is(err, ErrPermanent) {
 		t.Fatalf("cap below floor: %v, want ErrPermanent", err)
 	}
@@ -95,12 +96,12 @@ func TestFeeRateShorsPerVBHonoursTheOperatorsCap(t *testing.T) {
 // estimate", not for one that answered something else.
 func TestFeeRateShorsPerVBErrors(t *testing.T) {
 	c, _ := rpcServer(t, func(string, []interface{}) string { return rpcErr(CodeInWarmup, "Loading block index...") })
-	if _, err := c.FeeRateShorsPerVB(6); !errors.Is(err, ErrTransient) {
+	if _, err := c.FeeRateShorsPerVB(context.Background(), 6); !errors.Is(err, ErrTransient) {
 		t.Errorf("warmup: %v, want ErrTransient", err)
 	}
 	for _, reply := range []string{`{"blocks":6}`, `{"feerate":null,"blocks":6}`, `{"feerate":"abc","blocks":6}`, `{"feerate":true,"blocks":6}`, `{"feerate":1e-4,"blocks":6}`, `{"feerate":0.000000001,"blocks":6}`} {
 		c, _ := feeServer(t, reply)
-		got, err := c.FeeRateShorsPerVB(6)
+		got, err := c.FeeRateShorsPerVB(context.Background(), 6)
 		if !errors.Is(err, types.ErrAmountFormat) || errors.Is(err, ErrTransient) || errors.Is(err, ErrPermanent) || got.Fallback {
 			t.Errorf("%s: %+v, %v; want ErrAmountFormat and no fallback", reply, got, err)
 		}

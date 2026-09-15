@@ -19,14 +19,16 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -43,6 +45,14 @@ import (
 
 var network = types.Stagenet
 
+// logger is shared by the program and the SDK components it builds.
+var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+func fatal(msg string, err error) {
+	logger.Error(msg, "err", err)
+	os.Exit(1)
+}
+
 func main() {
 	dir := flag.String("dir", "stagenet_withdrawal_state", "directory for the keystore, spent set and intent store")
 	initKeys := flag.Bool("init", false, "create the keystore and print the funding and destination addresses")
@@ -54,19 +64,19 @@ func main() {
 
 	passphrase := os.Getenv("SOQ_KEYSTORE_PASSPHRASE")
 	if passphrase == "" {
-		log.Fatal("SOQ_KEYSTORE_PASSPHRASE is not set")
+		fatal("SOQ_KEYSTORE_PASSPHRASE is not set", nil)
 	}
 	if err := os.MkdirAll(*dir, 0o700); err != nil {
-		log.Fatal(err)
+		fatal("state directory", err)
 	}
 	// Load refuses a missing file; only -init, the first run, may create one.
 	keystore := keys.NewManager(filepath.Join(*dir, "keys.enc"), passphrase)
 	if *initKeys {
 		if err := keystore.LoadOrCreate(); err != nil {
-			log.Fatalf("create keystore: %v", err)
+			fatal("create keystore", err)
 		}
 		if err := createKeys(keystore); err != nil {
-			log.Fatal(err)
+			fatal("create keys", err)
 		}
 		return
 	}
@@ -75,10 +85,14 @@ func main() {
 		os.Exit(2)
 	}
 	if err := keystore.Load(); err != nil {
-		log.Fatalf("load keystore: %v", err)
+		fatal("load keystore", err)
 	}
-	if err := run(*dir, keystore, *inputs, *to, *amountSOQ*types.ShorsPerSOQ, *confirmations); err != nil {
-		log.Fatal(err)
+	// Ctrl-C ends the context. A broadcast interrupted by it is a lost reply:
+	// the intent stays Built and the next run's Recover sends the same bytes.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := run(ctx, *dir, keystore, *inputs, *to, *amountSOQ*types.ShorsPerSOQ, *confirmations); err != nil {
+		fatal("withdrawal", err)
 	}
 }
 
@@ -105,7 +119,7 @@ func createKeys(keystore *keys.Manager) error {
 		kp, err := keys.FromSeed(network.HRP, seed)
 		seed = [keys.SeedSize]byte{}
 		if errors.Is(err, keys.ErrInvalidPublicKey) {
-			log.Printf("index %d derives the node's invalid-key marker; skipped", index)
+			logger.Info("index derives the node's invalid-key marker, skipped", "index", index)
 			continue
 		}
 		if err != nil {
@@ -124,17 +138,17 @@ func createKeys(keystore *keys.Manager) error {
 	return nil
 }
 
-func run(dir string, keystore *keys.Manager, inputList, to string, amount, required int64) error {
+func run(ctx context.Context, dir string, keystore *keys.Manager, inputList, to string, amount, required int64) error {
 	if err := address.Validate(network.HRP, to); err != nil {
 		return err
 	}
-	node := rpc.NewClient(rpcURL(), os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"))
+	node := rpc.NewClient(rpcURL(), os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"), logger)
 	node.Network = network
-	if err := node.RequireSynced(); err != nil {
+	if err := node.RequireSynced(ctx); err != nil {
 		return err
 	}
 
-	funding, hot, err := fundingUTXOs(node, keystore, inputList)
+	funding, hot, err := fundingUTXOs(ctx, node, keystore, inputList)
 	if err != nil {
 		return err
 	}
@@ -143,7 +157,7 @@ func run(dir string, keystore *keys.Manager, inputList, to string, amount, requi
 		return err
 	}
 
-	spent, err := utxo.OpenSpentSet(filepath.Join(dir, "spent_set.json"))
+	spent, err := utxo.OpenSpentSet(filepath.Join(dir, "spent_set.json"), logger)
 	if err != nil {
 		return err
 	}
@@ -159,12 +173,13 @@ func run(dir string, keystore *keys.Manager, inputList, to string, amount, requi
 		Broadcaster:           node,
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
 		RequiredConfirmations: required,
+		Logger:                logger,
 		// ReservationTTL left at its default, withdraw.DefaultReservationTTL.
-		Select: func(amount, feeRate int64) ([]types.UTXO, error) {
-			if err := node.RequireSynced(); err != nil {
+		Select: func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
+			if err := node.RequireSynced(ctx); err != nil {
 				return nil, err
 			}
-			tip, err := node.GetBlockCount()
+			tip, err := node.GetBlockCount(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -175,9 +190,9 @@ func run(dir string, keystore *keys.Manager, inputList, to string, amount, requi
 			if err != nil {
 				return nil, err
 			}
-			return node.VerifyAndFilterUTXOs(selected, nil, nil)
+			return node.VerifyAndFilterUTXOs(ctx, selected, nil, nil)
 		},
-		BuildSign: func(inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
+		BuildSign: func(_ context.Context, inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
 			recipientSPK, err := address.ScriptFor(to)
 			if err != nil {
 				return "", "", err
@@ -185,40 +200,44 @@ func run(dir string, keystore *keys.Manager, inputList, to string, amount, requi
 			return tx.BuildAndSign(inputs, recipientSPK, amount, changeSPK, feeRate, keystore)
 		},
 	}
-	if err := engine.Recover(); err != nil {
+	if err := engine.Recover(ctx); err != nil {
 		return fmt.Errorf("recover: %w", err)
 	}
 
 	// The idempotency key is derived from the first input, so running the
 	// program again for the same outputs resumes the same intent.
 	id := "verification-" + funding[0].TxID[:16]
-	if _, _, err := engine.Submit(id, to, amount, types.RecommendedFeeRate); err != nil {
+	if _, _, err := engine.Submit(ctx, id, to, amount, types.RecommendedFeeRate); err != nil {
 		return fmt.Errorf("submit: %w", err)
 	}
-	intent, err := engine.Process(id)
+	intent, err := engine.Process(ctx, id)
 	if err != nil {
 		if intent != nil {
 			return fmt.Errorf("process (state %s): %w", intent.State, err)
 		}
 		return fmt.Errorf("process: %w", err)
 	}
-	log.Printf("%s broadcast as %s", id, intent.TxID)
+	logger.Info("broadcast", "intent", id, "txid", intent.TxID)
 
 	for intent.State != withdraw.StateConfirmed {
-		time.Sleep(15 * time.Second)
-		if err := engine.UpdateConfirmations(intent); err != nil {
-			log.Printf("confirmations: %v", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+		}
+		if err := engine.UpdateConfirmations(ctx, intent); err != nil {
+			logger.Warn("confirmations", "err", err)
 			continue
 		}
-		log.Printf("%d of %d confirmations", intent.Confirmations, required)
+		logger.Info("confirmations", "have", intent.Confirmations, "want", required)
 	}
-	return printRecord(node, intent.TxID)
+	return printRecord(ctx, node, intent.TxID)
 }
 
 // fundingUTXOs reads each outpoint from the node and returns them as inputs,
 // with the one keystore address they all pay. An outpoint that is spent,
 // unconfirmed or paid to any other script is refused.
-func fundingUTXOs(node *rpc.Client, keystore *keys.Manager, list string) ([]types.UTXO, string, error) {
+func fundingUTXOs(ctx context.Context, node *rpc.Client, keystore *keys.Manager, list string) ([]types.UTXO, string, error) {
 	scripts := map[string]string{}
 	for _, addr := range keystore.GetAddresses() {
 		spk, err := address.ScriptFor(addr)
@@ -230,7 +249,7 @@ func fundingUTXOs(node *rpc.Client, keystore *keys.Manager, list string) ([]type
 	if len(scripts) == 0 {
 		return nil, "", errors.New("the keystore holds no key; run -init first")
 	}
-	tip, err := node.GetBlockCount()
+	tip, err := node.GetBlockCount(ctx)
 	if err != nil {
 		return nil, "", err
 	}
@@ -247,7 +266,7 @@ func fundingUTXOs(node *rpc.Client, keystore *keys.Manager, list string) ([]type
 		if err != nil {
 			return nil, "", fmt.Errorf("outpoint %q: %w", item, err)
 		}
-		txout, err := node.GetTxOut(parts[0], uint32(vout), false)
+		txout, err := node.GetTxOut(ctx, parts[0], uint32(vout), false)
 		if err != nil {
 			return nil, "", err
 		}
@@ -275,8 +294,8 @@ func fundingUTXOs(node *rpc.Client, keystore *keys.Manager, list string) ([]type
 
 // printRecord prints the fields docs/VERIFICATION.md records, read back from
 // the node so every figure is the node's own.
-func printRecord(node *rpc.Client, txid string) error {
-	raw, err := node.Call("getrawtransaction", txid, true)
+func printRecord(ctx context.Context, node *rpc.Client, txid string) error {
+	raw, err := node.Call(ctx, "getrawtransaction", txid, true)
 	if err != nil {
 		return err
 	}
@@ -302,7 +321,7 @@ func printRecord(node *rpc.Client, txid string) error {
 		Time   int64 `json:"time"`
 	}
 	if decoded.BlockHash != "" {
-		raw, err := node.Call("getblockheader", decoded.BlockHash)
+		raw, err := node.Call(ctx, "getblockheader", decoded.BlockHash)
 		if err != nil {
 			return err
 		}

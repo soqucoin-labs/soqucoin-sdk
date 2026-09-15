@@ -8,17 +8,12 @@
 package electrumx
 
 import (
-	"io"
-	"log"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	coinsel "github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
-
-func init() { log.SetOutput(io.Discard) }
 
 const (
 	txA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -28,7 +23,7 @@ const (
 
 // newTestClient returns a client with a pre-seeded cache and no network.
 func newTestClient(seed map[string][]types.UTXO) *Client {
-	c := NewClient("127.0.0.1:1", time.Second)
+	c := NewClient("127.0.0.1:1", time.Second, nil)
 	if seed != nil {
 		c.utxos = seed
 	}
@@ -37,26 +32,6 @@ func newTestClient(seed map[string][]types.UTXO) *Client {
 
 func utxo(txid string, vout uint32, value int64, height int64, asset uint8) types.UTXO {
 	return types.UTXO{TxID: txid, Vout: vout, Value: value, Height: height, Address: adr, AssetType: asset}
-}
-
-// ── shortID: the panic regression ──────────────────────────────────────────
-//
-// EvictUTXO used to format its log line with txid[:12] and no length guard, so a
-// UTXO with a short identifier crashed the process. That call sits on the
-// withdrawal path — VerifyAndFilterUTXOs passes EvictUTXO as its eviction
-// callback — so the panic would land mid-payout, and it would replace a handled
-// stale-UTXO condition with process death.
-
-func TestShortIDNeverPanics(t *testing.T) {
-	for _, s := range []string{"", "a", "abc", "0123456789", "0123456789ab", txA} {
-		got := shortID(s, 12)
-		if len(got) > 12 {
-			t.Errorf("shortID(%q, 12) = %q, longer than 12", s, got)
-		}
-		if !strings.HasPrefix(s, got) {
-			t.Errorf("shortID(%q, 12) = %q, not a prefix", s, got)
-		}
-	}
 }
 
 func TestEvictUTXODoesNotPanicOnShortTxID(t *testing.T) {

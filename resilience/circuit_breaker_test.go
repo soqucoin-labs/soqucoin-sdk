@@ -1,6 +1,7 @@
 package resilience
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -10,7 +11,7 @@ import (
 )
 
 func TestCircuitBreakerStartsClosed(t *testing.T) {
-	cb := NewCircuitBreaker(3, 5*time.Second)
+	cb := NewCircuitBreaker(3, 5*time.Second, nil)
 	state, failures, _, _ := cb.State()
 	if state != CircuitClosed {
 		t.Errorf("expected CLOSED, got %s", state)
@@ -21,14 +22,14 @@ func TestCircuitBreakerStartsClosed(t *testing.T) {
 }
 
 func TestCircuitBreakerAllowsWhenClosed(t *testing.T) {
-	cb := NewCircuitBreaker(3, 5*time.Second)
+	cb := NewCircuitBreaker(3, 5*time.Second, nil)
 	if err := cb.Allow(); err != nil {
 		t.Errorf("expected Allow() to succeed when closed, got: %v", err)
 	}
 }
 
 func TestCircuitBreakerTripsAfterMaxFailures(t *testing.T) {
-	cb := NewCircuitBreaker(3, 5*time.Second)
+	cb := NewCircuitBreaker(3, 5*time.Second, nil)
 
 	// Record 3 consecutive failures
 	for i := 0; i < 3; i++ {
@@ -50,7 +51,7 @@ func TestCircuitBreakerTripsAfterMaxFailures(t *testing.T) {
 }
 
 func TestCircuitBreakerDoesNotTripBeforeThreshold(t *testing.T) {
-	cb := NewCircuitBreaker(3, 5*time.Second)
+	cb := NewCircuitBreaker(3, 5*time.Second, nil)
 
 	// Record 2 failures (below threshold)
 	cb.RecordFailure(errors.New("fail 1"))
@@ -67,7 +68,7 @@ func TestCircuitBreakerDoesNotTripBeforeThreshold(t *testing.T) {
 }
 
 func TestCircuitBreakerResetsOnSuccess(t *testing.T) {
-	cb := NewCircuitBreaker(3, 5*time.Second)
+	cb := NewCircuitBreaker(3, 5*time.Second, nil)
 
 	// 2 failures then 1 success
 	cb.RecordFailure(errors.New("fail"))
@@ -88,7 +89,7 @@ func TestCircuitBreakerResetsOnSuccess(t *testing.T) {
 
 func TestCircuitBreakerHalfOpenAfterCooldown(t *testing.T) {
 	// Use a very short cooldown for testing
-	cb := NewCircuitBreaker(1, 10*time.Millisecond)
+	cb := NewCircuitBreaker(1, 10*time.Millisecond, nil)
 
 	cb.RecordFailure(errors.New("fail"))
 
@@ -112,7 +113,7 @@ func TestCircuitBreakerHalfOpenAfterCooldown(t *testing.T) {
 }
 
 func TestCircuitBreakerHalfOpenProbeSuccess(t *testing.T) {
-	cb := NewCircuitBreaker(1, 10*time.Millisecond)
+	cb := NewCircuitBreaker(1, 10*time.Millisecond, nil)
 
 	cb.RecordFailure(errors.New("fail"))
 	time.Sleep(15 * time.Millisecond)
@@ -131,7 +132,7 @@ func TestCircuitBreakerHalfOpenProbeSuccess(t *testing.T) {
 }
 
 func TestCircuitBreakerHalfOpenProbeFail(t *testing.T) {
-	cb := NewCircuitBreaker(1, 10*time.Millisecond)
+	cb := NewCircuitBreaker(1, 10*time.Millisecond, nil)
 
 	cb.RecordFailure(errors.New("fail"))
 	time.Sleep(15 * time.Millisecond)
@@ -147,7 +148,7 @@ func TestCircuitBreakerHalfOpenProbeFail(t *testing.T) {
 }
 
 func TestCircuitBreakerReset(t *testing.T) {
-	cb := NewCircuitBreaker(1, 5*time.Second)
+	cb := NewCircuitBreaker(1, 5*time.Second, nil)
 	cb.RecordFailure(errors.New("fail"))
 
 	state, _, _, _ := cb.State()
@@ -167,7 +168,7 @@ func TestCircuitBreakerReset(t *testing.T) {
 }
 
 func TestCircuitBreakerOnStateChangeCallback(t *testing.T) {
-	cb := NewCircuitBreaker(1, 5*time.Second)
+	cb := NewCircuitBreaker(1, 5*time.Second, nil)
 
 	var called bool
 	var capturedFrom, capturedTo string
@@ -188,7 +189,7 @@ func TestCircuitBreakerOnStateChangeCallback(t *testing.T) {
 }
 
 func TestCircuitBreakerTotalStats(t *testing.T) {
-	cb := NewCircuitBreaker(5, 5*time.Second) // High threshold so it stays closed
+	cb := NewCircuitBreaker(5, 5*time.Second, nil) // High threshold so it stays closed
 
 	cb.RecordSuccess()
 	cb.RecordSuccess()
@@ -208,11 +209,30 @@ func TestCircuitBreakerTotalStats(t *testing.T) {
 // computed is a systemic disagreement between signer and node, not a bad
 // request: it must count toward opening the breaker.
 func TestTxIDMismatchCountsAsSystemic(t *testing.T) {
-	cb := NewCircuitBreaker(1, time.Minute)
+	cb := NewCircuitBreaker(1, time.Minute, nil)
 	if !cb.RecordResult(fmt.Errorf("broadcast: %w", rpc.ErrTxIDMismatch)) {
 		t.Fatal("txid mismatch was ignored as a per-request error")
 	}
 	if cb.Allow() == nil {
 		t.Fatal("breaker did not open on a txid mismatch")
+	}
+}
+
+// A cancelled context is the operator's own stop signal, not a failure of
+// the system: it neither counts nor resets. A deadline that expired counts.
+func TestContextCanceledIsNotAFailure(t *testing.T) {
+	cb := NewCircuitBreaker(2, time.Minute, nil)
+	for i := 0; i < 5; i++ {
+		if cb.RecordResult(fmt.Errorf("process: %w", context.Canceled)) {
+			t.Fatal("a cancelled context changed the breaker")
+		}
+	}
+	if st, n, _, _ := cb.State(); st != CircuitClosed || n != 0 {
+		t.Fatalf("after five cancels: %s %d", st, n)
+	}
+	cb.RecordResult(fmt.Errorf("node: %w", context.DeadlineExceeded))
+	cb.RecordResult(fmt.Errorf("node: %w", context.DeadlineExceeded))
+	if st, _, _, _ := cb.State(); st != CircuitOpen {
+		t.Fatalf("two deadlines: %s, want OPEN", st)
 	}
 }
