@@ -116,7 +116,9 @@ type Monitor struct {
 
 	// MaxCacheAge bounds how stale the indexer cache may be before a scan is
 	// skipped entirely (default 5 minutes). A stale cache is an outage, not
-	// "no deposits".
+	// "no deposits". With electrumx.Client it must exceed that client's
+	// PingInterval with room for one missed ping: the ping is what advances a
+	// quiet address's freshness, so a lost connection ages every address out.
 	MaxCacheAge time.Duration
 
 	// OnAlert receives every condition a human should see: indexer and node
