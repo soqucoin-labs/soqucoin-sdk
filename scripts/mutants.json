@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "Declared mutants. Each entry names one behaviour change and the single test",
+    "that must catch it; scripts/check-mutants.py requires the test to pass",
+    "unmutated and to fail mutated.",
+    "",
+    "Rules for an entry. The mutation must change behaviour, not well-formedness:",
+    "neutering a guard so the code below it runs on undefined state makes the",
+    "failure a property of the nonsense rather than of the line. It must occur",
+    "exactly once in the file. 'why' states the defect the line prevents, so a",
+    "reader can judge whether the test is pinning the right thing.",
+    "",
+    "Entries naming a file a branch does not carry are skipped, not failed: each",
+    "branch adds the entries for the mechanism it introduces."
+  ],
+  "mutants": [
+    {
+      "id": "deposit-credits-below-required-depth",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestRefusesWhatTheNodeDoesNotConfirm",
+      "find": "case out.Confirmations < m.Required(u.Value):",
+      "replace": "case out.Confirmations < -1:",
+      "why": "An output the node has not buried to the required depth must not be credited, and the disagreement with the indexer must alarm. Without this the exchange credits a deposit a reorganisation can still take back."
+    },
+    {
+      "id": "deposit-credits-immature-coinbase",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestImmatureCoinbaseWaitsWithoutAlarm",
+      "find": "case out.Coinbase && out.Confirmations < m.network().CoinbaseMaturity:",
+      "replace": "case out.Coinbase && out.Confirmations < -1:",
+      "why": "A coinbase output is real but unspendable until maturity. Crediting it early hands out a balance the node will refuse to spend, and it is not an indexer disagreement, so it must not alarm either."
+    }
+  ]
+}
