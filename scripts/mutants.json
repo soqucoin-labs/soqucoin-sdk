@@ -160,22 +160,13 @@
       "why": "Version 1 files were sealed with no additional data. Opening one with version 2's bound header makes every keystore written before v0.4 unreadable, which is the loss of the keys in it."
     },
     {
-      "id": "keystore-passphrase-file-opened-with-an-external-key",
+      "id": "keystore-key-source-not-checked-against-the-file",
       "file": "keys/keystore.go",
       "package": "./keys",
       "test": "TestKeySourceMismatchIsNamed",
-      "find": "\t\tif m.extKey != nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is passphrase-encrypted, this manager holds an external key\", ErrKDFMismatch)",
-      "replace": "\t\tif m.extKey == nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is passphrase-encrypted, this manager holds an external key\", ErrKDFMismatch)",
-      "why": "The file records which key source wrote it. Without the check, a manager holding a Vault key pointed at a passphrase keystore runs Argon2id over an empty passphrase and reports a decryption failure, sending an operator to look for a wrong passphrase that was never used."
-    },
-    {
-      "id": "keystore-external-key-file-opened-with-a-passphrase",
-      "file": "keys/keystore.go",
-      "package": "./keys",
-      "test": "TestKeySourceMismatchIsNamed",
-      "find": "\t\tif m.extKey == nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is encrypted under an external key, this manager holds a passphrase\", ErrKDFMismatch)",
-      "replace": "\t\tif m.extKey != nil {\n\t\t\treturn nil, fmt.Errorf(\"%w: file is encrypted under an external key, this manager holds a passphrase\", ErrKDFMismatch)",
-      "why": "The mirror of the entry above, and the reason the rule needs both sites: a passphrase manager pointed at an external-key keystore would derive from an empty key and report the same misleading failure."
+      "find": "\tif ks.KDF != m.kdfName() {",
+      "replace": "\tif ks.KDF == \"\" {",
+      "why": "The file records which key source wrote it, and a manager's source is fixed at construction. Without the comparison, a manager holding a Vault key pointed at a passphrase keystore runs Argon2id over an empty passphrase, and the reverse runs HKDF over an empty key; both report a decryption failure and send an operator to look for a wrong passphrase that was never used."
     },
     {
       "id": "keystore-external-key-derivation-ignores-the-salt",

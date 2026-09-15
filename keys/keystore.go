@@ -211,25 +211,42 @@ func aadFor(ks Keystore) ([]byte, error) {
 	return headerAAD(ks)
 }
 
+// kdfName is the KDF this manager writes and the only one it opens. The key
+// source is fixed at construction, so both directions ask this one question
+// rather than each testing extKey for itself.
+func (m *Manager) kdfName() string {
+	if m.extKey != nil {
+		return KDFHKDFSHA256
+	}
+	return KDFArgon2id
+}
+
+// keySourceOf names a KDF the way an operator holds it, for the one error
+// where the KDF identifier alone would not say what to go and fix.
+func keySourceOf(kdf string) string {
+	if kdf == KDFHKDFSHA256 {
+		return "an external key"
+	}
+	return "a passphrase"
+}
+
 // deriveKey produces the AES-256 key for a header, and is the only place in
-// this package that produces one. It refuses a file written under the other
-// key source: a manager holding an external key cannot open a passphrase
-// keystore, and a passphrase manager cannot open an external-key one.
+// this package that produces one. A file written under the other key source is
+// named as such: a decryption failure would send an operator looking for a
+// wrong passphrase that was never used.
 func (m *Manager) deriveKey(ks *Keystore) ([]byte, error) {
+	if ks.KDF != m.kdfName() {
+		return nil, fmt.Errorf("%w: the file was written under %s, this manager holds %s",
+			ErrKDFMismatch, keySourceOf(ks.KDF), keySourceOf(m.kdfName()))
+	}
 	switch ks.KDF {
 	case KDFArgon2id:
-		if m.extKey != nil {
-			return nil, fmt.Errorf("%w: file is passphrase-encrypted, this manager holds an external key", ErrKDFMismatch)
-		}
 		if err := ks.KDFParams.check(); err != nil {
 			return nil, err
 		}
 		p := ks.KDFParams
 		return argon2.IDKey(m.passwd, ks.Salt, p.Time, p.Memory, p.Threads, p.KeyLen), nil
 	case KDFHKDFSHA256:
-		if m.extKey == nil {
-			return nil, fmt.Errorf("%w: file is encrypted under an external key, this manager holds a passphrase", ErrKDFMismatch)
-		}
 		// The external key is a key, not a passphrase, so it needs no work
 		// factor. HKDF is here for the salt: it gives every Save a different
 		// AES key, so an external key that never changes does not put the
@@ -245,14 +262,12 @@ func (m *Manager) deriveKey(ks *Keystore) ([]byte, error) {
 func (m *Manager) newHeader() (Keystore, error) {
 	ks := Keystore{
 		Version: keystoreVersion,
+		KDF:     m.kdfName(),
 		Salt:    make([]byte, saltSize),
 		Nonce:   make([]byte, nonceSize),
 	}
-	if m.extKey != nil {
-		ks.KDF = KDFHKDFSHA256
-	} else {
+	if ks.KDF == KDFArgon2id {
 		params := defaultParams
-		ks.KDF = KDFArgon2id
 		ks.KDFParams = &params
 	}
 	if _, err := rand.Read(ks.Salt); err != nil {
