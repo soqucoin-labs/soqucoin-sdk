@@ -251,7 +251,13 @@ func (l lyingBroadcaster) Broadcast(ctx context.Context, raw, txid string) (stri
 	if err != nil {
 		return got, err
 	}
-	fake := "f" + got[1:]
+	// A txid that differs from the real one in its first character, whatever
+	// that character is: a real txid beginning with "f" must still differ.
+	first := "f"
+	if got[0] == 'f' {
+		first = "0"
+	}
+	fake := first + got[1:]
 	return fake, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", rpc.ErrTxIDMismatch, fake, txid)
 }
 
