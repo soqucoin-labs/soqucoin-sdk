@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,13 +45,21 @@ var (
 	soqucoind = flag.String("soqucoind", os.Getenv("SOQUCOIND"), "path to the soqucoind binary (regtest)")
 )
 
+const (
+	startupTimeout = 60 * time.Second
+	logTailLines   = 20
+)
+
 // node is a managed regtest soqucoind.
 type node struct {
-	t    *testing.T
-	dir  string
-	cmd  *exec.Cmd
-	rpc  *rpc.Client
-	port int
+	t       *testing.T
+	dir     string
+	cmd     *exec.Cmd
+	rpc     *rpc.Client
+	port    int
+	logPath string
+	exited  chan struct{} // closed when cmd.Wait returns
+	exitErr error         // valid only once exited is closed
 }
 
 func freePort(t *testing.T) int {
@@ -85,17 +94,27 @@ func startNode(t *testing.T) *node {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start soqucoind: %v", err)
 	}
-	n := &node{t: t, dir: dir, cmd: cmd, port: rpcPort,
-		rpc: rpc.NewClient(fmt.Sprintf("http://127.0.0.1:%d", rpcPort), "it", "it", nil)}
+	n := &node{t: t, dir: dir, cmd: cmd, port: rpcPort, logPath: logf.Name(),
+		exited: make(chan struct{}),
+		rpc:    rpc.NewClient(fmt.Sprintf("http://127.0.0.1:%d", rpcPort), "it", "it", nil)}
 	n.rpc.Network = types.Regtest
+	go func() { n.exitErr = cmd.Wait(); close(n.exited) }()
 	t.Cleanup(n.stop)
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(startupTimeout)
 	for {
 		if _, err := n.rpc.GetBlockCount(context.Background()); err == nil {
 			break
 		}
+		select {
+		case <-n.exited:
+			// The binary died instead of refusing RPC: a shared library it cannot
+			// find, a datadir it cannot use, an option it rejects. Polling out the
+			// deadline reports a timeout and hides the reason.
+			t.Fatalf("soqucoind exited during startup: %v\n%s", n.exitErr, n.logTail())
+		default:
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("node did not come up; see %s", logf.Name())
+			t.Fatalf("node did not come up within %s\n%s", startupTimeout, n.logTail())
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -107,13 +126,30 @@ func startNode(t *testing.T) *node {
 
 func (n *node) stop() {
 	n.rpc.Call(context.Background(), "stop")
-	done := make(chan struct{})
-	go func() { n.cmd.Wait(); close(done) }()
 	select {
-	case <-done:
+	case <-n.exited:
 	case <-time.After(30 * time.Second):
 		n.cmd.Process.Kill()
 	}
+}
+
+// logTail quotes the end of the node's logs. They live under t.TempDir, which is
+// removed when the test ends, so a failure has to carry them rather than name them.
+func (n *node) logTail() string {
+	var b strings.Builder
+	for _, p := range []string{n.logPath, filepath.Join(n.dir, "regtest", "debug.log")} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			fmt.Fprintf(&b, "--- %s: %v\n", p, err)
+			continue
+		}
+		lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+		if len(lines) > logTailLines {
+			lines = lines[len(lines)-logTailLines:]
+		}
+		fmt.Fprintf(&b, "--- %s (last %d lines)\n%s\n", p, len(lines), strings.Join(lines, "\n"))
+	}
+	return b.String()
 }
 
 func (n *node) mine(to string, blocks int) []string {
