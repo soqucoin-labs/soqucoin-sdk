@@ -85,7 +85,7 @@
       "test": "TestDifferentTxIDNeverReturnsItsInput",
       "find": "\tif got[0] == 'f' {\n\t\treturn \"0\" + got[1:]\n\t}",
       "replace": "",
-      "why": "The lying broadcaster must hand the engine a txid that is not the real one. Replacing the first character with a fixed 'f' returns the input unchanged for the one real txid in sixteen that already starts with 'f', and scenario 8 then asserts a mismatch the engine was never shown."
+      "why": "The lying broadcaster must hand the engine a txid that is not the real one. Replacing the first character with a fixed 'f' returns the input unchanged for the one real txid in sixteen that already starts with 'f', and scenario 8 then fails, because it requires a node txid that differs from the engine's own and was handed two that are equal. A spurious failure in one run in sixteen, not a vacuous pass."
     }
   ]
 }

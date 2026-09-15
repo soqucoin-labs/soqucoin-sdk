@@ -8,11 +8,15 @@ script:
   1. runs the test unmutated and requires it to pass, so a test that is already
      red cannot be scored as catching anything;
   2. applies the mutation;
-  3. runs the test again and requires it to fail;
+  3. runs the test again and requires it to have run and to fail: a mutated
+     tree that does not build proves nothing, so that is a failure, not a catch;
   4. puts the file back.
 
 Step 4 rewrites the file from a copy held in memory rather than from version
-control, so uncommitted work in a mutated file cannot be destroyed.
+control, so the run does not discard uncommitted work in a mutated file. That
+copy also goes to a recovery record before the mutation and is removed after
+it, so a run killed in between is detected rather than mistaken for a branch
+that does not carry the line.
 
 A mutant must leave the program in a defined state. Neutering a guard so that
 the code below it runs on nonsense makes the failure a property of the
@@ -34,6 +38,11 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "scripts" / "mutants.json"
+# Written before a file is mutated and removed once it is back, so a run killed
+# in between leaves a record on disk. Without one the next run reads the mutated
+# text, matches no `find`, and reports a skip and exit 0 with the injected
+# defect live in the working copy.
+RECOVERY = ROOT / ".check-mutants-recovery.json"
 
 # Files currently mutated, so a signal puts them back before exit.
 _in_flight: dict[pathlib.Path, str] = {}
@@ -43,6 +52,27 @@ def _put_back_all() -> None:
     for path, original in list(_in_flight.items()):
         path.write_text(original)
         del _in_flight[path]
+    RECOVERY.unlink(missing_ok=True)
+
+
+def _recovery_report() -> list[str]:
+    """Refuse to run while a killed run's mutation may still be in the tree."""
+    try:
+        rec = json.loads(RECOVERY.read_text())
+    except (OSError, ValueError):
+        return [f"{RECOVERY.name} exists but cannot be read; inspect it by hand."]
+    path = ROOT / rec["file"]
+    current = path.read_text() if path.exists() else ""
+    if current == rec["original"]:
+        RECOVERY.unlink(missing_ok=True)
+        return []
+    return [
+        f"a previous run was killed while {rec['file']} was mutated for "
+        f"{rec['id']}, and the file no longer holds what it held before.",
+        f"  the text it held is saved under \"original\" in {RECOVERY.name};",
+        "  put that text back, delete the record, and run again.",
+        "  this run is refused rather than reporting on a mutated tree.",
+    ]
 
 
 def _on_signal(signum, _frame):
@@ -50,20 +80,23 @@ def _on_signal(signum, _frame):
     sys.exit(128 + signum)
 
 
-def run_test(package: str, test: str, tags: str = "") -> tuple[bool, str]:
+def run_test(package: str, test: str, tags: str = "") -> tuple[bool, bool, str]:
+    """Return (ran, passed, output).
+
+    `ran` is its own answer because "the test did not run" and "the test
+    failed" are the same exit status to `go test`, and they mean opposite
+    things on the two sides of a mutation. `go test -run` also exits 0 when
+    the pattern matches nothing, so a misspelled or tag-hidden test would
+    otherwise score as passing.
+    """
     cmd = ["go", "test"]
     if tags:
         cmd += ["-tags", tags]
     cmd += [package, "-run", f"^{test}$", "-count=1", "-v"]
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     output = (proc.stdout + proc.stderr).strip()
-    # `go test -run` exits 0 when the pattern matches nothing, so a misspelled
-    # or tag-hidden test would score as passing both runs. Report it as absent.
     ran = f"=== RUN   {test}\n" in proc.stdout or f"=== RUN   {test}/" in proc.stdout
-    if not ran:
-        return False, f"no test named {test} ran in {package}" + (
-            f" with -tags {tags}" if tags else "") + f"\n{output[-400:]}"
-    return proc.returncode == 0, output
+    return ran, proc.returncode == 0, output
 
 
 def check(entry: dict) -> tuple[str, str]:
@@ -86,19 +119,36 @@ def check(entry: dict) -> tuple[str, str]:
         )
 
     tags = entry.get("tags", "")
-    ok, output = run_test(entry["package"], entry["test"], tags)
-    if not ok:
+    ran, passed, output = run_test(entry["package"], entry["test"], tags)
+    if not ran:
+        return "fail", (
+            f"no test named {entry['test']} ran in {entry['package']}"
+            + (f" with -tags {tags}" if tags else "")
+            + f"\n{output[-600:]}"
+        )
+    if not passed:
         return "fail", f"{entry['test']} does not pass unmutated:\n{output[-600:]}"
 
     _in_flight[path] = original
     try:
+        RECOVERY.write_text(json.dumps(
+            {"id": entry["id"], "file": entry["file"], "original": original}))
         path.write_text(original.replace(find, replace, 1))
-        caught, _ = run_test(entry["package"], entry["test"], tags)
+        ran, passed, output = run_test(entry["package"], entry["test"], tags)
     finally:
         path.write_text(original)
         _in_flight.pop(path, None)
+        RECOVERY.unlink(missing_ok=True)
 
-    if caught:
+    if not ran:
+        # The mutated tree did not build, or the test vanished with it. The run
+        # proves nothing: a mutation must change behaviour, not well-formedness.
+        return "fail", (
+            f"the mutated tree did not run {entry['test']}, so the mutation "
+            "changes well-formedness rather than behaviour and proves nothing."
+            f"\n  mutation: {find!r} -> {replace!r}\n{output[-600:]}"
+        )
+    if passed:
         return "fail", (
             f"{entry['test']} still passes with the mutation applied, so it does "
             f"not pin this behaviour.\n  mutation: {find!r} -> {replace!r}"
@@ -125,6 +175,14 @@ def main() -> int:
         for e in entries:
             print(f"{e['id']:<44} {e['package']} {e['test']}")
         return 0
+
+    if RECOVERY.exists():
+        stale = _recovery_report()
+        if stale:
+            print("check-mutants: refusing to run\n", file=sys.stderr)
+            for line in stale:
+                print(line, file=sys.stderr)
+            return 1
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)

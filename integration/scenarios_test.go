@@ -242,8 +242,10 @@ type lyingBroadcaster struct{ inner *rpc.Client }
 
 // differentTxID returns a txid that is not the one passed in. Replacing the
 // first character with a fixed one returns the input unchanged whenever the
-// input already starts with it, and scenario 8 then asserts a mismatch the
-// engine was never shown.
+// input already starts with it. Scenario 8 then fails: it requires the engine
+// to hold a node txid that differs from its own, and the broadcaster handed it
+// two that are equal. The defect was a spurious failure in about one run in
+// sixteen, not a test that passed without checking anything.
 func differentTxID(got string) string {
 	if got == "" {
 		return "f"

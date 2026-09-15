@@ -17,8 +17,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Full history: the static-analysis ratchet and the branch check both
-      # compare against origin/main.
+      # Full history: the static-analysis ratchet compares against origin/main.
+      # The branch check runs in its own job below, off the pull request head.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0

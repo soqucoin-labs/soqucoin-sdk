@@ -4,8 +4,8 @@
 Neither check is about taste. Both answer in a second a question a reading can
 miss.
 
-1. The branch is current with main, decided by comparing the diffs rather than
-   the ancestry. `git merge-base --is-ancestor` is the obvious check and it is
+1. The branch is current with main, decided by comparing the patch text of the
+   two diffs rather than the ancestry or their line counts. `git merge-base --is-ancestor` is the obvious check and it is
    wrong whenever main squash-merges: the squash commit is not an ancestor of
    the branch, and the branch's own copy of that work is not an ancestor of
    main, so the ancestry test passes on a branch that is stale. What matters is
@@ -48,30 +48,53 @@ def numstat(rev_range: str) -> dict[str, tuple[int, int]]:
     return out
 
 
+def patch(rev_range: str, *paths: str) -> str:
+    """The full patch text for a range. Binary files appear as a marker line."""
+    return git("diff", "--no-color", rev_range, "--", *paths)
+
+
+def touched(rev_range: str) -> set[str]:
+    """Every path in a diff, including the ones numstat reports as binary."""
+    return set(git("diff", "--name-only", rev_range).splitlines())
+
+
 def is_non_test_go(path: str) -> bool:
     return path.endswith(".go") and not path.endswith("_test.go")
 
 
 def check_current(base: str) -> list[str]:
-    """The rendered diff must be the diff that lands."""
-    three = numstat(f"{base}...HEAD")
-    two = numstat(f"{base}..HEAD")
-    if three == two:
+    """The rendered diff must be the diff that lands.
+
+    Compared as patch text. Line counts are not enough: a branch that edits a
+    line main has also edited shows 1 added and 1 removed on both sides while
+    the content differs, and landing it reverts main. Counts also drop the
+    files git reports as binary, which hides a branch stale only in those.
+    """
+    if patch(f"{base}...HEAD") == patch(f"{base}..HEAD"):
         return []
-    extra = sorted(set(three) - set(two))
-    changed = sorted(p for p in set(three) & set(two) if three[p] != two[p])
+    three, two = numstat(f"{base}...HEAD"), numstat(f"{base}..HEAD")
+    three_p, two_p = touched(f"{base}...HEAD"), touched(f"{base}..HEAD")
+    extra = sorted(three_p - two_p)
+    changed = sorted(
+        p for p in three_p & two_p
+        if patch(f"{base}...HEAD", p) != patch(f"{base}..HEAD", p)
+    )
     lines = [
         f"the branch is behind {base}: what a reviewer sees is not what will land.",
-        f"  rendered (three dot): {len(three)} files, "
+        f"  rendered (three dot): {len(three_p)} files, "
         f"+{sum(a for a, _ in three.values())}/-{sum(r for _, r in three.values())}",
-        f"  landing  (two dot):   {len(two)} files, "
+        f"  landing  (two dot):   {len(two_p)} files, "
         f"+{sum(a for a, _ in two.values())}/-{sum(r for _, r in two.values())}",
     ]
     if extra:
         lines.append(f"  files in the rendered diff only: {', '.join(extra[:8])}"
                      + (" ..." if len(extra) > 8 else ""))
+    missing = sorted(two_p - three_p)
+    if missing:
+        lines.append(f"  files in the landing diff only: {', '.join(missing[:8])}"
+                     + (" ..." if len(missing) > 8 else ""))
     if changed:
-        lines.append(f"  files whose counts differ: {', '.join(changed[:8])}"
+        lines.append(f"  files whose content differs: {', '.join(changed[:8])}"
                      + (" ..." if len(changed) > 8 else ""))
     lines.append(f"  fix: git merge {base}   (a squash merge on {base} makes an "
                  "ancestry check useless; the trees are what matter)")

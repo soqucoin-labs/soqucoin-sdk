@@ -44,13 +44,19 @@ formatters:
     - gofmt
 
 issues:
-  # A ratchet, not a cleanup. The existing tree reports thirty findings and none
-  # of them is a defect: the two that look substantive are a gosec false
-  # positive on a slice index the line above it bounds, and a dead
-  # `fee += change` whose effect already happens by construction. Clearing
-  # thirty cosmetic items would be a large cross-package diff with no change in
-  # behaviour, so the existing tree is the baseline and new code is held to the
-  # bar.
+  # A ratchet, not a cleanup. The existing tree reports 56 findings under the
+  # caps set below: errcheck 43, gosec 6, staticcheck 4, ineffassign 3. Thirty
+  # is the count under golangci-lint's own default caps, which the two lines
+  # below remove, so quote 56 and not thirty. The 43 errcheck are 27
+  # `binary.Write` into a `bytes.Buffer`, 12 `Close` on a response body or a
+  # connection, 3 cleanup calls on an already-failing path in atomicfile whose
+  # durable `Close` and `fsync` are both checked, and one `io.WriteString` in a
+  # `fmt.Formatter`, which has no error to return. The two that look
+  # substantive were read and are not defects: two gosec G602 reports on a
+  # slice index the line above bounds, and a dead `fee += change` whose effect
+  # already happens by construction. Clearing 56 cosmetic items would be a
+  # large cross-package diff with no change in behaviour, so the existing tree
+  # is the baseline and new code is held to the bar.
   new-from-rev: origin/main
   max-issues-per-linter: 0
   max-same-issues: 0
