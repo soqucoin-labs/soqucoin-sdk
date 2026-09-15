@@ -10,14 +10,13 @@ import "time"
 // in subscribe.go is the only caller and does nothing but supply events and
 // carry out the decisions.
 //
-// The separation is not tidiness. Three consecutive readings of this logic
-// while it was inline in the select loop each found a defect introduced by
-// the previous reading's fix: the dial storm, the reconnect trigger counting
-// application errors, and a reconcile tick discarded during a backoff and
-// never made up. A reader cannot enumerate the orderings; a test can.
+// The separation is not tidiness. Inline in the select loop this logic mixes
+// scheduling state with I/O, and its defects are orderings rather than lines:
+// a wake that outruns the backoff, a trigger that counts the wrong failures,
+// a tick dropped and never made up. Each is invisible on the line and plain
+// in the sequence. A reader cannot enumerate the sequences; a test can, and
 // refreshpolicy_model_test.go enumerates every sequence of four events and
-// outcomes against the three properties stated below, and each of those three
-// heads fails at least one of them.
+// outcomes against the three properties stated below.
 
 // refreshEvent is what wakes the refresher.
 type refreshEvent int

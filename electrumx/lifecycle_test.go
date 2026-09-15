@@ -300,10 +300,9 @@ func TestFailedRefreshAfterANotificationIsRetried(t *testing.T) {
 // One address the indexer refuses on every pass must not starve the
 // reconcile. The full pass is the only safety net against a notification the
 // server never sent, so a tick that lands during a backoff is deferred and
-// made up by the pass after it, not dropped. Round 1's pacing fix introduced
-// the drop, round 2 read the same function and kept it, and the review bot
-// found it on 67ee3a9; the policy it lives in is now model-tested in
-// refreshpolicy_model_test.go and this is the same statement end to end.
+// made up by the pass after it, not dropped. The policy that decides this is
+// model-tested in refreshpolicy_model_test.go; the same statement is made here
+// against a real refresher and a real server.
 func TestARefusedAddressDoesNotStarveTheReconcile(t *testing.T) {
 	stub := newPushStub(t)
 	a1, a2 := craftAddr(t, 0x11), craftAddr(t, 0x22)

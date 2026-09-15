@@ -31,9 +31,8 @@ func TestARefusedAddressDoesNotRebuildTheConnection(t *testing.T) {
 	}
 	// Scope: the reconcile is an hour away here, so this says only that the
 	// retries after a failure are confined to the address that failed. It says
-	// nothing about the reconcile still running, which is
-	// TestARefusedAddressDoesNotStarveTheReconcile; read as liveness, this
-	// assertion pinned a defect as correct.
+	// nothing about whether the reconcile still runs, and must not be read as
+	// saying so; that is TestARefusedAddressDoesNotStarveTheReconcile.
 	if n := stub.count("blockchain.scripthash.listunspent", sh1); n != 1 {
 		t.Fatalf("the healthy address was refreshed %d times; a retry is scoped to the address that failed", n)
 	}

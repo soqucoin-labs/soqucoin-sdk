@@ -15,10 +15,9 @@ import (
 // them) plus four thousand random traces of length 120 are checked against
 // all three.
 //
-// The mutants below are the three heads this loop actually shipped through.
-// Each breaks exactly one behaviour, and the test requires that the
-// properties catch each one: a property no mutant can violate is not pinning
-// anything.
+// Each mutant below breaks exactly one behaviour the properties are meant to
+// hold, and the test requires that a property catch it. A property no mutant
+// can violate is not pinning anything.
 
 // state lets the harness read the scheduling state of a policy or a mutant.
 func (p *refreshPolicy) state() *refreshPolicy { return p }
@@ -29,9 +28,9 @@ type policyUnderTest interface {
 	state() *refreshPolicy
 }
 
-// mutantWakeIgnoresBackoff is head 9a86be9: a wake runs a pass whatever the
-// backoff says, which dialled about 4,200 times a second against a server
-// that hung up after every handshake.
+// mutantWakeIgnoresBackoff: a wake runs a pass whatever the backoff says.
+// Against a server that hangs up after every handshake this dials thousands
+// of times a second.
 type mutantWakeIgnoresBackoff struct{ *refreshPolicy }
 
 func (p mutantWakeIgnoresBackoff) onEvent(ev refreshEvent) refreshAction {
@@ -41,9 +40,9 @@ func (p mutantWakeIgnoresBackoff) onEvent(ev refreshEvent) refreshAction {
 	return p.refreshPolicy.onEvent(ev)
 }
 
-// mutantEveryFailureCounts is head 4a1ccdb: the reconnect trigger counted
-// every failed pass, so one address the indexer refuses rebuilt the
-// connection on every other backoff tick.
+// mutantEveryFailureCounts: the reconnect trigger counts every failed pass,
+// so one address the indexer refuses rebuilds the connection on every other
+// backoff tick.
 type mutantEveryFailureCounts struct{ *refreshPolicy }
 
 func (p mutantEveryFailureCounts) onResult(out refreshOutcome) refreshResult {
@@ -53,9 +52,9 @@ func (p mutantEveryFailureCounts) onResult(out refreshOutcome) refreshResult {
 	return p.refreshPolicy.onResult(out)
 }
 
-// mutantDropsReconcile is head 67ee3a9: a reconcile tick arriving during a
-// backoff is discarded and never made up, so one permanently refused address
-// starves the full pass for the life of the process.
+// mutantDropsReconcile: a reconcile tick arriving during a backoff is
+// discarded and never made up, so one permanently refused address starves the
+// full pass for the life of the process.
 type mutantDropsReconcile struct{ *refreshPolicy }
 
 func (p mutantDropsReconcile) onEvent(ev refreshEvent) refreshAction {
@@ -65,9 +64,9 @@ func (p mutantDropsReconcile) onEvent(ev refreshEvent) refreshAction {
 	return p.refreshPolicy.onEvent(ev)
 }
 
-// mutantAppErrKeepsCount is the second defect on head 67ee3a9: an application
-// error does not break a run of reply timeouts, so a timeout, one refused
-// address and another timeout rebuild a healthy connection.
+// mutantAppErrKeepsCount: an application error does not break a run of reply
+// timeouts, so a timeout, one refused address and another timeout rebuild a
+// healthy connection.
 type mutantAppErrKeepsCount struct{ *refreshPolicy }
 
 func (p mutantAppErrKeepsCount) onResult(out refreshOutcome) refreshResult {
@@ -236,21 +235,20 @@ func TestRefreshPolicyHoldsItsProperties(t *testing.T) {
 	}
 }
 
-// TestRefreshPolicyPropertiesCatchEveryShippedDefect is the mutation gate on
-// the properties themselves. Each mutant is one of the heads this loop
-// shipped through; a property set that cannot fail against them proves
-// nothing about the policy that replaced them.
-func TestRefreshPolicyPropertiesCatchEveryShippedDefect(t *testing.T) {
+// TestRefreshPolicyPropertiesCatchKnownDefects is the sensitivity gate on the
+// properties themselves. A property set that cannot fail against a policy
+// carrying a known defect proves nothing about the policy that holds them.
+func TestRefreshPolicyPropertiesCatchKnownDefects(t *testing.T) {
 	base := func() *refreshPolicy { return newRefreshPolicy() }
 	for _, m := range []struct {
 		head string
 		want string
 		mk   func() policyUnderTest
 	}{
-		{"9a86be9 a wake ignores the backoff", "pacing", func() policyUnderTest { return mutantWakeIgnoresBackoff{base()} }},
-		{"4a1ccdb every failure counts toward the reconnect", "reconnect trigger", func() policyUnderTest { return mutantEveryFailureCounts{base()} }},
-		{"67ee3a9 a reconcile tick during a backoff is dropped", "reconcile liveness", func() policyUnderTest { return mutantDropsReconcile{base()} }},
-		{"67ee3a9 an application error does not break a run of timeouts", "reconnect trigger", func() policyUnderTest { return mutantAppErrKeepsCount{base()} }},
+		{"a wake ignores the backoff", "pacing", func() policyUnderTest { return mutantWakeIgnoresBackoff{base()} }},
+		{"every failure counts toward the reconnect", "reconnect trigger", func() policyUnderTest { return mutantEveryFailureCounts{base()} }},
+		{"a reconcile tick during a backoff is dropped", "reconcile liveness", func() policyUnderTest { return mutantDropsReconcile{base()} }},
+		{"an application error does not break a run of timeouts", "reconnect trigger", func() policyUnderTest { return mutantAppErrKeepsCount{base()} }},
 	} {
 		bad := checkAll(4, m.mk)
 		if _, caught := bad[m.want]; !caught {
@@ -269,11 +267,11 @@ func keysOf(m map[string]string) []string {
 	return out
 }
 
-// TestRefreshPolicyDoesNotStarveTheReconcile states the defect the review
-// bot found on 67ee3a9 the way an operator would: one address the indexer
-// refuses on every pass, reconcile ticking throughout, for long enough that
-// no reader would call it a transient. The live policy must keep reconciling
-// and must never rebuild the connection over an application error.
+// TestRefreshPolicyDoesNotStarveTheReconcile states the case the way an
+// operator would: one address the indexer refuses on every pass, reconcile
+// ticking throughout, for long enough that no reader would call it a
+// transient. The policy must keep reconciling and must never rebuild the
+// connection over an application error.
 func TestRefreshPolicyDoesNotStarveTheReconcile(t *testing.T) {
 	seq := make([]modelStep, 3000)
 	for i := range seq {

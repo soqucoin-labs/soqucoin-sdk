@@ -12,8 +12,7 @@ import (
 // The UTXO cache is the one per-address map that GetBalance, GetAllUTXOs and
 // the selector read, and it was the one TrackAddresses did not prune: a
 // retired address kept its coins in the balance and kept offering them to the
-// selector for the life of the process. Inherited, not introduced by the push
-// model; found by the review bot on 2026-09-15.
+// selector for the life of the process.
 func TestUntrackingAnAddressRemovesItsCoinsFromEveryView(t *testing.T) {
 	a1, a2 := craftAddr(t, 0x11), craftAddr(t, 0x22)
 	c := NewClient("127.0.0.1:1", time.Second, nil)
