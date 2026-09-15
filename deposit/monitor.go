@@ -140,9 +140,12 @@ type Monitor struct {
 	// word that it is final (gettxout confirmations past MaxReorgDepth). The
 	// indexer's word never adds one, and absence from Pending is not taken as
 	// finality: the Ledger contract lets Pending leave out outputs the
-	// exchange spent. An entry is removed when its address was scanned and the
-	// outpoint is no longer in the cache (spent or swept); a restart empties
-	// the set and the node is asked once more per outpoint.
+	// exchange spent. A credited outpoint the ledger leaves out of Pending
+	// costs one IsCredited and one gettxout per scan until the node puts it
+	// past the horizon, then nothing. An entry is removed when its address was
+	// scanned and the outpoint is no longer in the cache (spent or swept);
+	// entries of an address no longer scanned stay for the life of the
+	// process. A restart empties the set.
 	finalMu sync.Mutex
 	final   map[string]string
 }
@@ -299,7 +302,7 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	}
 
 	// 3. Re-verify everything credited but not yet final.
-	pending, err := m.recheckPending(ctx, tip)
+	pending, err := m.recheckPending(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -357,10 +360,10 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			}
 			if done {
 				// Credited. It enters the final set once the node, not the
-				// indexer, puts it past the horizon: one gettxout per outpoint
-				// per process, in place of one ledger query per scan. An
-				// outpoint still in Pending is marked final by recheckPending
-				// when its turn comes.
+				// indexer, puts it past the horizon: until then, one gettxout
+				// per scan for an outpoint the ledger leaves out of Pending;
+				// after that, no question at all. An outpoint still in Pending
+				// is marked final by recheckPending when its turn comes.
 				if !pending[outpointKey(u.TxID, u.Vout)] {
 					out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 					if err != nil {
@@ -439,13 +442,13 @@ func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u ty
 	return Deposit{}, false, nil
 }
 
-// recheckPending confirms every credited, non-final deposit still exists on
-// the node with at least its credited depth, and marks it final past the
+// recheckPending confirms every credited, non-final deposit still exists in
+// the node's UTXO set, and marks it final once the node puts it past the
 // horizon. A vanished output is a reorg or a lie; either way the exchange's
 // book now holds a credit with nothing behind it. It returns the set of
 // outpoints the ledger reported pending, so the scan can tell a credited
-// outpoint that is final (absent here) from one still under watch.
-func (m *Monitor) recheckPending(ctx context.Context, tip int64) (map[string]bool, error) {
+// outpoint the ledger no longer watches from one still under watch.
+func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 	pending, err := m.Ledger.Pending(ctx)
 	if err != nil {
 		if !ended(ctx, err) {

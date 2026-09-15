@@ -473,11 +473,15 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 
 	c.utxos[addr] = merged
 	c.recordRefreshLocked(addr, gen, seqBefore, nil)
+	count := len(merged)
+	c.mu.Unlock()
 
+	// Outside the lock: a slow OnRefresh must not hold the reader, which
+	// takes mu to note a change, and with it every reply on the connection.
 	if c.OnRefresh != nil {
-		c.OnRefresh(addr, len(merged))
+		c.OnRefresh(addr, count)
 	}
-
+	c.mu.Lock() // released by the deferred Unlock
 	return nil
 }
 

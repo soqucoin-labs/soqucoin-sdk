@@ -29,6 +29,11 @@ import (
 // context does not end them first.
 const callDeadline = 30 * time.Second
 
+// errNoReply is wrapped by a call whose reply did not arrive within
+// callDeadline: the connection may be hung, and two in a row make the
+// refresher rebuild it. An application error from the server is not this.
+var errNoReply = errors.New("electrumx: no reply within the call deadline")
+
 // pendingCall is one caller waiting for the reply to one id on one connection
 // generation. ch holds one reply and is closed, never sent on, when that
 // connection is lost. done is the generation's own channel, closed by the
@@ -389,7 +394,7 @@ func (c *Client) await(ctx context.Context, id int64, p pendingCall, method stri
 		return nil, ctx.Err()
 	case <-timer.C:
 		c.unregister(id)
-		return nil, fmt.Errorf("electrumx: no reply to %s (request %d) within %v", method, id, callDeadline)
+		return nil, fmt.Errorf("%w: %s (request %d)", errNoReply, method, id)
 	}
 }
 
@@ -579,4 +584,10 @@ func (c *Client) stopped() bool {
 // refresher reconnects at once rather than after repeated failures.
 func errIsConnection(err error) bool {
 	return errors.Is(err, ErrNotConnected)
+}
+
+// errIsNoReply reports a call that timed out waiting for its reply: a sign
+// the connection may be hung, though the server may only be slow.
+func errIsNoReply(err error) bool {
+	return errors.Is(err, errNoReply)
 }

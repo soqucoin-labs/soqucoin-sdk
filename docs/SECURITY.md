@@ -280,9 +280,10 @@ if err := client.Connect(ctx); err != nil {
 ```
 
 `TLSConfig` applies to reconnects as well. This matters: the client reconnects
-automatically when the connection is lost, after two failed calls in a row and
-after a panic in the refresher goroutine, so a downgrade there would be silent
-and could last for days. There is a test that pins it.
+automatically when the connection is lost, when two calls in a row time out
+waiting for a reply, and after a panic in the refresher goroutine, so a
+downgrade there would be silent and could last for days. There is a test that
+pins it.
 
 Do not set `InsecureSkipVerify`. An unverified TLS connection is worse than a
 plaintext one, because it looks secure while an on-path attacker can still

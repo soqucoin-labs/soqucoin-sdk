@@ -413,7 +413,8 @@ Monitor pauses only when every address is stale. The costs, each cited to the co
 - The client's own cost per address, over loopback against a server that answers at once, is
   44 µs for one subscribe and one listunspent (about 22,700 addresses per second), measured by
   `BenchmarkSubscribeAndRefreshPerAddress` in `electrumx/bench_test.go`; from a notification to the
-  `listunspent` it asks for, 32 µs (`BenchmarkNotificationToRefresh`). Your indexer's round trip is
+  `listunspent` it asks for, between 26 and 46 µs across runs at the benchtime the file names
+  (`BenchmarkNotificationToRefresh`, `-benchtime 1000x`). Your indexer's round trip is
   added to each call, so a reconnect over 60,000 addresses at a 5 ms round trip is about five minutes
   of subscribe calls, during which the addresses not yet re-subscribed keep their last records and
   age toward `MaxCacheAge`. Run one client per block of addresses if that ramp is too long.
@@ -863,8 +864,8 @@ Every package now carries unit tests. Measured with `go test -cover ./...`:
 | `utxo` | **94.3%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
 | `rpc` | **85.0%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
-| `deposit` | **84.0%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **77.4%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
+| `electrumx` | **85.9%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
 | `tx` | **80.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **85.8%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **82.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |

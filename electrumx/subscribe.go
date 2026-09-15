@@ -225,13 +225,15 @@ func (c *Client) pingInterval() time.Duration {
 // Start launches the refresher: it subscribes every tracked address, refreshes
 // an address when the server reports it changed, makes a full pass on the
 // reconcile interval, and reconnects when the connection is lost (at once) or
-// calls keep failing (after two in a row). Every failure is followed by a
-// retry after a backoff that doubles from one second to a minute and resets
-// on the first clean pass, so a connection that dies after every handshake
-// is dialled a few times a minute, not thousands. The ping runs on its own
-// goroutine on PingInterval, beside any pass in progress, so a long reconcile
-// does not age the addresses it has not reached. Both goroutines end when ctx
-// ends or Stop is called; every call they make runs under ctx.
+// two calls in a row time out waiting for a reply. An application error from
+// the server, such as one address it refuses, never rebuilds the connection.
+// Every failed pass is followed by a retry after a backoff that doubles from
+// one second to a minute and resets on the first clean pass, so a connection
+// that dies after every handshake is dialled a few times a minute, not
+// thousands. The ping runs on its own goroutine on PingInterval, beside any
+// pass in progress, so a long reconcile does not age the addresses it has
+// not reached. Both goroutines end when ctx ends or Stop is called; every
+// call they make runs under ctx.
 //
 // Production lesson: the goroutine includes panic recovery and auto-reconnect.
 // Without this, a bufio panic kills the entire process. With recovery, the
@@ -246,6 +248,16 @@ func (c *Client) Start(ctx context.Context) {
 // which decides on the reconnect; a success resets nothing there, since only
 // a clean pass shows the connection is doing its work.
 func (c *Client) pingLoop(ctx context.Context, pingErr chan<- error) {
+	// PF-018: the same recovery as the refresher; a panic on the ping path
+	// must not take the process down.
+	defer func() {
+		if r := recover(); r != nil {
+			c.log.Error("panic in the ping loop, restarting it", "panic", r)
+			if ctx.Err() == nil && !c.stopped() {
+				go c.pingLoop(ctx, pingErr)
+			}
+		}
+	}()
 	ticker := time.NewTicker(c.pingInterval())
 	defer ticker.Stop()
 	for {
@@ -290,12 +302,14 @@ func (c *Client) run(ctx context.Context, pingErr <-chan error) {
 	consecutive := 0
 
 	// after takes a pass or ping result. Every failure schedules the next
-	// pass after the backoff, whatever else is done about it, so an address
-	// whose listunspent failed once is refreshed again well before the
-	// reconcile and a connection that keeps dying is redialled at the ladder's
-	// pace. A lost connection is reconnected at once, other failures after
-	// two in a row; the pass that re-subscribes waits for the retry timer.
-	// Only a clean pass resets the ladder.
+	// pass after the backoff, so an address whose listunspent failed once is
+	// refreshed again well before the reconcile and a connection that keeps
+	// dying is redialled at the ladder's pace. Only a clean pass resets the
+	// ladder. The connection is rebuilt when it is lost (at once) or when two
+	// calls in a row timed out waiting for a reply; an application error from
+	// the server, such as one address it refuses, says nothing about the
+	// connection and never rebuilds it. A reconnect that succeeds resets the
+	// timeout count; the pass that re-subscribes waits for the retry timer.
 	after := func(err error) {
 		if err == nil {
 			consecutive, backoff, retry = 0, time.Second, nil
@@ -304,18 +318,26 @@ func (c *Client) run(ctx context.Context, pingErr <-chan error) {
 		if ctx.Err() != nil || c.stopped() {
 			return
 		}
-		consecutive++
-		c.log.Warn("refresh failed", "consecutive", consecutive, "in", backoff, "err", err)
+		c.log.Warn("refresh failed", "in", backoff, "err", err)
 		retry = time.After(backoff)
 		if backoff *= 2; backoff > maxReconnectBackoff {
 			backoff = maxReconnectBackoff
 		}
-		if !errIsConnection(err) && consecutive < 2 {
+		switch {
+		case errIsConnection(err):
+		case errIsNoReply(err):
+			consecutive++
+			if consecutive < 2 {
+				return
+			}
+		default:
 			return
 		}
 		if rerr := c.Reconnect(ctx); rerr != nil {
 			c.log.Warn("reconnect failed", "err", rerr)
+			return
 		}
+		consecutive = 0
 	}
 
 	after(c.pass(ctx, true))
@@ -341,10 +363,16 @@ func (c *Client) run(ctx context.Context, pingErr <-chan error) {
 			if ctx.Err() != nil {
 				return
 			}
+			if retry != nil {
+				continue // the retry timer's pass runs first; the next tick reconciles
+			}
 			after(c.pass(ctx, true))
 		case err := <-pingErr:
 			if ctx.Err() != nil {
 				return
+			}
+			if retry != nil {
+				continue // a failure is already being backed off
 			}
 			after(err)
 		case <-retry:
