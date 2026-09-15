@@ -5,13 +5,15 @@ Neither check is about taste. Both answer in a second a question a reading can
 miss.
 
 1. The branch is current with main, decided by comparing the patch text of
-   the two diffs rather than the ancestry or their line counts. `git merge-base --is-ancestor` is the obvious check and it is
-   wrong whenever main squash-merges: the squash commit is not an ancestor of
-   the branch, and the branch's own copy of that work is not an ancestor of
-   main, so the ancestry test passes on a branch that is stale. What matters is
-   that the diff a reviewer is shown (three dot, from the merge base) is the
-   diff that will land (two dot, against main's tip). When the two differ, the
-   branch is behind and part of what is on screen is already on main.
+   the two diffs rather than the ancestry or their line counts. The repository
+   uses merge commits (squash and rebase are off), so `git merge-base
+   --is-ancestor` is meaningful again: a merge commit is an ancestor of both
+   sides. The patch-text check survives the change of method because it tests
+   what matters regardless of how main advances: the diff a reviewer is shown
+   (three dot, from the merge base) must equal the diff that will land (two
+   dot, against main's tip). When the two differ, the branch is behind and
+   part of what is on screen is already on main. A branch still has to merge
+   main before opening.
 
 2. The change is one mechanism, measured in lines of non-test Go. The override
    is a line in the pull request body, `ALLOW_LARGE_DIFF: <why it is not
@@ -137,8 +139,8 @@ def check_current(base: str) -> list[str]:
     if changed:
         lines.append(f"  files whose content differs: {', '.join(changed[:8])}"
                      + (" ..." if len(changed) > 8 else ""))
-    lines.append(f"  fix: git merge {base}   (a squash merge on {base} makes an "
-                 "ancestry check useless; the trees are what matter)")
+    lines.append(f"  fix: git merge {base}   (the trees are what matter,"
+                 " not the ancestry)")
     return lines
 
 
