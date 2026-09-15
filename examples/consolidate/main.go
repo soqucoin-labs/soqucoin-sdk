@@ -153,7 +153,7 @@ func run(ctx context.Context, cfg config) error {
 	if !cfg.elxTLS && !loopbackHost(cfg.elxHost) {
 		return fmt.Errorf("electrumx %s is not on this machine; pass -electrumx-tls", cfg.elxHost)
 	}
-	elx := electrumx.NewClient(cfg.elxHost, 15*time.Second, logger)
+	elx := electrumx.NewClient(cfg.elxHost, 10*time.Minute, logger) // the reconcile interval; these examples call RefreshAll themselves
 	elx.HRP = network.HRP
 	if cfg.elxTLS {
 		elx.UseTLS()

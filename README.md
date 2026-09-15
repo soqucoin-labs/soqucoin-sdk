@@ -83,7 +83,7 @@ fmt.Println("Address:", kp.Address)
 Monitor deposits via ElectrumX:
 
 ```go
-client := electrumx.NewClient("electrumx.example.com:50002", 15*time.Second, logger) // nil logs nothing
+client := electrumx.NewClient("electrumx.example.com:50002", 10*time.Minute, logger) // reconcile interval; nil logs nothing
 client.UseTLS()
 if err := client.TrackAddresses([]string{depositAddr}); err != nil { // network inferred, mixed refused
     log.Fatal(err)
@@ -91,7 +91,7 @@ if err := client.TrackAddresses([]string{depositAddr}); err != nil { // network 
 if err := client.Connect(ctx); err != nil { // verifies the server's genesis hash
     log.Fatal(err)
 }
-client.StartPolling(ctx) // ends with ctx or Stop
+client.Start(ctx) // subscribes to every address; ends with ctx or Stop
 
 // Credit through deposit.Monitor, which checks every candidate against your
 // own node before crediting; see docs/EXCHANGE_INTEGRATION.md Step 2. The
@@ -155,7 +155,7 @@ because of a specific incident:
 | Defense | What it prevents | Origin |
 |---------|-----------------|--------|
 | **Defense 11** | Stale UTXO signing, via `gettxout` pre-verification | 2 weeks of failed payouts |
-| **Defense 12** | SpentPending flag loss, via merge refresh instead of replace | Race condition during polling |
+| **Defense 12** | SpentPending flag loss, via merge refresh instead of replace | Race condition during refresh |
 | **Defense 13** | Change recorded in the cache before the indexer reports it (`AddChangeUTXO`, deprecated: it never made change spendable, the selector waits for a confirmation) | Back-to-back payment failures |
 | **PF-018** | Bufio panic on large responses, via a 4MB read buffer | 18,000+ UTXO address |
 | **F5** | Broken pipe after idle, via TCP keepalive at 30s | NAT/firewall timeout |

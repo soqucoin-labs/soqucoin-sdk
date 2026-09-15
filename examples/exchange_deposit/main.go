@@ -52,7 +52,13 @@ const (
 const (
 	electrumxHost = "localhost:50002"        // your indexer (TLS port)
 	nodeURL       = "http://127.0.0.1:28332" // your soqucoind RPC (stagenet port shown)
-	pollInterval  = 15 * time.Second
+	// The indexer pushes changes as they happen; the reconcile is the full
+	// pass over every address that covers a notification it never sent.
+	reconcileInterval = 10 * time.Minute
+	// How often the Monitor reads the cache and credits what the node
+	// confirms. A pushed deposit is in the cache within milliseconds; this is
+	// the credit latency you choose.
+	scanInterval = 15 * time.Second
 )
 
 // requiredConfirmations returns the depth at which a deposit of this size may be
@@ -147,7 +153,7 @@ func main() {
 	// ── Indexer: discovery only ──
 	// The network is inferred from the addresses; mixed or undecodable
 	// addresses are refused here rather than silently never refreshed.
-	elx := electrumx.NewClient(electrumxHost, pollInterval, logger)
+	elx := electrumx.NewClient(electrumxHost, reconcileInterval, logger)
 	elx.UseTLS() // the server sees every address you track; keep that off the wire in the clear
 	if err := elx.TrackAddresses(depositAddresses); err != nil {
 		fatal("track deposit addresses", err)
@@ -156,7 +162,7 @@ func main() {
 		fatal("connect to ElectrumX at "+electrumxHost, err)
 	}
 	defer elx.Stop()
-	elx.StartPolling(ctx)
+	elx.Start(ctx) // subscribes every address, refreshes on push, reconciles on the interval
 	logger.Info("tracking deposit addresses", "count", len(depositAddresses), "indexer", electrumxHost)
 
 	// ── Your node: the verdict ──
@@ -186,7 +192,7 @@ func main() {
 		Logger: logger,
 	}
 
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(scanInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -196,8 +202,8 @@ func main() {
 		case <-ticker.C:
 		}
 		// Each pass is bounded on its own, so one stalled node call cannot
-		// hold the loop past the poll interval.
-		passCtx, cancel := context.WithTimeout(ctx, pollInterval)
+		// hold the loop past the scan interval.
+		passCtx, cancel := context.WithTimeout(ctx, scanInterval)
 		credited, err := monitor.Scan(passCtx)
 		cancel()
 		if err != nil {

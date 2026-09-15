@@ -183,7 +183,7 @@ func run(ctx context.Context, cfg runConfig) error {
 	if !cfg.elxTLS && !loopbackHost(cfg.elxHost) {
 		return fmt.Errorf("electrumx %s is not on this machine; pass -electrumx-tls", cfg.elxHost)
 	}
-	elxClient := electrumx.NewClient(cfg.elxHost, 15*time.Second, logger)
+	elxClient := electrumx.NewClient(cfg.elxHost, 10*time.Minute, logger) // the reconcile interval; these examples call RefreshAll themselves
 	elxClient.HRP = network.HRP
 	if cfg.elxTLS {
 		elxClient.UseTLS()
@@ -348,7 +348,7 @@ func executePayout(
 	// Only now, with the transaction accepted, record the effect. A spent-set
 	// write failure here is an alert, not a retry: the payment is out and this
 	// process still refuses the inputs; a restart would not. The change output
-	// reaches the cache on the next poll and becomes an input once confirmed.
+	// reaches the cache when the indexer reports it and becomes an input once confirmed.
 	if err := spentSet.MarkBroadcast(verified, txid); err != nil {
 		logger.Error("ALERT: broadcast, spent set not written", "txid", txid, "err", err)
 	}
