@@ -99,6 +99,11 @@ Opening a passphrase keystore with an external key, or the reverse, is
 `keys.ErrKDFMismatch` and says so, rather than a decryption failure that sends
 you looking for a wrong passphrase.
 
+Load before you save. `Save` writes the manager's keys over whatever is at the
+path, so calling it on a manager that has not loaded replaces a populated
+keystore with an empty one and returns no error. Open the file first, in every
+process that writes it.
+
 `Load` refuses a missing file (`keys.ErrKeystoreMissing`): a mistyped path would
 otherwise start a signer that hands out deposit addresses it can never spend from.
 The first run, and only the first run, calls `LoadOrCreate`, which writes an empty
