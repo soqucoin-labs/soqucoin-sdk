@@ -19,7 +19,7 @@ system. Knowing where its remit ends is the first step in integrating it safely.
 | | |
 |---|---|
 | Signing algorithm | ML-DSA-44 (FIPS 204), via [Cloudflare CIRCL](https://github.com/cloudflare/circl); `keys.Manager.Sign` uses the hedged (randomized) variant, so two signatures of one digest differ and both verify |
-| Keys encrypted at rest | AES-256-GCM with Argon2id key derivation |
+| Keys encrypted at rest | AES-256-GCM, under a passphrase stretched by Argon2id or under a 32-byte key from your own key-management system |
 | Network safety | Script derived per address; transactions mixing networks refused |
 | Transport encryption to ElectrumX | Supported, opt-in. See [Network security](#network-security) |
 | Consensus agreement | Serialization pinned to the node's own format vectors |
@@ -133,10 +133,10 @@ break; putting them there is only safe with the two rules below.
   and then guess the passphrase cheaply offline. A header claiming more memory
   than a gigabyte is refused for the other reason: it is a memory bomb aimed at
   whatever opens the file.
-- **The header is authenticated.** Everything in the file except the ciphertext
-  — the version, the KDF and its parameters, the salt, the nonce and the
-  unencrypted list of public keys and addresses — is bound into AES-GCM as
-  additional data. An edit to any of it is refused as a forgery. This is what
+- **The header is authenticated.** Everything in the file except the
+  ciphertext is bound into AES-GCM as additional data: the version, the KDF and
+  its parameters, the salt, the nonce, and the unencrypted list of public keys
+  and addresses. An edit to any of it is refused as a forgery. That is what
   protects the address list an operator reads out of the file to find the
   hot-wallet address.
 

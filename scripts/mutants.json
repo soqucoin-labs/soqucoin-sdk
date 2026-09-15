@@ -175,7 +175,7 @@
       "test": "TestExternalKeyDerivationIsSaltBound",
       "find": "\t\treturn hkdf.Key(sha256.New, m.extKey, ks.Salt, hkdfInfo, encKeySize)",
       "replace": "\t\treturn hkdf.Key(sha256.New, m.extKey, nil, hkdfInfo, encKeySize)",
-      "why": "An external key does not change between saves. The salt is what makes the AES key differ each time; without it every save of that keystore uses one key and a 96-bit random nonce is the only thing standing between two saves and a repeat."
+      "why": "An external key does not change between saves. The salt is what makes the AES key differ each time; without it every save of that keystore uses one key, and a 96-bit random nonce carries the whole requirement that no two saves repeat."
     },
     {
       "id": "keystore-save-writes-a-version-it-cannot-read",
