@@ -142,8 +142,13 @@ break; putting them there is only safe with the two rules below.
 
 Version 1 keystores, written by v0.3.6 and earlier, are read as before and
 rewritten as version 2 by the next `Save`. Nothing is required of you; opening
-one yields the same keys and the same addresses. Version 1 is passphrase-only,
-so open it with `keys.NewManager`.
+one yields the same keys and the same addresses. Reading alone does not rewrite,
+so a process that only loads leaves the file as it found it. Version 1 is
+passphrase-only, so open it with `keys.NewManager`.
+
+The rewrite goes one way. v0.3.6 reads version 1 only, and reports
+`unsupported keystore version: 2` for a file this release has saved. Copy the
+keystore before you upgrade if you may roll the binary back.
 
 The encryption key is drawn again on every `Save`, from a fresh salt. With an
 external key that never changes in your key-management system, that is what
