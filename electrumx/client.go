@@ -6,36 +6,41 @@
 //
 //   - PF-018: 4MB read buffer for addresses with 18,000+ UTXOs
 //   - F5: TCP keepalive at 30s to survive NAT/firewall timeouts
-//   - PF-018b: Connection mutex to prevent concurrent TCP stream corruption
+//   - PF-018b: Serialised writes, one reader, replies paired with calls by id
 //   - Defense 12: Merge-based UTXO refresh that preserves SpentPending flags
-//   - Panic recovery: Polling goroutine auto-restarts after crashes
+//   - Panic recovery: the refresher goroutine auto-restarts after crashes
 //
 // Usage:
 //
-//	client := electrumx.NewClient("host:50001", 15*time.Second, logger)
+//	client := electrumx.NewClient("host:50001", 10*time.Minute, logger)
 //	if err := client.Connect(ctx); err != nil {
 //	    return err
 //	}
 //	defer client.Stop()
 //
 //	client.TrackAddresses([]string{"ssq1abc..."})
-//	client.StartPolling(ctx)
+//	client.Start(ctx)
 //
 //	utxos := client.GetUTXOs("ssq1abc...")
 //	balance := client.GetBalance(1, tipHeight)
 //
-// Every method that reaches the server takes a context.Context first. A call
-// whose context ends returns ctx.Err() at once, whether it is waiting for the
-// connection behind another call or holds it: the connection deadline is
-// moved to now so the blocked write or read returns. A call cut short while
-// waiting for a reply that has not begun to arrive leaves the connection
-// usable, and the reply, if it arrives later, carries an id the next call
-// discards; a call cut short while writing, or after part of a reply line
-// has been read, closes the connection, since the stream is no longer known
-// to be at a line boundary, and the next call returns ErrNotConnected until
-// Reconnect or the polling loop restores it. Methods that read the cache
-// (GetUTXOs, GetBalance, LastRefresh and the rest) take no context; they
-// never block on the network.
+// The client subscribes to every tracked address and refreshes an address
+// when the server reports its history changed; a full pass over every address
+// runs on the reconcile interval given to NewClient as the safety net for a
+// notification the server never sent; a ping on PingInterval keeps the session
+// alive and advances the freshness of every subscribed address with no change
+// pending. Freshness is read per address through LastRefreshOf, which
+// deposit.Monitor uses to skip only the addresses the indexer has not
+// answered for.
+//
+// Every method that reaches the server takes a context.Context first. Calls
+// run concurrently on the one connection; a call whose context ends returns
+// ctx.Err() at once, and its reply, if it arrives later, finds no waiter and
+// is dropped. A call cut short while writing closes the connection, since the
+// stream is no longer known to be at a line boundary, and the next call
+// returns ErrNotConnected until Reconnect or Start restores it. Methods that
+// read the cache (GetUTXOs, GetBalance, LastRefresh and the rest) take no
+// context; they never block on the network.
 //
 // Copyright (c) 2025-2026 Soqucoin Labs Inc. MIT License.
 package electrumx
@@ -49,7 +54,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,32 +65,48 @@ import (
 
 // Client is a production-hardened TCP JSON-RPC client for ElectrumX.
 //
-// It maintains a persistent connection, tracks addresses via polling,
+// It maintains a persistent connection, tracks addresses by subscription,
 // and provides battle-tested UTXO caching with merge-based refresh
-// (Defense 12) that preserves spend-pending state across poll cycles.
+// (Defense 12) that preserves spend-pending state across refreshes.
 type Client struct {
-	mu     sync.RWMutex
-	utxos  map[string][]types.UTXO // address -> UTXOs
-	host   string
-	conn   net.Conn      // guarded by connSem
-	reader *bufio.Reader // guarded by connSem
-	// connSem is a one-slot semaphore: PF-018b, it serializes all TCP I/O and
-	// connection replacement. A channel rather than a mutex so that a caller
-	// queued behind a stalled exchange leaves the queue when its own context
-	// ends (lockConn) instead of waiting out the other call's deadline.
-	connSem      chan struct{}
-	reqID        atomic.Int64
-	lastTip      atomic.Int64 // latest height seen in a headers.subscribe reply or notification
-	addresses    []string
-	pollInterval time.Duration
-	stopCh       chan struct{}
-	stopOnce     sync.Once
-	log          *slog.Logger
+	mu    sync.RWMutex
+	utxos map[string][]types.UTXO // address -> UTXOs
+	host  string
+
+	// The connection: conn, reader and gen are guarded by connSem, a one-slot
+	// semaphore rather than a mutex so that a caller waiting for it leaves
+	// the queue when its own context ends. gen counts connections; a reader
+	// goroutine and every pending call belong to one generation. liveGen
+	// mirrors gen for readers that hold mu, not connSem.
+	conn     net.Conn
+	reader   *bufio.Reader
+	gen      uint64
+	connDone chan struct{} // closed by the reader when this connection is lost
+	connSem  chan struct{}
+	liveGen  atomic.Uint64
+
+	// pending pairs each in-flight request id with its waiting call.
+	pendMu  sync.Mutex
+	pending map[int64]pendingCall
+
+	reqID   atomic.Int64
+	lastTip atomic.Int64 // latest height seen in a headers.subscribe reply or notification
+
+	addresses         []string
+	reconcileInterval time.Duration
+	stopCh            chan struct{}
+	stopOnce          sync.Once
+	kickCh            chan struct{} // wakes the refresher; one slot
+	log               *slog.Logger
 
 	lastRefreshAt  time.Time                // guarded by mu: last time EVERY tracked address refreshed
-	lastRefreshErr error                    // guarded by mu: error of the last RefreshAll, nil on success
+	lastRefreshErr error                    // guarded by mu: error of the last full pass, nil on success
 	refreshed      map[string]refreshRecord // guarded by mu: per tracked address, see LastRefreshOf
 	trackedSet     map[string]bool          // guarded by mu: the addresses list as a set
+	byScriptHash   map[string]string        // guarded by mu: scripthash -> tracked address
+	subscribed     map[string]uint64        // guarded by mu: address -> generation the subscription was acknowledged on
+	status         map[string]string        // guarded by mu: address -> last status seen (reply or notification)
+	changed        map[string]bool          // guarded by mu: addresses with a change pending
 
 	// HRP is the network prefix the tracked addresses must carry. Leave it
 	// empty and TrackAddresses infers it from the addresses themselves; set it
@@ -94,6 +114,13 @@ type Client struct {
 	// any address on another network. There is deliberately no default: a
 	// silent stagenet default on a mainnet deployment refreshed nothing, ever.
 	HRP string
+
+	// PingInterval is how often Start pings the server: it keeps the server's
+	// idle timer from closing the session and advances the freshness of every
+	// subscribed address with no change pending. Zero means 60 seconds.
+	// deposit.Monitor.MaxCacheAge must exceed it, or every address reads stale
+	// between pings.
+	PingInterval time.Duration
 
 	// OnRefresh is called after each successful UTXO refresh with the address
 	// and current UTXO count. Useful for monitoring/logging.
@@ -119,7 +146,7 @@ type Client struct {
 // This is the setting an exchange should use for any ElectrumX server it does
 // not reach over a private network.
 //
-//	client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second, logger)
+//	client := electrumx.NewClient("electrum.example.org:50002", 10*time.Minute, logger)
 //	client.UseTLS()
 //	client.Connect(ctx)
 //
@@ -128,11 +155,22 @@ func (c *Client) UseTLS() {
 	c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 }
 
-// refreshRecord is one address's refresh state: when it last refreshed
-// successfully and the error of the most recent attempt, nil on success.
+// refreshRecord is one address's freshness state.
+//
+// at is the last moment the address's UTXO set was known current: a
+// listunspent reply landed, a subscribe reply carried the status last seen,
+// or a ping was answered while the address was subscribed with no change
+// pending. err is the last attempt's error, nil on success. gen is the
+// connection at was established on. dirty is set by a notification and
+// cleared by the listunspent that answers it, so no ping advances an address
+// with a change in flight; seq counts notifications so a reply that predates
+// one leaves dirty set.
 type refreshRecord struct {
-	at  time.Time
-	err error
+	at    time.Time
+	err   error
+	gen   uint64
+	dirty bool
+	seq   uint64
 }
 
 // request is a JSON-RPC request to ElectrumX.
@@ -142,17 +180,10 @@ type request struct {
 	Params interface{} `json:"params"`
 }
 
-// response is a JSON-RPC response from ElectrumX.
-type response struct {
-	ID     int64           `json:"id"`
-	Result json.RawMessage `json:"result"`
-	Error  json.RawMessage `json:"error,omitempty"`
-}
-
 // incoming is any line the server sends: a reply (id set) or a notification
-// (method set, no id). ElectrumX pushes blockchain.headers.subscribe
-// notifications on the same connection once GetTip has subscribed, so a reader
-// that takes "the next line" as "the reply" goes off by one at every new block.
+// (method set, no id). Replies are paired with calls by id, never by position:
+// a reader that took "the next line" as "the reply" went off by one at every
+// notification and stored address A's UTXOs under address B.
 type incoming struct {
 	ID     *int64          `json:"id"`
 	Method string          `json:"method"`
@@ -162,7 +193,9 @@ type incoming struct {
 }
 
 var (
-	// ErrNotConnected is returned by every call made before Connect or after Stop.
+	// ErrNotConnected is returned by every call made before Connect or after
+	// Stop, by a call whose connection was lost before its reply, and by
+	// every call after a lost connection until Reconnect or Start restores it.
 	ErrNotConnected = errors.New("electrumx: not connected")
 	// ErrNetworkMismatch is returned when a tracked address is on a different
 	// network than the client's HRP, or when addresses in one call disagree.
@@ -172,374 +205,48 @@ var (
 	ErrGenesisMismatch = errors.New("electrumx: server is indexing a different chain")
 )
 
-// maxSkippedLines bounds how many notifications or stale replies one call will
-// read past before giving up; the read deadline bounds it in time as well.
-const maxSkippedLines = 64
-
 // NewClient creates a new ElectrumX client.
 //
 // Parameters:
 //   - host: ElectrumX TCP address (e.g., "localhost:50001")
-//   - pollInterval: How often to refresh UTXOs (recommended: 15s for production)
-//   - logger: where connection events, reorgs and polling errors go; nil discards
-func NewClient(host string, pollInterval time.Duration, logger *slog.Logger) *Client {
+//   - reconcileInterval: how often Start makes a full listunspent pass over
+//     every tracked address, the safety net for a notification the server
+//     never sent. It must exceed the pass itself (one round trip per
+//     address); zero or negative means 10 minutes.
+//   - logger: where connection events, reorgs and refresh errors go; nil discards
+func NewClient(host string, reconcileInterval time.Duration, logger *slog.Logger) *Client {
+	if reconcileInterval <= 0 {
+		reconcileInterval = defaultReconcileInterval
+	}
 	return &Client{
-		log:          logutil.Or(logger),
-		utxos:        make(map[string][]types.UTXO),
-		refreshed:    make(map[string]refreshRecord),
-		host:         host,
-		pollInterval: pollInterval,
-		stopCh:       make(chan struct{}),
-		connSem:      make(chan struct{}, 1),
+		log:               logutil.Or(logger),
+		utxos:             make(map[string][]types.UTXO),
+		refreshed:         make(map[string]refreshRecord),
+		trackedSet:        make(map[string]bool),
+		byScriptHash:      make(map[string]string),
+		subscribed:        make(map[string]uint64),
+		status:            make(map[string]string),
+		changed:           make(map[string]bool),
+		pending:           make(map[int64]pendingCall),
+		host:              host,
+		reconcileInterval: reconcileInterval,
+		stopCh:            make(chan struct{}),
+		kickCh:            make(chan struct{}, 1),
+		connSem:           make(chan struct{}, 1),
 	}
 }
 
-// lockConn takes the connection semaphore or returns ctx.Err() when the
-// context ends first. The caller must release with unlockConn on success.
-func (c *Client) lockConn(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case c.connSem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+// pruneTo deletes from m every address not in keep. Caller holds mu.
+func pruneTo[V any](m map[string]V, keep map[string]bool) {
+	for a := range m {
+		if !keep[a] {
+			delete(m, a)
+		}
 	}
 }
 
-// lockConnBlocking takes the connection semaphore without a context: for
-// Stop, which must close the socket whatever else is happening.
-func (c *Client) lockConnBlocking() { c.connSem <- struct{}{} }
-
-func (c *Client) unlockConn() { <-c.connSem }
-
-// dial opens the transport. Keepalive is set on the TCP connection underneath
-// any TLS layer, so it survives the wrapping.
-//
-// The TLS handshake carries its own deadline. Without one a server that accepts
-// the TCP connection and then stalls would hang Connect indefinitely, which is
-// exactly how a reconnect loop wedges. Both the dial and the handshake end
-// early when ctx ends.
-func (c *Client) dial(ctx context.Context) (net.Conn, error) {
-	// F5: TCP keepalive at 30 s, so an idle connection survives NAT and
-	// firewall timeouts between polls.
-	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	raw, err := dialer.DialContext(ctx, "tcp", c.host)
-	if err != nil {
-		return nil, fmt.Errorf("connect to electrumx %s: %w", c.host, err)
-	}
-
-	if c.TLSConfig == nil {
-		return raw, nil
-	}
-
-	cfg := c.TLSConfig.Clone()
-	if cfg.ServerName == "" && !cfg.InsecureSkipVerify {
-		host, _, splitErr := net.SplitHostPort(c.host)
-		if splitErr != nil {
-			host = c.host
-		}
-		cfg.ServerName = host
-	}
-
-	tlsConn := tls.Client(raw, cfg)
-	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("electrumx %s: tls handshake: %w", c.host, err)
-	}
-	return tlsConn, nil
-}
-
-// Connect establishes a connection to ElectrumX with keepalive enabled, over TLS
-// if TLSConfig is set.
-//
-// Production lesson (F5): ElectrumX connections sit idle between poll intervals.
-// NAT/firewall timeouts silently kill the connection after ~4h on DigitalOcean
-// droplets. TCP keepalive at 30s prevents this.
-//
-// The connection is replaced under the connection lock, the same lock every
-// call holds, so a Reconnect from the polling goroutine can never race a
-// caller mid-request. A context that ends while a call holds the lock ends
-// Connect too, and the new connection is closed unused.
-// After the version handshake the server's genesis hash is checked against the
-// chains the client's HRP belongs to (see verifyGenesisLocked): an indexer for
-// the wrong chain would otherwise report "no deposits" forever.
-func (c *Client) Connect(ctx context.Context) error {
-	conn, err := c.dial(ctx)
-	if err != nil {
-		return err
-	}
-
-	if err := c.lockConn(ctx); err != nil {
-		conn.Close()
-		return err
-	}
-	defer c.unlockConn()
-
-	if c.conn != nil {
-		c.conn.Close()
-	}
-	c.conn = conn
-	// PF-018 FIX: Use 4MB buffer instead of default 4KB.
-	// ElectrumX responses for addresses with 18,000+ UTXOs can exceed
-	// 2MB. The default bufio.NewReader (4KB) panics on buffer growth
-	// in Go 1.26's bufio.ReadSlice when response > 4KB.
-	// 4MB accommodates ~50,000 UTXOs with margin.
-	c.reader = bufio.NewReaderSize(conn, 4*1024*1024)
-	c.log.Info("connected", "host", c.host, "tls", c.TLSConfig != nil)
-
-	fail := func(err error) error {
-		conn.Close()
-		c.conn = nil
-		c.reader = nil
-		return err
-	}
-
-	// Server version handshake
-	resp, err := c.callLocked(ctx, "server.version", []interface{}{"soqucoin-sdk/1.0", "1.4"})
-	if err != nil {
-		return fail(fmt.Errorf("electrumx handshake: %w", err))
-	}
-	c.log.Info("server version", "host", c.host, "version", string(resp))
-
-	if err := c.verifyGenesisLocked(ctx); err != nil {
-		return fail(err)
-	}
-	return nil
-}
-
-// verifyGenesisLocked refuses a server that indexes a chain other than the one
-// the client's addresses belong to. Skipped only while the HRP is still unknown
-// (before TrackAddresses), in which case TrackAddresses is the gate.
-func (c *Client) verifyGenesisLocked(ctx context.Context) error {
-	if c.HRP == "" {
-		return nil
-	}
-	want := types.GenesisHashesForHRP(c.HRP)
-	if len(want) == 0 {
-		return fmt.Errorf("%w: no known chain uses HRP %q", ErrNetworkMismatch, c.HRP)
-	}
-	raw, err := c.callLocked(ctx, "server.features", []interface{}{})
-	if err != nil {
-		return fmt.Errorf("electrumx server.features: %w", err)
-	}
-	var features struct {
-		Genesis string `json:"genesis_hash"`
-	}
-	if err := json.Unmarshal(raw, &features); err != nil {
-		return fmt.Errorf("electrumx server.features: parse: %w", err)
-	}
-	got := strings.ToLower(strings.TrimPrefix(features.Genesis, "0x"))
-	for _, w := range want {
-		if got == w {
-			return nil
-		}
-	}
-	return fmt.Errorf("%w: server genesis %q, client HRP %q expects one of %v", ErrGenesisMismatch, got, c.HRP, want)
-}
-
-// Reconnect closes the existing connection and re-establishes it.
-func (c *Client) Reconnect(ctx context.Context) error {
-	c.log.Info("reconnecting", "host", c.host)
-	if err := c.Connect(ctx); err != nil {
-		return fmt.Errorf("reconnect failed: %w", err)
-	}
-	c.log.Info("reconnected", "host", c.host)
-	return nil
-}
-
-// Call sends a JSON-RPC request and reads the response.
-// This is exported for advanced usage; prefer the typed methods below.
-//
-// Production lesson (PF-018b): Multiple goroutines (polling, sendmany,
-// consolidation) call this concurrently. Without the connection mutex,
-// concurrent writes corrupt the TCP stream, and concurrent reads corrupt
-// bufio's internal buffer → panic: slice bounds out of range.
-func (c *Client) Call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
-	return c.call(ctx, method, params)
-}
-
-func (c *Client) call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
-	// PF-018b FIX: Serialize TCP I/O. A caller whose context ends while
-	// another call holds the connection returns here, not after that call's
-	// deadline.
-	if err := c.lockConn(ctx); err != nil {
-		return nil, err
-	}
-	defer c.unlockConn()
-	return c.callLocked(ctx, method, params)
-}
-
-// callDeadline bounds one request/reply exchange when the context does not end
-// it first.
-const callDeadline = 30 * time.Second
-
-// callLocked performs one request/reply exchange. Caller holds the connection lock.
-//
-// The reply is identified by id, never by position. Lines carrying a method
-// are server notifications (headers.subscribe pushes one at every new block)
-// and are consumed here; lines carrying another id are replies to an earlier
-// request that timed out and are discarded. Before this, a notification was
-// returned as the reply to whatever call happened to read it, and every later
-// reply was off by one: listunspent for address A stored under address B.
-//
-// The context ends the exchange the same way the deadline does: when it is
-// done the connection deadline is moved to now, the blocked write or read
-// returns, and ctx.Err() is reported. A read cut short before any byte of a
-// line arrived leaves the stream in step: the reply, if it arrives, is a
-// stale id the next call discards. A write cut short, or a read cut short
-// with part of a line consumed, does not, so the connection is closed; the
-// next call returns ErrNotConnected and Reconnect, or the polling loop,
-// restores it.
-func (c *Client) callLocked(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
-	if c.conn == nil {
-		return nil, ErrNotConnected
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	id := c.reqID.Add(1)
-	req := request{
-		ID:     id,
-		Method: method,
-		Params: params,
-	}
-
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	// One deadline covers the write and the read: a stalled peer must not be
-	// able to hold the connection, and every caller behind it, forever. The
-	// context ends the exchange through the same deadline, moved to now when
-	// the context is done; it is not copied into the deadline up front,
-	// because the socket's timer and the context's timer would then fire
-	// together and the read could return before ctx.Err() is set.
-	conn := c.conn
-	if err := conn.SetDeadline(time.Now().Add(callDeadline)); err != nil {
-		// A socket that refuses a deadline is closed or broken underneath.
-		c.dropLocked()
-		return nil, fmt.Errorf("set deadline: %w", err)
-	}
-	// If the context ends while the call is in flight the callback moves the
-	// deadline to now. A socket that refuses the deadline is closed instead,
-	// which returns the blocked read the same way, and is dropped once the
-	// exchange has returned. On return the callback is stopped, or, when it
-	// has already started, waited for: the connection lock is still held
-	// here, so it cannot run after the next call has set its own deadline.
-	fired := make(chan struct{})
-	var closedByCtx atomic.Bool
-	stop := context.AfterFunc(ctx, func() {
-		defer close(fired)
-		if err := conn.SetDeadline(time.Now()); err != nil {
-			closedByCtx.Store(true)
-			conn.Close()
-		}
-	})
-	defer func() {
-		if !stop() {
-			<-fired
-		}
-		if closedByCtx.Load() && c.conn == conn {
-			c.dropLocked()
-		}
-	}()
-	// ctxErr reports the context's error in place of the deadline error the
-	// connection produced when the context is what ended the exchange.
-	ctxErr := func(err error) error {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		return err
-	}
-
-	// ElectrumX uses newline-delimited JSON
-	data = append(data, '\n')
-	if _, err := conn.Write(data); err != nil {
-		// Part of the line may have gone out; the stream cannot be trusted.
-		c.dropLocked()
-		return nil, fmt.Errorf("write request: %w", ctxErr(err))
-	}
-
-	for skipped := 0; skipped < maxSkippedLines; skipped++ {
-		line, err := c.reader.ReadBytes('\n')
-		if err != nil {
-			if len(line) > 0 {
-				// Part of a line was consumed; the rest would be read as the
-				// start of the next reply. The stream cannot be trusted.
-				c.dropLocked()
-			}
-			return nil, fmt.Errorf("read response: %w", ctxErr(err))
-		}
-		var in incoming
-		if err := json.Unmarshal(line, &in); err != nil {
-			return nil, fmt.Errorf("parse response: %w", err)
-		}
-		if in.Method != "" {
-			c.handleNotification(in)
-			continue
-		}
-		if in.ID == nil {
-			c.log.Warn("discarding a line with neither id nor method")
-			continue
-		}
-		if *in.ID != id {
-			c.log.Debug("discarding a stale reply", "got_id", *in.ID, "want_id", id)
-			continue
-		}
-		if len(in.Error) > 0 && string(in.Error) != "null" {
-			return nil, fmt.Errorf("electrumx error: %s", string(in.Error))
-		}
-		if method == "blockchain.headers.subscribe" {
-			c.recordTip(in.Result)
-		}
-		return in.Result, nil
-	}
-	return nil, fmt.Errorf("electrumx: no reply to request %d within %d lines", id, maxSkippedLines)
-}
-
-// dropLocked closes and forgets the connection. Caller holds the connection lock. The next
-// call returns ErrNotConnected until Reconnect, or the polling loop, dials again.
-func (c *Client) dropLocked() {
-	if c.conn != nil {
-		c.conn.Close()
-	}
-	c.conn = nil
-	c.reader = nil
-}
-
-// handleNotification consumes a server push. Only the headers subscription is
-// meaningful to this client; its height is recorded so LastTip stays current
-// between GetTip calls.
-func (c *Client) handleNotification(in incoming) {
-	if in.Method != "blockchain.headers.subscribe" {
-		return
-	}
-	var params []json.RawMessage
-	if err := json.Unmarshal(in.Params, &params); err != nil || len(params) == 0 {
-		return
-	}
-	c.recordTip(params[0])
-}
-
-func (c *Client) recordTip(header json.RawMessage) {
-	var h struct {
-		Height int64 `json:"height"`
-	}
-	if err := json.Unmarshal(header, &h); err == nil && h.Height > 0 {
-		c.lastTip.Store(h.Height)
-	}
-}
-
-// LastTip returns the most recent chain height this connection has seen, from
-// a GetTip reply or a server notification. Zero until the first GetTip.
-func (c *Client) LastTip() int64 { return c.lastTip.Load() }
-
-// TrackAddresses registers addresses for UTXO tracking.
+// TrackAddresses registers the addresses to keep fresh, replacing the previous
+// list. Start subscribes the new ones on its next pass.
 //
 // Every address must decode on one network. If HRP is unset it is inferred
 // from the first address; if it is set, an address on another network is an
@@ -547,7 +254,7 @@ func (c *Client) LastTip() int64 { return c.lastTip.Load() }
 // a mainnet deployment that forgets to set HRP gets an error at startup rather
 // than a cache that refreshes nothing for the life of the process.
 func (c *Client) TrackAddresses(addresses []string) error {
-	hrp := c.HRP
+	hrp := c.hrp()
 	for _, a := range addresses {
 		n, err := address.NetworkOf(a)
 		if err != nil {
@@ -562,6 +269,14 @@ func (c *Client) TrackAddresses(addresses []string) error {
 			return fmt.Errorf("track %s: %w", a, err)
 		}
 	}
+	byHash := make(map[string]string, len(addresses))
+	for _, a := range addresses {
+		sh, err := address.AddressToScriptHash(hrp, a)
+		if err != nil {
+			return fmt.Errorf("track %s: %w", a, err)
+		}
+		byHash[sh] = a
+	}
 	c.mu.Lock()
 	c.HRP = hrp
 	c.addresses = append([]string(nil), addresses...)
@@ -569,93 +284,117 @@ func (c *Client) TrackAddresses(addresses []string) error {
 	for _, a := range addresses {
 		c.trackedSet[a] = true
 	}
-	for a := range c.refreshed {
-		if !c.trackedSet[a] {
-			delete(c.refreshed, a)
-		}
-	}
+	c.byScriptHash = byHash
+	// Every per-address map is pruned to the new set, the UTXO cache included.
+	// It is the one that holds money: an address no longer tracked must not be
+	// counted by GetBalance, returned by GetAllUTXOs or offered to the
+	// selector. Pruning it was missing, and iterating only c.refreshed missed
+	// any address that had a cache entry and no freshness record.
+	pruneTo(c.refreshed, c.trackedSet)
+	pruneTo(c.subscribed, c.trackedSet)
+	pruneTo(c.status, c.trackedSet)
+	pruneTo(c.changed, c.trackedSet)
+	pruneTo(c.utxos, c.trackedSet)
 	c.mu.Unlock()
+	c.kick()
 	return nil
 }
 
-// RefreshAll fetches UTXOs for all tracked addresses.
+// hrp reads the network prefix under the lock TrackAddresses writes it under,
+// since TrackAddresses may run while Start's refresher is making calls.
+func (c *Client) hrp() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.HRP
+}
+
+// RefreshAll fetches UTXOs for all tracked addresses: one
+// blockchain.scripthash.listunspent per address, in sequence, on the one
+// connection, each under the 30-second call deadline. Start makes this pass
+// on the reconcile interval; resilience.Reconciler makes it before comparing
+// the cache with the node.
 //
 // One failing address does not stop the others: every address is attempted
 // and the returned error joins the failures, naming each address. The result
 // is recorded for LastRefresh, which callers must consult before treating an
 // empty UTXO set as "no deposits", and per address for LastRefreshOf.
 //
-// The pass is one blockchain.scripthash.listunspent per tracked address, in
-// sequence, on the one connection, each under the 30-second call deadline, so
-// a pass takes the sum of the round trips. deposit.Monitor treats an address
-// as stale once its last successful refresh is older than its MaxCacheAge,
-// which puts a ceiling on the addresses one client can keep fresh: at a
-// 5-minute MaxCacheAge, about 300 seconds divided by the round trip.
-//
-// When ctx ends mid-pass the pass stops there: the addresses reached keep
-// their new records, the rest keep their old ones, and the error names one
-// address, the one whose call was cut short or, between calls, the first not
-// attempted.
+// When ctx ends mid-pass, or the connection is lost, the pass stops there:
+// the addresses reached keep their new records, the rest keep their old ones,
+// and the error names one address, the one whose call was cut short or,
+// between calls, the first not attempted.
 func (c *Client) RefreshAll(ctx context.Context) error {
 	c.mu.RLock()
-	addrs := make([]string, len(c.addresses))
-	copy(addrs, c.addresses)
+	addrs := append([]string(nil), c.addresses...)
 	c.mu.RUnlock()
+	_, err := c.refresh(ctx, addrs, true)
+	return err
+}
 
+// refresh makes one listunspent per address in addrs and returns the
+// addresses not refreshed: those whose call failed and those not attempted
+// because the pass stopped. When full, the result is recorded as the last
+// full pass for LastRefresh.
+func (c *Client) refresh(ctx context.Context, addrs []string, full bool) ([]string, error) {
 	var errs []error
-	for _, addr := range addrs {
+	var failed []string
+	for i, addr := range addrs {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
+			failed = append(failed, addrs[i:]...)
 			break
 		}
 		err := c.refreshAddress(ctx, addr)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("refresh %s: %w", addr, err))
-		}
-		c.mu.Lock()
-		if c.trackedSet[addr] { // TrackAddresses may have dropped it during the call
-			rec := c.refreshed[addr]
-			rec.err = err
-			if err == nil {
-				rec.at = time.Now()
+			failed = append(failed, addr)
+			// A context that ended during this address's call is already
+			// named through its error; so is a lost connection, which every
+			// later call would report the same way. The pass stops here.
+			if ctx.Err() != nil || errIsConnection(err) {
+				failed = append(failed, addrs[i+1:]...)
+				break
 			}
-			c.refreshed[addr] = rec
-		}
-		c.mu.Unlock()
-		// A context that ended during this address's call is already named
-		// through its error; the pass stops here rather than naming the next
-		// address as well.
-		if err != nil && ctx.Err() != nil {
-			break
 		}
 	}
 	err := errors.Join(errs...)
-
-	c.mu.Lock()
-	c.lastRefreshErr = err
-	if err == nil {
-		c.lastRefreshAt = time.Now()
+	if full {
+		c.mu.Lock()
+		c.lastRefreshErr = err
+		if err == nil {
+			c.lastRefreshAt = time.Now()
+		}
+		c.mu.Unlock()
 	}
-	c.mu.Unlock()
-	return err
+	return failed, err
 }
 
 // LastRefresh reports when every tracked address last refreshed successfully
-// and the error of the most recent RefreshAll (nil on success). A zero time or
-// a non-nil error means the cache may be stale: GetUTXOs and GetBalance answer
-// from the cache regardless, so this is how an indexer outage is told apart
-// from "no deposits".
+// in one full pass and the error of the most recent full pass (nil on
+// success). A zero time or a non-nil error means the cache may be stale:
+// GetUTXOs and GetBalance answer from the cache regardless, so this is how an
+// indexer outage is told apart from "no deposits". deposit.Monitor reads the
+// per-address LastRefreshOf instead, which a subscription keeps current
+// between full passes.
 func (c *Client) LastRefresh() (time.Time, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastRefreshAt, c.lastRefreshErr
 }
 
-// LastRefreshOf reports when one tracked address last refreshed successfully
-// and the error of the most recent attempt for it, nil on success. The zero
-// time means never: the address is not tracked, or no pass has reached it.
-// deposit.Monitor uses it to skip only the addresses the indexer has not
-// answered for instead of pausing every credit when one of thousands fails.
+// LastRefreshOf reports the last moment one tracked address's UTXO set was
+// known current, and the error of the most recent attempt for it, nil on
+// success. The zero time means never: the address is not tracked, or no call
+// for it has succeeded.
+//
+// The moment advances when a listunspent reply lands, when a subscribe reply
+// on a new connection carries the status last seen (the history did not
+// change while the client was away), and when the server answers a ping
+// while the address is subscribed with no change pending. It does not
+// advance on a notification, or while the listunspent a notification asked
+// for is still in flight. deposit.Monitor uses it to skip only the addresses
+// the indexer has not answered for instead of pausing every credit when one
+// of thousands fails.
 func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -663,7 +402,8 @@ func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
 	return rec.at, rec.err
 }
 
-// refreshAddress fetches UTXOs for a single address via ElectrumX.
+// refreshAddress fetches UTXOs for a single address via ElectrumX and records
+// the attempt in the address's freshness record.
 //
 // Defense 12 (Merge Refresh): Uses a MERGE strategy instead of full replacement.
 // The old code wiped SpentPending flags on every poll, creating a race where a
@@ -671,20 +411,26 @@ func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
 // The new code:
 //  1. Preserves SpentPending and AssetType flags on UTXOs that still appear
 //  2. Removes UTXOs that ElectrumX no longer reports (confirmed spent)
-//  3. Adds new UTXOs that appeared since last poll (change outputs, new coinbases)
+//  3. Adds new UTXOs that appeared since last refresh (change outputs, new coinbases)
 func (c *Client) refreshAddress(ctx context.Context, addr string) error {
-	scriptHash, err := address.AddressToScriptHash(c.HRP, addr)
+	scriptHash, err := address.AddressToScriptHash(c.hrp(), addr)
 	if err != nil {
 		return fmt.Errorf("address to script hash: %w", err)
 	}
 
-	result, err := c.call(ctx, "blockchain.scripthash.listunspent", []interface{}{scriptHash})
+	c.mu.RLock()
+	seqBefore := c.refreshed[addr].seq
+	c.mu.RUnlock()
+
+	result, gen, err := c.callGen(ctx, "blockchain.scripthash.listunspent", []interface{}{scriptHash})
 	if err != nil {
+		c.recordRefresh(addr, gen, seqBefore, fmt.Errorf("listunspent: %w", err))
 		return fmt.Errorf("listunspent: %w", err)
 	}
 
 	var freshUTXOs []types.UTXO
 	if err := json.Unmarshal(result, &freshUTXOs); err != nil {
+		c.recordRefresh(addr, gen, seqBefore, fmt.Errorf("parse utxos: %w", err))
 		return fmt.Errorf("parse utxos: %w", err)
 	}
 
@@ -730,98 +476,66 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 	}
 
 	// Step 2: Add new UTXOs
-	newCount := 0
 	for key, u := range freshSet {
 		if !kept[key] {
 			merged = append(merged, u)
-			newCount++
 		}
 	}
 
-	c.utxos[addr] = merged
-
-	if c.OnRefresh != nil {
-		c.OnRefresh(addr, len(merged))
+	if !c.trackedSet[addr] {
+		// TrackAddresses dropped the address while this listunspent was in
+		// flight; committing now would put an untracked address's outputs
+		// back into the cache the balance and the selector read.
+		return nil
 	}
+	c.utxos[addr] = merged
+	c.recordRefreshLocked(addr, gen, seqBefore, nil)
+	count := len(merged)
+	c.mu.Unlock()
 
+	// Outside the lock: a slow OnRefresh must not hold the reader, which
+	// takes mu to note a change, and with it every reply on the connection.
+	if c.OnRefresh != nil {
+		c.OnRefresh(addr, count)
+	}
+	c.mu.Lock() // released by the deferred Unlock
 	return nil
 }
 
-// StartPolling begins periodic UTXO refresh in a goroutine. The goroutine
-// ends when ctx ends or Stop is called; every refresh it makes runs under ctx.
-//
-// Production lesson: The polling goroutine includes panic recovery
-// and auto-reconnect. Without this, a bufio panic kills the entire
-// process. With recovery, the goroutine logs the panic, reconnects,
-// and resumes polling.
-func (c *Client) StartPolling(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(c.pollInterval)
-		defer ticker.Stop()
-
-		// PF-018 FIX: Recover from panics in the polling goroutine.
-		defer func() {
-			if r := recover(); r != nil {
-				c.log.Error("panic in the polling goroutine, reconnecting", "panic", r)
-				if reconErr := c.Reconnect(ctx); reconErr != nil {
-					c.log.Error("reconnect after panic failed", "err", reconErr)
-				}
-				if ctx.Err() == nil {
-					c.StartPolling(ctx)
-				}
-			}
-		}()
-
-		// Initial refresh
-		if err := c.RefreshAll(ctx); err != nil {
-			c.log.Warn("initial refresh failed", "err", err)
-		}
-
-		consecutiveErrors := 0
-
-		for {
-			select {
-			case <-ticker.C:
-				// The tick and the context can be ready together and select
-				// picks either; no refresh starts once the context has ended.
-				if ctx.Err() != nil {
-					return
-				}
-				if err := c.RefreshAll(ctx); err != nil {
-					consecutiveErrors++
-					c.log.Warn("refresh failed", "consecutive", consecutiveErrors, "err", err)
-
-					// F5: Auto-reconnect after 2 consecutive failures
-					if consecutiveErrors >= 2 && ctx.Err() == nil {
-						if reconErr := c.Reconnect(ctx); reconErr != nil {
-							c.log.Warn("reconnect failed, retrying at the next poll", "err", reconErr)
-						} else {
-							consecutiveErrors = 0
-						}
-					}
-				} else {
-					consecutiveErrors = 0
-				}
-			case <-ctx.Done():
-				return
-			case <-c.stopCh:
-				return
-			}
-		}
-	}()
+func (c *Client) recordRefresh(addr string, gen, seqBefore uint64, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recordRefreshLocked(addr, gen, seqBefore, err)
 }
 
-// Stop halts the polling goroutine and closes the connection. Safe to call
-// more than once; calls after Stop return ErrNotConnected.
-func (c *Client) Stop() {
-	c.stopOnce.Do(func() { close(c.stopCh) })
-	c.lockConnBlocking()
-	defer c.unlockConn()
-	if c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
-		c.reader = nil
+// recordRefreshLocked records one listunspent attempt. Caller holds mu. A
+// success makes the set known current as of now on connection gen and clears
+// the change flag, unless a notification arrived while the call was in
+// flight: then the reply may predate the change, so neither the moment nor
+// the flag moves, and the next pass refreshes the address again.
+// TrackAddresses may have dropped the address during the call; then nothing
+// is recorded.
+func (c *Client) recordRefreshLocked(addr string, gen, seqBefore uint64, err error) {
+	if !c.trackedSet[addr] {
+		return
 	}
+	rec := c.refreshed[addr]
+	if !endedErr(err) {
+		// A context that ended says nothing about the indexer; the previous
+		// verdict stands and no alert follows from a shutdown.
+		rec.err = err
+	}
+	if err == nil && rec.seq == seqBefore {
+		rec.at = time.Now()
+		rec.gen = gen
+		rec.dirty = false
+	}
+	c.refreshed[addr] = rec
+}
+
+// endedErr reports an error that is, or wraps, a context ending.
+func endedErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // GetBalance returns the total confirmed and unconfirmed balance across all tracked addresses.
@@ -932,8 +646,8 @@ func (c *Client) EvictUTXO(txid string, vout uint32) {
 // fund the next stalls; keep enough confirmed outputs for the run instead.
 //
 // Deprecated: the injection has no effect on selection and the cache shows
-// the output within one poll anyway. Kept for callers that read the
-// unconfirmed balance; it may be removed in v0.4.
+// the output as soon as the indexer reports it anyway. Kept for callers that
+// read the unconfirmed balance; it may be removed in v0.4.
 func (c *Client) AddChangeUTXO(txid string, vout uint32, value int64, addr string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1002,7 +716,7 @@ func (c *Client) GetTip(ctx context.Context) (int64, error) {
 
 // GetHistory fetches transaction history for an address.
 func (c *Client) GetHistory(ctx context.Context, addr string) ([]TxHistoryEntry, error) {
-	scriptHash, err := address.AddressToScriptHash(c.HRP, addr)
+	scriptHash, err := address.AddressToScriptHash(c.hrp(), addr)
 	if err != nil {
 		return nil, fmt.Errorf("address to script hash: %w", err)
 	}

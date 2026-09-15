@@ -77,9 +77,11 @@ func TestCallWithAnEndedContextSendsNothing(t *testing.T) {
 	var calls int
 	var mu sync.Mutex
 	stub := newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
-		mu.Lock()
-		calls++
-		mu.Unlock()
+		if req.Method == "anything" {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+		}
 		return []string{reply(req.ID, `null`)}
 	})
 	c := connect(t, stub)
@@ -121,9 +123,11 @@ func TestRefreshAllStopsAtTheContext(t *testing.T) {
 	var calls int
 	var mu sync.Mutex
 	stub := newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
-		mu.Lock()
-		calls++
-		mu.Unlock()
+		if req.Method == "blockchain.scripthash.listunspent" {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+		}
 		return []string{reply(req.ID, `[]`)}
 	})
 	c := connect(t, stub)
@@ -204,7 +208,7 @@ func TestPollingStopsWithTheContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c.StartPolling(ctx)
+	c.Start(ctx)
 	time.Sleep(120 * time.Millisecond)
 	cancel()
 	// A refresh in flight at the cancel may still complete and log; after
@@ -266,7 +270,9 @@ func TestFailedWriteClosesTheConnection(t *testing.T) {
 		t.Fatalf("after reconnect: %v", err)
 	}
 
-	// The socket refuses a deadline: closed underneath the client.
+	// The socket is closed underneath the client: the reader notices and
+	// drops it, or the next write fails and drops it; either way the call
+	// after that reports ErrNotConnected.
 	c.lockConnBlocking()
 	c.conn.Close()
 	c.unlockConn()
@@ -274,15 +280,16 @@ func TestFailedWriteClosesTheConnection(t *testing.T) {
 		t.Fatal("a call on a closed socket succeeded")
 	}
 	if _, err := c.Call(context.Background(), "anything", []interface{}{}); !errors.Is(err, ErrNotConnected) {
-		t.Fatalf("after a failed deadline: %v, want ErrNotConnected", err)
+		t.Fatalf("after a closed socket: %v, want ErrNotConnected", err)
 	}
 }
 
-// A reply cut short by the context after part of its line has been read
-// closes the connection: the remainder would otherwise be read as the start
-// of the next reply. A reply that has not begun leaves it open (the test
-// above this one).
-func TestPartialReplyCutShortClosesTheConnection(t *testing.T) {
+// A reply the server leaves half sent poisons the line: the reader is waiting
+// for the rest of it, the call's context ends and the call returns, and the
+// next reply the server sends lands on the same line and cannot be parsed.
+// That drops the connection, fails the call waiting on it, and a Reconnect
+// restores service. Nothing is ever paired with a call by position.
+func TestPartialReplyPoisonsTheLineUntilTheConnectionIsRebuilt(t *testing.T) {
 	stub := newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
 		if req.Method == "half" {
 			// Half a line, no newline; the rest never comes.

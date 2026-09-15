@@ -233,7 +233,7 @@ func main() {
 		log.Printf("ALERT spent set not written after broadcast %s: %v", txid, err)
 	}
 
-	// 9. The change output reaches the cache on the next poll and becomes an
+	// 9. The change output reaches the cache when the indexer reports it and becomes an
 	//    input once it has confirmed; a second payment in the same block needs
 	//    another confirmed output.
 	if len(transaction.Outputs) > 1 {
