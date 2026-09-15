@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
@@ -116,7 +117,8 @@ type Monitor struct {
 
 	// MaxCacheAge bounds how stale the indexer cache may be before a scan is
 	// skipped entirely (default 5 minutes). A stale cache is an outage, not
-	// "no deposits".
+	// "no deposits". With electrumx.Client it must exceed the client's
+	// PingInterval, which is what keeps a quiet address's freshness moving.
 	MaxCacheAge time.Duration
 
 	// OnAlert receives every condition a human should see: indexer and node
@@ -129,6 +131,54 @@ type Monitor struct {
 	Logger *slog.Logger
 
 	now func() time.Time
+
+	// final is the set of outpoints known credited and past the node's
+	// horizon, keyed by outpoint and holding the address, so IsCredited is not
+	// asked again about an output that can neither be un-credited nor
+	// reorganised away. An entry needs the ledger's word that the outpoint is
+	// credited (MarkFinal succeeded, or IsCredited said so) and the node's
+	// word that it is final (gettxout confirmations past MaxReorgDepth). The
+	// indexer's word never adds one, and absence from Pending is not taken as
+	// finality: the Ledger contract lets Pending leave out outputs the
+	// exchange spent. A credited outpoint the ledger leaves out of Pending
+	// costs one IsCredited and one gettxout per scan until the node puts it
+	// past the horizon, then nothing. An entry is removed when its address was
+	// scanned and the outpoint is no longer in the cache (spent or swept);
+	// entries of an address no longer scanned stay for the life of the
+	// process. A restart empties the set.
+	finalMu sync.Mutex
+	final   map[string]string
+}
+
+func outpointKey(txid string, vout uint32) string { return fmt.Sprintf("%s:%d", txid, vout) }
+
+func (m *Monitor) isFinal(txid string, vout uint32) bool {
+	m.finalMu.Lock()
+	defer m.finalMu.Unlock()
+	_, ok := m.final[outpointKey(txid, vout)]
+	return ok
+}
+
+func (m *Monitor) markFinal(txid string, vout uint32, addr string) {
+	m.finalMu.Lock()
+	defer m.finalMu.Unlock()
+	if m.final == nil {
+		m.final = make(map[string]string)
+	}
+	m.final[outpointKey(txid, vout)] = addr
+}
+
+// pruneFinal drops the entries of scanned addresses whose outpoints the cache
+// no longer lists. An address skipped as stale keeps its entries: nothing
+// was learned about it.
+func (m *Monitor) pruneFinal(scanned map[string]bool, seen map[string]bool) {
+	m.finalMu.Lock()
+	defer m.finalMu.Unlock()
+	for k, addr := range m.final {
+		if scanned[addr] && !seen[k] {
+			delete(m.final, k)
+		}
+	}
 }
 
 // AlertKind classifies alerts.
@@ -252,7 +302,8 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	}
 
 	// 3. Re-verify everything credited but not yet final.
-	if err := m.recheckPending(ctx, tip); err != nil {
+	pending, err := m.recheckPending(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -267,6 +318,8 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	}
 	var stale []string
 	var staleErr error
+	scanned := make(map[string]bool, len(addrs)) // addresses this pass read the cache for
+	seen := make(map[string]bool)                // outpoints the cache listed for them
 	for _, addr := range addrs {
 		if perAddress != nil {
 			at, err := perAddress.LastRefreshOf(addr)
@@ -285,13 +338,18 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			continue
 		}
 		wantHex := hex.EncodeToString(wantScript)
+		scanned[addr] = true
 		for _, u := range m.Cache.GetUTXOs(addr) {
+			seen[outpointKey(u.TxID, u.Vout)] = true
 			if u.Height <= 0 || u.AssetType != types.AssetTypeSOQ {
 				continue // unconfirmed (or a lying indexer's negative height), or not SOQ
 			}
 			confs := tip - u.Height + 1
 			if confs < m.Required(u.Value) {
 				continue
+			}
+			if m.isFinal(u.TxID, u.Vout) {
+				continue // credited by the ledger's word, final by the node's; nothing to ask
 			}
 			done, err := m.Ledger.IsCredited(ctx, u.TxID, u.Vout)
 			if err != nil {
@@ -301,6 +359,23 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 				return credited, err
 			}
 			if done {
+				// Credited. It enters the final set once the node, not the
+				// indexer, puts it past the horizon: until then, one gettxout
+				// per scan for an outpoint the ledger leaves out of Pending;
+				// after that, no question at all. An outpoint still in Pending
+				// is marked final by recheckPending when its turn comes.
+				if !pending[outpointKey(u.TxID, u.Vout)] {
+					out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
+					if err != nil {
+						if ended(ctx, err) {
+							return credited, err
+						}
+						continue // asked again next scan; the credit stands
+					}
+					if out != nil && out.Confirmations > types.MaxReorgDepth {
+						m.markFinal(u.TxID, u.Vout, addr)
+					}
+				}
 				continue
 			}
 			d, ok, err := m.verifyWithNode(ctx, addr, wantHex, u, confs)
@@ -327,6 +402,9 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			return nil, fmt.Errorf("%w: indexer cache stale for every address", ErrPaused)
 		}
 	}
+	// Only a pass that read every scanned address to the end knows which
+	// outpoints are gone; a pass cut short prunes nothing.
+	m.pruneFinal(scanned, seen)
 	return credited, nil
 }
 
@@ -364,22 +442,26 @@ func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u ty
 	return Deposit{}, false, nil
 }
 
-// recheckPending confirms every credited, non-final deposit still exists on
-// the node with at least its credited depth, and marks it final past the
+// recheckPending confirms every credited, non-final deposit still exists in
+// the node's UTXO set, and marks it final once the node puts it past the
 // horizon. A vanished output is a reorg or a lie; either way the exchange's
-// book now holds a credit with nothing behind it.
-func (m *Monitor) recheckPending(ctx context.Context, tip int64) error {
+// book now holds a credit with nothing behind it. It returns the set of
+// outpoints the ledger reported pending, so the scan can tell a credited
+// outpoint the ledger no longer watches from one still under watch.
+func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 	pending, err := m.Ledger.Pending(ctx)
 	if err != nil {
 		if !ended(ctx, err) {
 			m.alert(AlertLedgerError, "Pending: %v", err)
 		}
-		return err
+		return nil, err
 	}
+	keys := make(map[string]bool, len(pending))
 	for _, d := range pending {
+		keys[outpointKey(d.TxID, d.Vout)] = true
 		out, err := m.Node.GetTxOut(ctx, d.TxID, d.Vout, false)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if out == nil {
 			// gettxout is nil for a SPENT output too. An exchange sweeping its
@@ -391,9 +473,10 @@ func (m *Monitor) recheckPending(ctx context.Context, tip int64) error {
 		if out.Confirmations > types.MaxReorgDepth {
 			if err := m.Ledger.MarkFinal(context.WithoutCancel(ctx), d.TxID, d.Vout); err != nil {
 				m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
-				return err
+				return nil, err
 			}
+			m.markFinal(d.TxID, d.Vout, d.Address)
 		}
 	}
-	return nil
+	return keys, nil
 }
