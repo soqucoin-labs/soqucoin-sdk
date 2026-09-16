@@ -87,6 +87,9 @@ func TestDroppedNotificationIsCoveredByTheReconcile(t *testing.T) {
 		t.Fatalf("initial scan: %v %+v", err, got)
 	}
 
+	sh := idx.scripthash(f.dep)
+	subsBefore := idx.count("blockchain.scripthash.subscribe", sh)
+
 	idx.setDrop(true)
 	f.mineDepositAndBury(t, idx, f.dep)
 	// The server had a change to report and withheld it; without this the
@@ -96,6 +99,12 @@ func TestDroppedNotificationIsCoveredByTheReconcile(t *testing.T) {
 	waitUntil(t, "the reconcile to refresh the address", func() bool { return len(elx.GetUTXOs(f.dep)) == 2 })
 	if sent, _ := idx.notifications(); sent != 0 {
 		t.Fatalf("the server pushed %d notifications after all, so this run did not test the reconcile path", sent)
+	}
+	// The other candidate the comment rules out: a lost connection would
+	// re-subscribe, and the subscribe reply's status would fill the cache
+	// while this scenario still named the reconcile.
+	if n := idx.count("blockchain.scripthash.subscribe", sh); n != subsBefore {
+		t.Fatalf("the address was subscribed again (%d -> %d), so the cache may have been filled by a re-subscribe rather than by the reconcile", subsBefore, n)
 	}
 	got, err := m.Scan(context.Background())
 	if err != nil || len(got) != 1 {
@@ -109,12 +118,15 @@ func TestDroppedNotificationIsCoveredByTheReconcile(t *testing.T) {
 // with no notification ever having been sent.
 //
 // Only the deposit block is mined during the outage. Burying it there too
-// would hold the indexer down for sixty-odd blocks, and the refresher's
-// backoff doubles to a minute across a long outage, so the wait after
-// unpausing would be a race against a schedule the test does not control.
-// The maturity blocks pay the hot wallet and change nothing the deposit
-// address is subscribed to, so mining them after the reconnect tests the same
-// thing.
+// would hold the indexer down for sixty-odd blocks, and the wait after
+// service is restored is set by the refresher's backoff, which doubles.
+// Reconnect attempts fall at 0, 1, 3, 7, 15, 31 and 63 seconds after the
+// loss, and the pass that re-subscribes runs one further step after the
+// attempt that succeeds: so a sub-second outage is answered in about three
+// seconds, and the 30-second bound below holds until the outage itself runs
+// past about fifteen. The maturity blocks pay the hot wallet and change
+// nothing the deposit address is subscribed to, so mining them after the
+// reconnect tests the same thing.
 func TestReconnectResubscribesAndPicksUpTheGap(t *testing.T) {
 	f := setup(t)
 	idx, elx := f.indexer(t, time.Hour, f.dep)
@@ -143,8 +155,8 @@ func TestReconnectResubscribesAndPicksUpTheGap(t *testing.T) {
 	}
 
 	idx.setPaused(false)
-	// The refresher dials on its backoff, which has had one outage step to
-	// climb, so this is a wait on a schedule rather than on a round trip.
+	// A wait on the backoff schedule above, not on a round trip: one step to
+	// the dial that succeeds and one more to the pass that subscribes.
 	waitUpTo(t, 30*time.Second, "the re-subscription", func() bool {
 		return idx.count("blockchain.scripthash.subscribe", sh) == subsBefore+1
 	})

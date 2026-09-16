@@ -226,7 +226,7 @@ Four more cover the push model the `electrumx` client uses: a deposit the indexe
 after the node check with exactly one `listunspent` behind it; a notification the indexer never
 sends, covered by the reconcile pass; an indexer outage across which a deposit is mined, picked up
 from the status in the re-subscribe reply; and one address the indexer fails, skipped and alarmed
-while the others are credited.
+while the other is credited.
 
 The indexer role is played by an in-test block scanner, and for the push scenarios by an in-process
 fake ElectrumX over that scanner, so the harness needs no ElectrumX build. The methods that fake

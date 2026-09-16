@@ -29,12 +29,14 @@ import (
 // altogether.
 //
 // It answers every method electrumx.Client sends, and that is a checked
-// property rather than a claim: the set lives in indexerMethods below and
+// property: the set lives in indexerMethods below, and
 // fake_electrumx_coverage_test.go reads the client's own source for its call
-// sites and fails when one has no handler here. A double that answers six of
-// the client's eight methods is worse than no double, because a scenario that
-// reaches a seventh does not hang — it quietly skips the path and reports
-// success, and this double stands in front of the deposit path that decides
+// sites and fails when one has no handler here. A method the client sends and
+// this double does not answer meets "unknown method", which the client reads
+// as an error from the server, so a scenario reaching that path takes the
+// error branch and reports success without exercising what it names. A double
+// that has drifted from its client is worse than no double, because it is
+// believed, and this one stands in front of the deposit path that decides
 // whether an exchange credits a customer.
 type fakeIndexer struct {
 	t      *testing.T
@@ -81,8 +83,8 @@ type indexerHandler func(f *fakeIndexer, ic *indexerConn, req indexerRequest) (s
 
 // indexerMethods is what this double answers, keyed by method name. The
 // coverage test compares these keys against the methods electrumx.Client
-// sends, so adding a call site there fails the harness until a handler lands
-// here.
+// sends, read from its source, so a call site there with no handler here
+// fails the harness.
 var indexerMethods = map[string]indexerHandler{
 	"server.version":                    (*fakeIndexer).handleVersion,
 	"server.features":                   (*fakeIndexer).handleFeatures,
@@ -95,9 +97,10 @@ var indexerMethods = map[string]indexerHandler{
 }
 
 // scripthashMethods are the methods whose first parameter is a scripthash.
-// Only these are counted and failed per address; server.version's first
-// parameter is the client's version string, and keying the counters on it
-// would have made setFail(addr) collide with a client identifier.
+// The counter key is built from it for these and left empty for the rest, so
+// that a count reads per address. Without this, server.version's counter
+// would be keyed on the client's version string, which is its first
+// parameter, and server.ping's and server.features' on nothing.
 var scripthashMethods = map[string]bool{
 	"blockchain.scripthash.subscribe":   true,
 	"blockchain.scripthash.listunspent": true,
@@ -145,8 +148,8 @@ func (f *fakeIndexer) count(method, sh string) int {
 	return f.counts[method+" "+sh]
 }
 
-// notifications reports how many scripthash notifications the server wrote and
-// how many a drop withheld. A scenario that claims the client learned of a
+// notifications reports how many scripthash notifications the server wrote,
+// counted after the write returned, and how many a drop withheld. A scenario that claims the client learned of a
 // deposit by a push, or in spite of one never arriving, asserts on these
 // rather than on a quiet interval, which only ever meant "the reconcile has
 // not fired yet on this machine".
@@ -220,13 +223,20 @@ func (f *fakeIndexer) tip() int64 {
 	return f.scan.scanned
 }
 
-// utxosFor is the scanner's set for the address behind a scripthash, empty for
-// one the indexer does not track.
+// utxosFor is the scanner's set for the address behind a scripthash.
+//
+// A scripthash the indexer was never given fails the test rather than
+// answering "no outputs". newFakeIndexer and startClientOn take their
+// addresses separately, so a scenario can track an address it forgot to give
+// the fake; answering that with an affirmative empty set is the silent
+// "no deposits" this file exists to keep out of the harness.
 func (f *fakeIndexer) utxosFor(sh string) []types.UTXO {
-	if a, ok := f.byHash[sh]; ok {
-		return f.scan.GetUTXOs(a)
+	a, ok := f.byHash[sh]
+	if !ok {
+		f.t.Errorf("the client asked about scripthash %s, which this indexer was not given; pass the address to newFakeIndexer too", sh)
+		return nil
 	}
-	return nil
+	return f.scan.GetUTXOs(a)
 }
 
 func (f *fakeIndexer) handleVersion(_ *indexerConn, _ indexerRequest) (string, *rpcError) {
@@ -250,8 +260,13 @@ func (f *fakeIndexer) handleHeadersSubscribe(ic *indexerConn, _ indexerRequest) 
 
 func (f *fakeIndexer) handleScripthashSubscribe(ic *indexerConn, req indexerRequest) (string, *rpcError) {
 	sh := firstString(req)
-	st := f.status(sh)
+	// The status is read under the lock that records the subscription. Read
+	// outside it, an advance between the read and the store rescans to a new
+	// status, finds no subscription to notify, and then the store overwrites
+	// its record with the older one: the client is told a status the server
+	// has already moved past and is not told it moved.
 	f.mu.Lock()
+	st := f.status(sh)
 	ic.subs[sh] = st
 	f.mu.Unlock()
 	if st == "" {
@@ -322,8 +337,11 @@ func (f *fakeIndexer) handleGetHistory(_ *indexerConn, req indexerRequest) (stri
 }
 
 // handleBroadcast relays to the harness node, which is what an ElectrumX does.
-// A double that invented a txid here would let a scenario believe a
-// transaction reached a mempool it never entered.
+// No scenario reaches it today: nothing under integration/ calls BroadcastTx,
+// and the withdrawal scenarios broadcast through the node's own RPC. It is
+// here because the client has the call site, and it relays rather than
+// inventing a txid so that the scenario which first does reach it cannot
+// believe a transaction entered a mempool it never entered.
 func (f *fakeIndexer) handleBroadcast(_ *indexerConn, req indexerRequest) (string, *rpcError) {
 	raw := firstString(req)
 	txid, err := f.scan.node.rpc.SendRawTransaction(context.Background(), raw)
@@ -437,14 +455,15 @@ func (f *fakeIndexer) advance() {
 	tip := f.tip()
 
 	type outgoing struct {
-		ic   *indexerConn
-		line string
+		ic     *indexerConn
+		line   string
+		notify bool // a scripthash notification, as opposed to a header
 	}
 	var lines []outgoing
 	f.mu.Lock()
 	for _, ic := range f.conns {
 		if ic.headers {
-			lines = append(lines, outgoing{ic, fmt.Sprintf(`{"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[{"height":%d,"hex":"00"}]}`, tip)})
+			lines = append(lines, outgoing{ic, fmt.Sprintf(`{"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[{"height":%d,"hex":"00"}]}`, tip), false})
 		}
 		for sh, last := range ic.subs {
 			st := f.status(sh)
@@ -460,14 +479,23 @@ func (f *fakeIndexer) advance() {
 			if st != "" {
 				stJSON = fmt.Sprintf("%q", st)
 			}
-			f.notified++
-			lines = append(lines, outgoing{ic, fmt.Sprintf(`{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":[%q,%s]}`, sh, stJSON)})
+			lines = append(lines, outgoing{ic, fmt.Sprintf(`{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":[%q,%s]}`, sh, stJSON), true})
 		}
 	}
 	f.mu.Unlock()
 
+	// Counted after the write returns, so notifications() reports what the
+	// server put on a socket and not what it queued: a connection that closes
+	// between the gather and the write would otherwise be recorded as a push
+	// the client never received.
 	for _, o := range lines {
-		_ = o.ic.write(o.line)
+		err := o.ic.write(o.line)
+		if err != nil || !o.notify {
+			continue
+		}
+		f.mu.Lock()
+		f.notified++
+		f.mu.Unlock()
 	}
 }
 

@@ -248,7 +248,7 @@
       "test": "TestTheFakeIndexerAnswersEveryMethodTheClientSends",
       "find": "\t\"blockchain.transaction.broadcast\":  (*fakeIndexer).handleBroadcast,",
       "replace": "\t\"blockchain.transaction.broadcast.absent\": (*fakeIndexer).handleBroadcast,",
-      "why": "The push scenarios believe the fake indexer, so it has to answer every method electrumx.Client sends. The branch this harness came from was cut before the client grew blockchain.scripthash.get_history and blockchain.transaction.broadcast, and nothing failed: a scenario that reaches either meets 'unknown method', takes the error path and reports success without exercising the path it names. A double that has drifted from its client is worse than no double, because it is believed."
+      "why": "The push scenarios believe the fake indexer, so it has to answer every method electrumx.Client sends. A method the client sends and the fake does not answer meets 'unknown method', which the client reads as an error from the server, so a scenario reaching that path takes the error branch and reports success without exercising what it names. A double that has drifted from its client is worse than no double, because it is believed."
     }
   ]
 }
