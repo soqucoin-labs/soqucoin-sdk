@@ -239,6 +239,46 @@
       "find": "\tks, err := strictDecode(data)",
       "replace": "\tm.seenFile.Store(true)\n\tks, err := strictDecode(data)",
       "why": "The bit that lets Save overwrite is set where a load succeeds, not where the file is read. A load that got the bytes and then failed to decrypt them knows less about the keystore than one that never opened it, and it is the state an operator retries from. Setting it on the read lets that manager write an empty keystore over a populated one, which is the defect the guard exists for."
+    },
+    {
+      "id": "harness-fake-indexer-lacks-a-method-the-client-sends",
+      "file": "integration/fake_electrumx_test.go",
+      "package": "./integration",
+      "tags": "integration",
+      "test": "TestTheFakeIndexerAnswersEveryMethodTheClientSends",
+      "find": "\t\"blockchain.transaction.broadcast\":  (*fakeIndexer).handleBroadcast,",
+      "replace": "\t\"blockchain.transaction.broadcast.absent\": (*fakeIndexer).handleBroadcast,",
+      "why": "The push scenarios believe the fake indexer, so it has to answer every method electrumx.Client sends. A method the client sends and the fake does not answer meets 'unknown method', which the client reads as an error from the server, so a scenario reaching that path takes the error branch and reports success without exercising what it names. A double that has drifted from its client is worse than no double, because it is believed."
+    },
+    {
+      "id": "harness-call-site-reading-skips-a-caller-that-forwards-nothing",
+      "file": "integration/callsites_test.go",
+      "package": "./integration",
+      "tags": "integration",
+      "test": "TestTheCallSiteReadingSeesEveryShape",
+      "find": "var forwarders = map[string]bool{\"Call\": true, \"call\": true}",
+      "replace": "var forwarders = map[string]bool{\"Call\": true, \"call\": true, \"callGen\": true}",
+      "why": "The forwarder skip drops a whole function body. Only Call and call forward a method parameter to another caller; callGen and callLocked go to sendLocked and await, so skipping either hides every real call site in its body and the fake can fall behind the client with the coverage test green."
+    },
+    {
+      "id": "harness-call-site-reading-skips-by-name-without-the-receiver",
+      "file": "integration/callsites_test.go",
+      "package": "./integration",
+      "tags": "integration",
+      "test": "TestTheCallSiteReadingSeesEveryShape",
+      "find": "\treturn receiverTypeName(fn) == recvType",
+      "replace": "\treturn true",
+      "why": "The forwarder skip is keyed on the receiver type as well as the method name. Without the receiver test, any method called call or Call on any type in the package hides every call site in its body."
+    },
+    {
+      "id": "harness-call-site-reading-reads-only-function-declarations",
+      "file": "integration/callsites_test.go",
+      "package": "./integration",
+      "tags": "integration",
+      "test": "TestTheCallSiteReadingSeesEveryShape",
+      "find": "\t\t\tif fn, ok := decl.(*ast.FuncDecl); ok && isForwarder(fn, recvType) {\n\t\t\t\tcontinue\n\t\t\t}",
+      "replace": "\t\t\tfn, isFunc := decl.(*ast.FuncDecl)\n\t\t\tif !isFunc || isForwarder(fn, recvType) {\n\t\t\t\tcontinue\n\t\t\t}",
+      "why": "Every declaration is walked, not only the function declarations: a package-level function literal lives in a GenDecl, and a reading that filters to FuncDecl never sees the call sites inside one."
     }
   ]
 }

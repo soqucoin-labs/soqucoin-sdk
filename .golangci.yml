@@ -1,5 +1,12 @@
 version: "2"
 
+# The integration harness is behind a build tag, so without this the linter
+# parses none of it and the floor stops at the package boundary of the tests
+# that drive the deposit and withdrawal paths end to end.
+run:
+  build-tags:
+    - integration
+
 # A static-analysis floor. It catches the duller class the eye slides over —
 # unchecked errors, dead assignments, nil paths, permissive file modes — and it
 # does not catch contract or scheduling defects, which are pinned by the model

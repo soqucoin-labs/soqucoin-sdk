@@ -16,8 +16,8 @@ fuzz:
 	go test ./tx -run '^$$' -fuzz FuzzBuildSendNeverPanicsAndNeverOverpays -fuzztime 30s
 
 # The self-serve integration harness: a throwaway regtest node, real deposit and
-# withdrawal flows, nine scenarios, about 45 seconds. Needs a soqucoind build
-# (v2.3.0 or later) on PATH or in SOQUCOIND.
+# withdrawal flows, thirteen scenarios, about 70 seconds. Needs a soqucoind
+# build (v2.3.0 or later) on PATH or in SOQUCOIND.
 SOQUCOIND ?= $(shell command -v soqucoind 2>/dev/null)
 integration:
 	@test -n "$(SOQUCOIND)" || { echo "set SOQUCOIND=/path/to/soqucoind (regtest-capable, v2.3.0+)"; exit 1; }

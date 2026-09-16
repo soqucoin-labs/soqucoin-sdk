@@ -13,10 +13,18 @@
 // broadcast and confirmed, a lost broadcast reply survived without a second
 // transaction, two withdrawals that cannot share an input, refused inputs, a
 // reorganisation that removes a credited deposit, retries past the reservation
-// TTL, a txid mismatch, and a broadcast cancelled while the node holds the
-// reply. The indexer role is played
-// by a small in-test block scanner so the harness needs no ElectrumX; the
-// ElectrumX fork is exercised by the electrumx package's protocol tests.
+// TTL, a txid mismatch, a broadcast cancelled while the node holds the reply,
+// and the push model: a deposit the indexer pushes, a notification it drops, a
+// reconnect across an outage, and one address it fails.
+//
+// The indexer role is played by a small in-test block scanner, and for the
+// push scenarios by an in-process fake ElectrumX over that scanner
+// (fake_electrumx_test.go), so the harness needs no ElectrumX build. That
+// fake is a test double in front of the deposit path, so the methods it
+// answers are checked against the client's own call sites
+// (fake_electrumx_coverage_test.go) rather than asserted in a comment. The
+// ElectrumX fork's wire behaviour is exercised by the electrumx package's
+// protocol tests.
 package integration
 
 import (

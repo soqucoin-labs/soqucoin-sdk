@@ -213,7 +213,7 @@ SOQUCOIND=/path/to/soqucoind make integration   # a soqucoind build, v2.3.0 or l
 ```
 
 The harness starts a throwaway regtest node, mines to SDK-generated addresses, and drives the same
-`deposit` and `withdraw` packages this guide uses through nine scenarios: a deposit credited only
+`deposit` and `withdraw` packages this guide uses through thirteen scenarios: a deposit credited only
 after the node confirms it, a withdrawal built, signed, broadcast, mined and confirmed, a lost
 broadcast reply survived with exactly one payment, two withdrawals that cannot share an input,
 refused inputs (a USDSOQ-form destination, an amount below the relay floor, a fee-rate typo) that
@@ -221,8 +221,18 @@ never reach the node, a reorganisation that removes a credited deposit and raise
 retries past the reservation TTL that keep their inputs, a node that accepts the bytes under a
 different txid with the inputs held, and a broadcast whose context is cancelled while the node
 holds the reply, recovered after a restart with exactly one payment.
-The indexer role is played by an in-test block scanner, so the harness needs no ElectrumX; the
-ElectrumX client is exercised by its own protocol tests against a scripted server.
+
+Four more cover the push model the `electrumx` client uses: a deposit the indexer pushes, credited
+after the node check with exactly one `listunspent` behind it; a notification the indexer never
+sends, covered by the reconcile pass; an indexer outage across which a deposit is mined, picked up
+from the status in the re-subscribe reply; and one address the indexer fails, skipped and alarmed
+while the other is credited.
+
+The indexer role is played by an in-test block scanner, and for the push scenarios by an in-process
+fake ElectrumX over that scanner, so the harness needs no ElectrumX build. The methods that fake
+answers are checked against the client's own call sites, because a double that has drifted from its
+client is believed rather than noticed. The ElectrumX client's wire behaviour is exercised by its
+own protocol tests against a scripted server.
 
 ---
 
