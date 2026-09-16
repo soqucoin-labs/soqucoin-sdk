@@ -76,6 +76,16 @@ type plaintextKey struct {
 	Index      uint32 `json:"index"`
 }
 
+// String and Format keep the guarantee KeyPair makes: this type exists only to
+// hold private keys, and it is passed between two files, so a struct dump that
+// reaches one must not print 2560 bytes of key material. The reasoning and the
+// two shapes fmt prints raw regardless are on KeyPair.Format.
+func (k plaintextKey) String() string {
+	return fmt.Sprintf("keys.plaintextKey{Address: %s, PubKeyHash: %s, Index: %d}", k.Address, PubKeyHashHex(k.PublicKey), k.Index)
+}
+
+func (k plaintextKey) Format(f fmt.State, verb rune) { _, _ = io.WriteString(f, k.String()) }
+
 type plaintextKeys struct {
 	Keys []plaintextKey `json:"keys"`
 }
@@ -270,15 +280,21 @@ func (m *Manager) load(create bool) error {
 		return m.saveLocked()
 	}
 
-	// Unknown fields are refused rather than dropped. What the AEAD binds is
-	// the canonical re-encoding of the fields this build knows (headerAAD),
-	// so a field it does not know would sit in the file unauthenticated while
-	// the header claimed to be tamper-evident.
+	// Unknown fields are refused rather than dropped, and so is anything after
+	// the object. What the AEAD binds is the canonical re-encoding of the
+	// fields this build knows (headerAAD), so any other content would sit in
+	// the file unauthenticated while the header claimed to be tamper-evident.
+	// The end-of-stream check is not redundant: a Decoder reads one value and
+	// ignores the rest of the input, where json.Unmarshal refuses it.
 	var ks Keystore
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&ks); err != nil {
 		return fmt.Errorf("parse keystore: %w", err)
+	}
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("parse keystore: content after the keystore object")
 	}
 
 	// The additional data is the header as the file carries it, so it is
@@ -366,9 +382,12 @@ func (m *Manager) Save() error {
 func (m *Manager) saveLocked() error {
 	// Serialize key material
 	// plaintextKey is KeyPair's fields under the tags the ciphertext uses, so
-	// the conversion is the whole mapping. A field added to either type stops
-	// it compiling, which is the point at which the two formats should be
-	// thought about rather than kept in step by hand.
+	// the conversion is the whole mapping. Adding or removing a field on
+	// either type stops it compiling, which is the point at which the two
+	// formats should be thought about rather than kept in step by hand.
+	// Reordering two fields of the same type would still compile and would
+	// exchange them; checkKeyRecord refuses the result on the next Load,
+	// because the public key would not derive from the private one.
 	pk := plaintextKeys{}
 	for _, k := range m.keys {
 		pk.Keys = append(pk.Keys, plaintextKey(k))

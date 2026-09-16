@@ -3,8 +3,11 @@ package keys
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -295,31 +298,35 @@ func TestKDFParamsOutsideTheRangeAreRefused(t *testing.T) {
 	}
 }
 
-// Every field of the header is refused when it is edited, and this records
-// which mechanism does the refusing, because they are not the same strength
-// and only one case turns out to rest on the binding alone. Editing the salt
-// or the parameters changes the derived key; editing the nonce or the
-// ciphertext changes the message; the version and the KDF are read by the
-// header check; and the public key list is compared against the decrypted
-// records, which is the check that also covers version 1. What is left for
-// the additional data alone is a file that claims to be version 1 in order to
-// be opened with none. For a case marked byBinding the test proves the claim
-// rather than asserting it, by showing the edited header still passes the
-// header check and still derives the same key.
+// Every field of the header is refused when it is edited, and each case
+// declares which guard does the refusing, because they are not the same
+// strength. Editing the salt or the parameters changes the derived key;
+// editing the nonce or the ciphertext changes what the AEAD is given; the
+// version and an unknown KDF are read by the header check; naming the other
+// key source is caught by the comparison in deriveKey; and the public key list
+// is compared against the decrypted records, which is the guard that also
+// covers version 1.
 //
-// The binding is therefore defence in depth for every field but that one.
-// That is worth keeping and worth stating: it makes "the header is
-// authenticated" one property of the format instead of a conclusion drawn
-// from five separate checks all staying in place.
+// The declaration is checked rather than trusted. refusalMechanism re-runs
+// load's questions in load's order and returns the guard that fires first, and
+// the declared field list is compared against the edit that was actually made,
+// so a case can neither claim a mechanism it does not exercise nor claim a
+// field it leaves alone.
 //
-// The declared field list is compared against the edit that was actually
-// made, so a case cannot claim to cover a field it leaves alone.
+// Most fields are covered twice over, and on a version 2 file the binding
+// usually fires first. That is worth keeping and worth stating plainly: the
+// binding makes "the header is authenticated" one property of the format
+// rather than a conclusion drawn from five separate guards all staying in
+// place. TestSwappedPublicKeyListIsRefused is where the list check is the
+// guard on its own, on version 1, which binds nothing.
 const (
+	byParse       = "the parser"
 	byHeaderCheck = "the header check"
+	byKeySource   = "the key source comparison"
 	byDerivedKey  = "a different derived key"
-	byMessage     = "a different message"
-	byListCheck   = "the public key list check"
+	byMessage     = "a different AEAD input"
 	byBinding     = "the bound header"
+	byListCheck   = "the public key list check"
 )
 
 func TestEveryHeaderFieldIsTamperEvident(t *testing.T) {
@@ -337,7 +344,7 @@ func TestEveryHeaderFieldIsTamperEvident(t *testing.T) {
 			h["version"] = 1
 			delete(h, "kdfparams")
 		}, nil},
-		{[]string{"kdf", "kdfparams"}, "another key source", byHeaderCheck, func(h map[string]any) {
+		{[]string{"kdf", "kdfparams"}, "another key source", byKeySource, func(h map[string]any) {
 			h["kdf"] = KDFHKDFSHA256
 			delete(h, "kdfparams")
 		}, ErrKDFMismatch},
@@ -355,7 +362,7 @@ func TestEveryHeaderFieldIsTamperEvident(t *testing.T) {
 			func(h map[string]any) { h["nonce"] = "" }, ErrKeystoreHeader},
 		{[]string{"ciphertext"}, "an edited ciphertext", byMessage,
 			func(h map[string]any) { h["ciphertext"] = flipFirstByte(t, h["ciphertext"]) }, nil},
-		{[]string{"pubkeys"}, "the operator's copy of the address swapped", byListCheck,
+		{[]string{"pubkeys"}, "the operator's copy of the address swapped", byBinding,
 			func(h map[string]any) {
 				h["pubkeys"].([]any)[0].(map[string]any)["address"] = v1FixtureAddresses[0]
 			}, nil},
@@ -373,8 +380,8 @@ func TestEveryHeaderFieldIsTamperEvident(t *testing.T) {
 			if got := changedFields(t, path, before); !reflect.DeepEqual(got, sorted(tc.fields)) {
 				t.Fatalf("the edit changed %v, the case declares %v", got, sorted(tc.fields))
 			}
-			if tc.by == byBinding {
-				assertRefusedOnlyByTheBinding(t, path, before, m)
+			if got := refusalMechanism(t, path, before, m); got != tc.by {
+				t.Errorf("refused by %s, the case declares %s", got, tc.by)
 			}
 
 			loader := NewManager(path, "pw")
@@ -399,36 +406,85 @@ func TestEveryHeaderFieldIsTamperEvident(t *testing.T) {
 	}
 }
 
-// assertRefusedOnlyByTheBinding establishes that nothing except the additional
-// data can be what refuses this edit: the edited header passes the header
-// check, and it derives the same encryption key as the file did before the
-// edit. Remove the binding and the file would open.
-func assertRefusedOnlyByTheBinding(t *testing.T, path string, before Keystore, m *Manager) {
+// refusalMechanism works out which guard refuses the file at path, by running
+// the same questions load runs, in the order load runs them, against the file
+// before and after the edit. It is derived rather than declared: a case in the
+// table above cannot claim a mechanism that is not the one doing the work, and
+// a case nothing refuses is reported as such instead of passing because some
+// other guard happened to catch it.
+func refusalMechanism(t *testing.T, path string, before Keystore, m *Manager) string {
 	t.Helper()
-	after := readKeystore(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := decodeKeystore(data)
+	if err != nil {
+		return byParse
+	}
+	aad, err := aadFor(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wasAAD, err := aadFor(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	normalise := func(ks Keystore) *Keystore {
 		if ks.Version == keystoreVersionV1 {
 			if err := upgradeV1(&ks); err != nil {
-				t.Fatalf("the edited header is not readable at all: %v", err)
+				return nil
 			}
 		}
 		return &ks
 	}
-	edited, original := normalise(after), normalise(before)
-	if err := checkHeader(edited); err != nil {
-		t.Fatalf("the edited header is refused by the header check, so this case does not test the binding: %v", err)
+	edited := normalise(after)
+	if edited == nil {
+		return byHeaderCheck
 	}
-	wantKey, err := m.deriveKey(original)
+	if err := checkHeader(edited); err != nil {
+		return byHeaderCheck
+	}
+
+	editedKey, err := m.deriveKey(edited)
+	if errors.Is(err, ErrKDFMismatch) {
+		return byKeySource
+	}
+	if err != nil {
+		return byHeaderCheck
+	}
+	originalKey, err := m.deriveKey(normalise(before))
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotKey, err := m.deriveKey(edited)
-	if err != nil {
-		t.Fatalf("the edited header derives no key, so this case does not test the binding: %v", err)
+	if !bytes.Equal(editedKey, originalKey) {
+		return byDerivedKey
 	}
-	if !bytes.Equal(gotKey, wantKey) {
-		t.Fatal("the edited header derives a different key, so this case does not test the binding")
+	if !bytes.Equal(after.Nonce, before.Nonce) || !bytes.Equal(after.Ciphertext, before.Ciphertext) {
+		return byMessage
 	}
+	if !bytes.Equal(aad, wasAAD) {
+		return byBinding
+	}
+	return byListCheck
+}
+
+// decodeKeystore parses a keystore file the way load does, so a test can tell
+// a parser refusal from a later one.
+func decodeKeystore(data []byte) (Keystore, error) {
+	var ks Keystore
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ks); err != nil {
+		return Keystore{}, err
+	}
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return Keystore{}, errors.New("content after the keystore object")
+	}
+	return ks, nil
 }
 
 // changedFields is the sorted set of top-level header fields whose value
@@ -838,9 +894,15 @@ func TestKeystoreFieldSetIsFrozen(t *testing.T) {
 
 // The exact bytes the AEAD binds for a known version 2 header. A change here
 // is a change to the format, whatever produced it: a renamed tag, a reordered
-// field, a different encoding of a byte slice. Paired with
-// TestKeystoreFieldSetIsFrozen and the committed version 2 fixture, this is
-// what keeps a later release able to open the files this one wrote.
+// field, a different encoding of a byte slice. The entry in PubKeys is what
+// extends that to KeyPair, whose tags the outer field set does not describe;
+// the vector also shows the private key staying out of the bound data, where
+// KeyPair's `json:"-"` puts it.
+//
+// Three tests hold the format together and each catches something the others
+// do not: this one the encoding, TestKeystoreFieldSetIsFrozen the outer field
+// set, and TestV2KeystoreFromAnEarlierBuildStillOpens a real file written by
+// another build.
 func TestHeaderAADIsFrozenForVersion2(t *testing.T) {
 	ks := Keystore{
 		Version:    keystoreVersion,
@@ -849,11 +911,20 @@ func TestHeaderAADIsFrozenForVersion2(t *testing.T) {
 		Salt:       bytes.Repeat([]byte{0xA1}, saltSize),
 		Nonce:      bytes.Repeat([]byte{0xB2}, nonceSize),
 		Ciphertext: bytes.Repeat([]byte{0xC3}, 8),
-		PubKeys:    []KeyPair{},
+		// One entry, so the vector pins KeyPair's own tags and field order as
+		// well as the outer ones. A public key of four bytes keeps the vector
+		// readable; headerAAD encodes, it does not validate.
+		PubKeys: []KeyPair{{
+			PrivateKey: bytes.Repeat([]byte{0xD4}, 4),
+			PublicKey:  bytes.Repeat([]byte{0xE5}, 4),
+			Address:    "ssq1pgoldenvector",
+			Index:      7,
+		}},
 	}
 	const want = `{"version":2,"kdf":"argon2id","kdfparams":{"t":3,"m":65536,"p":4,"keylen":32},` +
 		`"salt":"oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE=",` +
-		`"nonce":"srKysrKysrKysrKy","ciphertext":null,"pubkeys":[]}`
+		`"nonce":"srKysrKysrKysrKy","ciphertext":null,` +
+		`"pubkeys":[{"pubkey":"5eXl5Q==","address":"ssq1pgoldenvector","index":7}]}`
 	got, err := headerAAD(ks)
 	if err != nil {
 		t.Fatalf("headerAAD: %v", err)
@@ -863,20 +934,70 @@ func TestHeaderAADIsFrozenForVersion2(t *testing.T) {
 	}
 }
 
-// A field this build does not know is refused rather than dropped. Dropping it
-// would leave it in the file unauthenticated while the header claimed to be
-// tamper-evident.
-func TestUnknownHeaderFieldIsRefused(t *testing.T) {
+// Content this build does not know is refused rather than dropped, whether it
+// sits inside the object or after it. Either way it would be in the file and
+// outside everything the header's tamper-evidence covers. The second case is
+// its own test and not a variation on the first: a Decoder reads one value and
+// ignores whatever follows, so refusing unknown fields does not refuse this.
+func TestContentThisBuildDoesNotKnowIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(t *testing.T, path string)
+	}{
+		{"a field inside the object", func(t *testing.T, path string) {
+			editHeader(t, path, func(h map[string]any) { h["note"] = "added after the fact" })
+		}},
+		{"a field inside a public key entry", func(t *testing.T, path string) {
+			editHeader(t, path, func(h map[string]any) {
+				h["pubkeys"].([]any)[0].(map[string]any)["label"] = "hot wallet"
+			})
+		}},
+		{"another object after it", func(t *testing.T, path string) {
+			appendToFile(t, path, []byte(`{"note":"appended"}`))
+		}},
+		{"bytes after it", func(t *testing.T, path string) {
+			appendToFile(t, path, []byte{0x00, 0xFF})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "keys.enc")
+			saveOneKey(t, NewManager(path, "pw"))
+			tc.break_(t, path)
+
+			m := NewManager(path, "pw")
+			if err := m.Load(); err == nil {
+				t.Fatal("Load accepted a keystore carrying content this build does not know")
+			}
+			if m.KeyCount() != 0 {
+				t.Error("manager holds keys after a refused Load")
+			}
+		})
+	}
+}
+
+// A trailing newline is not content: a file an editor has touched still opens.
+func TestTrailingWhitespaceIsNotContent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keys.enc")
-	saveOneKey(t, NewManager(path, "pw"))
-	editHeader(t, path, func(h map[string]any) { h["note"] = "added after the fact" })
+	addr, _ := saveOneKey(t, NewManager(path, "pw"))
+	appendToFile(t, path, []byte("\n\n  \t"))
 
 	m := NewManager(path, "pw")
-	if err := m.Load(); err == nil {
-		t.Fatal("Load accepted a keystore carrying an unknown field")
+	if err := m.Load(); err != nil {
+		t.Fatalf("Load of a keystore with a trailing newline: %v", err)
 	}
-	if m.KeyCount() != 0 {
-		t.Error("manager holds keys after a refused Load")
+	if !m.HasKey(addr) {
+		t.Error("the keystore did not yield its key")
+	}
+}
+
+func appendToFile(t *testing.T, path string, extra []byte) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, extra...), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1057,5 +1178,30 @@ func TestTheHeaderIsBoundIntoTheCiphertext(t *testing.T) {
 	}
 	if err := open(other); err == nil {
 		t.Error("the ciphertext opens under an altered header; the header is not bound")
+	}
+}
+
+// plaintextKey exists only to hold private keys, and it is handed between two
+// files, so the guarantee KeyPair makes has to hold for it as well: no fmt
+// verb prints key material. Without it a struct dump of what came out of the
+// ciphertext writes 2560 bytes of private key to a log.
+func TestPlaintextKeyPrintingRedactsThePrivateKey(t *testing.T) {
+	kp, err := GenerateKeyForNetwork("ssq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := plaintextKey(*kp)
+	secret := hex.EncodeToString(k.PrivateKey[:16])
+
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%d", "%x", "%q"} {
+		for _, subject := range []any{k, &k, []plaintextKey{k}, plaintextKeys{Keys: []plaintextKey{k}}} {
+			out := fmt.Sprintf(verb, subject)
+			if strings.Contains(out, secret) {
+				t.Errorf("%s of %T printed private key bytes", verb, subject)
+			}
+			if !strings.Contains(out, k.Address) {
+				t.Errorf("%s of %T did not print the address: %s", verb, subject, out)
+			}
+		}
 	}
 }

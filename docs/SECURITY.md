@@ -156,7 +156,11 @@ break; putting them there is only safe with the rules below.
   version 1 keystore this check carries that list on its own.
 
 Version 1 keystores, written by v0.3.6 and earlier, are read as before and
-rewritten as version 2 by the next `Save`. Nothing is required of you; opening
+rewritten as version 2 by the next `Save`. One tightening applies to them too:
+a file carrying a field this release does not recognise, or anything after the
+JSON object, is refused rather than ignored. Nothing the SDK has ever written
+carries either, so this reaches only a file something else annotated; the error
+names the field, and removing it restores the file. Nothing is required of you; opening
 one yields the same keys and the same addresses. Reading alone does not rewrite,
 so a process that only loads leaves the file as it found it. Version 1 is
 passphrase-only, so open it with `keys.NewManager`.

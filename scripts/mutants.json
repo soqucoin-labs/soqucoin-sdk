@@ -199,10 +199,19 @@
       "id": "keystore-unknown-header-field-accepted",
       "file": "keys/keys.go",
       "package": "./keys",
-      "test": "TestUnknownHeaderFieldIsRefused",
+      "test": "TestContentThisBuildDoesNotKnowIsRefused",
       "find": "\tdec.DisallowUnknownFields()",
       "replace": "\t_ = dec",
       "why": "What the AEAD binds is the canonical re-encoding of the fields this build knows. A field it does not know would be dropped on the way in and never authenticated, so the file would carry content the header's tamper-evidence does not cover."
+    },
+    {
+      "id": "keystore-content-after-the-object-accepted",
+      "file": "keys/keys.go",
+      "package": "./keys",
+      "test": "TestContentThisBuildDoesNotKnowIsRefused",
+      "find": "\tif err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {",
+      "replace": "\tif err := dec.Decode(&trailing); !errors.Is(err, err) {",
+      "why": "A json.Decoder reads one value and ignores whatever follows it, where json.Unmarshal refuses it. Without this the refusal of unknown fields covers only the inside of the object, and bytes appended to the file sit outside everything the header's tamper-evidence covers."
     }
   ]
 }
