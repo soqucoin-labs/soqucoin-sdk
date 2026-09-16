@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -50,8 +51,8 @@ const snapshotName = "snapshot.json"
 
 // EnsureDir creates a directory with mode 0700 and refuses one that is
 // readable or writable by anyone else. The snapshot tells the signer what to
-// spend and the intent files tell it what to sign, so a directory another
-// account can write is an open door to both.
+// spend and the intent files tell it what to sign, so another account with
+// write access to this directory chooses both.
 func EnsureDir(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
@@ -75,6 +76,11 @@ var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // ErrBadID is returned for an id that cannot be a file name in the store.
 var ErrBadID = errors.New("split: intent id is not usable as a file name")
+
+// ErrIDMismatch is returned when a file's name and the id inside it disagree,
+// which a case-folding filesystem produces from two ids that differ only in
+// case.
+var ErrIDMismatch = errors.New("split: the file name and the record's id disagree")
 
 // CheckID returns nil when id may be used as a store file name.
 func CheckID(id string) error {
@@ -145,17 +151,25 @@ func (s *DirStore) Get(_ context.Context, id string) (*withdraw.Intent, bool, er
 		// record is never treated as "no such withdrawal".
 		return nil, false, fmt.Errorf("parse intent %s: %w", id, err)
 	}
+	if in.ID != id {
+		// The file name and the record disagree. APFS, NTFS and most SMB
+		// shares fold case, so a read of W1.json can answer with w1.json, and
+		// a Store that returned it would report one withdrawal as another:
+		// Submit would take the second as already submitted and never pay it.
+		return nil, false, fmt.Errorf("%w: %s holds the record of %s", ErrIDMismatch, s.file(id), in.ID)
+	}
 	return &in, true, nil
 }
 
 // Put implements withdraw.Store. The record is on disk, and its directory
 // entry synced, before it returns nil.
 //
-// Unlike withdraw.FileStore there is nothing to roll back: this store keeps no
-// map, so a write that failed after the rename leaves the file holding the new
-// record and no memory to contradict it. The error still says durability is
-// unconfirmed, and the caller still treats the intent as unsaved, which for a
-// Built intent means the engine releases the inputs and builds again.
+// Unlike withdraw.FileStore there is nothing to roll back, because this store
+// keeps no map. A write that failed after the rename leaves the file holding
+// the new record, and the error wraps withdraw.ErrWrittenNotDurable to say so:
+// the record is in the store and only its durability is unconfirmed. A Built
+// intent then keeps its inputs reserved, because the broadcaster reads the
+// same file and will send it.
 func (s *DirStore) Put(_ context.Context, in *withdraw.Intent) error {
 	if err := CheckID(in.ID); err != nil {
 		return err
@@ -195,6 +209,12 @@ func (s *DirStore) List(_ context.Context, states ...withdraw.State) ([]*withdra
 		var in withdraw.Intent
 		if err := json.Unmarshal(data, &in); err != nil {
 			return nil, fmt.Errorf("parse intent file %s: %w", name, err)
+		}
+		if name != s.file(in.ID) {
+			// The same disagreement Get refuses. Here it would hand the engine
+			// two entries for one record, or one record under a name no Get
+			// will ever resolve to it.
+			return nil, fmt.Errorf("%w: %s holds the record of %s", ErrIDMismatch, name, in.ID)
 		}
 		if len(want) == 0 || want[in.State] {
 			cp := in
@@ -242,16 +262,21 @@ func replaceFile(path string, data []byte, perm os.FileMode) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return fail("rename", err)
 	}
+	if runtime.GOOS == "windows" {
+		// Syncing a directory handle fails there; the file sync above has run.
+		// The SDK's own replace step makes the same exception.
+		return nil
+	}
 	// filepath.Clean, although filepath.Dir above already returned a clean
 	// path: it is what the static-analysis floor reads to see that the name
 	// opened here is the directory of the file just written.
 	d, err := os.Open(filepath.Clean(dir))
 	if err != nil {
-		return fmt.Errorf("open directory of %s: %w", path, err)
+		return fmt.Errorf("open directory of %s: %w: %w", path, withdraw.ErrWrittenNotDurable, err)
 	}
 	defer func() { _ = d.Close() }()
 	if err := d.Sync(); err != nil {
-		return fmt.Errorf("sync directory of %s: %w", path, err)
+		return fmt.Errorf("sync directory of %s: %w: %w", path, withdraw.ErrWrittenNotDurable, err)
 	}
 	return nil
 }

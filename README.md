@@ -40,7 +40,7 @@ ports, sizing and the indexer are in the guide's
 The node behaves as an ordinary Bitcoin-style JSON-RPC daemon, and the post-quantum specifics are
 confined to signature construction, which this SDK handles.
 
-â ï¸ **ElectrumX is required.** With the node wallet disabled there is no address index to query, so
+⚠️ **ElectrumX is required.** With the node wallet disabled there is no address index to query, so
 deposit monitoring reads from an ElectrumX indexer. Upstream ElectrumX ships no Soqucoin coin
 definition, so we publish a fork:
 
@@ -223,7 +223,7 @@ Soqucoin uses **NIST FIPS 204 ML-DSA-44** (formerly CRYSTALS-Dilithium) for all 
 Key properties:
 - **Public key size:** 1,312 bytes
 - **Signature size:** 2,420 bytes
-- **Security level:** NIST Level 2 (â¥128-bit quantum security)
+- **Security level:** NIST Level 2 (≥128-bit quantum security)
 - **Standard:** [FIPS 204](https://csrc.nist.gov/pubs/fips/204/final) (August 2024)
 
 ## Examples
@@ -236,7 +236,7 @@ See the [`examples/`](./examples) directory:
 - [`pool_payout`](./examples/pool_payout): Batch payouts with circuit breaker
 - [`consolidate`](./examples/consolidate): Merge the smallest final outputs into one at the hot wallet, through `tx.BuildSignedSweep` against your own node
 - [`stagenet_withdrawal`](./examples/stagenet_withdrawal): The withdrawal recorded in [VERIFICATION.md](docs/VERIFICATION.md), through `withdraw.Engine` against your own node
-- [`exchange_split`](./examples/exchange_split): The same withdrawal path as three processes — a watcher with the node credential, a signer with the key and no network access, a broadcaster that sends — sharing one directory
+- [`exchange_split`](./examples/exchange_split): The same withdrawal path as three processes sharing one directory: a watcher with the node credential, a signer that holds the key and opens no socket, and a broadcaster that sends
 
 ## Contributing
 
@@ -252,4 +252,4 @@ go test ./...
 
 MIT, see [LICENSE](LICENSE).
 
-Copyright Â© 2026 [Soqucoin Labs Inc.](https://soqucoin.com)
+Copyright © 2026 [Soqucoin Labs Inc.](https://soqucoin.com)

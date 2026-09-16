@@ -1,4 +1,4 @@
-# exchange_split — the withdrawal path as three processes
+# exchange_split: the withdrawal path as three processes
 
 Every other example in this repository is one binary that holds everything: the
 node's RPC credential, the indexer's address and the key. This one is the same
@@ -8,7 +8,7 @@ nothing else.
 | Process | Holds | Writes | Transitions it owns |
 |---|---|---|---|
 | `watcher` | node RPC credential, indexer address. No key | accepted requests, `snapshot.json` | → `Created` |
-| `signer` | the keystore. **No network access of any kind** | intent files | `Created` → `Built` |
+| `signer` | the keystore. **No socket, no credential** | intent files | `Created` → `Built` |
 | `broadcaster` | node RPC credential. No key | intent files | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed` |
 
 The processes never speak to each other. Each reads the files the others left
@@ -17,8 +17,10 @@ nothing listening on the signer's host.
 
 ## What the split buys, and what it does not
 
-The key is on a host with no path to the network, and the host that can send
-has no key. Compromising the broadcaster spends nothing that is not already
+The signer opens no socket and holds no credential, and the process that can
+send holds no key. The signer's host still reaches the shared directory, over a
+mount if the three run on three machines, and that mount is the whole of its
+exposure. Compromising the broadcaster spends nothing that is not already
 signed and waiting; compromising the watcher offers the signer inputs that do
 not exist, which the node then refuses.
 
@@ -38,13 +40,18 @@ selects from the snapshot the watcher publishes.
 <dir>/snapshot.json         what may be spent, according to the node
 ```
 
-Mode 0700, one owner. Whoever can write it decides what the signer believes
-exists. The processes refuse a directory another account can reach.
+Mode 0700, one owner. Whoever can write it decides what the signer treats as spendable. The processes refuse a directory another account can reach.
+
+Exactly one process per role. Two signers on one directory would both pick up the same `Created`
+intent, sign a different transaction over the same inputs and write one over the other: the lost
+one's inputs are spent by whichever transaction is broadcast first, and the record of the other is
+gone. Nothing here enforces that, because the convention is what the file layout can express; an
+implementation of `withdraw.Store` over a database enforces it with a row lock.
 
 `withdraw.FileStore` is not used here and cannot be: it holds every intent in
 memory and rewrites the whole file from that map on each `Put`, so a second
-process overwrites the first rather than merging with it — an intent saved as
-`Built` would come back as `Created` with its signed transaction already in a
+process overwrites the first rather than merging with it. An intent saved as
+`Built` comes back as `Created` with its signed transaction already in a
 mempool. `split.DirStore` keeps one record per file and reads from disk every
 time. What keeps two processes off one record is that each state has exactly
 one owner, as in the table above; an exchange that wants a lock rather than a
@@ -78,17 +85,27 @@ cat > state/requests/w-0001.json <<'JSON'
 JSON
 ```
 
-Amounts are `int64` shors, never SOQ and never a float.
+Amounts are `int64` shors. SOQ figures and floats do not appear at this boundary.
 
 `-state` is each process's own directory: its keystore, its spent set. On three
 hosts only `-dir` is shared, over a filesystem the three of them can reach;
 the two `-state` directories never leave their host.
 
+Two settings have to agree with each other, or the signer refuses every snapshot and no withdrawal
+is built at all:
+
+- the signer's `-max-snapshot-age` (2 minutes) must be comfortably longer than the watcher's
+  `-interval` (15 seconds), which is how often the stamp is refreshed;
+- the two clocks must agree within the signer's `-clock-skew` (5 seconds), because the stamp is
+  written by the watcher's clock and read against the signer's. Run a time daemon on both hosts. A
+  snapshot stamped in the future is refused rather than trusted, so a badly set clock stops
+  withdrawals rather than ageing out of the check.
+
 ## Reading it in order
 
-1. `split/split.go` — the directory, the store, the snapshot, the request file.
+1. `split/split.go`: the directory, the store, the snapshot, the request file.
    The reasoning about what may be trusted is in its comments.
-2. `watcher/main.go` — when a snapshot is withheld, which is most of the safety.
-3. `signer/main.go` — the reconcile pass, and why a signer cannot call
+2. `watcher/main.go`: the conditions under which a snapshot is withheld.
+3. `signer/main.go`: the reconcile pass, and why a signer cannot call
    `withdraw.Engine.Recover`.
-4. `broadcaster/main.go` — `Recover` at startup, then send and confirm.
+4. `broadcaster/main.go`: `Recover` at startup, then send and confirm.

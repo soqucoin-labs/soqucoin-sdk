@@ -138,14 +138,14 @@ func TestTheSDKFileStoreLosesARecordWhenTwoProcessesShareIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok, _ := reloaded.Get(context.Background(), "w1"); ok {
-		t.Fatal("FileStore kept both records; if it is safe to share, DirStore has no reason to exist and this test should be deleted with it")
+		t.Fatal("FileStore kept both records; if sharing it is safe then DirStore is unnecessary, and this test goes with it")
 	}
 }
 
 // A snapshot is the signer's whole view of the chain. Every refusal here is a
-// pass in which nothing is built, which is the safe direction: an old
-// snapshot lists outputs that may already be spent, and one that contradicts
-// itself is not a view of anything.
+// pass in which nothing is built. An old snapshot lists outputs that may
+// already be spent, and one that contradicts itself does not describe any
+// state the chain was in.
 func TestASnapshotIsRefusedUnlessItIsCurrentAndConsistent(t *testing.T) {
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	good := Snapshot{
@@ -302,4 +302,66 @@ func with(s Snapshot, edit func(*Snapshot)) Snapshot {
 	cp.Outputs = append([]Output(nil), s.Outputs...)
 	edit(&cp)
 	return cp
+}
+
+// A case-folding filesystem (APFS, NTFS, most SMB shares) answers a read of
+// W1.json with w1.json. A store that returned that record would report one
+// withdrawal as another: Submit would take the second as already submitted,
+// move its request to accepted/ and never pay it. So the record's own id is
+// checked against the name it was read under, in Get and in List.
+func TestARecordWhoseIDIsNotTheNameItWasReadUnderIsRefused(t *testing.T) {
+	s, dir := openStore(t)
+	other := intent("w2", withdraw.StateCreated)
+	data, err := json.Marshal(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "w1.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, err := s.Get(context.Background(), "w1"); !errors.Is(err, ErrIDMismatch) || ok {
+		t.Fatalf("Get returned ok=%v, err=%v; want ErrIDMismatch", ok, err)
+	}
+	if _, err := s.List(context.Background()); !errors.Is(err, ErrIDMismatch) {
+		t.Fatalf("List returned %v; want ErrIDMismatch", err)
+	}
+}
+
+// The engine reads List's order: Recover re-sends built withdrawals in it, so
+// the oldest goes first, ties by id. withdraw.FileStore sorts the same way and
+// nothing was checking that this store does.
+func TestListIsOldestFirstThenByID(t *testing.T) {
+	s, _ := openStore(t)
+	base := time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
+	write := func(id string, at time.Time) {
+		t.Helper()
+		in := intent(id, withdraw.StateBuilt)
+		in.CreatedAt = at
+		if err := s.Put(context.Background(), in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("w3", base.Add(2*time.Minute))
+	write("w2b", base.Add(time.Minute))
+	write("w2a", base.Add(time.Minute))
+	write("w1", base)
+
+	got, err := s.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, in := range got {
+		ids = append(ids, in.ID)
+	}
+	want := []string{"w1", "w2a", "w2b", "w3"}
+	if len(ids) != len(want) {
+		t.Fatalf("List returned %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("List returned %v, want %v", ids, want)
+		}
+	}
 }

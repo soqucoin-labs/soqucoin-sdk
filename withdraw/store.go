@@ -15,9 +15,23 @@ import (
 )
 
 // writeFile is the durable replace step, a variable so a test can fail it
-// after the content has landed at the path, which is the one failure Put must
-// not roll its map back on and the one no test can provoke from outside.
+// after the content has landed at the path. That is the one failure Put keeps
+// its record on, and the one no test can provoke from outside.
 var writeFile = atomicfile.WriteFile
+
+// ErrWrittenNotDurable reports a Put whose record reached the store but whose
+// durability is unconfirmed: the content is at the path and a reader of the
+// store will find it, and only a power loss before the filesystem flushes its
+// directory entry would lose it.
+//
+// A Store that can tell the two apart should return it, wrapped, instead of a
+// plain error, and must keep the new record when it does. Engine.Build then
+// keeps the intent Built with its inputs reserved and returns the error,
+// rather than releasing inputs for a signed transaction the store is holding.
+// A Store that cannot tell them apart returns a plain error, and Build treats
+// the intent as unsaved, which is the safe reading for a store that may have
+// discarded the record.
+var ErrWrittenNotDurable = atomicfile.ErrWrittenNotDurable
 
 func unmarshal(raw json.RawMessage, v interface{}) error { return json.Unmarshal(raw, v) }
 

@@ -315,6 +315,33 @@
       "find": "\tif !idPattern.MatchString(id) || id == \"..\" {",
       "replace": "\tif false {",
       "why": "The intent id is chosen by the system that asks for the withdrawal and it becomes a file name. Unchecked, a separator or a parent reference writes the record outside the store, or reads another file as a withdrawal."
+    },
+    {
+      "id": "build-releases-inputs-for-a-record-the-store-holds",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBuildKeepsTheReservationWhenTheSaveLandedButIsNotKnownDurable",
+      "find": "\t\tif errors.Is(err, ErrWrittenNotDurable) {",
+      "replace": "\t\tif errors.Is(err, context.Canceled) {",
+      "why": "A save that landed and is only unconfirmed for durability leaves the record in the store, where Recover and any broadcaster will find it Built. Treating that as unsaved releases the inputs of a signed transaction, and the next withdrawal selects them: two transactions stand over one input and one is rejected for good."
+    },
+    {
+      "id": "split-signer-skips-built-withdrawals-it-holds-no-reservation-for",
+      "file": "examples/exchange_split/signer/main.go",
+      "package": "./examples/exchange_split/signer",
+      "test": "TestReconcileReservesABuiltWithdrawalThisSetHasNoReservationFor",
+      "find": "\tbuilt, err := store.List(ctx, withdraw.StateBuilt)",
+      "replace": "\tbuilt, err := store.List(ctx, withdraw.StateFailed)",
+      "why": "A reservation expires by its TTL and is dropped when the set is loaded, and a signer on a new host has no set at all, so a signed withdrawal waiting for the broadcaster can have no reservation in this process. Its inputs are still unspent and therefore in the snapshot, so the pass over the store's Built withdrawals is the only thing keeping the next selection off them."
+    },
+    {
+      "id": "split-store-answers-with-a-record-of-another-id",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestARecordWhoseIDIsNotTheNameItWasReadUnderIsRefused",
+      "find": "\tif in.ID != id {",
+      "replace": "\tif false {",
+      "why": "A case-folding filesystem answers a read of W1.json with w1.json. Without this check the store reports one withdrawal as another, so Submit takes the second as already submitted, its request is moved aside and it is never paid."
     }
   ]
 }

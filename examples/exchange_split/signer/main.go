@@ -1,7 +1,9 @@
 // Command signer is the process in examples/exchange_split that holds the
-// key. It has no node credential, no indexer address and no listening socket:
-// the shared directory is its only input, and the only thing it does with it
-// is turn Created intents into Built ones.
+// key. It has no node credential, no indexer address and no listening socket,
+// so the shared directory is its only input and the only thing it does with
+// that input is turn Created intents into Built ones. The host still reaches
+// the directory, over a mount if the three processes are on three machines,
+// and that mount is the whole of its exposure.
 //
 // It has no node credential because the node cannot give it a safe one. There
 // is no per-method access control in the node's RPC interface, so a credential
@@ -13,9 +15,9 @@
 // What it does each pass, in this order:
 //
 //  1. Reconciles its spent set with the shared store. Inputs of intents the
-//     store holds as Broadcast or Confirmed are marked spent, reservations of
-//     intents that are Created or Failed are released, and reservations of
-//     Built intents are renewed. The store is the durable truth about spends;
+//     store holds as sent are recorded as spent rather than reserved,
+//     reservations of intents that are Created or Failed are released, and
+//     reservations of Built intents are renewed. The store is the durable truth about spends;
 //     this file is only this process's copy of it. Without this pass a
 //     reservation would expire while the transaction sat in a mempool and the
 //     inputs would be offered to the next withdrawal.
@@ -112,7 +114,7 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
-	// Load, not LoadOrCreate: a signer that silently creates an empty keystore
+	// Load rather than LoadOrCreate: a signer that silently creates an empty keystore
 	// would build nothing and say nothing about why.
 	keystore := keys.NewManager(filepath.Join(cfg.state, "keys.enc"), cfg.passphrase)
 	if err := keystore.Load(); err != nil {
@@ -205,10 +207,15 @@ func run(ctx context.Context, cfg config) error {
 // once at startup, since nothing else changes the facts while it runs. Here
 // the broadcaster changes them continuously, so it runs every pass:
 //
-//   - Broadcast or Confirmed: the inputs are spent for good, whatever this
-//     file said before. This is the one that matters. Without it the
-//     reservation expires by its TTL while the transaction sits in a mempool
-//     and the next selection offers the same inputs to another withdrawal.
+//   - Broadcast: the inputs are spent for good, whatever this file said
+//     before. This is the one that matters. Without it the reservation expires
+//     by its TTL while the transaction sits in a mempool and the next
+//     selection offers the same inputs to another withdrawal. A withdrawal
+//     already recorded here as a spend is left alone, since marking rewrites
+//     the whole file.
+//   - Confirmed: the entries this set already holds are flipped to confirmed,
+//     so they can be pruned by age. Nothing is created: an input of a
+//     confirmed withdrawal cannot come back.
 //   - Built: the transaction is signed and waiting for the broadcaster, so the
 //     reservation is renewed rather than left to expire.
 //   - Created or Failed: nothing signed exists, so a reservation held for one
@@ -222,13 +229,59 @@ func reconcile(ctx context.Context, store *split.DirStore, spent *utxo.SpentSet,
 		logger.Error("reconcile: the store could not be read; nothing is selected this pass", "err", err)
 		return
 	}
+	// Which intents still hold a reservation here. A Broadcast intent among
+	// them is the case this pass exists for: the transaction is out and this
+	// set still calls its inputs reserved, so the reservation would expire and
+	// the inputs would be offered again.
+	reserved := map[string]bool{}
+	for _, id := range spent.ReservedIntents() {
+		reserved[id] = true
+	}
 	for _, in := range sent {
+		inputs := inputsOf(in)
+		if in.State == withdraw.StateConfirmed {
+			// Confirmed on chain: flip the entries this set already holds so
+			// the hour-old ones can be pruned. It writes only on a change and
+			// creates nothing. An input of a confirmed withdrawal cannot come
+			// back, and the watcher's snapshot is read from the node, so it
+			// cannot offer one either.
+			if err := spent.ConfirmSpentAll(inputs); err != nil {
+				logger.Error("reconcile: inputs of a confirmed withdrawal not marked confirmed", "id", in.ID, "err", err)
+			}
+			continue
+		}
+		// Marking rewrites the whole file, so a withdrawal already recorded as
+		// a spend here is left alone: without this the set is rewritten on
+		// every pass for the whole history of sent withdrawals.
+		if !reserved[in.ID] && allSpent(spent, inputs) {
+			continue
+		}
 		txid := in.TxID
 		if in.NodeTxID != "" {
 			txid = in.NodeTxID // the node accepted other bytes; those are the spend
 		}
-		if err := spent.MarkBroadcastFor(inputsOf(in), txid, in.ID); err != nil {
+		if err := spent.MarkBroadcastFor(inputs, txid, in.ID); err != nil {
 			logger.Error("reconcile: inputs of a sent withdrawal not marked spent", "id", in.ID, "err", err)
+			continue
+		}
+		logger.Info("reconcile: inputs of a sent withdrawal are recorded as spent", "id", in.ID, "txid", txid)
+	}
+	// Every Built intent is re-reserved from the store, and not only the ones
+	// this file already holds a reservation for. A reservation expires by its
+	// TTL and is dropped when the set is loaded, and a signer on a new host
+	// starts with no set at all, so a withdrawal signed and waiting for the
+	// broadcaster can have no reservation here at all. Its inputs are in the
+	// watcher's snapshot, since nothing has spent them yet, so without this
+	// the next withdrawal selects them and two signed transactions stand over
+	// one input. Reserve with the same id renews rather than refuses.
+	built, err := store.List(ctx, withdraw.StateBuilt)
+	if err != nil {
+		logger.Error("reconcile: the store could not be read for built withdrawals; nothing is selected this pass", "err", err)
+		return
+	}
+	for _, in := range built {
+		if err := spent.Reserve(inputsOf(in), in.ID, ttl); err != nil {
+			logger.Error("reconcile: a built withdrawal's inputs could not be reserved", "id", in.ID, "err", err)
 		}
 	}
 	for _, id := range spent.ReservedIntents() {
@@ -241,10 +294,6 @@ func reconcile(ctx context.Context, store *split.DirStore, spent *utxo.SpentSet,
 			continue
 		}
 		switch in.State {
-		case withdraw.StateBuilt:
-			if err := spent.Reserve(inputsOf(in), in.ID, ttl); err != nil {
-				logger.Error("reconcile: a built withdrawal's reservation could not be renewed", "id", in.ID, "err", err)
-			}
 		case withdraw.StateCreated, withdraw.StateFailed:
 			if err := spent.Release(in.ID); err != nil {
 				logger.Error("reconcile: reservation not released", "id", in.ID, "err", err)
@@ -255,8 +304,8 @@ func reconcile(ctx context.Context, store *split.DirStore, spent *utxo.SpentSet,
 	}
 }
 
-// build builds every Created intent. An error is this intent's, not the
-// pass's: a selector error that the engine treats as transient leaves the
+// build builds every Created intent. An error stops that intent and not
+// the pass: a selector error that the engine treats as transient leaves the
 // intent Created for the next pass, and a permanent one fails it.
 //
 // The destination is checked against the network here as well as in the
@@ -283,6 +332,18 @@ func build(ctx context.Context, store *split.DirStore, engine *withdraw.Engine, 
 		}
 		logger.Info("built", "id", in.ID, "txid", in.TxID, "inputs", len(in.Inputs))
 	}
+}
+
+// allSpent reports whether the set already holds every input. It is asked
+// only about an intent that holds no reservation here, so an entry it finds is
+// a spend and not this intent's own reservation.
+func allSpent(spent *utxo.SpentSet, inputs []types.UTXO) bool {
+	for _, u := range inputs {
+		if !spent.IsSpent(u.TxID, u.Vout) {
+			return false
+		}
+	}
+	return len(inputs) > 0
 }
 
 func inputsOf(in *withdraw.Intent) []types.UTXO {

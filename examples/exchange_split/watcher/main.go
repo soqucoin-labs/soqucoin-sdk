@@ -185,9 +185,9 @@ func accept(ctx context.Context, cfg config, engine *withdraw.Engine) {
 // Three conditions, and the snapshot is withheld unless all three hold: the
 // indexer has answered for the address recently enough, the node is caught up
 // (VerifyAndFilterUTXOs refuses to act on a syncing node), and every output
-// survives being read back from the node. A withheld snapshot stops the signer
-// building, which is the safe direction: the alternative is signing against a
-// view no one has confirmed.
+// is still unspent when the node is asked for it again. A withheld snapshot
+// stops the signer building, and the alternative is signing against a view
+// no node has confirmed.
 func publish(ctx context.Context, cfg config, elx *electrumx.Client, node *rpc.Client) {
 	at, err := elx.LastRefreshOf(cfg.hot)
 	if err != nil {

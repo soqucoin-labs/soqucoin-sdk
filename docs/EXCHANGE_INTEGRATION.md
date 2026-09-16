@@ -808,7 +808,7 @@ directory, and its README is the longer form of what follows.
 | Process | Holds | Transitions it owns |
 |---|---|---|
 | watcher | node RPC credential, indexer address, no key | → `Created`, and it publishes what may be spent |
-| signer | the keystore, and no network access at all | `Created` → `Built` |
+| signer | the keystore; it opens no socket and holds no credential | `Created` → `Built` |
 | broadcaster | node RPC credential, no key | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed` |
 
 Three things decide whether a split is safe, and they are worth stating before you build your own.
@@ -820,19 +820,19 @@ as powerful as the broadcaster's, or it gets none and selects from what another 
 checked against the node. The example takes the second road: the watcher writes a snapshot of
 outputs it read back from the node one at a time, stamped with the node's tip height and the time
 it answered, and the signer refuses a snapshot older than a bound it is given. A withheld or stale
-snapshot means no withdrawal is built, which is the direction to fail in.
+snapshot means no withdrawal is built until the watcher publishes a current one.
 
 **`withdraw.FileStore` is for one process.** Every `Put` writes the whole file from that process's
 own map, so a second process does not merge with the first, it overwrites it: an intent saved as
 `Built` comes back as `Created` while its signed transaction is already in a mempool, and its
 inputs are free for the next withdrawal to select. Share a store only through something that
-writes one record at a time — a row in your database behind `withdraw.Store`, or the one-file-per-
-intent store the example carries.
+writes one record at a time: a row in your database behind `withdraw.Store`, or the
+one-file-per-intent store the example carries.
 
 **One state, one writer, and the store is the truth about spends.** Give each transition to exactly
 one process and have each process list only the states it owns. The spent set is then per process,
 not shared: the signer holds the reservations because it is the only one that selects, and it
-reconciles them against the store before every selection — inputs of intents the store holds as
+reconciles them against the store before every selection. Inputs of intents the store holds as
 `Broadcast` or `Confirmed` are marked spent, a `Built` intent's reservation is renewed, and a
 reservation held for something `Created` or `Failed` is released. In one process
 `withdraw.Engine.Recover` does this once at startup. In a split the facts change while the signer
