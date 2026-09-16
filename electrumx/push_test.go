@@ -134,6 +134,12 @@ func TestNotificationWritesNothingUntilListunspentAnswers(t *testing.T) {
 		at, err := c.LastRefreshOf(a1)
 		return err == nil && !at.IsZero()
 	})
+	// Pin the startup count. The count below is read against this baseline: at two startup
+	// refreshes, "at least two calls" would hold with nothing asked for by the notification,
+	// and the property this test is named for would go untested.
+	if n := stub.count("blockchain.scripthash.listunspent", sh1); n != 1 {
+		t.Fatalf("startup asked for %d listunspent, want 1", n)
+	}
 	if len(c.GetUTXOs(a1)) != 0 {
 		t.Fatal("cache should be empty after an empty listunspent")
 	}
