@@ -5,11 +5,22 @@
 package atomicfile
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 )
+
+// ErrWrittenNotDurable reports a failure after the rename: the new content is
+// at the path and synced as a file, and only the directory entry was not
+// forced out. Every error from WriteFile means "not known to be durable", but
+// this one also means "written", and the difference matters to a caller that
+// keeps a copy in memory. Rolling that copy back to the old record on this
+// error leaves memory contradicting the file, and the next successful write,
+// which writes the whole file from memory, puts the old record back over the
+// new one. Keep the new record and treat durability as unconfirmed.
+var ErrWrittenNotDurable = errors.New("atomicfile: content written, durability not confirmed")
 
 // fsync is the sync step, a variable so a test can observe the order of the
 // steps and make one fail.
@@ -22,8 +33,9 @@ var fsync = func(f *os.File) error { return f.Sync() }
 // A failure before the rename removes the temporary file and leaves path
 // unchanged. A failure after the rename (opening or syncing the directory) is
 // reported with path holding the new content, synced to disk as a file but
-// with the directory entry not yet forced out. Treat a returned error as "not
-// known to be durable", never as "undone". The directory sync is skipped on
+// with the directory entry not yet forced out, and wraps
+// ErrWrittenNotDurable so a caller can tell the two apart. Treat a returned
+// error as "not known to be durable", never as "undone". The directory sync is skipped on
 // Windows, where syncing a directory handle fails; the file sync still runs
 // there.
 //
@@ -62,11 +74,11 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	d, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("open directory of %s: %w", path, err)
+		return fmt.Errorf("open directory of %s: %w: %w", path, ErrWrittenNotDurable, err)
 	}
 	defer d.Close()
 	if err := fsync(d); err != nil {
-		return fmt.Errorf("sync directory of %s: %w", path, err)
+		return fmt.Errorf("sync directory of %s: %w: %w", path, ErrWrittenNotDurable, err)
 	}
 	return nil
 }

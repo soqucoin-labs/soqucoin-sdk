@@ -3,6 +3,7 @@ package withdraw
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,11 @@ import (
 
 	"github.com/soqucoin-labs/soqucoin-sdk/internal/atomicfile"
 )
+
+// writeFile is the durable replace step, a variable so a test can fail it
+// after the content has landed at the path, which is the one failure Put must
+// not roll its map back on and the one no test can provoke from outside.
+var writeFile = atomicfile.WriteFile
 
 func unmarshal(raw json.RawMessage, v interface{}) error { return json.Unmarshal(raw, v) }
 
@@ -60,6 +66,13 @@ func (m *MemStore) List(_ context.Context, states ...State) ([]*Intent, error) {
 // database should implement Store over it instead and keep the same "durable
 // before broadcast" rule. The file stores ignore the context; a database
 // store bounds its queries with it.
+//
+// One process, not two. Every Put writes the whole file from this process's
+// map, so a second process on the same path does not merge with it: it
+// overwrites whatever the first one wrote with its own view, and an intent
+// saved as Built by one process reappears as Created to the other while its
+// signed bytes are in a mempool. Two processes that must share a store need
+// one record per file, or a database; examples/exchange_split shows the first.
 type FileStore struct {
 	mu      sync.Mutex
 	path    string
@@ -112,6 +125,14 @@ func (fs *FileStore) Get(_ context.Context, id string) (*Intent, bool, error) {
 // fails the store keeps reporting the record it held before, so a caller that
 // treats the error as "not saved" and Get agree; the next successful Put
 // writes the whole store from memory again.
+//
+// The one write failure that is not rolled back is the one that happened after
+// the rename (atomicfile.ErrWrittenNotDurable): the file holds the new record
+// already. Rolling memory back there would make Get contradict the file, and
+// because the next Put writes the whole store from memory, it would put the
+// older record back over the newer one on disk. For a Built intent that is a
+// signed transaction whose inputs the store has forgotten. The error is still
+// returned, because durability is unconfirmed; only the rollback is skipped.
 func (fs *FileStore) Put(_ context.Context, in *Intent) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -119,6 +140,9 @@ func (fs *FileStore) Put(_ context.Context, in *Intent) error {
 	cp := *in
 	fs.intents[in.ID] = &cp
 	if err := fs.write(); err != nil {
+		if errors.Is(err, atomicfile.ErrWrittenNotDurable) {
+			return err
+		}
 		if had {
 			fs.intents[in.ID] = prev
 		} else {
@@ -138,7 +162,7 @@ func (fs *FileStore) write() error {
 	if err := os.MkdirAll(filepath.Dir(fs.path), 0700); err != nil {
 		return fmt.Errorf("create intents dir: %w", err)
 	}
-	if err := atomicfile.WriteFile(fs.path, buf, 0600); err != nil {
+	if err := writeFile(fs.path, buf, 0600); err != nil {
 		return fmt.Errorf("write intents: %w", err)
 	}
 	return nil
