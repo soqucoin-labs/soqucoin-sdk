@@ -229,7 +229,7 @@
       "test": "TestSaveRefusesAKeystoreItHasNotRead",
       "find": "\tif m.seenFile.Load() {\n\t\treturn nil\n\t}",
       "replace": "\tif true {\n\t\treturn nil\n\t}",
-      "why": "Save writes the manager's keys over whatever is at the path. Without this test a manager that never read the file replaces the keys in it with its own, which is none on a manager that only just opened, and returns no error. Measured on the shipped behaviour: a 9,192-byte keystore holding one key became 284 bytes holding none, and a later Load yielded nothing."
+      "why": "Save writes the manager's keys over whatever is at the path. Without this test a manager that never read the file replaces the keys in it with its own, which is none on a manager that has only just opened, and returns no error. The keystore is still a keystore afterwards, so nothing downstream reports anything either."
     },
     {
       "id": "keystore-save-permitted-after-a-load-that-failed",

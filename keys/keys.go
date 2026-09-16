@@ -148,13 +148,17 @@ var (
 	// ErrNoKey marks an address this manager holds no key for.
 	ErrNoKey = errors.New("keys: no key for address")
 
-	// ErrKeystoreUnread is returned by Save when the file at the manager's
-	// path exists and this manager has never read it. It is the mirror of
-	// ErrKeysHeld: that one refuses to read over keys held in memory, this
-	// one refuses to write over keys held on disk, and both exist because the
-	// alternative is losing key material without a word. Load the keystore
-	// before saving it, or save to a path of your own.
-	ErrKeystoreUnread = errors.New("keys: Save would overwrite a keystore this manager has not read")
+	// ErrKeystoreUnread marks a write to a keystore file that exists and that
+	// this manager has never read. It is the mirror of ErrKeysHeld: that one
+	// refuses to read over keys held in memory, this one refuses to write over
+	// keys held on disk, and both exist because the alternative is losing key
+	// material without a word. Load the keystore before writing it, or write
+	// to a path of your own.
+	//
+	// Save returns it, and so does LoadOrCreate in the one case where the file
+	// was absent when it looked and present when it wrote. The wording does
+	// not name Save for that reason.
+	ErrKeystoreUnread = errors.New("keys: refusing to write over a keystore this manager has not read")
 )
 
 // maxKeygenAttempts bounds the regeneration loop in GenerateKeyForNetwork. The
@@ -275,7 +279,14 @@ func (m *Manager) Load() error {
 // LoadOrCreate is Load for the first run: when the keystore file does not
 // exist it creates an empty, encrypted one at the path, so every later Load
 // on that path succeeds and a second process cannot mistake the path for a
-// new one. Any other failure is reported as by Load.
+// new one.
+//
+// Other failures are reported as by Load, with one addition of its own. If the
+// file appears between the moment this looks for it and the moment it writes,
+// the write is refused with ErrKeystoreUnread rather than replacing what
+// appeared. The manager is left holding an empty key set rather than keys, so
+// Load on it afterwards is not refused as ErrKeysHeld and reads what the other
+// writer put there.
 func (m *Manager) LoadOrCreate() error {
 	return m.load(true)
 }

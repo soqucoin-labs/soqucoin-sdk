@@ -186,8 +186,7 @@ func TestKeyPairPrintingRedactsThePrivateKey(t *testing.T) {
 // The attack, and the reason this exists: a signer pointed at a populated
 // keystore that it never opened, saving. Before this, the file's keys were
 // replaced by the manager's, Save returned nil, and nothing anywhere said the
-// keys were gone. Measured on the shipped behaviour: 9,192 bytes holding one
-// key became 284 bytes holding none.
+// keys were gone.
 func TestSaveRefusesAKeystoreItHasNotRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keys.enc")
 	writer := NewManager(path, "pw")
@@ -280,6 +279,23 @@ func TestSaveAllowsTheWaysAKeystoreIsMeantToBeWritten(t *testing.T) {
 		}
 	})
 
+	// The precondition LoadOrCreate's refusal path depends on: it leaves the
+	// manager holding an empty key set, and an empty key set does not trip
+	// ErrKeysHeld, so the manager can still read the file afterwards.
+	t.Run("a manager holding an empty key set can still load", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "keys.enc")
+		m := NewManager(path, "pw")
+		if err := m.LoadOrCreate(); err != nil {
+			t.Fatal(err)
+		}
+		if m.KeyCount() != 0 {
+			t.Fatalf("manager holds %d keys after creating an empty keystore", m.KeyCount())
+		}
+		if err := m.Load(); err != nil {
+			t.Fatalf("Load on a manager holding an empty key set: %v", err)
+		}
+	})
+
 	t.Run("LoadOrCreate then save", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "keys.enc")
 		m := NewManager(path, "pw")
@@ -346,10 +362,17 @@ func TestSaveAllowsTheWaysAKeystoreIsMeantToBeWritten(t *testing.T) {
 	})
 }
 
-// LoadOrCreate creates only when there is nothing to lose. If another process
-// wrote the keystore between the read and the write, the creating save is
-// refused rather than replacing it, and the operator's next run loads it.
-func TestLoadOrCreateDoesNotReplaceAKeystoreThatAppeared(t *testing.T) {
+// The decision LoadOrCreate's creating write would reach if the keystore
+// appeared between the moment it looked and the moment it wrote: refuse, and
+// let the next run load what appeared.
+//
+// This asks checkMayOverwrite directly. The window it describes cannot be
+// opened from a test without injecting a fault into the file system, so what
+// is checked here is the decision, and that the creating write routes through
+// it is established by there being exactly one call site, at the top of
+// saveLocked, which the create branch returns into. Do not read this test as
+// covering that branch.
+func TestCheckMayOverwriteRefusesAKeystoreThatAppeared(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keys.enc")
 	m := NewManager(path, "pw")
 
@@ -385,6 +408,11 @@ func TestSaveRefusesAPathItCannotExamine(t *testing.T) {
 	path := filepath.Join(dir, "sub", "keys.enc")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		// Root traverses a directory whose mode forbids it and stats through
+		// it, so there is no unexaminable path to construct here.
+		t.Skip("running as root: permissions do not apply")
 	}
 	if err := os.Chmod(dir, 0o000); err != nil {
 		t.Skip("cannot drop directory permissions here")
