@@ -8,7 +8,49 @@ import (
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
+	"github.com/soqucoin-labs/soqucoin-sdk/withdraw"
 )
+
+// A withdrawal worker pool is the ordinary exchange shape, so two workers
+// take the same job and one of them loses the build race in withdraw.Build.
+// Its Process returns ErrWrongState, and the documented loop hands every
+// Process error to RecordResult. Unrecognised errors count as systemic, so
+// three race losses in a row would open the breaker and stop every
+// withdrawal for its cooldown: one queue redelivering three duplicates halts
+// payouts, and nothing is wrong with the node. The same holds for an unknown
+// or malformed id and for an idempotency key reused for another payment.
+func TestWithdrawalStateErrorsAreNotSystemic(t *testing.T) {
+	perRequest := []error{
+		fmt.Errorf("%w: w1 is Built", withdraw.ErrWrongState),
+		fmt.Errorf("%w: unknown intent w2", withdraw.ErrInvalidIntent),
+		fmt.Errorf("submit: %w", withdraw.ErrConflict),
+		fmt.Errorf("%w: w3: selector", withdraw.ErrFailed),
+	}
+	cb := NewCircuitBreaker(3, time.Hour, nil)
+	for i := 0; i < 3; i++ {
+		for _, e := range perRequest {
+			if cb.RecordResult(e) {
+				t.Errorf("counted as systemic: %v", e)
+			}
+		}
+	}
+	if err := cb.Allow(); err != nil {
+		t.Fatalf("twelve refused withdrawals halted every withdrawal: %v", err)
+	}
+
+	// The boundary. An intent held after a txid mismatch, and a built intent
+	// whose inputs another withdrawal took, are both conditions an operator
+	// resolves before anything else is sent; the breaker is what stops the
+	// run, so these still count.
+	for _, e := range []error{
+		fmt.Errorf("broadcast: %w", withdraw.ErrHeld),
+		fmt.Errorf("broadcast: %w", withdraw.ErrReservationLost),
+	} {
+		if !NewCircuitBreaker(1, time.Hour, nil).RecordResult(e) {
+			t.Errorf("not counted, so nothing stops the run: %v", e)
+		}
+	}
+}
 
 func TestCircuitBreakerStartsClosed(t *testing.T) {
 	cb := NewCircuitBreaker(3, 5*time.Second, nil)

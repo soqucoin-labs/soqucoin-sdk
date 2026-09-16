@@ -461,3 +461,77 @@ func TestSubmitUnderAnEndedContextRegistersNothing(t *testing.T) {
 		t.Fatalf("resubmit: %v created=%v", err, created)
 	}
 }
+
+// ctxBoundStore is the store the exchange guide tells an integrator to write:
+// a database behind withdraw.Store, which bounds every query with the context
+// it is given. Both in-tree stores ignore the context (store.go), so this is
+// the only shape that can show whether a pass survives a context that has
+// already ended.
+type ctxBoundStore struct{ Store }
+
+func (s ctxBoundStore) Get(ctx context.Context, id string) (*Intent, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, fmt.Errorf("get %s: %w", id, err)
+	}
+	return s.Store.Get(ctx, id)
+}
+
+func (s ctxBoundStore) Put(ctx context.Context, in *Intent) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("put %s: %w", in.ID, err)
+	}
+	return s.Store.Put(ctx, in)
+}
+
+func (s ctxBoundStore) List(ctx context.Context, states ...State) ([]*Intent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	return s.Store.List(ctx, states...)
+}
+
+// Recover's documentation says every Built intent stays Built and re-reserved,
+// to be sent by the next Recover. The context stops the sending, not the
+// re-reserving: checking it between the Reserve and the Broadcast with a break
+// left every Built intent after the first one unreserved, and their inputs
+// belong to signed transactions that may be in a mempool, so the next
+// selection could take them. Reached whenever a reservation file is lost or
+// has expired across an outage, which is the case Recover's Reserve is for.
+//
+// The second engine runs on a ctxBoundStore, because the re-reservation also
+// depends on the List that finds the Built intents: under an ended context a
+// database store answers that List with an error, and against a store that
+// ignores the context this test would pass with the repair unreachable.
+func TestRecoverUnderAnEndedContextReReservesEveryBuiltIntent(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewFileStore(filepath.Join(dir, "intents.json"))
+	net := &fakeNet{mode: "lost"}
+	e := newEngine(t, store, utxo.NewSpentSet(filepath.Join(dir, "spent.json"), nil), net, coins())
+	ids := []string{"w1", "w2", "w3"}
+	for _, id := range ids {
+		e.Submit(context.Background(), id, dst, 500_000, 1000)
+		e.Process(context.Background(), id)
+	}
+	for _, id := range ids {
+		if in, _, _ := store.Get(context.Background(), id); in.State != StateBuilt {
+			t.Fatalf("setup: %s is %s, want Built", id, in.State)
+		}
+	}
+
+	// A spent set that knows nothing: the reservation file was lost or expired
+	// while the process was down.
+	reopened, _ := NewFileStore(filepath.Join(dir, "intents.json"))
+	store2 := ctxBoundStore{Store: reopened}
+	spent2 := utxo.NewSpentSet(filepath.Join(dir, "spent-fresh.json"), nil)
+	e2 := newEngine(t, store2, spent2, &fakeNet{mode: "ok"}, coins())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = e2.Recover(ctx)
+
+	for _, id := range ids {
+		in, _, _ := store2.Get(context.Background(), id)
+		if !spent2.IsSpent(in.Inputs[0].TxID, in.Inputs[0].Vout) {
+			t.Errorf("%s was not re-reserved, so its inputs are selectable while its bytes may be in a mempool", id)
+		}
+	}
+}

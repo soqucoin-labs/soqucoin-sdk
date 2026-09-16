@@ -627,7 +627,12 @@ unconfirmed spend.
 `Recover` at startup re-sends anything persisted but not yet acknowledged. The circuit breaker is
 fed through `RecordResult`, which never counts a per-request error (a bad address, an amount below
 the floor, insufficient funds, a node rejection of one transaction), so a user cannot halt every
-withdrawal with three malformed requests.
+withdrawal with three malformed requests. A withdrawal the engine refuses to act on is also a
+per-request error: `withdraw.ErrWrongState` when another worker holds the intent,
+`withdraw.ErrInvalidIntent`, `withdraw.ErrConflict` and `withdraw.ErrFailed`. A worker pool loses a
+race for the same id as a matter of course, and counting those losses would let three of them halt
+every payout. `withdraw.ErrHeld` and `withdraw.ErrReservationLost` do count: each names a
+transaction an operator resolves before anything else is sent, and halting is the point.
 
 ```go
 package main
@@ -722,14 +727,14 @@ func main() {
 			// against the cap. A one-input, two-output payment is about
 			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB, so
 			// asking for utxo.MaxInputsPerTX inputs' worth demands about
-			// 0.77 SOQ of headroom at the recommended rate: a wallet holding
+			// 0.78 SOQ of headroom at the recommended rate: a wallet holding
 			// 25 SOQ in one output could not then pay 24.99, and the last
-			// 0.77 SOQ of any hot wallet would be unspendable. Ask for n
+			// 0.78 SOQ of any hot wallet would be unspendable. Ask for n
 			// inputs' worth and ask again when the answer needs more; n only
 			// grows, and MaxInputsPerTX bounds the loop.
 			var selected []types.UTXO
 			for n := 1; n <= utxo.MaxInputsPerTX; {
-				vsize := int64(1100 + 950*(n-1))
+				vsize := int64(1100 + 976*(n-1))
 				selected, _, err = selector.SelectUTXOs(elx.GetAllUTXOs(), amount+vsize*feeRate, 1, tip, []string{hotWallet})
 				if err != nil {
 					return nil, err
@@ -789,6 +794,15 @@ func main() {
 		// the breaker counts it, and every later Process of that intent
 		// returns withdraw.ErrHeld, which also counts. Stop and investigate,
 		// never rebuild.
+		// withdraw.ErrWrongState: another worker advanced this intent between
+		// this call's read and Build's lock, so the withdrawal belongs to that
+		// worker. Nothing is wrong, the breaker does not count it, and a later
+		// Process of the same id sends it. The intent returned is this call's
+		// own copy, which is out of date whenever this error is the reason, so
+		// do not read its State here.
+		// withdraw.ErrFailed: the intent was already Failed when this call
+		// began. Terminal, no payment is on the network, and the breaker does
+		// not count it. Resolve the payout; never reuse the id.
 		log.Printf("process %s: state %s: %v", requestID, intent.State, err)
 		return
 	}
@@ -844,7 +858,12 @@ writes one record at a time: a row in your database behind `withdraw.Store`, or 
 one-file-per-intent store the example carries.
 
 **One state, one writer, and the store is the truth about spends.** Give each transition to exactly
-one process and have each process list only the states it owns. The spent set is then per process,
+one process and have each process list only the states it owns. This is also what keeps one intent
+to one transaction: `Build` re-reads the stored intent under a lock that is held inside one
+process, so two goroutines of a worker pool cannot both build one id, but two processes sharing a
+store do not share that lock. Each would re-read, each would find `Created`, and each would build
+and broadcast from different inputs, which pays the recipient twice. A shared database behind
+`withdraw.Store` does not make that safe on its own; one writer of `Created` → `Built` does. The spent set is then per process,
 not shared: the signer holds the reservations because it is the only one that selects, and it
 reconciles them against the store before every selection. Every `Built` intent in the store is
 re-reserved, inputs of `Broadcast` intents are marked spent, entries the set already holds for a

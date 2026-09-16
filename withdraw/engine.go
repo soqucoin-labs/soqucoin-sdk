@@ -220,7 +220,31 @@ var (
 	// never submitted). The reservation is kept; a Built intent that the lost
 	// store knew may have its bytes in a mempool.
 	ErrUnknownReservation = errors.New("withdraw: reservation held by an intent the store does not know; intent store and spent set disagree")
+	// ErrFailed is returned by Process for an intent that was already Failed
+	// when it was called. Failed is terminal and nothing of it is on the
+	// network. Submit answers the same id with no error, so a caller that
+	// retries a payout would otherwise read a nil error from Process and
+	// record a withdrawal that has no transaction behind it.
+	//
+	// It wraps rpc.ErrPermanent because one withdrawal that cannot succeed is
+	// a fact about that withdrawal and not about the node or the indexer.
+	// resilience.CircuitBreaker reads the wrapped sentinel and leaves itself
+	// untouched, so a caller retrying one bad payout cannot halt every
+	// withdrawal, which is what that breaker's own documentation says it
+	// exists to prevent.
+	//
+	// A Failed intent reached through a permanent rejection at broadcast keeps
+	// its TxID and RawHex, so Failed does not mean the bytes never reached a
+	// node, only that the node refused them and the inputs were released.
+	ErrFailed = fmt.Errorf("withdraw: intent failed permanently and was not sent (%w)", rpc.ErrPermanent)
 )
+
+// beforeBuild runs between Process's read of the intent and the Build call it
+// makes, a variable so a test can occupy that window. Two workers that have
+// both read one intent as Created before either builds is the race Build
+// settles by re-reading the stored state under its lock, and this is the only
+// place another goroutine can get between the read and the build.
+var beforeBuild = func() {}
 
 // DefaultReservationTTL applies when Engine.ReservationTTL is zero.
 const DefaultReservationTTL = 4 * time.Hour
@@ -295,6 +319,25 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// The check above reads the caller's copy of the intent, which another
+	// worker can have advanced between the caller's read and this lock. The
+	// stored state is the one that decides. Without this re-read, two workers
+	// each holding a Created copy of one intent both pass the check, and the
+	// lock then serialises them into two builds: each selects different inputs
+	// because the other's are reserved, each signs, and each broadcasts. That
+	// pays the recipient twice from different inputs, which is the first of the
+	// two failure modes this package exists to prevent.
+	stored, ok, err := e.Store.Get(ctx, in.ID)
+	if err != nil {
+		return fmt.Errorf("re-read %s: %w", in.ID, err)
+	}
+	if !ok {
+		return fmt.Errorf("%w: unknown intent %s", ErrInvalidIntent, in.ID)
+	}
+	if stored.State != StateCreated {
+		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, stored.State)
+	}
 
 	inputs, err := e.Select(ctx, in.Amount, in.FeeRate)
 	if err != nil {
@@ -461,7 +504,16 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 		return nil, fmt.Errorf("%w: unknown intent %s", ErrInvalidIntent, id)
 	}
 	if in.State == StateCreated {
+		beforeBuild()
 		if err := e.Build(ctx, in); err != nil {
+			// ErrWrongState here means another worker holds this intent and
+			// advanced it between the read above and Build's lock. It is
+			// returned rather than followed, because carrying on would put two
+			// workers into Broadcast at once on separate copies: the second
+			// would re-reserve inputs the first had already marked spent, raise
+			// ErrReservationLost naming a withdrawal that does not exist, and
+			// save Built over the Broadcast state the first had recorded. A
+			// later call reads the intent fresh and sends it.
 			return in, err
 		}
 	}
@@ -469,6 +521,14 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 		if err := e.Broadcast(ctx, in); err != nil {
 			return in, err
 		}
+	}
+	if in.State == StateFailed {
+		// Terminal, and reached only when the intent was already Failed before
+		// this call: a Build or Broadcast that fails it here returns its own
+		// error above. Submit answers a Failed id with no error, so a caller
+		// that retries a payout arrives here, and returning nil would report a
+		// withdrawal as sent with an empty txid.
+		return in, fmt.Errorf("%w: %s: %s", ErrFailed, in.ID, in.LastError)
 	}
 	return in, nil
 }
@@ -491,11 +551,15 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 // The passes that repair the spent set never touch the network and are not
 // cut short by the caller's context: their store reads run under
 // context.WithoutCancel(ctx), so a Recover started with an ended context
-// still re-marks every Broadcast intent's inputs and releases the orphan
-// reservations. The re-broadcast pass runs under ctx: its List and its
-// sends stop once ctx has ended, and every Built intent stays Built,
-// re-reserved, to be sent by the next Recover. The context's error is among
-// those returned.
+// still re-marks every Broadcast intent's inputs, releases the orphan
+// reservations, and re-reserves every Built intent. Listing the Built
+// intents is one of those reads: their re-reservation depends on it, and a
+// store that bounds its queries with the context it is given (which is what
+// a database store does, and what the file stores do not) would answer an
+// ended context with an error, so nothing would be re-reserved. Only the
+// sending runs under ctx. It stops once ctx has ended, and every Built
+// intent stays Built, re-reserved, to be sent by the next Recover. The
+// context's error is among those returned.
 func (e *Engine) Recover(ctx context.Context) error {
 	var errs []error
 	note := func(err error) {
@@ -514,7 +578,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 		}
 	}
 	note(e.releaseOrphanReservations(repair))
-	built, err := e.Store.List(ctx, StateBuilt)
+	built, err := e.Store.List(repair, StateBuilt)
 	if err != nil {
 		return errors.Join(append(errs, err)...)
 	}
@@ -531,8 +595,12 @@ func (e *Engine) Recover(ctx context.Context) error {
 			e.log().Warn("recover: re-reserve failed", "intent", in.ID, "err", err)
 		}
 		if err := ctx.Err(); err != nil {
+			// The context stops the sending, not the re-reserving. Breaking
+			// here left every Built intent after the first one unreserved,
+			// against what this method's documentation promises, and their
+			// inputs belong to signed transactions that may be in a mempool.
 			note(fmt.Errorf("recover %s: not sent: %w", in.ID, err))
-			break
+			continue
 		}
 		if err := e.Broadcast(ctx, in); err != nil {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
