@@ -127,7 +127,13 @@ func TestNotificationWritesNothingUntilListunspentAnswers(t *testing.T) {
 	sh1 := scripthashOf(t, a1)
 	stub.set(sh1, "s0", `[]`)
 	c, _ := startClient(t, stub, a1)
-	waitFor(t, "the first refresh", func() bool { return stub.count("blockchain.scripthash.listunspent", sh1) == 1 })
+	// Wait for the record, not the call: an empty cache proves nothing while the reply is
+	// still in flight, so waiting on the count would let this assertion pass for the
+	// wrong reason.
+	waitFor(t, "the first refresh to reach the record", func() bool {
+		at, err := c.LastRefreshOf(a1)
+		return err == nil && !at.IsZero()
+	})
 	if len(c.GetUTXOs(a1)) != 0 {
 		t.Fatal("cache should be empty after an empty listunspent")
 	}
@@ -293,10 +299,17 @@ func TestReconnectResubscribesAndRefreshesOnlyWhatChanged(t *testing.T) {
 	stub.set(sh1, "s1", `[]`)
 	stub.set(sh2, "s2", `[]`)
 	c, _ := startClient(t, stub, a1, a2)
-	waitFor(t, "both refreshed", func() bool {
-		return stub.count("blockchain.scripthash.listunspent", sh1) == 1 && stub.count("blockchain.scripthash.listunspent", sh2) == 1
+	// Both records, not both calls: a zero at1Before would make the "did the record
+	// advance" check at the end of this test true whatever the client did.
+	waitFor(t, "both records written", func() bool {
+		at1, err1 := c.LastRefreshOf(a1)
+		at2, err2 := c.LastRefreshOf(a2)
+		return err1 == nil && err2 == nil && !at1.IsZero() && !at2.IsZero()
 	})
-	at1Before, _ := c.LastRefreshOf(a1)
+	at1Before, err := c.LastRefreshOf(a1)
+	if err != nil || at1Before.IsZero() {
+		t.Fatalf("no record for a1 before the gap: %v, %v", at1Before, err)
+	}
 
 	// The server drops the connection; while the client is away, a2 changes.
 	stub.set(sh2, "s2b", oneUTXO)
@@ -305,12 +318,14 @@ func TestReconnectResubscribesAndRefreshesOnlyWhatChanged(t *testing.T) {
 	waitFor(t, "the re-subscriptions", func() bool {
 		return stub.count("blockchain.scripthash.subscribe", sh1) == 2 && stub.count("blockchain.scripthash.subscribe", sh2) == 2
 	})
-	waitFor(t, "a2 refreshed after the gap", func() bool { return stub.count("blockchain.scripthash.listunspent", sh2) == 2 })
+	// The deposit in the cache is the effect; the listunspent call is only how it got
+	// there. Waiting on the call races the window in which the client reads the reply.
+	waitFor(t, "a2's deposit to reach the cache after the gap", func() bool { return len(c.GetUTXOs(a2)) == 1 })
+	if n := stub.count("blockchain.scripthash.listunspent", sh2); n != 2 {
+		t.Fatalf("a2 was refreshed %d times after the gap, want 2", n)
+	}
 	if n := stub.count("blockchain.scripthash.listunspent", sh1); n != 1 {
 		t.Fatalf("an unchanged address was refreshed after the reconnect: %d listunspent", n)
-	}
-	if len(c.GetUTXOs(a2)) != 1 {
-		t.Fatal("the deposit mined during the gap is not in the cache")
 	}
 	at1After, err := c.LastRefreshOf(a1)
 	if err != nil || !at1After.After(at1Before) {
