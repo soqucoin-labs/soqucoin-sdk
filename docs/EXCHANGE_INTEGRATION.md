@@ -893,19 +893,21 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 ## Verification: a real confirmed transaction
 
 Rather than asking you to trust that the signing path works, there is a
-[verification record](VERIFICATION.md) for two stagenet transactions **built, signed,
+[verification record](VERIFICATION.md) for three stagenet transactions **built, signed,
 serialized, broadcast and confirmed entirely by this SDK**:
 
-| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` |
-|---|---|---|
-| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` |
-| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` |
-| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
+| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` | v0.4, `withdraw.Engine` |
+|---|---|---|---|
+| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` | `b0c659f7d63fd1346c6d4d95e15cbe465e7464213391654f694a08fa62f8422c` |
+| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` | `c1c1c95fae85e1fbcc1cf2c7e586f61a3fbc558e083a370583f22e56b74c0a44` |
+| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
 
-The transaction id the SDK computed matches the one the node assigned in both
+The transaction id the SDK computed matches the one the node assigned in all three
 cases, which independently confirms that serialization agrees with consensus byte
-for byte. The second was produced by [`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal):
-intent persisted, inputs reserved, broadcast and confirmed through the engine.
+for byte. The second and third were produced through the engine: intent persisted,
+inputs reserved, broadcast and confirmed. The second is
+[`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal); the third is the same path on
+the v0.4 tree, where every call takes a context and the amounts are `int64` shors throughout.
 
 That document also gives the exact witness format consensus requires, a table
 mapping `testmempoolaccept` rejections to their causes, and the steps to reproduce
