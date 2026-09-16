@@ -100,7 +100,7 @@ func startClient(t *testing.T, stub *pushStub, addrs ...string) (*Client, contex
 func startClientEvery(t *testing.T, stub *pushStub, reconcile time.Duration, addrs ...string) (*Client, context.CancelFunc) {
 	t.Helper()
 	c := NewClient(stub.addr(), reconcile, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	c.PingInterval = time.Hour
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestNotificationFloodCoalescesToOneRefreshPerPass(t *testing.T) {
 	a1 := craftAddr(t, 0x11)
 	sh1 := scripthashOf(t, a1)
 	c := NewClient(stub.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestPingAdvancesOnlyCleanRecords(t *testing.T) {
 	stub.failList[sh3] = true
 	stub.mu.Unlock()
 	c := NewClient(stub.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func TestReconcileCoversADroppedNotification(t *testing.T) {
 	sh1 := scripthashOf(t, a1)
 	stub.set(sh1, "s0", `[]`)
 	c := NewClient(stub.addr(), 150*time.Millisecond, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	c.PingInterval = time.Hour
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)

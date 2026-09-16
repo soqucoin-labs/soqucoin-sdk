@@ -547,7 +547,9 @@ func (f *fixture) indexer(t *testing.T, reconcile time.Duration, addrs ...string
 func startClientOn(t *testing.T, idx *fakeIndexer, reconcile time.Duration, addrs ...string) (*electrumx.Client, context.CancelFunc) {
 	t.Helper()
 	elx := electrumx.NewClient(idx.addr(), reconcile, nil)
-	elx.HRP = types.Regtest.HRP
+	if err := elx.SetHRP(types.Regtest.HRP); err != nil {
+		t.Fatal(err)
+	}
 	elx.PingInterval = time.Hour
 	if err := elx.TrackAddresses(addrs); err != nil {
 		t.Fatal(err)

@@ -199,7 +199,7 @@ func TestPollingStopsWithTheContext(t *testing.T) {
 	})
 	logs := &countingHandler{}
 	c := NewClient(stub.addr(), 20*time.Millisecond, slog.New(logs))
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}

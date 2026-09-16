@@ -112,12 +112,12 @@ type Client struct {
 	status         map[string]string        // guarded by mu: address -> last status seen (reply or notification)
 	changed        map[string]bool          // guarded by mu: addresses with a change pending
 
-	// HRP is the network prefix the tracked addresses must carry. Leave it
-	// empty and TrackAddresses infers it from the addresses themselves; set it
-	// explicitly ("sq" mainnet, "ssq" stagenet) to have TrackAddresses reject
-	// any address on another network. There is deliberately no default: a
-	// silent stagenet default on a mainnet deployment refreshed nothing, ever.
-	HRP string
+	// networkHRP is the network prefix the tracked addresses must carry,
+	// guarded by mu. Read it through hrp(), set it through SetHRP: it was an
+	// exported field, and a caller assigning to it while the refresher was
+	// running was the same data race from outside the package that hrp()
+	// closes inside it.
+	networkHRP string
 
 	// PingInterval is how often Start pings the server: it keeps the server's
 	// idle timer from closing the session and advances the freshness of every
@@ -286,7 +286,7 @@ func (c *Client) TrackAddresses(addresses []string) error {
 		byHash[sh] = a
 	}
 	c.mu.Lock()
-	c.HRP = hrp
+	c.networkHRP = hrp
 	c.addresses = append([]string(nil), addresses...)
 	c.trackedSet = make(map[string]bool, len(addresses))
 	for _, a := range addresses {
@@ -313,7 +313,37 @@ func (c *Client) TrackAddresses(addresses []string) error {
 func (c *Client) hrp() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.HRP
+	return c.networkHRP
+}
+
+// SetHRP pins the network prefix the tracked addresses must carry: "sq" for
+// mainnet and regtest, "ssq" for stagenet. Leave it unset and TrackAddresses
+// infers the prefix from the addresses it is given; pin it and TrackAddresses
+// refuses an address on any other network. There is deliberately no default: a
+// silent stagenet default on a mainnet deployment refreshed nothing, ever.
+//
+// The write is under the lock every read of the prefix takes, so this is safe
+// on a running client. Two things are refused. A prefix no supported network
+// uses, because it can only ever produce script hashes no server knows. And a
+// change of prefix once addresses are tracked, because the UTXO cache, the
+// subscriptions and the script hashes were all derived under the old one, so
+// the client would be reading one network's server with another network's
+// keys: call TrackAddresses(nil) first if that is really the intent.
+func (c *Client) SetHRP(hrp string) error {
+	if len(types.GenesisHashesForHRP(hrp)) == 0 {
+		return fmt.Errorf("%w: %q is not the prefix of a supported network", ErrNetworkMismatch, hrp)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.networkHRP == hrp {
+		return nil
+	}
+	if c.networkHRP != "" && len(c.addresses) > 0 {
+		return fmt.Errorf("%w: client is %s with %d addresses tracked, cannot become %s",
+			ErrNetworkMismatch, c.networkHRP, len(c.addresses), hrp)
+	}
+	c.networkHRP = hrp
+	return nil
 }
 
 // RefreshAll fetches UTXOs for all tracked addresses: one
@@ -666,37 +696,6 @@ func (c *Client) EvictUTXO(txid string, vout uint32) {
 			}
 		}
 	}
-}
-
-// AddChangeUTXO records a change output in the UTXO cache before the indexer
-// reports it, at height 0. It shows in GetBalance's unconfirmed figure and in
-// GetUTXOs at once; the next refresh replaces it with the indexer's record, or
-// drops it if the indexer does not know the transaction yet.
-//
-// It does not make the change spendable. utxo.CoinSelector selects only
-// outputs with a height above zero at the confirmations asked for, so change
-// becomes an input once it has confirmed and the indexer reports it, whether
-// or not it was injected here. A run that needs the change of one payment to
-// fund the next stalls; keep enough confirmed outputs for the run instead.
-//
-// Deprecated: the injection has no effect on selection and the cache shows
-// the output as soon as the indexer reports it anyway. Kept for callers that
-// read the unconfirmed balance; it may be removed in v0.4.
-func (c *Client) AddChangeUTXO(txid string, vout uint32, value int64, addr string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	changeUTXO := types.UTXO{
-		TxID:      txid,
-		Vout:      vout,
-		Value:     value,
-		Height:    0, // Unconfirmed — updated by next refresh
-		Address:   addr,
-		AssetType: types.AssetTypeSOQ,
-	}
-
-	c.utxos[addr] = append(c.utxos[addr], changeUTXO)
-	c.log.Info("added a change output to the cache", "txid", txid, "vout", vout, "value", value, "address", addr)
 }
 
 // SetAssetType stamps the asset type on a cached UTXO. Called by Defense 11

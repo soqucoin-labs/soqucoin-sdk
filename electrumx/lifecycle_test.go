@@ -82,7 +82,7 @@ func newHangupServer(t *testing.T, answer int, hold bool) *hangupServer {
 func TestConnectFailsAtOnceWhenTheServerHangsUpInTheHandshake(t *testing.T) {
 	srv := newHangupServer(t, 0, false)
 	c := NewClient(srv.ln.Addr().String(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	start := time.Now()
 	err := c.Connect(context.Background())
 	if err == nil {
@@ -100,7 +100,7 @@ func TestConnectFailsAtOnceWhenTheServerHangsUpInTheHandshake(t *testing.T) {
 	// wait for the call deadline, and the Connect must fail.
 	held := newHangupServer(t, 1, true)
 	c2 := NewClient(held.ln.Addr().String(), time.Hour, nil)
-	c2.HRP = types.Stagenet.HRP
+	setHRP(t, c2, types.Stagenet.HRP)
 	connErr := make(chan error, 1)
 	go func() { connErr <- c2.Connect(context.Background()) }()
 	time.Sleep(100 * time.Millisecond)
@@ -126,7 +126,7 @@ func TestConnectFailsAtOnceWhenTheServerHangsUpInTheHandshake(t *testing.T) {
 func TestReconnectIsPacedWhenTheConnectionDiesAfterTheHandshake(t *testing.T) {
 	srv := newHangupServer(t, 3, false)
 	c := NewClient(srv.ln.Addr().String(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	c.PingInterval = time.Hour
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestUnchangedStatusDoesNotSkipARefreshAfterAFailure(t *testing.T) {
 	sh1 := scripthashOf(t, a1)
 	stub.set(sh1, "s0", `[]`)
 	c := NewClient(stub.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestNotificationFromAReplacedConnectionIsIgnored(t *testing.T) {
 	a1 := craftAddr(t, 0x11)
 	sh1 := scripthashOf(t, a1)
 	c := NewClient(stub.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
