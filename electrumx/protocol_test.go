@@ -176,7 +176,7 @@ func firstParam(req request) string {
 func connect(t *testing.T, s *scriptedStub) *Client {
 	t.Helper()
 	c := NewClient(s.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -418,8 +418,8 @@ func TestTrackAddressesInfersAndEnforcesNetwork(t *testing.T) {
 	if err := c.TrackAddresses([]string{ssq}); err != nil {
 		t.Fatalf("infer: %v", err)
 	}
-	if c.HRP != types.Stagenet.HRP {
-		t.Errorf("HRP inferred as %q, want ssq", c.HRP)
+	if c.hrp() != types.Stagenet.HRP {
+		t.Errorf("HRP inferred as %q, want ssq", c.hrp())
 	}
 	if err := c.TrackAddresses([]string{sq}); !errors.Is(err, ErrNetworkMismatch) {
 		t.Errorf("mainnet address accepted on a stagenet client: %v", err)
@@ -456,7 +456,7 @@ func TestConnectRejectsWrongGenesis(t *testing.T) {
 		return []string{reply(req.ID, `null`)}
 	})
 	c := NewClient(stub.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	err := c.Connect(context.Background())
 	if !errors.Is(err, ErrGenesisMismatch) {
 		t.Fatalf("stagenet client accepted a mainnet indexer: %v", err)
@@ -466,7 +466,7 @@ func TestConnectRejectsWrongGenesis(t *testing.T) {
 	}
 	// Mainnet and regtest share an HRP, so a mainnet client accepts either.
 	c2 := NewClient(stub.addr(), time.Hour, nil)
-	c2.HRP = types.Mainnet.HRP
+	setHRP(t, c2, types.Mainnet.HRP)
 	if err := c2.Connect(context.Background()); err != nil {
 		t.Fatalf("mainnet client refused a mainnet indexer: %v", err)
 	}

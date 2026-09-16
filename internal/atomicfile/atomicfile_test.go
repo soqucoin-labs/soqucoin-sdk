@@ -116,8 +116,11 @@ func TestWriteFileDirectorySyncFailureIsReported(t *testing.T) {
 	recordSyncs(t, func(name string) bool { return name == dir })
 
 	err := WriteFile(path, []byte("new"), 0o600)
-	if err == nil || err.Error() != "sync directory of "+path+": injected sync failure" {
-		t.Fatalf("error %v", err)
+	if err == nil || !errors.Is(err, ErrWrittenNotDurable) {
+		t.Fatalf("error %v, want one wrapping ErrWrittenNotDurable", err)
+	}
+	if want := "sync directory of " + path; err.Error() != want+": "+ErrWrittenNotDurable.Error()+": injected sync failure" {
+		t.Fatalf("error text %q", err)
 	}
 	onlyEntry(t, dir, "state.json")
 	got, _ := os.ReadFile(path)

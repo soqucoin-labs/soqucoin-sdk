@@ -156,7 +156,6 @@ because of a specific incident:
 |---------|-----------------|--------|
 | **Defense 11** | Stale UTXO signing, via `gettxout` pre-verification | 2 weeks of failed payouts |
 | **Defense 12** | SpentPending flag loss, via merge refresh instead of replace | Race condition during refresh |
-| **Defense 13** | Change recorded in the cache before the indexer reports it (`AddChangeUTXO`, deprecated: it never made change spendable, the selector waits for a confirmation) | Back-to-back payment failures |
 | **PF-018** | Bufio panic on large responses, via a 4MB read buffer | 18,000+ UTXO address |
 | **F5** | Broken pipe after idle, via TCP keepalive at 30s | NAT/firewall timeout |
 | **PF-018b** | TCP stream corruption, via a connection mutex | Concurrent broadcast+poll |
@@ -237,6 +236,7 @@ See the [`examples/`](./examples) directory:
 - [`pool_payout`](./examples/pool_payout): Batch payouts with circuit breaker
 - [`consolidate`](./examples/consolidate): Merge the smallest final outputs into one at the hot wallet, through `tx.BuildSignedSweep` against your own node
 - [`stagenet_withdrawal`](./examples/stagenet_withdrawal): The withdrawal recorded in [VERIFICATION.md](docs/VERIFICATION.md), through `withdraw.Engine` against your own node
+- [`exchange_split`](./examples/exchange_split): The same withdrawal path as three processes sharing one directory: a watcher with the node credential, a signer that holds the key and opens no socket, and a broadcaster that sends
 
 ## Contributing
 

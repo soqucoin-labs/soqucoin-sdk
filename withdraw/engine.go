@@ -330,7 +330,17 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	}
 	in.State = StateBuilt
 	if err := e.save(ctx, in); err != nil {
-		// Not durable, so it must not reach the network: release and report.
+		if errors.Is(err, ErrWrittenNotDurable) {
+			// The store has the record and says so: only its durability is
+			// unconfirmed. Every other reader of the store, including Recover
+			// and any process that broadcasts, will find this intent Built, so
+			// releasing its inputs here would leave a signed transaction whose
+			// inputs the next withdrawal can select. The intent stays Built
+			// with its reservation, and the error is returned so the caller
+			// knows the record may not survive a power loss.
+			return fmt.Errorf("built intent %s saved, durability not confirmed: %w", in.ID, err)
+		}
+		// Not saved, so it must not reach the network: release and report.
 		e.release(in)
 		in.State, in.RawHex, in.TxID, in.Inputs = StateCreated, "", "", nil
 		return fmt.Errorf("persist built intent %s: %w", in.ID, err)

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
-	coinsel "github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
 
 const (
@@ -46,19 +45,6 @@ func TestEvictUTXODoesNotPanicOnShortTxID(t *testing.T) {
 	c.EvictUTXO("abc", 0)
 	if n := len(c.utxos[adr]); n != 0 {
 		t.Errorf("UTXO not evicted: %d remain", n)
-	}
-}
-
-func TestAddChangeUTXODoesNotPanicOnShortIdentifiers(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("AddChangeUTXO panicked: %v", r)
-		}
-	}()
-	c := newTestClient(nil)
-	c.AddChangeUTXO("ab", 0, 500, "s")
-	if n := len(c.utxos["s"]); n != 1 {
-		t.Errorf("change UTXO not added: %d entries", n)
 	}
 }
 
@@ -211,49 +197,6 @@ func TestSetAssetTypeUnknownOutpointIsANoOp(t *testing.T) {
 	c.SetAssetType(txB, 0, 1)
 	if got := c.GetUTXOs(adr)[0].AssetType; got != types.AssetTypeSOQ {
 		t.Errorf("an unrelated UTXO was restamped to %d", got)
-	}
-}
-
-// ── AddChangeUTXO ──────────────────────────────────────────────────────────
-
-// Injected change is cached as unconfirmed: it counts in the unconfirmed
-// balance and is not selected. The claim it once carried, that it made
-// back-to-back payments possible, was false: the selector requires a height
-// above zero, so an injected output at height 0 is never an input.
-func TestAddChangeUTXOIsCachedAsUnconfirmedAndNotSelected(t *testing.T) {
-	c := newTestClient(nil)
-	c.AddChangeUTXO(txA, 1, 750, adr)
-
-	got := c.GetUTXOs(adr)
-	if len(got) != 1 {
-		t.Fatalf("cache entries = %d, want 1", len(got))
-	}
-	if got[0].Height != 0 {
-		t.Errorf("Height = %d, want 0 (unconfirmed)", got[0].Height)
-	}
-	if got[0].Value != 750 || got[0].Vout != 1 {
-		t.Errorf("change UTXO = %+v, want value 750 vout 1", got[0])
-	}
-	if got[0].AssetType != types.AssetTypeSOQ {
-		t.Errorf("AssetType = %d, want native SOQ", got[0].AssetType)
-	}
-	if got[0].SpentPending {
-		t.Error("fresh change must not be marked spent-pending")
-	}
-	// Unconfirmed, so it must not appear in the confirmed balance.
-	confirmed, unconfirmed := c.GetBalance(1, 100)
-	if confirmed != 0 {
-		t.Errorf("confirmed = %d, want 0", confirmed)
-	}
-	if unconfirmed != 750 {
-		t.Errorf("unconfirmed = %d, want 750", unconfirmed)
-	}
-	// And the selector does not spend it, at one confirmation or at none.
-	sel := coinsel.NewCoinSelector(nil)
-	for _, minConf := range []int{1, 0} {
-		if picked, _, err := sel.SelectUTXOs(c.GetAllUTXOs(), 1, minConf, 100, nil); err == nil {
-			t.Errorf("minConf %d: injected change was selected: %+v", minConf, picked)
-		}
 	}
 }
 

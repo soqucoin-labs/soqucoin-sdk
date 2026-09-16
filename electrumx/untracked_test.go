@@ -16,7 +16,7 @@ import (
 func TestUntrackingAnAddressRemovesItsCoinsFromEveryView(t *testing.T) {
 	a1, a2 := craftAddr(t, 0x11), craftAddr(t, 0x22)
 	c := NewClient("127.0.0.1:1", time.Second, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.TrackAddresses([]string{a1, a2}); err != nil {
 		t.Fatal(err)
 	}

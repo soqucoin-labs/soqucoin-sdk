@@ -279,6 +279,114 @@
       "find": "\t\t\tif fn, ok := decl.(*ast.FuncDecl); ok && isForwarder(fn, recvType) {\n\t\t\t\tcontinue\n\t\t\t}",
       "replace": "\t\t\tfn, isFunc := decl.(*ast.FuncDecl)\n\t\t\tif !isFunc || isForwarder(fn, recvType) {\n\t\t\t\tcontinue\n\t\t\t}",
       "why": "Every declaration is walked, not only the function declarations: a package-level function literal lives in a GenDecl, and a reading that filters to FuncDecl never sees the call sites inside one."
+    },
+    {
+      "id": "electrumx-hrp-changed-under-tracked-addresses",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestSetHRPRefusesMovingATrackedClientToAnotherNetwork",
+      "find": "\tif c.networkHRP != \"\" && len(c.addresses) > 0 {",
+      "replace": "\tif false {",
+      "why": "A client cannot change network once addresses are tracked: the UTXO cache, the subscriptions and every script hash were derived under the old prefix, so it would be asking one network's server about another network's keys and answering 'no coins' for every address."
+    },
+    {
+      "id": "filestore-rolls-back-a-write-that-landed",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestPutKeepsARecordThatLandedButIsNotKnownDurable",
+      "find": "\t\tif errors.Is(err, atomicfile.ErrWrittenNotDurable) {",
+      "replace": "\t\tif errors.Is(err, os.ErrClosed) {",
+      "why": "A write that failed after the rename left the new record in the file. Rolling the map back there makes memory contradict the file, and because every Put writes the whole file from memory the next one puts the older record back over the newer: a Built intent, with a signed transaction and reserved inputs, silently reverts."
+    },
+    {
+      "id": "split-snapshot-age-unchecked",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestASnapshotIsRefusedUnlessItIsCurrentAndConsistent",
+      "find": "\tif age := now.Sub(s.At); age > maxAge {",
+      "replace": "\tif age := now.Sub(s.At); false {",
+      "why": "The snapshot is the signer's whole view of the chain and it has no other way to check it. An old one lists outputs that may already be spent, so building from it signs a second transaction over inputs the first one used."
+    },
+    {
+      "id": "split-store-id-unchecked",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestTheStoreRefusesAnIDThatIsNotAFileNameInIt",
+      "find": "\tif !idPattern.MatchString(id) || id == \"..\" {",
+      "replace": "\tif false {",
+      "why": "The intent id is chosen by the system that asks for the withdrawal and it becomes a file name. Unchecked, a separator or a parent reference writes the record outside the store, or reads another file as a withdrawal."
+    },
+    {
+      "id": "build-releases-inputs-for-a-record-the-store-holds",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBuildKeepsTheReservationWhenTheSaveLandedButIsNotKnownDurable",
+      "find": "\t\tif errors.Is(err, ErrWrittenNotDurable) {",
+      "replace": "\t\tif errors.Is(err, context.Canceled) {",
+      "why": "A save that landed and is only unconfirmed for durability leaves the record in the store, where Recover and any broadcaster will find it Built. Treating that as unsaved releases the inputs of a signed transaction, and the next withdrawal selects them: two transactions stand over one input and one is rejected for good."
+    },
+    {
+      "id": "split-signer-skips-built-withdrawals-it-holds-no-reservation-for",
+      "file": "examples/exchange_split/signer/main.go",
+      "package": "./examples/exchange_split/signer",
+      "test": "TestReconcileReservesABuiltWithdrawalThisSetHasNoReservationFor",
+      "find": "\tbuilt, err := store.List(ctx, withdraw.StateBuilt)",
+      "replace": "\tbuilt, err := store.List(ctx, withdraw.StateFailed)",
+      "why": "A reservation expires by its TTL and is dropped when the set is loaded, and a signer on a new host has no set at all, so a signed withdrawal waiting for the broadcaster can have no reservation in this process. Its inputs are still unspent and therefore in the snapshot, so the pass over the store's Built withdrawals is the only thing keeping the next selection off them."
+    },
+    {
+      "id": "split-store-answers-with-a-record-of-another-id",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestARecordWhoseIDIsNotTheNameItWasReadUnderIsRefused",
+      "find": "\tif in.ID != id {",
+      "replace": "\tif false {",
+      "why": "A case-folding filesystem answers a read of W1.json with w1.json. Without this check the store reports one withdrawal as another, so Submit takes the second as already submitted, its request is moved aside and it is never paid."
+    },
+    {
+      "id": "split-store-list-not-ordered-oldest-first",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestListIsOldestFirstThenByID",
+      "find": "\t\treturn out[i].CreatedAt.Before(out[j].CreatedAt)",
+      "replace": "\t\treturn false",
+      "why": "Recover re-sends built withdrawals in the order List returns, oldest first, as withdraw.FileStore does. Without the sort the order is whatever the directory read gives, so the oldest signed transaction is not the first one re-sent after a restart. The first version of the test asserted an order the directory read already produced, so it passed with the sort deleted."
+    },
+    {
+      "id": "electrumx-track-commits-over-a-pin-taken-during-the-call",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestTrackAddressesRefusesACommitAfterAnotherNetworkWasPinned",
+      "find": "\tif c.networkHRP != \"\" && c.networkHRP != hrp {",
+      "replace": "\tif false {",
+      "why": "TrackAddresses reads the prefix, validates the addresses against it, then commits. A SetHRP that lands in between is silently overwritten without this test, and both calls return nil: the client then tracks one network's addresses while another is pinned, which is the mainnet-reading-stagenet case pinning exists to prevent."
+    },
+    {
+      "id": "split-watcher-publishes-a-snapshot-with-no-tip",
+      "file": "examples/exchange_split/watcher/main.go",
+      "package": "./examples/exchange_split/watcher",
+      "test": "TestPublishWithholdsTheSnapshotUnlessTheViewIsCurrentAndConfirmed",
+      "find": "\tif tip <= 0 {",
+      "replace": "\tif false {",
+      "why": "A node that answers zero for the tip has no chain to speak of. Writing the snapshot anyway leaves a file the signer refuses as self-contradicting, so every withdrawal stops until a good snapshot replaces it, and the signer cannot tell that state from a watcher that has not started."
+    },
+    {
+      "id": "split-store-lists-a-record-with-an-unusable-id",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestListRefusesARecordWhoseIDIsNotUsableAtAll",
+      "find": "\t\tif err := CheckID(in.ID); err != nil {",
+      "replace": "\t\tif false {",
+      "why": "A file name and the id inside it can agree and both still be unusable. Without the check List hands the engine a withdrawal that Get and Put refuse, so its next transition cannot be saved and the record is stuck wherever the engine left it."
+    },
+    {
+      "id": "split-signer-accepts-a-selection-it-cannot-pay-the-fee-for",
+      "file": "examples/exchange_split/signer/main.go",
+      "package": "./examples/exchange_split/signer",
+      "test": "TestSelectForFeeRefusesInputsThatCannotPayTheirOwnFee",
+      "find": "\t\tif len(selected) <= n {",
+      "replace": "\t\tif true {",
+      "why": "The fee of an ML-DSA payment is dominated by its inputs, so a selection made under a one-input target and answered with three is short of its own fee. Accepting it signs a transaction the node refuses for paying less than its weight."
     }
   ]
 }

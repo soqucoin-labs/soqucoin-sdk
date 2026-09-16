@@ -184,7 +184,9 @@ func run(ctx context.Context, cfg runConfig) error {
 		return fmt.Errorf("electrumx %s is not on this machine; pass -electrumx-tls", cfg.elxHost)
 	}
 	elxClient := electrumx.NewClient(cfg.elxHost, 15*time.Second, logger)
-	elxClient.HRP = network.HRP
+	if err := elxClient.SetHRP(network.HRP); err != nil {
+		return err
+	}
 	if cfg.elxTLS {
 		elxClient.UseTLS()
 	}

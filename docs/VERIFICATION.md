@@ -1,9 +1,9 @@
 # Transaction Verification Record
 
 This document lets you verify the signing path independently rather than take our
-word for it. It records two transactions **built, signed, serialized, broadcast and
-confirmed entirely by the public SDK**, the second through its withdrawal engine,
-with identifiers you can decode against a Soqucoin node yourself, and the
+word for it. It records three transactions **built, signed, serialized, broadcast and
+confirmed entirely by the public SDK**, the second and third through its withdrawal
+engine, with identifiers you can decode against a Soqucoin node yourself, and the
 procedure to reproduce them.
 
 Nothing here requires access to our infrastructure. Every identifier below is
@@ -55,6 +55,44 @@ inputs reserved, the transaction broadcast through `rpc.Client.Broadcast` and co
 soqucoin-cli getrawtransaction \
   13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be 1
 ```
+
+## The confirmed withdrawal from the v0.4 tree
+
+Stagenet, built and signed by the v0.4 tree and driven through `withdraw.Engine`: the intent was
+persisted before anything reached the network, the input was reserved in the spent set at build
+time, the transaction was broadcast once, and the engine's confirmer moved the intent to confirmed
+on the node's word.
+
+| | |
+|---|---|
+| **Transaction id** | `b0c659f7d63fd1346c6d4d95e15cbe465e7464213391654f694a08fa62f8422c` |
+| **Block** | `c1c1c95fae85e1fbcc1cf2c7e586f61a3fbc558e083a370583f22e56b74c0a44` (height 85,205, 2026-09-16T07:46:13Z) |
+| Funding transaction | `c4bf3724891b21bbc09c9330092f9b8f328799e7b2d80dc5d5c2778dd7f1b655`, output 0 |
+| Inputs / outputs | 1 in, 2 out (payment plus change) |
+| Size / vsize | 3,880 bytes / 1,073 vB |
+| Witness stack | `[2421, 1313]` bytes |
+| Payment / change | 2,497,900,000 / 1,026,000 shors |
+| Fee | 1,074,000 shors, 1,001 shors/vB against the 1,000 asked for |
+| Network | stagenet |
+| SDK version | `v0.4.0` |
+
+```bash
+soqucoin-cli getrawtransaction \
+  b0c659f7d63fd1346c6d4d95e15cbe465e7464213391654f694a08fa62f8422c 1
+```
+
+Two things this record adds to the two above. The amounts are `int64` shors end to end, so the
+payment is exactly 2,497,900,000 shors rather than a decimal figure rounded into one. And the
+transaction id the SDK computed before the broadcast is the id the node assigned, which is the
+check worth making your own: any disagreement in serialization would produce a different hash.
+
+The engine path is the one [`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal) runs.
+This particular run reached the node over the public builders gateway (`gettxout`,
+`getrawtransaction` and a client-signed broadcast over HTTPS) because the machine that produced it
+had no route to an RPC port; the engine, the selector, the keystore and the signing path were the
+SDK's own. With node RPC of your own, the example reproduces it directly.
+
+---
 
 The keys were derived with `keys.DeriveSeed` and `keys.FromSeed` from a master secret created for
 the run (under the v1 scheme of v0.3.5; the keystore file holds the keys, so the v2 derivation of

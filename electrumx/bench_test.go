@@ -47,7 +47,7 @@ func BenchmarkSubscribeAndRefreshPerAddress(b *testing.B) {
 	})
 	addrs := benchAddrs(b, n)
 	c := NewClient(stub.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(b, c, types.Stagenet.HRP)
 	if err := c.Connect(context.Background()); err != nil {
 		b.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func BenchmarkNotificationToRefresh(b *testing.B) {
 	a := benchAddrs(b, 1)[0]
 	sh, _ := address.AddressToScriptHash(types.Stagenet.HRP, a)
 	c := NewClient(stub.addr(), time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(b, c, types.Stagenet.HRP)
 	c.PingInterval = time.Hour
 	if err := c.Connect(context.Background()); err != nil {
 		b.Fatal(err)

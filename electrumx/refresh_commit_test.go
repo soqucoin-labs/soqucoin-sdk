@@ -18,7 +18,7 @@ const twoUTXOs = `[{"tx_hash":"` + txA + `","tx_pos":0,"value":100,"height":10},
 func connectOnly(t *testing.T, addr string, addrs ...string) *Client {
 	t.Helper()
 	c := NewClient(addr, time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	c.PingInterval = time.Hour
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestAPanicInOnRefreshLeavesTheClientUsable(t *testing.T) {
 func TestASubscribeReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	a := craftAddr(t, 0x11)
 	c := NewClient("127.0.0.1:1", time.Hour, nil)
-	c.HRP = types.Stagenet.HRP
+	setHRP(t, c, types.Stagenet.HRP)
 	if err := c.TrackAddresses([]string{a}); err != nil {
 		t.Fatal(err)
 	}

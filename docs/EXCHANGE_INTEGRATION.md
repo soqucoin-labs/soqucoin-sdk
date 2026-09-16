@@ -718,12 +718,26 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			// Budget the fee against vsize: a one-input, two-output payment is about
-			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB.
-			budget := amount + (1100+950*int64(utxo.MaxInputsPerTX))*feeRate
-			selected, _, err := selector.SelectUTXOs(elx.GetAllUTXOs(), budget, 1, tip, []string{hotWallet})
-			if err != nil {
-				return nil, err
+			// Budget the fee against the inputs the selection takes, not
+			// against the cap. A one-input, two-output payment is about
+			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB, so
+			// asking for utxo.MaxInputsPerTX inputs' worth demands about
+			// 0.77 SOQ of headroom at the recommended rate: a wallet holding
+			// 25 SOQ in one output could not then pay 24.99, and the last
+			// 0.77 SOQ of any hot wallet would be unspendable. Ask for n
+			// inputs' worth and ask again when the answer needs more; n only
+			// grows, and MaxInputsPerTX bounds the loop.
+			var selected []types.UTXO
+			for n := 1; n <= utxo.MaxInputsPerTX; {
+				vsize := int64(1100 + 950*(n-1))
+				selected, _, err = selector.SelectUTXOs(elx.GetAllUTXOs(), amount+vsize*feeRate, 1, tip, []string{hotWallet})
+				if err != nil {
+					return nil, err
+				}
+				if len(selected) <= n {
+					break
+				}
+				n = len(selected)
 			}
 			// Defense 11: the node must still have every input. Refuses to
 			// evict on a syncing node; skips immature coinbase.
@@ -797,6 +811,56 @@ output's program, the signature checked over the recomputed sighash), so a signe
 as a build error rather than as a rejected broadcast. A payout is pre-flighted with `VerifyAll`,
 never with `keys.Verify` alone ([Security Guide](SECURITY.md#a-signature-over-your-own-digest)).
 
+### Running the withdrawal path as more than one process
+
+Everything above is one process holding the node's RPC credential, the indexer's address and the
+key. The interfaces do not require that: `Selector`, `BuildSigner`, `Broadcaster` and `Store` are
+injected, so the work splits across hosts.
+[`examples/exchange_split`](../examples/exchange_split) is that split as three binaries sharing one
+directory, and its README is the longer form of what follows.
+
+| Process | Holds | Transitions it owns |
+|---|---|---|
+| watcher | node RPC credential, indexer address, no key | → `Created`, and it publishes what may be spent |
+| signer | the keystore; it opens no socket and holds no credential | `Created` → `Built` |
+| broadcaster | node RPC credential, no key | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed` |
+
+Three things decide whether a split is safe, and they are worth stating before you build your own.
+
+**The node cannot give the signer a safe credential.** It has no per-method access control on its
+RPC interface, so an account that may call `gettxout` may also call `sendrawtransaction`. A
+"read-only signer account" is not something the node enforces. Either the signer gets a credential
+as powerful as the broadcaster's, or it gets none and selects from what another process has already
+checked against the node. The example takes the second road: the watcher writes a snapshot of
+outputs it read back from the node one at a time, stamped with the node's tip height and the time
+it answered, and the signer refuses a snapshot older than a bound it is given. A withheld or stale
+snapshot means no withdrawal is built until the watcher publishes a current one.
+
+**`withdraw.FileStore` is for one process.** Every `Put` writes the whole file from that process's
+own map, so a second process does not merge with the first, it overwrites it: an intent saved as
+`Built` comes back as `Created` while its signed transaction is already in a mempool, and its
+inputs are free for the next withdrawal to select. Share a store only through something that
+writes one record at a time: a row in your database behind `withdraw.Store`, or the
+one-file-per-intent store the example carries.
+
+**One state, one writer, and the store is the truth about spends.** Give each transition to exactly
+one process and have each process list only the states it owns. The spent set is then per process,
+not shared: the signer holds the reservations because it is the only one that selects, and it
+reconciles them against the store before every selection. Every `Built` intent in the store is
+re-reserved, inputs of `Broadcast` intents are marked spent, entries the set already holds for a
+`Confirmed` intent are marked confirmed so they age out, and a reservation held for something
+`Created` or `Failed` is released. In one process
+`withdraw.Engine.Recover` does this once at startup. In a split the facts change while the signer
+runs, so the repair runs every pass; the signer cannot call `Recover` itself, because `Recover`
+also re-broadcasts, and re-broadcasting is the broadcaster's job.
+
+```bash
+# Three terminals, one directory. Only -dir is shared between hosts.
+go run ./examples/exchange_split/watcher      -dir state -network stagenet -hot ssq1p... -electrumx 127.0.0.1:50001
+go run ./examples/exchange_split/signer       -dir state -network stagenet -state signer-state
+go run ./examples/exchange_split/broadcaster  -dir state -network stagenet -state broadcaster-state -confirmations 6
+```
+
 ---
 
 ## Step 4: Confirm Transactions
@@ -843,19 +907,21 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 ## Verification: a real confirmed transaction
 
 Rather than asking you to trust that the signing path works, there is a
-[verification record](VERIFICATION.md) for two stagenet transactions **built, signed,
+[verification record](VERIFICATION.md) for three stagenet transactions **built, signed,
 serialized, broadcast and confirmed entirely by this SDK**:
 
-| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` |
-|---|---|---|
-| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` |
-| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` |
-| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
+| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` | v0.4, `withdraw.Engine` |
+|---|---|---|---|
+| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` | `b0c659f7d63fd1346c6d4d95e15cbe465e7464213391654f694a08fa62f8422c` |
+| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` | `c1c1c95fae85e1fbcc1cf2c7e586f61a3fbc558e083a370583f22e56b74c0a44` |
+| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
 
-The transaction id the SDK computed matches the one the node assigned in both
+The transaction id the SDK computed matches the one the node assigned in all three
 cases, which independently confirms that serialization agrees with consensus byte
-for byte. The second was produced by [`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal):
-intent persisted, inputs reserved, broadcast and confirmed through the engine.
+for byte. The second and third were produced through the engine: intent persisted,
+inputs reserved, broadcast and confirmed. The second is
+[`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal); the third is the same path on
+the v0.4 tree, where every call takes a context and the amounts are `int64` shors throughout.
 
 That document also gives the exact witness format consensus requires, a table
 mapping `testmempoolaccept` rejections to their causes, and the steps to reproduce
