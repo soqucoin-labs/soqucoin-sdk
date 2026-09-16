@@ -28,10 +28,30 @@ jobs:
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
     runs-on: ubuntu-latest
     steps:
+      # The checker comes from the BASE of the pull request, never from the pull request.
+      # On a pull_request event actions/checkout defaults to the merge ref, so the default
+      # would run the copy of the checker that the pull request itself ships: a change to
+      # that file, or to this workflow, could make the check pass without checking any text.
+      # A pull request cannot alter its own base. On an issue_comment event GitHub already
+      # runs the default branch's workflow, and the fallback below resolves to it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The corpus runs first. A check whose own fixtures fail would otherwise pass every
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          persist-credentials: false
+      # The corpus runs first. A checker whose own fixtures fail would otherwise pass every
       # pull request and read as a green tick.
-      - run: python3 .github/scripts/register-lint-selftest.py
-      - run: python3 .github/scripts/register-lint.py
+      #
+      # A base with no checker fails the job rather than skipping it. Skipping would be the
+      # same fail-open shape this whole check exists to remove, and the one moment it costs
+      # anything is the change that installs the checker, whose own run has no trusted copy
+      # to use. That merge is reviewed by hand.
+      - name: Lint the text of this pull request
+        run: |
+          test -f .github/scripts/register-lint.py || {
+            echo "::error title=Register check::the base of this pull request carries no register checker, so there is no trusted copy to run, and this fails closed. Expected only for the change that installs the checker."
+            exit 1
+          }
+          python3 .github/scripts/register-lint-selftest.py
+          python3 .github/scripts/register-lint.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
