@@ -183,10 +183,7 @@ func run(ctx context.Context, dir string, keystore *keys.Manager, inputList, to 
 			if err != nil {
 				return nil, err
 			}
-			// Budget the fee against vsize: a one-input, two-output payment is about
-			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB.
-			budget := amount + (1100+976*int64(len(funding)))*feeRate
-			selected, _, err := selector.SelectUTXOs(funding, budget, 1, tip, []string{hot})
+			selected, err := selectForFee(selector, funding, hot, amount, feeRate, tip)
 			if err != nil {
 				return nil, err
 			}
@@ -233,6 +230,37 @@ func run(ctx context.Context, dir string, keystore *keys.Manager, inputList, to 
 	}
 	return printRecord(ctx, node, intent.TxID)
 }
+
+// selectForFee budgets the fee against the number of inputs the selection
+// actually takes, the same shape as the split signer's selectForFee and the
+// exchange guide's Step 3.
+//
+// The two obvious targets are both wrong. One input's worth can come back
+// with three, whose fee is larger than the budget they were chosen under.
+// Budgeting for every candidate instead asks for the fee of inputs the
+// payment will not spend: a further 976 vB for each unselected output, so a
+// wallet holding its coins in one output could not send nearly all of it. It
+// asks for n inputs' worth and asks again when the answer needs more; n only
+// grows, and the selector's own cap bounds the loop.
+func selectForFee(selector *utxo.CoinSelector, funding []types.UTXO, hot string, amount, feeRate, tip int64) ([]types.UTXO, error) {
+	for n := 1; n <= utxo.MaxInputsPerTX; {
+		selected, _, err := selector.SelectUTXOs(funding, amount+vsizeFor(n)*feeRate, 1, tip, []string{hot})
+		if err != nil {
+			return nil, err
+		}
+		if len(selected) <= n {
+			return selected, nil
+		}
+		n = len(selected)
+	}
+	return nil, fmt.Errorf("no selection fits the fee of %d inputs", utxo.MaxInputsPerTX)
+}
+
+// vsizeFor is the vsize of a payment with n inputs and two outputs, measured:
+// about 1,073 vB at one input and about 976 vB for each further ML-DSA-44
+// input (docs/EXCHANGE_INTEGRATION.md, Transaction Size). Rounded up, as a
+// fee target should be.
+func vsizeFor(n int) int64 { return 1100 + 976*int64(n-1) }
 
 // fundingUTXOs reads each outpoint from the node and returns them as inputs,
 // with the one keystore address they all pay. An outpoint that is spent,
