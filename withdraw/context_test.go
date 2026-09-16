@@ -462,6 +462,34 @@ func TestSubmitUnderAnEndedContextRegistersNothing(t *testing.T) {
 	}
 }
 
+// ctxBoundStore is the store the exchange guide tells an integrator to write:
+// a database behind withdraw.Store, which bounds every query with the context
+// it is given. Both in-tree stores ignore the context (store.go), so this is
+// the only shape that can show whether a pass survives a context that has
+// already ended.
+type ctxBoundStore struct{ Store }
+
+func (s ctxBoundStore) Get(ctx context.Context, id string) (*Intent, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, fmt.Errorf("get %s: %w", id, err)
+	}
+	return s.Store.Get(ctx, id)
+}
+
+func (s ctxBoundStore) Put(ctx context.Context, in *Intent) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("put %s: %w", in.ID, err)
+	}
+	return s.Store.Put(ctx, in)
+}
+
+func (s ctxBoundStore) List(ctx context.Context, states ...State) ([]*Intent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	return s.Store.List(ctx, states...)
+}
+
 // Recover's documentation says every Built intent stays Built and re-reserved,
 // to be sent by the next Recover. The context stops the sending, not the
 // re-reserving: checking it between the Reserve and the Broadcast with a break
@@ -469,6 +497,11 @@ func TestSubmitUnderAnEndedContextRegistersNothing(t *testing.T) {
 // belong to signed transactions that may be in a mempool, so the next
 // selection could take them. Reached whenever a reservation file is lost or
 // has expired across an outage, which is the case Recover's Reserve is for.
+//
+// The second engine runs on a ctxBoundStore, because the re-reservation also
+// depends on the List that finds the Built intents: under an ended context a
+// database store answers that List with an error, and against a store that
+// ignores the context this test would pass with the repair unreachable.
 func TestRecoverUnderAnEndedContextReReservesEveryBuiltIntent(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewFileStore(filepath.Join(dir, "intents.json"))
@@ -487,7 +520,8 @@ func TestRecoverUnderAnEndedContextReReservesEveryBuiltIntent(t *testing.T) {
 
 	// A spent set that knows nothing: the reservation file was lost or expired
 	// while the process was down.
-	store2, _ := NewFileStore(filepath.Join(dir, "intents.json"))
+	reopened, _ := NewFileStore(filepath.Join(dir, "intents.json"))
+	store2 := ctxBoundStore{Store: reopened}
 	spent2 := utxo.NewSpentSet(filepath.Join(dir, "spent-fresh.json"), nil)
 	e2 := newEngine(t, store2, spent2, &fakeNet{mode: "ok"}, coins())
 	ctx, cancel := context.WithCancel(context.Background())

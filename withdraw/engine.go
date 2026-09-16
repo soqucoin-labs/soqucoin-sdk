@@ -551,11 +551,15 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 // The passes that repair the spent set never touch the network and are not
 // cut short by the caller's context: their store reads run under
 // context.WithoutCancel(ctx), so a Recover started with an ended context
-// still re-marks every Broadcast intent's inputs and releases the orphan
-// reservations. The re-broadcast pass runs under ctx: its List and its
-// sends stop once ctx has ended, and every Built intent stays Built,
-// re-reserved, to be sent by the next Recover. The context's error is among
-// those returned.
+// still re-marks every Broadcast intent's inputs, releases the orphan
+// reservations, and re-reserves every Built intent. Listing the Built
+// intents is one of those reads: their re-reservation depends on it, and a
+// store that bounds its queries with the context it is given (which is what
+// a database store does, and what the file stores do not) would answer an
+// ended context with an error, so nothing would be re-reserved. Only the
+// sending runs under ctx. It stops once ctx has ended, and every Built
+// intent stays Built, re-reserved, to be sent by the next Recover. The
+// context's error is among those returned.
 func (e *Engine) Recover(ctx context.Context) error {
 	var errs []error
 	note := func(err error) {
@@ -574,7 +578,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 		}
 	}
 	note(e.releaseOrphanReservations(repair))
-	built, err := e.Store.List(ctx, StateBuilt)
+	built, err := e.Store.List(repair, StateBuilt)
 	if err != nil {
 		return errors.Join(append(errs, err)...)
 	}
