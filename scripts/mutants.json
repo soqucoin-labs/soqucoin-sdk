@@ -342,6 +342,15 @@
       "find": "\tif in.ID != id {",
       "replace": "\tif false {",
       "why": "A case-folding filesystem answers a read of W1.json with w1.json. Without this check the store reports one withdrawal as another, so Submit takes the second as already submitted, its request is moved aside and it is never paid."
+    },
+    {
+      "id": "split-store-list-not-ordered-oldest-first",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestListIsOldestFirstThenByID",
+      "find": "\t\treturn out[i].CreatedAt.Before(out[j].CreatedAt)",
+      "replace": "\t\treturn false",
+      "why": "Recover re-sends built withdrawals in the order List returns, oldest first, as withdraw.FileStore does. Without the sort the order is whatever the directory read gives, so the oldest signed transaction is not the first one re-sent after a restart. The first version of the test asserted an order the directory read already produced, so it passed with the sort deleted."
     }
   ]
 }

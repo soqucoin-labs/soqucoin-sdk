@@ -832,9 +832,10 @@ one-file-per-intent store the example carries.
 **One state, one writer, and the store is the truth about spends.** Give each transition to exactly
 one process and have each process list only the states it owns. The spent set is then per process,
 not shared: the signer holds the reservations because it is the only one that selects, and it
-reconciles them against the store before every selection. Inputs of intents the store holds as
-`Broadcast` or `Confirmed` are marked spent, a `Built` intent's reservation is renewed, and a
-reservation held for something `Created` or `Failed` is released. In one process
+reconciles them against the store before every selection. Every `Built` intent in the store is
+re-reserved, inputs of `Broadcast` intents are marked spent, entries the set already holds for a
+`Confirmed` intent are marked confirmed so they age out, and a reservation held for something
+`Created` or `Failed` is released. In one process
 `withdraw.Engine.Recover` does this once at startup. In a split the facts change while the signer
 runs, so the repair runs every pass; the signer cannot call `Recover` itself, because `Recover`
 also re-broadcasts, and re-broadcasting is the broadcaster's job.

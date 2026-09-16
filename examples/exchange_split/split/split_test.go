@@ -342,10 +342,13 @@ func TestListIsOldestFirstThenByID(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The oldest record has the lexically last name, so the file order
+	// os.ReadDir returns is not the order this test expects: without the sort
+	// by CreatedAt it fails.
 	write("w3", base.Add(2*time.Minute))
 	write("w2b", base.Add(time.Minute))
 	write("w2a", base.Add(time.Minute))
-	write("w1", base)
+	write("w9", base)
 
 	got, err := s.List(context.Background())
 	if err != nil {
@@ -355,7 +358,7 @@ func TestListIsOldestFirstThenByID(t *testing.T) {
 	for _, in := range got {
 		ids = append(ids, in.ID)
 	}
-	want := []string{"w1", "w2a", "w2b", "w3"}
+	want := []string{"w9", "w2a", "w2b", "w3"}
 	if len(ids) != len(want) {
 		t.Fatalf("List returned %v, want %v", ids, want)
 	}
