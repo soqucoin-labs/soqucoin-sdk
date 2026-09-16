@@ -182,3 +182,223 @@ func TestKeyPairPrintingRedactsThePrivateKey(t *testing.T) {
 		}
 	}
 }
+
+// The attack, and the reason this exists: a signer pointed at a populated
+// keystore that it never opened, saving. Before this, the file's keys were
+// replaced by the manager's, Save returned nil, and nothing anywhere said the
+// keys were gone. Measured on the shipped behaviour: 9,192 bytes holding one
+// key became 284 bytes holding none.
+func TestSaveRefusesAKeystoreItHasNotRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.enc")
+	writer := NewManager(path, "pw")
+	kp, err := GenerateKeyForNetwork("ssq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Save(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		manager func(t *testing.T) *Manager
+	}{
+		{"holding nothing", func(t *testing.T) *Manager {
+			return NewManager(path, "pw")
+		}},
+		{"holding an imported key", func(t *testing.T) *Manager {
+			m := NewManager(path, "pw")
+			other, err := GenerateKeyForNetwork("ssq")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.ImportPrivateKey(other.PrivateKey, other.PublicKey, other.Address); err != nil {
+				t.Fatal(err)
+			}
+			return m
+		}},
+		{"after a load that failed on the passphrase", func(t *testing.T) *Manager {
+			m := NewManager(path, "not the passphrase")
+			if err := m.Load(); err == nil {
+				t.Fatal("Load with a wrong passphrase succeeded")
+			}
+			return m
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.manager(t)
+			err := m.Save()
+			if !errors.Is(err, ErrKeystoreUnread) {
+				t.Fatalf("Save: %v, want ErrKeystoreUnread", err)
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Errorf("the error does not name the path: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("the refused Save changed the keystore")
+			}
+			reader := NewManager(path, "pw")
+			if err := reader.Load(); err != nil {
+				t.Fatalf("Load after the refused Save: %v", err)
+			}
+			if !reader.HasKey(kp.Address) {
+				t.Error("the original key is gone")
+			}
+		})
+	}
+}
+
+// The three legitimate ways to write a keystore stay silent. Each of these
+// would be a regression an integrator hits on their first run.
+func TestSaveAllowsTheWaysAKeystoreIsMeantToBeWritten(t *testing.T) {
+	t.Run("a first run on a path that does not exist", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "keys.enc")
+		m := NewManager(path, "pw")
+		kp, err := GenerateKeyForNetwork("ssq")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Save(); err != nil {
+			t.Fatalf("Save on a new path: %v", err)
+		}
+		if err := m.Save(); err != nil {
+			t.Fatalf("second Save by the manager that created it: %v", err)
+		}
+	})
+
+	t.Run("LoadOrCreate then save", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "keys.enc")
+		m := NewManager(path, "pw")
+		if err := m.LoadOrCreate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Save(); err != nil {
+			t.Fatalf("Save after LoadOrCreate created the file: %v", err)
+		}
+	})
+
+	t.Run("load then save", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "keys.enc")
+		first := NewManager(path, "pw")
+		if err := first.LoadOrCreate(); err != nil {
+			t.Fatal(err)
+		}
+		second := NewManager(path, "pw")
+		if err := second.Load(); err != nil {
+			t.Fatal(err)
+		}
+		kp, err := GenerateKeyForNetwork("ssq")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := second.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
+			t.Fatal(err)
+		}
+		if err := second.Save(); err != nil {
+			t.Fatalf("Save after Load: %v", err)
+		}
+		third := NewManager(path, "pw")
+		if err := third.Load(); err != nil {
+			t.Fatal(err)
+		}
+		if !third.HasKey(kp.Address) {
+			t.Error("the key added after the load is not in the file")
+		}
+	})
+
+	t.Run("LoadOrCreate on a populated keystore", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "keys.enc")
+		first := NewManager(path, "pw")
+		kp, err := GenerateKeyForNetwork("ssq")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := first.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Save(); err != nil {
+			t.Fatal(err)
+		}
+		second := NewManager(path, "pw")
+		if err := second.LoadOrCreate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := second.Save(); err != nil {
+			t.Fatalf("Save after LoadOrCreate opened an existing file: %v", err)
+		}
+		if !second.HasKey(kp.Address) {
+			t.Error("LoadOrCreate did not bring the existing key back")
+		}
+	})
+}
+
+// LoadOrCreate creates only when there is nothing to lose. If another process
+// wrote the keystore between the read and the write, the creating save is
+// refused rather than replacing it, and the operator's next run loads it.
+func TestLoadOrCreateDoesNotReplaceAKeystoreThatAppeared(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.enc")
+	m := NewManager(path, "pw")
+
+	// What the create path does, with the file present as it would be had
+	// another process won the race: the guard is the last thing between the
+	// two, so it is asked directly.
+	other := NewManager(path, "pw")
+	kp, err := GenerateKeyForNetwork("ssq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.ImportPrivateKey(kp.PrivateKey, kp.PublicKey, kp.Address); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.checkMayOverwrite(); !errors.Is(err, ErrKeystoreUnread) {
+		t.Fatalf("checkMayOverwrite: %v, want ErrKeystoreUnread", err)
+	}
+	if err := NewManager(path, "pw").LoadOrCreate(); err != nil {
+		t.Fatalf("the next run does not load what appeared: %v", err)
+	}
+}
+
+// A path that cannot be examined is not a path this can call empty, so it is
+// refused rather than written.
+func TestSaveRefusesAPathItCannotExamine(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "unreadable")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "sub", "keys.enc")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Skip("cannot drop directory permissions here")
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	err := NewManager(path, "pw").Save()
+	if err == nil {
+		t.Fatal("Save into a directory that cannot be examined succeeded")
+	}
+	if errors.Is(err, ErrKeystoreUnread) {
+		t.Fatalf("a stat failure is reported as an overwrite refusal: %v", err)
+	}
+	if !strings.Contains(err.Error(), "stat keystore") {
+		t.Fatalf("Save failed for some other reason than the stat: %v", err)
+	}
+}
