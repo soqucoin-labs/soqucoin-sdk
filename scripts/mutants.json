@@ -387,6 +387,42 @@
       "find": "\t\tif len(selected) <= n {",
       "replace": "\t\tif true {",
       "why": "The fee of an ML-DSA payment is dominated by its inputs, so a selection made under a one-input target and answered with three is short of its own fee. Accepting it signs a transaction the node refuses for paying less than its weight."
+    },
+    {
+      "id": "withdraw-build-trusts-the-callers-intent-state",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestConcurrentProcessOfOneIntentBuildsOneTransaction",
+      "find": "\tif stored.State != StateCreated {\n\t\treturn fmt.Errorf(\"%w: %s is %s\", ErrWrongState, in.ID, stored.State)\n\t}",
+      "replace": "\tif false {\n\t\treturn fmt.Errorf(\"%w: %s is %s\", ErrWrongState, in.ID, stored.State)\n\t}",
+      "why": "Build's first state check reads the caller's copy of the intent, which another worker can have advanced between its read and this lock. Without the stored state deciding, two workers each holding a Created copy of one intent both build, each reserving different inputs because the other's are taken, and each broadcasts. The recipient is paid twice from different inputs, which is the first of the two failure modes the package exists to prevent."
+    },
+    {
+      "id": "withdraw-process-reports-a-failed-intent-as-sent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestProcessOfAnAlreadyFailedIntentReportsTheFailure",
+      "find": "\tif in.State == StateFailed {",
+      "replace": "\tif false {",
+      "why": "Failed is terminal and nothing was sent, but Submit answers the same id with no error, so an exchange retrying a payout reaches Process again. Without this branch Process returns a nil error and an empty txid, so the caller records the withdrawal as sent and a circuit breaker fed that nil records a success."
+    },
+    {
+      "id": "withdraw-recover-stops-re-reserving-at-the-ended-context",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRecoverUnderAnEndedContextReReservesEveryBuiltIntent",
+      "find": "\t\t\tnote(fmt.Errorf(\"recover %s: not sent: %w\", in.ID, err))\n\t\t\tcontinue",
+      "replace": "\t\t\tnote(fmt.Errorf(\"recover %s: not sent: %w\", in.ID, err))\n\t\t\tbreak",
+      "why": "The context stops Recover's sending, not its re-reserving. Breaking here leaves every Built intent after the first one unreserved, and their inputs belong to signed transactions that may be in a mempool, so the next selection can take them."
+    },
+    {
+      "id": "split-signer-fee-target-undersizes-its-own-transaction",
+      "file": "examples/exchange_split/signer/main.go",
+      "package": "./examples/exchange_split/signer",
+      "test": "TestVsizeForNeverUndersizesTheTransactionItBudgets",
+      "find": "return 1100 + 976*int64(n-1)",
+      "replace": "return 1100 + 950*int64(n-1)",
+      "why": "A fee target under the real vsize makes selectForFee accept a selection that cannot pay its own fee. BuildSendTransaction then computes a negative change and returns ErrInsufficientFunds, which is neither transient nor a context error, so the engine fails the withdrawal permanently. The measured figure is 976 vB per further input and the guide's size table gives it; 950 was short from three inputs up."
     }
   ]
 }
