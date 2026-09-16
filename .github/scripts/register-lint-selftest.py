@@ -65,3 +65,6 @@ for name, path, must_fail in PATHS:
 total = len(TEXTS) + len(PATHS)
 print(f"\n{total - bad}/{total} fixtures behave")
 sys.exit(1 if bad else 0)
+
+# Probe branch: opened against guard/register-ci so the base carries the checker, which
+# exercises the trusted path. Closed once the check has reported.
