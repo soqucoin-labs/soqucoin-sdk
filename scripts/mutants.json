@@ -423,6 +423,24 @@
       "find": "return 1100 + 976*int64(n-1)",
       "replace": "return 1100 + 950*int64(n-1)",
       "why": "A fee target under the real vsize makes selectForFee accept a selection that cannot pay its own fee. BuildSendTransaction then computes a negative change and returns ErrInsufficientFunds, which is neither transient nor a context error, so the engine fails the withdrawal permanently. The measured figure is 976 vB per further input and the guide's size table gives it; 950 was short from three inputs up."
+    },
+    {
+      "id": "withdraw-failed-intent-is-not-a-per-request-fault",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestProcessOfAnAlreadyFailedIntentReportsTheFailure",
+      "find": "\tErrFailed = fmt.Errorf(\"withdraw: intent failed permanently and was not sent (%w)\", rpc.ErrPermanent)",
+      "replace": "\tErrFailed = errors.New(\"withdraw: intent failed permanently and was not sent\")",
+      "why": "One withdrawal that cannot succeed says nothing about the node or the indexer. resilience.CircuitBreaker recognises a per-request fault by rpc.ErrPermanent and counts anything else as systemic, so an ErrFailed that wraps nothing makes three retries of one bad payout open the breaker and stop every withdrawal for its cooldown. That is the outcome the breaker's own documentation says it exists to prevent."
+    },
+    {
+      "id": "withdraw-process-follows-a-lost-build-race-into-broadcast",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestConcurrentProcessOfOneIntentBuildsOneTransaction",
+      "find": "\t\t\t// later call reads the intent fresh and sends it.\n\t\t\treturn in, err",
+      "replace": "\t\t\t// later call reads the intent fresh and sends it.\n\t\t\tif errors.Is(err, ErrWrongState) {\n\t\t\t\tin, _, _ = e.Store.Get(ctx, id)\n\t\t\t} else {\n\t\t\t\treturn in, err\n\t\t\t}",
+      "why": "The worker that loses the build race must stop on the state error rather than follow the intent into Broadcast. Two workers in Broadcast at once hold separate copies and Broadcast takes no lock: the second re-reserves inputs the first marked permanently spent, raises ErrReservationLost naming a withdrawal that does not exist, and saves Built over the Broadcast state the first recorded, so the payout is not marked confirmed until a later pass re-sends it."
     }
   ]
 }

@@ -1,29 +1,52 @@
 #!/usr/bin/env python3
 """Ask, for a list of candidate guard sites, whether anything in the tree pins them.
 
-The declared-mutant runner answers a narrower question: does the one named test
-catch this one named change. This asks the enumeration question instead. Given a
-site and a behaviour change at it, does `go test ./...` over every package go red?
-A site nothing turns red is a site the tree states in code and pins nowhere.
+check-mutants.py answers a narrower question: does the one named test catch the
+one named change. This asks the enumeration question instead. Given a site and a
+behaviour change at it, does `go test ./...` over every package go red? A site
+nothing turns red is a site the tree states in code and pins nowhere.
 
-Not a gate and not committed to the manifest: a scratch instrument for a reading.
+Not a gate and not part of `make gates`: a scratch instrument for a reading.
+
+It mutates tracked source in place, so it takes the same precaution
+check-mutants.py does. The file's original text goes to a recovery record before
+the mutation and the record is removed once the file is back, so a run killed in
+between leaves a marker on disk rather than an injected defect that reads as
+ordinary source. Signals restore the file before exiting, and a leftover record
+stops the next run until it is dealt with.
 
   scripts/probe-sites.py sites.json
 """
 
 import json
 import pathlib
+import signal
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+RECOVERY = ROOT / ".probe-sites-recovery.json"
+
+_in_flight: dict[pathlib.Path, str] = {}
+
+
+def _restore_all() -> None:
+    for path, original in list(_in_flight.items()):
+        path.write_text(original)
+        _in_flight.pop(path, None)
+    RECOVERY.unlink(missing_ok=True)
+
+
+def _on_signal(signum, _frame):
+    _restore_all()
+    sys.exit(128 + signum)
 
 
 def run_suite() -> tuple[bool, str]:
     """(everything passed, first failing package or the build error)."""
     proc = subprocess.run(
         ["go", "test", "./..."],
-        capture_output=True, text=True, cwd=ROOT,
+        capture_output=True, text=True, cwd=ROOT, timeout=900,
     )
     if proc.returncode == 0:
         return True, ""
@@ -33,6 +56,13 @@ def run_suite() -> tuple[bool, str]:
 
 
 def main() -> int:
+    if RECOVERY.exists():
+        print(f"a previous run was killed mid-mutation; {RECOVERY} holds the original text.\n"
+              f"put the file back and remove the record before running again.", file=sys.stderr)
+        return 2
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+
     sites = json.loads(pathlib.Path(sys.argv[1]).read_text())
     unpinned = []
     for s in sites:
@@ -41,11 +71,15 @@ def main() -> int:
         if original.count(s["find"]) != 1:
             print(f"SKIP  {s['id']}: `find` occurs {original.count(s['find'])} times")
             continue
+        RECOVERY.write_text(json.dumps({"file": s["file"], "original": original}))
+        _in_flight[path] = original
         path.write_text(original.replace(s["find"], s["replace"]))
         try:
             ok, detail = run_suite()
         finally:
             path.write_text(original)
+            _in_flight.pop(path, None)
+            RECOVERY.unlink(missing_ok=True)
         if ok:
             print(f"UNPINNED  {s['id']}")
             unpinned.append(s["id"])
