@@ -100,9 +100,12 @@ Opening a passphrase keystore with an external key, or the reverse, is
 you looking for a wrong passphrase.
 
 Load before you save. `Save` writes the manager's keys over whatever is at the
-path, so calling it on a manager that has not loaded replaces a populated
-keystore with an empty one and returns no error. Open the file first, in every
-process that writes it.
+path, so a manager that has not read that file does not know what it is
+replacing. It refuses (`keys.ErrKeystoreUnread`) rather than replacing a
+populated keystore with its own idea of the contents. Creating a keystore on a
+path that does not exist yet, `LoadOrCreate`, and every save after either of
+those are unaffected; what is refused is a process writing a keystore it never
+opened. To replace one deliberately, remove the file or write to a new path.
 
 `Load` refuses a missing file (`keys.ErrKeystoreMissing`): a mistyped path would
 otherwise start a signer that hands out deposit addresses it can never spend from.

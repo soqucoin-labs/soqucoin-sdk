@@ -221,6 +221,24 @@
       "find": "\t\t\tif seen[name] {",
       "replace": "\t\t\tif false && seen[name] {",
       "why": "Go's decoder keeps the last of two members with the same name, and headerAAD authenticates what the decoder kept. A copy of pubkeys prepended before the real one therefore loads cleanly and is authenticated away, while a reader that takes the first member sees the address the person who edited the file chose."
+    },
+    {
+      "id": "keystore-save-overwrites-a-file-it-never-read",
+      "file": "keys/keys.go",
+      "package": "./keys",
+      "test": "TestSaveRefusesAKeystoreItHasNotRead",
+      "find": "\tif m.seenFile.Load() {\n\t\treturn nil\n\t}",
+      "replace": "\tif true {\n\t\treturn nil\n\t}",
+      "why": "Save writes the manager's keys over whatever is at the path. Without this test a manager that never read the file replaces the keys in it with its own, which is none on a manager that has only just opened, and returns no error. The keystore is still a keystore afterwards, so nothing downstream reports anything either."
+    },
+    {
+      "id": "keystore-save-permitted-after-a-load-that-failed",
+      "file": "keys/keys.go",
+      "package": "./keys",
+      "test": "TestSaveRefusesAKeystoreItHasNotRead",
+      "find": "\tks, err := strictDecode(data)",
+      "replace": "\tm.seenFile.Store(true)\n\tks, err := strictDecode(data)",
+      "why": "The bit that lets Save overwrite is set where a load succeeds, not where the file is read. A load that got the bytes and then failed to decrypt them knows less about the keystore than one that never opened it, and it is the state an operator retries from. Setting it on the read lets that manager write an empty keystore over a populated one, which is the defect the guard exists for."
     }
   ]
 }

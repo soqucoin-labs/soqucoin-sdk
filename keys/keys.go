@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa44"
 	soqaddr "github.com/soqucoin-labs/soqucoin-sdk/address"
@@ -102,6 +103,17 @@ type Manager struct {
 	keyFile string
 	passwd  []byte
 	extKey  []byte
+
+	// seenFile records that this manager has read the file at keyFile, or
+	// written it, so Save knows whether it is replacing content it can
+	// describe. It is set by a load that succeeds and by a save that
+	// completes, and never cleared.
+	//
+	// Atomic rather than a field under mu, deliberately: Save holds only a
+	// read lock, across Argon2id and a disk write, so that a save in progress
+	// does not block signing. Taking a write lock to record one monotonic bit
+	// would stall every Sign on a hot-wallet signer for the length of a save.
+	seenFile atomic.Bool
 }
 
 var (
@@ -135,6 +147,18 @@ var (
 
 	// ErrNoKey marks an address this manager holds no key for.
 	ErrNoKey = errors.New("keys: no key for address")
+
+	// ErrKeystoreUnread marks a write to a keystore file that exists and that
+	// this manager has never read. It is the mirror of ErrKeysHeld: that one
+	// refuses to read over keys held in memory, this one refuses to write over
+	// keys held on disk, and both exist because the alternative is losing key
+	// material without a word. Load the keystore before writing it, or write
+	// to a path of your own.
+	//
+	// Save returns it, and so does LoadOrCreate in the one case where the file
+	// was absent when it looked and present when it wrote. The wording does
+	// not name Save for that reason.
+	ErrKeystoreUnread = errors.New("keys: refusing to write over a keystore this manager has not read")
 )
 
 // maxKeygenAttempts bounds the regeneration loop in GenerateKeyForNetwork. The
@@ -255,7 +279,14 @@ func (m *Manager) Load() error {
 // LoadOrCreate is Load for the first run: when the keystore file does not
 // exist it creates an empty, encrypted one at the path, so every later Load
 // on that path succeeds and a second process cannot mistake the path for a
-// new one. Any other failure is reported as by Load.
+// new one.
+//
+// Other failures are reported as by Load, with one addition of its own. If the
+// file appears between the moment this looks for it and the moment it writes,
+// the write is refused with ErrKeystoreUnread rather than replacing what
+// appeared. The manager is left holding an empty key set rather than keys, so
+// Load on it afterwards is not refused as ErrKeysHeld and reads what the other
+// writer put there.
 func (m *Manager) LoadOrCreate() error {
 	return m.load(true)
 }
@@ -358,10 +389,22 @@ func (m *Manager) load(create bool) error {
 		}
 	}
 
+	// Here, and not where the file was read: a load that got the bytes and
+	// then failed to decrypt them knows less about the keystore than one that
+	// never opened it, and it is exactly the state an operator retries from.
+	// Setting the bit on the read would let that manager write an empty
+	// keystore over a populated one, which is the defect this guards.
+	m.seenFile.Store(true)
 	return nil
 }
 
 // Save encrypts and persists keys to the keystore file.
+//
+// It refuses to write over a keystore this manager has never read
+// (ErrKeystoreUnread), because the keys in that file are not the keys it is
+// about to write and nothing would say so afterwards. Load first, or save to a
+// path that does not exist yet; the first run on a new path, LoadOrCreate, and
+// every save after either of those are unaffected.
 func (m *Manager) Save() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -370,6 +413,10 @@ func (m *Manager) Save() error {
 
 // saveLocked is Save with the lock held by the caller.
 func (m *Manager) saveLocked() error {
+	if err := m.checkMayOverwrite(); err != nil {
+		return err
+	}
+
 	// Serialize key material
 	// plaintextKey is KeyPair's fields under the tags the ciphertext uses, so
 	// the conversion is the whole mapping. Adding or removing a field on
@@ -448,7 +495,35 @@ func (m *Manager) saveLocked() error {
 	if err := atomicfile.WriteFile(m.keyFile, data, 0600); err != nil {
 		return fmt.Errorf("write keystore: %w", err)
 	}
+	// The file at the path is now this manager's own work, so the next Save
+	// is not writing over anything it has not seen.
+	m.seenFile.Store(true)
 	return nil
+}
+
+// checkMayOverwrite is the one place Save decides whether it is allowed to
+// replace what is at the path. A manager that has read the file, or written
+// it, may; one that has not may only create.
+//
+// A stat error other than "does not exist" is a refusal rather than a pass: a
+// path that cannot be examined is not a path this can be sure is empty.
+//
+// The window between this test and the rename belongs to the operator, not to
+// this check. Two processes writing one keystore was never safe and is not
+// made safe here; what is closed is one process writing a keystore it never
+// opened.
+func (m *Manager) checkMayOverwrite() error {
+	if m.seenFile.Load() {
+		return nil
+	}
+	switch _, err := os.Stat(m.keyFile); {
+	case err == nil:
+		return fmt.Errorf("%w: %s", ErrKeystoreUnread, m.keyFile)
+	case os.IsNotExist(err):
+		return nil
+	default:
+		return fmt.Errorf("stat keystore: %w", err)
+	}
 }
 
 // ImportPrivateKey adds a key held in memory: a derived deposit key at sweep
