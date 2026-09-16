@@ -367,7 +367,7 @@ func selectForFee(selector *utxo.CoinSelector, snap split.Snapshot, amount, feeR
 // about 1,073 vB at one input and about 976 vB for each further ML-DSA-44
 // input (docs/EXCHANGE_INTEGRATION.md, Transaction Size). Rounded up, as a fee
 // target should be.
-func vsizeFor(n int) int64 { return 1100 + 950*int64(n-1) }
+func vsizeFor(n int) int64 { return 1100 + 976*int64(n-1) }
 
 // build builds every Created intent. An error stops that intent and not
 // the pass: a selector error that the engine treats as transient leaves the

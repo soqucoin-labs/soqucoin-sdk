@@ -729,7 +729,7 @@ func main() {
 			// grows, and MaxInputsPerTX bounds the loop.
 			var selected []types.UTXO
 			for n := 1; n <= utxo.MaxInputsPerTX; {
-				vsize := int64(1100 + 950*(n-1))
+				vsize := int64(1100 + 976*(n-1))
 				selected, _, err = selector.SelectUTXOs(elx.GetAllUTXOs(), amount+vsize*feeRate, 1, tip, []string{hotWallet})
 				if err != nil {
 					return nil, err

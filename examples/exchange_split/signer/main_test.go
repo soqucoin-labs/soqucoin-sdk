@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/examples/exchange_split/split"
+	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
 	"github.com/soqucoin-labs/soqucoin-sdk/withdraw"
@@ -315,5 +317,36 @@ func TestSelectForFeeRefusesInputsThatCannotPayTheirOwnFee(t *testing.T) {
 	}
 	if selected, err := selectForFee(selector, snap, amount, types.RecommendedFeeRate, 1); err == nil {
 		t.Fatalf("selected %d inputs that cannot pay the fee of %d inputs", len(selected), len(selected))
+	}
+}
+
+// vsizeFor is a fee target, so it must never fall under the vsize of the
+// transaction the selection it sizes will actually produce. Every other fee
+// test in this file measures a selection against vsizeFor itself, so the
+// budget was only ever compared with the budget. That is how a constant 26 vB
+// per input under the measured figure survived: it makes selectForFee accept a
+// selection whose total cannot pay the transaction's real fee, BuildSend then
+// computes a negative change and returns ErrInsufficientFunds, and the engine
+// reads that as permanent and fails the withdrawal for good.
+func TestVsizeForNeverUndersizesTheTransactionItBudgets(t *testing.T) {
+	recipient := tx.ScriptP2WPKH(make([]byte, 32))
+	change := tx.ScriptP2WPKH(bytes.Repeat([]byte{1}, 32))
+	for _, n := range []int{1, 2, 3, 5, 10, 40, utxo.MaxInputsPerTX} {
+		inputs := make([]types.UTXO, n)
+		for i := range inputs {
+			inputs[i] = types.UTXO{
+				TxID:   fmt.Sprintf("%060d%04d", 0, i),
+				Vout:   uint32(i),
+				Value:  10_000_000_000,
+				Height: 900, Address: "sq1pa3n373z2lgva3m53nssuwm7jl0dz697uzul7wh55ct7maf00xe4s2m80fs",
+			}
+		}
+		tr, err := tx.BuildSendTransaction(inputs, recipient, 1_000_000_000, change, types.RecommendedFeeRate)
+		if err != nil {
+			t.Fatalf("n=%d: build: %v", n, err)
+		}
+		if budget, real := vsizeFor(n), tr.VSize(); budget < real {
+			t.Errorf("n=%d: fee target %d vB, transaction %d vB, short by %d", n, budget, real, real-budget)
+		}
 	}
 }
