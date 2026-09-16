@@ -52,6 +52,7 @@ type fakeIndexer struct {
 	counts            map[string]int  // method+" "+scripthash
 	notified          int             // scripthash notifications written
 	suppressed        int             // scripthash notifications a drop withheld
+	unknown           []string        // scripthashes asked about that this indexer was not given
 }
 
 // indexerConn is one client connection: its write lock and what it subscribed.
@@ -98,9 +99,10 @@ var indexerMethods = map[string]indexerHandler{
 
 // scripthashMethods are the methods whose first parameter is a scripthash.
 // The counter key is built from it for these and left empty for the rest, so
-// that a count reads per address. Without this, server.version's counter
-// would be keyed on the client's version string, which is its first
-// parameter, and server.ping's and server.features' on nothing.
+// that a count reads per address. Without this the key would be whatever each
+// other method's first parameter happens to be: the client's version string
+// for server.version, the raw transaction for transaction.broadcast, and
+// nothing at all for server.ping, server.features and headers.subscribe.
 var scripthashMethods = map[string]bool{
 	"blockchain.scripthash.subscribe":   true,
 	"blockchain.scripthash.listunspent": true,
@@ -126,6 +128,14 @@ func newFakeIndexer(t *testing.T, scan *scanner, addrs ...string) *fakeIndexer {
 	t.Cleanup(func() {
 		_ = ln.Close()
 		f.closeClients()
+		// On the test goroutine, so a scripthash the fake was never given is
+		// a failure and not a panic from a connection goroutine.
+		f.mu.Lock()
+		unknown := append([]string(nil), f.unknown...)
+		f.mu.Unlock()
+		if len(unknown) > 0 {
+			t.Errorf("the client asked about %d scripthash(es) this indexer was not given (%v); pass every tracked address to newFakeIndexer too, or it answers 'no outputs' for them", len(unknown), unknown)
+		}
 	})
 	return f
 }
@@ -149,10 +159,10 @@ func (f *fakeIndexer) count(method, sh string) int {
 }
 
 // notifications reports how many scripthash notifications the server wrote,
-// counted after the write returned, and how many a drop withheld. A scenario that claims the client learned of a
-// deposit by a push, or in spite of one never arriving, asserts on these
-// rather than on a quiet interval, which only ever meant "the reconcile has
-// not fired yet on this machine".
+// counted after the write returned, and how many a drop withheld. A scenario
+// that claims the client learned of a deposit by a push, or in spite of one
+// never arriving, asserts on these rather than on a quiet interval, which
+// only ever meant "the reconcile has not fired yet on this machine".
 func (f *fakeIndexer) notifications() (sent, suppressed int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -225,15 +235,24 @@ func (f *fakeIndexer) tip() int64 {
 
 // utxosFor is the scanner's set for the address behind a scripthash.
 //
-// A scripthash the indexer was never given fails the test rather than
-// answering "no outputs". newFakeIndexer and startClientOn take their
-// addresses separately, so a scenario can track an address it forgot to give
-// the fake; answering that with an affirmative empty set is the silent
-// "no deposits" this file exists to keep out of the harness.
+// A scripthash the indexer was never given is recorded and reported by the
+// cleanup newFakeIndexer registers, rather than answered with "no outputs".
+// newFakeIndexer and startClientOn take their addresses separately, so a
+// scenario can track an address it forgot to give the fake; answering that
+// with an affirmative empty set is the silent "no deposits" this file exists
+// to keep out of the harness.
+//
+// It is recorded and not reported here because this runs on a connection
+// goroutine, and testing.T.Errorf from a goroutine still running after the
+// test function has returned panics instead of failing.
 func (f *fakeIndexer) utxosFor(sh string) []types.UTXO {
+	f.mu.Lock()
 	a, ok := f.byHash[sh]
 	if !ok {
-		f.t.Errorf("the client asked about scripthash %s, which this indexer was not given; pass the address to newFakeIndexer too", sh)
+		f.unknown = append(f.unknown, sh)
+	}
+	f.mu.Unlock()
+	if !ok {
 		return nil
 	}
 	return f.scan.GetUTXOs(a)
@@ -262,9 +281,10 @@ func (f *fakeIndexer) handleScripthashSubscribe(ic *indexerConn, req indexerRequ
 	sh := firstString(req)
 	// The status is read under the lock that records the subscription. Read
 	// outside it, an advance between the read and the store rescans to a new
-	// status, finds no subscription to notify, and then the store overwrites
-	// its record with the older one: the client is told a status the server
-	// has already moved past and is not told it moved.
+	// status, finds no subscription to notify, and the store then records the
+	// older one as the status last told: the client is told a status the
+	// server has already moved past, and learns of the move only on the next
+	// advance, which finds the recorded status stale and notifies.
 	f.mu.Lock()
 	st := f.status(sh)
 	ic.subs[sh] = st
