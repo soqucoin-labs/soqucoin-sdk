@@ -6,6 +6,11 @@ one named change. This asks the enumeration question instead. Given a site and a
 behaviour change at it, does `go test ./...` over every package go red? A site
 nothing turns red is a site the tree states in code and pins nowhere.
 
+A red site is the answer "pinned", so a tree that is already red answers
+"pinned" for every site and the instrument agrees with itself. The unmutated
+tree is run once first and a red one refuses the run, which is what
+check-mutants.py establishes per entry before it scores a catch.
+
 Not a gate and not part of `make gates`: a scratch instrument for a reading.
 
 It mutates tracked source in place, so it takes the same precaution
@@ -64,6 +69,11 @@ def main() -> int:
         signal.signal(sig, _on_signal)
 
     sites = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    ok, detail = run_suite()
+    if not ok:
+        print(f"the unmutated tree is red, so every site would read as pinned: {detail}",
+              file=sys.stderr)
+        return 2
     unpinned = []
     for s in sites:
         path = ROOT / s["file"]
@@ -73,8 +83,10 @@ def main() -> int:
             continue
         RECOVERY.write_text(json.dumps({"file": s["file"], "original": original}))
         _in_flight[path] = original
-        path.write_text(original.replace(s["find"], s["replace"]))
         try:
+            # Inside the try: a write that raises part way through leaves the
+            # file mutated, and the restore below is what puts it back.
+            path.write_text(original.replace(s["find"], s["replace"]))
             ok, detail = run_suite()
         finally:
             path.write_text(original)

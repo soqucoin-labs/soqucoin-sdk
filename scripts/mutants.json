@@ -441,6 +441,42 @@
       "find": "\t\t\t// later call reads the intent fresh and sends it.\n\t\t\treturn in, err",
       "replace": "\t\t\t// later call reads the intent fresh and sends it.\n\t\t\tif errors.Is(err, ErrWrongState) {\n\t\t\t\tin, _, _ = e.Store.Get(ctx, id)\n\t\t\t} else {\n\t\t\t\treturn in, err\n\t\t\t}",
       "why": "The worker that loses the build race must stop on the state error rather than follow the intent into Broadcast. Two workers in Broadcast at once hold separate copies and Broadcast takes no lock: the second re-reserves inputs the first marked permanently spent, raises ErrReservationLost naming a withdrawal that does not exist, and saves Built over the Broadcast state the first recorded, so the payout is not marked confirmed until a later pass re-sends it."
+    },
+    {
+      "id": "breaker-counts-a-lost-build-race-as-systemic",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestWithdrawalStateErrorsAreNotSystemic",
+      "find": "\twithdraw.ErrWrongState, withdraw.ErrInvalidIntent, withdraw.ErrConflict,",
+      "replace": "\twithdraw.ErrInvalidIntent, withdraw.ErrConflict,",
+      "why": "A withdrawal the engine refuses to act on is a fact about that withdrawal. The breaker counts every error it does not recognise as systemic, and Process returns ErrWrongState to the worker that loses the build race for an id, which a worker pool does as a matter of course: three losses in a row then open the breaker and stop every withdrawal for its cooldown. That is the outcome the breaker's own documentation says it exists to prevent, and it is the defect ErrFailed had in the first round of this branch. ErrHeld and ErrReservationLost are deliberately not in the set, because each is a transaction an operator must resolve before anything else is sent."
+    },
+    {
+      "id": "withdraw-recover-lists-built-intents-under-the-callers-context",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRecoverUnderAnEndedContextReReservesEveryBuiltIntent",
+      "find": "built, err := e.Store.List(repair, StateBuilt)",
+      "replace": "built, err := e.Store.List(ctx, StateBuilt)",
+      "why": "Re-reserving the Built intents is a repair of the spent set, not a network call, and it cannot happen unless the List that finds them answers. A store that bounds its queries with the context, which is what the guide tells an exchange to implement over its database, answers an ended context with an error; Recover would then return before the loop and leave every Built intent unreserved, with its inputs selectable while its signed bytes may be in a mempool. Both in-tree stores ignore the context, so only a context-bound store shows it."
+    },
+    {
+      "id": "stagenet-withdrawal-budgets-candidates-instead-of-the-selection",
+      "file": "examples/stagenet_withdrawal/main.go",
+      "package": "./examples/stagenet_withdrawal",
+      "test": "TestSelectForFeeLetsOneFundingOutputPayNearlyAllOfIt",
+      "find": "amount+vsizeFor(n)*feeRate",
+      "replace": "amount+vsizeFor(len(funding)+1)*feeRate",
+      "why": "The fee target must size the inputs the selection takes, not the candidate list it chose from. Budgeting for every candidate charges a further 976 vB for each output the payment will not spend and counts the first input twice, so a wallet holding its coins in one output is asked for 2,076 vB of headroom against a transaction of about 1,073 and the selector refuses a payment the wallet can pay. This is the program that produces the stagenet verification transaction, where one freshly funded output is the ordinary case."
+    },
+    {
+      "id": "stagenet-withdrawal-fee-target-undersizes-its-own-transaction",
+      "file": "examples/stagenet_withdrawal/main.go",
+      "package": "./examples/stagenet_withdrawal",
+      "test": "TestVsizeForNeverUndersizesTheTransactionItBudgets",
+      "find": "func vsizeFor(n int) int64 { return 1100 + 976*int64(n-1) }",
+      "replace": "func vsizeFor(n int) int64 { return 1100 + 950*int64(n-1) }",
+      "why": "A fee target under the real vsize makes the selection accept inputs that cannot pay their own fee. BuildSendTransaction then computes a negative change and returns ErrInsufficientFunds, which is neither transient nor a context error, so the engine fails the withdrawal permanently. The measured figure is 976 vB per further input; 950 was short from three inputs up. The constant now appears in this example and in the split signer, so each is pinned where it stands."
     }
   ]
 }
