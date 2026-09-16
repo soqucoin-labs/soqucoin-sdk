@@ -90,10 +90,16 @@ func setup(t *testing.T) *fixture {
 }
 
 func (f *fixture) monitor(t *testing.T, led *memLedger, required int64) *deposit.Monitor {
+	return f.monitorOver(t, f.scan, led, required, f.dep)
+}
+
+// monitorOver is a Monitor reading the given cache for the given addresses:
+// the scanner directly, or an electrumx.Client fed by the fake indexer.
+func (f *fixture) monitorOver(t *testing.T, cache deposit.Cache, led *memLedger, required int64, addrs ...string) *deposit.Monitor {
 	return &deposit.Monitor{
 		Network: types.Regtest, // coinbase maturity 60; every harness deposit is a coinbase
-		Cache:   f.scan, Node: f.n.rpc, Ledger: led,
-		Addresses: func(context.Context) []string { return []string{f.dep} },
+		Cache:   cache, Node: f.n.rpc, Ledger: led,
+		Addresses: func(context.Context) []string { return addrs },
 		Required:  func(int64) int64 { return required },
 		OnAlert: func(k deposit.AlertKind, m string) {
 			f.alerts = append(f.alerts, k)

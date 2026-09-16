@@ -239,6 +239,16 @@
       "find": "\tks, err := strictDecode(data)",
       "replace": "\tm.seenFile.Store(true)\n\tks, err := strictDecode(data)",
       "why": "The bit that lets Save overwrite is set where a load succeeds, not where the file is read. A load that got the bytes and then failed to decrypt them knows less about the keystore than one that never opened it, and it is the state an operator retries from. Setting it on the read lets that manager write an empty keystore over a populated one, which is the defect the guard exists for."
+    },
+    {
+      "id": "harness-fake-indexer-lacks-a-method-the-client-sends",
+      "file": "integration/fake_electrumx_test.go",
+      "package": "./integration",
+      "tags": "integration",
+      "test": "TestTheFakeIndexerAnswersEveryMethodTheClientSends",
+      "find": "\t\"blockchain.transaction.broadcast\":  (*fakeIndexer).handleBroadcast,",
+      "replace": "\t\"blockchain.transaction.broadcast.absent\": (*fakeIndexer).handleBroadcast,",
+      "why": "The push scenarios believe the fake indexer, so it has to answer every method electrumx.Client sends. The branch this harness came from was cut before the client grew blockchain.scripthash.get_history and blockchain.transaction.broadcast, and nothing failed: a scenario that reaches either meets 'unknown method', takes the error path and reports success without exercising the path it names. A double that has drifted from its client is worse than no double, because it is believed."
     }
   ]
 }

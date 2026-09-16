@@ -202,8 +202,8 @@ it is stated plainly, with the reason, in
 SOQUCOIND=/path/to/soqucoind make integration
 ```
 
-A throwaway regtest node, the real `deposit` and `withdraw` packages, nine end-to-end scenarios,
-about forty-five seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
+A throwaway regtest node, the real `deposit` and `withdraw` packages, thirteen end-to-end
+scenarios, about seventy seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
 each scenario proves.
 
 `SOQUCOIND` must be a runnable binary. In an autotools build tree that is `src/soqucoind`, the
