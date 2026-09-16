@@ -110,7 +110,7 @@ func run(ctx context.Context, cfg config) error {
 	if err := split.EnsureDir(cfg.state); err != nil {
 		return err
 	}
-	store, err := split.OpenDirStore(cfg.dir.Intents())
+	store, err := cfg.dir.Open()
 	if err != nil {
 		return err
 	}
@@ -139,15 +139,7 @@ func run(ctx context.Context, cfg config) error {
 		Spent:  spent,
 		Logger: logger,
 		Select: func(_ context.Context, amount, feeRate int64) ([]types.UTXO, error) {
-			// Budget the fee against vsize, as the guide does: a one-input,
-			// two-output payment is about 1,073 vB and each further
-			// ML-DSA-44 input adds about 976 vB.
-			budget := amount + (1100+950*int64(utxo.MaxInputsPerTX))*feeRate
-			selected, _, err := selector.SelectUTXOs(snap.Spendable(), budget, cfg.minConf, snap.Tip, []string{snap.HotAddress})
-			if err != nil {
-				return nil, err
-			}
-			return selected, nil
+			return selectForFee(selector, snap, amount, feeRate, cfg.minConf)
 		},
 		BuildSign: func(_ context.Context, inputs []types.UTXO, to string, amount, feeRate int64) (string, string, error) {
 			recipientSPK, err := address.ScriptFor(to)
@@ -168,7 +160,18 @@ func run(ctx context.Context, cfg config) error {
 
 	logger.Info("signer started", "dir", string(cfg.dir), "state", cfg.state, "keys", keystore.KeyCount())
 	for {
-		reconcile(ctx, store, spent, engine.ReservationTTL)
+		// Nothing is selected in a pass whose reconciliation did not finish.
+		// The spent set is this process's only record of what the broadcaster
+		// has sent, so selecting against a set that may be behind the store is
+		// how one input ends up under two signatures.
+		if err := reconcile(ctx, store, spent, engine.ReservationTTL); err != nil {
+			logger.Error("reconcile failed; nothing is built this pass", "err", err)
+			wait(ctx, cfg.interval)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			continue
+		}
 		var err error
 		snap, err = split.ReadSnapshot(cfg.dir, cfg.maxSnapshotAge, cfg.skew, time.Now().UTC())
 		switch {
@@ -191,11 +194,18 @@ func run(ctx context.Context, cfg config) error {
 				build(ctx, store, engine, cfg.network.HRP)
 			}
 		}
-		select {
-		case <-ctx.Done():
+		wait(ctx, cfg.interval)
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case <-time.After(cfg.interval):
 		}
+	}
+}
+
+// wait sleeps for d or until ctx ends.
+func wait(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
 	}
 }
 
@@ -220,22 +230,42 @@ func run(ctx context.Context, cfg config) error {
 //     reservation is renewed rather than left to expire.
 //   - Created or Failed: nothing signed exists, so a reservation held for one
 //     is a crash between reserving and saving, and the coins are free.
-func reconcile(ctx context.Context, store *split.DirStore, spent *utxo.SpentSet, ttl time.Duration) {
+func reconcile(ctx context.Context, store withdraw.Store, spent *utxo.SpentSet, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = withdraw.DefaultReservationTTL
 	}
+	// Built is listed first and the sent states second, which is the order
+	// that leaves no gap. These are two readings of a directory another
+	// process is writing, so an intent can move between them: promoted after
+	// the first listing it appears in both, is re-reserved by the first pass
+	// and recorded as a spend by the second. In the other order it appeared in
+	// neither, and a signer whose reservation for it had expired could select
+	// its input while the broadcaster was sending it.
+	built, err := store.List(ctx, withdraw.StateBuilt)
+	if err != nil {
+		return fmt.Errorf("list built withdrawals: %w", err)
+	}
+	for _, in := range built {
+		if in.NodeTxID != "" {
+			// The node accepted other bytes for this withdrawal. Those inputs
+			// are spent for good and must not sit on a reservation that
+			// expires, which is how Recover records the same case.
+			if err := recordSpend(spent, in, in.NodeTxID); err != nil {
+				return fmt.Errorf("record the spend of held withdrawal %s: %w", in.ID, err)
+			}
+			continue
+		}
+		if err := spent.Reserve(inputsOf(in), in.ID, ttl); err != nil {
+			// Either the write failed or another withdrawal holds one of these
+			// inputs, which means two signed transactions over one input. Both
+			// stop this pass: selecting while either is true is how the second
+			// payment gets made.
+			return fmt.Errorf("reserve the inputs of built withdrawal %s: %w", in.ID, err)
+		}
+	}
 	sent, err := store.List(ctx, withdraw.StateBroadcast, withdraw.StateConfirmed)
 	if err != nil {
-		logger.Error("reconcile: the store could not be read; nothing is selected this pass", "err", err)
-		return
-	}
-	// Which intents still hold a reservation here. A Broadcast intent among
-	// them is the case this pass exists for: the transaction is out and this
-	// set still calls its inputs reserved, so the reservation would expire and
-	// the inputs would be offered again.
-	reserved := map[string]bool{}
-	for _, id := range spent.ReservedIntents() {
-		reserved[id] = true
+		return fmt.Errorf("list sent withdrawals: %w", err)
 	}
 	for _, in := range sent {
 		inputs := inputsOf(in)
@@ -246,42 +276,16 @@ func reconcile(ctx context.Context, store *split.DirStore, spent *utxo.SpentSet,
 			// back, and the watcher's snapshot is read from the node, so it
 			// cannot offer one either.
 			if err := spent.ConfirmSpentAll(inputs); err != nil {
-				logger.Error("reconcile: inputs of a confirmed withdrawal not marked confirmed", "id", in.ID, "err", err)
+				return fmt.Errorf("mark the inputs of confirmed withdrawal %s: %w", in.ID, err)
 			}
-			continue
-		}
-		// Marking rewrites the whole file, so a withdrawal already recorded as
-		// a spend here is left alone: without this the set is rewritten on
-		// every pass for the whole history of sent withdrawals.
-		if !reserved[in.ID] && allSpent(spent, inputs) {
 			continue
 		}
 		txid := in.TxID
 		if in.NodeTxID != "" {
 			txid = in.NodeTxID // the node accepted other bytes; those are the spend
 		}
-		if err := spent.MarkBroadcastFor(inputs, txid, in.ID); err != nil {
-			logger.Error("reconcile: inputs of a sent withdrawal not marked spent", "id", in.ID, "err", err)
-			continue
-		}
-		logger.Info("reconcile: inputs of a sent withdrawal are recorded as spent", "id", in.ID, "txid", txid)
-	}
-	// Every Built intent is re-reserved from the store, and not only the ones
-	// this file already holds a reservation for. A reservation expires by its
-	// TTL and is dropped when the set is loaded, and a signer on a new host
-	// starts with no set at all, so a withdrawal signed and waiting for the
-	// broadcaster can have no reservation here at all. Its inputs are in the
-	// watcher's snapshot, since nothing has spent them yet, so without this
-	// the next withdrawal selects them and two signed transactions stand over
-	// one input. Reserve with the same id renews rather than refuses.
-	built, err := store.List(ctx, withdraw.StateBuilt)
-	if err != nil {
-		logger.Error("reconcile: the store could not be read for built withdrawals; nothing is selected this pass", "err", err)
-		return
-	}
-	for _, in := range built {
-		if err := spent.Reserve(inputsOf(in), in.ID, ttl); err != nil {
-			logger.Error("reconcile: a built withdrawal's inputs could not be reserved", "id", in.ID, "err", err)
+		if err := recordSpend(spent, in, txid); err != nil {
+			return fmt.Errorf("record the spend of withdrawal %s: %w", in.ID, err)
 		}
 	}
 	for _, id := range spent.ReservedIntents() {
@@ -296,13 +300,74 @@ func reconcile(ctx context.Context, store *split.DirStore, spent *utxo.SpentSet,
 		switch in.State {
 		case withdraw.StateCreated, withdraw.StateFailed:
 			if err := spent.Release(in.ID); err != nil {
-				logger.Error("reconcile: reservation not released", "id", in.ID, "err", err)
-				continue
+				return fmt.Errorf("release the reservation of withdrawal %s: %w", in.ID, err)
 			}
 			logger.Info("reconcile: released the reservation of a withdrawal with nothing built", "id", in.ID, "state", in.State)
 		}
 	}
+	return nil
 }
+
+// recordSpend records an intent's inputs as spent under txid, unless this set
+// already holds them as a spend for it. Marking rewrites the whole file, so
+// without the test the set is rewritten once per historic withdrawal on every
+// pass. The reservation test is asked of the set rather than of a list read
+// earlier, so a withdrawal re-reserved a moment ago is not mistaken for one
+// already recorded.
+func recordSpend(spent *utxo.SpentSet, in *withdraw.Intent, txid string) error {
+	inputs := inputsOf(in)
+	if !holdsReservation(spent, in.ID) && allSpent(spent, inputs) {
+		return nil
+	}
+	if err := spent.MarkBroadcastFor(inputs, txid, in.ID); err != nil {
+		return err
+	}
+	logger.Info("reconcile: inputs of a sent withdrawal are recorded as spent", "id", in.ID, "txid", txid)
+	return nil
+}
+
+// holdsReservation reports whether the set holds a reservation for id, as
+// opposed to a spend.
+func holdsReservation(spent *utxo.SpentSet, id string) bool {
+	for _, held := range spent.ReservedIntents() {
+		if held == id {
+			return true
+		}
+	}
+	return false
+}
+
+// selectForFee budgets the fee against the number of inputs the selection
+// actually takes.
+//
+// The fee of an ML-DSA payment is dominated by its inputs, so the two obvious
+// targets are both wrong. One input's worth can come back with three, whose
+// fee is larger than the budget they were chosen under. The hard maximum of
+// utxo.MaxInputsPerTX asks for about 77,100 vB, which at the recommended rate
+// is 0.77 SOQ of headroom a payout does not need: a wallet with 25 SOQ in one
+// output cannot then pay 24.99, and the last 0.77 SOQ of any hot wallet is
+// unspendable. So it asks for n inputs' worth and asks again when the answer
+// needs more; n only grows, and the selector's own cap bounds the loop.
+func selectForFee(selector *utxo.CoinSelector, snap split.Snapshot, amount, feeRate int64, minConf int) ([]types.UTXO, error) {
+	candidates := snap.Spendable()
+	for n := 1; n <= utxo.MaxInputsPerTX; {
+		selected, _, err := selector.SelectUTXOs(candidates, amount+vsizeFor(n)*feeRate, minConf, snap.Tip, []string{snap.HotAddress})
+		if err != nil {
+			return nil, err
+		}
+		if len(selected) <= n {
+			return selected, nil
+		}
+		n = len(selected)
+	}
+	return nil, fmt.Errorf("no selection fits the fee of %d inputs", utxo.MaxInputsPerTX)
+}
+
+// vsizeFor is the vsize of a payment with n inputs and two outputs, measured:
+// about 1,073 vB at one input and about 976 vB for each further ML-DSA-44
+// input (docs/EXCHANGE_INTEGRATION.md, Transaction Size). Rounded up, as a fee
+// target should be.
+func vsizeFor(n int) int64 { return 1100 + 950*int64(n-1) }
 
 // build builds every Created intent. An error stops that intent and not
 // the pass: a selector error that the engine treats as transient leaves the
@@ -315,7 +380,7 @@ func reconcile(ctx context.Context, store *split.DirStore, spent *utxo.SpentSet,
 // the transaction and the coins would go to whoever holds that program on this
 // chain. The intent is left Created and reported rather than failed, since a
 // destination this wrong is a question for a person.
-func build(ctx context.Context, store *split.DirStore, engine *withdraw.Engine, hrp string) {
+func build(ctx context.Context, store withdraw.Store, engine *withdraw.Engine, hrp string) {
 	created, err := store.List(ctx, withdraw.StateCreated)
 	if err != nil {
 		logger.Error("build: the store could not be read", "err", err)

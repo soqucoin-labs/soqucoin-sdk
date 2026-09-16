@@ -99,13 +99,10 @@ type config struct {
 }
 
 func run(ctx context.Context, cfg config) error {
-	if err := split.EnsureDir(string(cfg.dir)); err != nil {
-		return err
-	}
 	if err := split.EnsureDir(cfg.dir.Requests()); err != nil {
 		return err
 	}
-	store, err := split.OpenDirStore(cfg.dir.Intents())
+	store, err := cfg.dir.Open()
 	if err != nil {
 		return err
 	}
@@ -188,7 +185,18 @@ func accept(ctx context.Context, cfg config, engine *withdraw.Engine) {
 // is still unspent when the node is asked for it again. A withheld snapshot
 // stops the signer building, and the alternative is signing against a view
 // no node has confirmed.
-func publish(ctx context.Context, cfg config, elx *electrumx.Client, node *rpc.Client) {
+// indexer is the part of electrumx.Client that publish reads.
+// *electrumx.Client satisfies it. publish is the gate that decides what the
+// key-holding signer may spend, so it takes the interface and a test supplies
+// its own indexer rather than the gate going untested.
+type indexer interface {
+	LastRefreshOf(addr string) (time.Time, error)
+	GetUTXOs(addr string) []types.UTXO
+	EvictUTXO(txid string, vout uint32)
+	SetAssetType(txid string, vout uint32, assetType uint8)
+}
+
+func publish(ctx context.Context, cfg config, elx indexer, node *rpc.Client) {
 	at, err := elx.LastRefreshOf(cfg.hot)
 	if err != nil {
 		logger.Warn("snapshot withheld: the indexer's last answer for the address was an error", "err", err)
@@ -204,15 +212,24 @@ func publish(ctx context.Context, cfg config, elx *electrumx.Client, node *rpc.C
 		logger.Warn("snapshot withheld: no tip height", "err", err)
 		return
 	}
-	// Confirmed, unspent, native SOQ outputs only. An output the indexer has
-	// not seen confirm has height 0, which no selector can spend anyway, and
-	// it would make the snapshot fail its own consistency check.
+	if tip <= 0 {
+		// A node that answers zero has no chain to speak of, and the snapshot
+		// would be written with a tip the signer refuses as inconsistent,
+		// which stops every withdrawal until a good one replaces it. Withhold
+		// instead: the signer tells "no snapshot yet" from "refused".
+		logger.Warn("snapshot withheld: the node reports a tip of zero")
+		return
+	}
+	// Confirmed and unspent, by the indexer's account: an output it has not
+	// seen confirm has height 0, which no selector can spend anyway, and it
+	// would make the snapshot fail its own consistency check. The asset type
+	// is not decided here, because the indexer does not send one.
 	var candidates []types.UTXO
 	for _, u := range elx.GetUTXOs(cfg.hot) {
 		switch {
 		case u.Height <= 0, tip-u.Height+1 < cfg.minConf:
 			continue
-		case u.SpentPending, u.AssetType != types.AssetTypeSOQ:
+		case u.SpentPending:
 			continue
 		}
 		candidates = append(candidates, u)
@@ -222,18 +239,33 @@ func publish(ctx context.Context, cfg config, elx *electrumx.Client, node *rpc.C
 		logger.Warn("snapshot withheld: the node could not confirm the outputs", "err", err)
 		return
 	}
+	// The asset type the node reported, which is the only one worth acting on.
+	// types.UTXO.AssetType is absent from the indexer's JSON, so a cached
+	// output reads as native SOQ until this call stamps it; the verification
+	// returns outputs of either asset. One USDSOQ output left in the file
+	// makes the signer refuse the whole snapshot, which stops every
+	// withdrawal until someone moves that output.
+	native := make([]types.UTXO, 0, len(verified))
+	for _, u := range verified {
+		if u.AssetType != types.AssetTypeSOQ {
+			logger.Info("output left out of the snapshot: the node reports another asset",
+				"txid", u.TxID, "vout", u.Vout, "asset_type", u.AssetType)
+			continue
+		}
+		native = append(native, u)
+	}
 
-	snap := split.Snapshot{At: time.Now().UTC(), Tip: tip, HotAddress: cfg.hot, Outputs: split.OutputsFrom(verified)}
+	snap := split.Snapshot{At: time.Now().UTC(), Tip: tip, HotAddress: cfg.hot, Outputs: split.OutputsFrom(native)}
 	if err := split.WriteSnapshot(cfg.dir, snap); err != nil {
 		logger.Error("snapshot not written", "err", err)
 		return
 	}
 	var total int64
-	for _, u := range verified {
+	for _, u := range native {
 		total += u.Value
 	}
-	logger.Info("snapshot published", "outputs", len(verified), "shors", total, "tip", tip,
-		"dropped_by_the_node", len(candidates)-len(verified))
+	logger.Info("snapshot published", "outputs", len(native), "shors", total, "tip", tip,
+		"dropped_by_the_node", len(candidates)-len(verified), "not_native", len(verified)-len(native))
 }
 
 func rpcURL(n types.Network) string {

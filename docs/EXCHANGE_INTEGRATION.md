@@ -718,12 +718,26 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			// Budget the fee against vsize: a one-input, two-output payment is about
-			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB.
-			budget := amount + (1100+950*int64(utxo.MaxInputsPerTX))*feeRate
-			selected, _, err := selector.SelectUTXOs(elx.GetAllUTXOs(), budget, 1, tip, []string{hotWallet})
-			if err != nil {
-				return nil, err
+			// Budget the fee against the inputs the selection takes, not
+			// against the cap. A one-input, two-output payment is about
+			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB, so
+			// asking for utxo.MaxInputsPerTX inputs' worth demands about
+			// 0.77 SOQ of headroom at the recommended rate: a wallet holding
+			// 25 SOQ in one output could not then pay 24.99, and the last
+			// 0.77 SOQ of any hot wallet would be unspendable. Ask for n
+			// inputs' worth and ask again when the answer needs more; n only
+			// grows, and MaxInputsPerTX bounds the loop.
+			var selected []types.UTXO
+			for n := 1; n <= utxo.MaxInputsPerTX; {
+				vsize := int64(1100 + 950*(n-1))
+				selected, _, err = selector.SelectUTXOs(elx.GetAllUTXOs(), amount+vsize*feeRate, 1, tip, []string{hotWallet})
+				if err != nil {
+					return nil, err
+				}
+				if len(selected) <= n {
+					break
+				}
+				n = len(selected)
 			}
 			// Defense 11: the node must still have every input. Refuses to
 			// evict on a syncing node; skips immature coinbase.

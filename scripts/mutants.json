@@ -351,6 +351,42 @@
       "find": "\t\treturn out[i].CreatedAt.Before(out[j].CreatedAt)",
       "replace": "\t\treturn false",
       "why": "Recover re-sends built withdrawals in the order List returns, oldest first, as withdraw.FileStore does. Without the sort the order is whatever the directory read gives, so the oldest signed transaction is not the first one re-sent after a restart. The first version of the test asserted an order the directory read already produced, so it passed with the sort deleted."
+    },
+    {
+      "id": "electrumx-track-commits-over-a-pin-taken-during-the-call",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestTrackAddressesRefusesACommitAfterAnotherNetworkWasPinned",
+      "find": "\tif c.networkHRP != \"\" && c.networkHRP != hrp {",
+      "replace": "\tif false {",
+      "why": "TrackAddresses reads the prefix, validates the addresses against it, then commits. A SetHRP that lands in between is silently overwritten without this test, and both calls return nil: the client then tracks one network's addresses while another is pinned, which is the mainnet-reading-stagenet case pinning exists to prevent."
+    },
+    {
+      "id": "split-watcher-publishes-a-snapshot-with-no-tip",
+      "file": "examples/exchange_split/watcher/main.go",
+      "package": "./examples/exchange_split/watcher",
+      "test": "TestPublishWithholdsTheSnapshotUnlessTheViewIsCurrentAndConfirmed",
+      "find": "\tif tip <= 0 {",
+      "replace": "\tif false {",
+      "why": "A node that answers zero for the tip has no chain to speak of. Writing the snapshot anyway leaves a file the signer refuses as self-contradicting, so every withdrawal stops until a good snapshot replaces it, and the signer cannot tell that state from a watcher that has not started."
+    },
+    {
+      "id": "split-store-lists-a-record-with-an-unusable-id",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestListRefusesARecordWhoseIDIsNotUsableAtAll",
+      "find": "\t\tif err := CheckID(in.ID); err != nil {",
+      "replace": "\t\tif false {",
+      "why": "A file name and the id inside it can agree and both still be unusable. Without the check List hands the engine a withdrawal that Get and Put refuse, so its next transition cannot be saved and the record is stuck wherever the engine left it."
+    },
+    {
+      "id": "split-signer-accepts-a-selection-it-cannot-pay-the-fee-for",
+      "file": "examples/exchange_split/signer/main.go",
+      "package": "./examples/exchange_split/signer",
+      "test": "TestSelectForFeeRefusesInputsThatCannotPayTheirOwnFee",
+      "find": "\t\tif len(selected) <= n {",
+      "replace": "\t\tif true {",
+      "why": "The fee of an ML-DSA payment is dominated by its inputs, so a selection made under a one-input target and answered with three is short of its own fee. Accepting it signs a transaction the node refuses for paying less than its weight."
     }
   ]
 }

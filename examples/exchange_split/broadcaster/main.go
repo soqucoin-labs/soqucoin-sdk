@@ -71,7 +71,7 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 	if err := split.EnsureDir(state); err != nil {
 		return err
 	}
-	store, err := split.OpenDirStore(dir.Intents())
+	store, err := dir.Open()
 	if err != nil {
 		return err
 	}

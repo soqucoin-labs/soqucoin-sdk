@@ -285,7 +285,20 @@ func (c *Client) TrackAddresses(addresses []string) error {
 		}
 		byHash[sh] = a
 	}
+	beforeTrackCommit()
 	c.mu.Lock()
+	if c.networkHRP != "" && c.networkHRP != hrp {
+		// SetHRP pinned another network between the read at the top of this
+		// function and this commit. Writing the prefix here would drop that
+		// pin while installing addresses derived under the old one, and both
+		// calls would return nil: the client would then ask one network's
+		// server about another network's keys and answer "no coins" for every
+		// address, which is what pinning exists to prevent.
+		pinned := c.networkHRP
+		c.mu.Unlock()
+		return fmt.Errorf("%w: the client was pinned to %s while %s addresses were being prepared",
+			ErrNetworkMismatch, pinned, hrp)
+	}
 	c.networkHRP = hrp
 	c.addresses = append([]string(nil), addresses...)
 	c.trackedSet = make(map[string]bool, len(addresses))
@@ -307,6 +320,12 @@ func (c *Client) TrackAddresses(addresses []string) error {
 	c.kick()
 	return nil
 }
+
+// beforeTrackCommit runs between the validation a TrackAddresses call does and
+// the commit of its result, a variable so a test can occupy that window. The
+// prefix is read before the validation and written after it, and this is the
+// only place another goroutine can get between the two.
+var beforeTrackCommit = func() {}
 
 // hrp reads the network prefix under the lock TrackAddresses writes it under,
 // since TrackAddresses may run while Start's refresher is making calls.

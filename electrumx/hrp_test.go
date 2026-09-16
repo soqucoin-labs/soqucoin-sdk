@@ -100,3 +100,33 @@ func TestSetHRPIsSafeAgainstAConcurrentRead(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// The window between the validation a TrackAddresses call does and the commit
+// of its result. The prefix is read at the top of that function, the addresses
+// are validated against it, and the result is written at the end; a SetHRP
+// that lands in between used to be overwritten, so both calls returned nil and
+// the client tracked one network's addresses while another was pinned.
+func TestTrackAddressesRefusesACommitAfterAnotherNetworkWasPinned(t *testing.T) {
+	c := NewClient("127.0.0.1:1", time.Second, nil)
+	a := craftAddr(t, 0x51)
+	real := beforeTrackCommit
+	t.Cleanup(func() { beforeTrackCommit = real })
+	beforeTrackCommit = func() {
+		beforeTrackCommit = real // once: the commit below must not recurse
+		setHRP(t, c, types.Mainnet.HRP)
+	}
+
+	err := c.TrackAddresses([]string{a})
+	if !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("TrackAddresses returned %v, want ErrNetworkMismatch", err)
+	}
+	if got := c.hrp(); got != types.Mainnet.HRP {
+		t.Fatalf("the prefix is %q: the pin taken during the call was overwritten", got)
+	}
+	c.mu.RLock()
+	tracked := len(c.addresses)
+	c.mu.RUnlock()
+	if tracked != 0 {
+		t.Fatalf("%d addresses were registered by a call that failed", tracked)
+	}
+}

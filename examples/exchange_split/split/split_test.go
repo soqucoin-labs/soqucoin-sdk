@@ -368,3 +368,21 @@ func TestListIsOldestFirstThenByID(t *testing.T) {
 		}
 	}
 }
+
+// A file name and the record inside it can agree and both still be unusable.
+// Get and Put refuse such an id, so List admitting it would hand the engine a
+// withdrawal this store can neither read back nor save on its next transition.
+func TestListRefusesARecordWhoseIDIsNotUsableAtAll(t *testing.T) {
+	s, dir := openStore(t)
+	in := intent("bad id", withdraw.StateCreated)
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bad id.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.List(context.Background()); !errors.Is(err, ErrBadID) {
+		t.Fatalf("List returned %v, want ErrBadID", err)
+	}
+}

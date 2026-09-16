@@ -117,12 +117,27 @@ type DirStore struct {
 	mu sync.Mutex
 }
 
-// OpenDirStore creates or opens the store under dir.
+// OpenDirStore creates or opens the store under dir. Prefer Dir.Open, which
+// checks the shared directory as well as the store inside it.
 func OpenDirStore(dir string) (*DirStore, error) {
 	if err := EnsureDir(dir); err != nil {
 		return nil, err
 	}
 	return &DirStore{dir: dir}, nil
+}
+
+// Open checks the shared directory and opens the intent store inside it. It is
+// the one call each of the three processes makes, because checking the store
+// and not its parent is no check at all: an account that can write the shared
+// directory can rename the intents directory aside and put its own in place,
+// and the process that opened only the inner path would never see it. The
+// watcher did check the root and the other two did not, which is the kind of
+// gap an enumerated site list exists to close.
+func (d Dir) Open() (*DirStore, error) {
+	if err := EnsureDir(string(d)); err != nil {
+		return nil, err
+	}
+	return OpenDirStore(d.Intents())
 }
 
 func (s *DirStore) file(id string) string { return id + ".json" }
@@ -209,6 +224,13 @@ func (s *DirStore) List(_ context.Context, states ...withdraw.State) ([]*withdra
 		var in withdraw.Intent
 		if err := json.Unmarshal(data, &in); err != nil {
 			return nil, fmt.Errorf("parse intent file %s: %w", name, err)
+		}
+		if err := CheckID(in.ID); err != nil {
+			// The name and the record can agree and both still be unusable,
+			// as "bad id.json" holding the id "bad id" does. Get and Put
+			// refuse that id, so the engine would receive a withdrawal this
+			// store can neither read back nor persist on its next transition.
+			return nil, fmt.Errorf("intent file %s: %w", name, err)
 		}
 		if name != s.file(in.ID) {
 			// The same disagreement Get refuses. Here it would hand the engine

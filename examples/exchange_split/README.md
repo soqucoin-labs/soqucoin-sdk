@@ -40,7 +40,11 @@ selects from the snapshot the watcher publishes.
 <dir>/snapshot.json         what may be spent, according to the node
 ```
 
-Mode 0700, one owner. Whoever can write it decides what the signer treats as spendable. The processes refuse a directory another account can reach.
+Mode 0700, one owner. Whoever can write it decides what the signer treats as spendable, so all
+three processes open it through `split.Dir.Open`, which refuses a directory any other account can
+reach before it touches the store inside. Checking the store and not its parent is no check at all:
+an account that can write the shared directory can rename `intents/` aside and put its own in
+place.
 
 Exactly one process per role. Two signers on one directory would both pick up the same `Created`
 intent, sign a different transaction over the same inputs and write one over the other: the lost
@@ -65,7 +69,11 @@ Three terminals, one directory. The signer's keystore is created by
 
 ```bash
 export SOQ_RPC_USER=... SOQ_RPC_PASSWORD=...
-mkdir -p state/requests
+
+# The processes refuse a shared directory any other account can reach, so
+# create it 0700. Without the umask a normal one leaves it 0755 and the
+# watcher exits on its first check.
+umask 077 && mkdir -p state/requests
 
 go run ./examples/exchange_split/watcher -dir state -network stagenet \
     -hot ssq1p... -electrumx 127.0.0.1:50001
