@@ -147,8 +147,12 @@ break; putting them there is only safe with the rules below.
 - **The header is authenticated.** Everything in the file except the
   ciphertext is bound into AES-GCM as additional data: the version, the KDF and
   its parameters, the salt, the nonce, and the unencrypted list of public keys
-  and addresses. A field this release does not recognise is refused rather than
-  ignored, so there is nothing in the file the binding does not cover.
+  and addresses. For that to mean anything the file has to have exactly one
+  reading, so a keystore must be one JSON object, carrying only the members
+  this release knows, each named once, with nothing after it. Anything else is
+  refused rather than ignored, because content that does not survive into the
+  values this release decodes is content the binding does not cover, and
+  another tool reading the same file could see it.
 - **The address list is checked against the keys.** The unencrypted list is
   what you read to find an address to send to, so it is compared with the
   records that come out of the ciphertext, and a file where the two disagree is
@@ -156,9 +160,9 @@ break; putting them there is only safe with the rules below.
   version 1 keystore this check carries that list on its own.
 
 Version 1 keystores, written by v0.3.6 and earlier, are read as before and
-rewritten as version 2 by the next `Save`. One tightening applies to them too:
-a file carrying a field this release does not recognise, or anything after the
-JSON object, is refused rather than ignored. Nothing the SDK has ever written
+rewritten as version 2 by the next `Save`. The strictness above applies to them
+too: a field this release does not recognise, a member named twice, or anything
+after the JSON object is refused rather than ignored. Nothing the SDK has ever written
 carries either, so this reaches only a file something else annotated; the error
 names the field, and removing it restores the file. Nothing is required of you; opening
 one yields the same keys and the same addresses. Reading alone does not rewrite,

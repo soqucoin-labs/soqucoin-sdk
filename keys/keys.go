@@ -280,21 +280,11 @@ func (m *Manager) load(create bool) error {
 		return m.saveLocked()
 	}
 
-	// Unknown fields are refused rather than dropped, and so is anything after
-	// the object. What the AEAD binds is the canonical re-encoding of the
-	// fields this build knows (headerAAD), so any other content would sit in
-	// the file unauthenticated while the header claimed to be tamper-evident.
-	// The end-of-stream check is not redundant: a Decoder reads one value and
-	// ignores the rest of the input, where json.Unmarshal refuses it.
-	var ks Keystore
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&ks); err != nil {
+	// strictDecode, not json.Unmarshal: a keystore file has to have exactly
+	// one meaning, and it has to be the one headerAAD authenticates.
+	ks, err := strictDecode(data)
+	if err != nil {
 		return fmt.Errorf("parse keystore: %w", err)
-	}
-	var trailing json.RawMessage
-	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("parse keystore: content after the keystore object")
 	}
 
 	// The additional data is the header as the file carries it, so it is

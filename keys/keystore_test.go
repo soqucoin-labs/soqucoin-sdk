@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -260,11 +259,16 @@ func TestV1KeystoreRefusedByAnExternalKeyManager(t *testing.T) {
 	}
 }
 
-// The attack: whoever can write the keystore file edits the parameters the
-// reader now takes from it. Below the floor is the downgrade, which would
-// make an offline guess at the passphrase cheap; above the ceiling is a
-// memory bomb against the process that opens the file. Both are refused by
-// name, before Argon2id is asked to run with them.
+// Parameters outside the range this build accepts are refused by name, and
+// before Argon2id is asked to run with them.
+//
+// The two ends are there for different reasons. The ceiling is a guard against
+// a hostile file: a header claiming 64 GiB would otherwise have the process
+// allocate it. The floor is not a guard against an edit at all, because the
+// parameters feed the derivation and an edited file opens for nobody; it
+// catches a file that was legitimately written weak, by an older writer or
+// another implementation, which would open without a word while its at-rest
+// protection was worth less than its holder believed.
 func TestKDFParamsOutsideTheRangeAreRefused(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -419,7 +423,7 @@ func refusalMechanism(t *testing.T, path string, before Keystore, m *Manager) st
 		t.Fatal(err)
 	}
 
-	after, err := decodeKeystore(data)
+	after, err := strictDecode(data)
 	if err != nil {
 		return byParse
 	}
@@ -469,22 +473,6 @@ func refusalMechanism(t *testing.T, path string, before Keystore, m *Manager) st
 		return byBinding
 	}
 	return byListCheck
-}
-
-// decodeKeystore parses a keystore file the way load does, so a test can tell
-// a parser refusal from a later one.
-func decodeKeystore(data []byte) (Keystore, error) {
-	var ks Keystore
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&ks); err != nil {
-		return Keystore{}, err
-	}
-	var trailing json.RawMessage
-	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return Keystore{}, errors.New("content after the keystore object")
-	}
-	return ks, nil
 }
 
 // changedFields is the sorted set of top-level header fields whose value
@@ -958,6 +946,15 @@ func TestContentThisBuildDoesNotKnowIsRefused(t *testing.T) {
 		{"bytes after it", func(t *testing.T, path string) {
 			appendToFile(t, path, []byte{0x00, 0xFF})
 		}},
+		{"a member named twice", func(t *testing.T, path string) {
+			duplicateMember(t, path, `"pubkeys":`, `"pubkeys": [], `)
+		}},
+		{"a member of a public key entry named twice", func(t *testing.T, path string) {
+			duplicateMember(t, path, `"address":`, `"address": "ssq1pnotthisone", `)
+		}},
+		{"a KDF parameter named twice", func(t *testing.T, path string) {
+			duplicateMember(t, path, `"m":`, `"m": 8, `)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "keys.enc")
@@ -1203,5 +1200,31 @@ func TestPlaintextKeyPrintingRedactsThePrivateKey(t *testing.T) {
 				t.Errorf("%s of %T did not print the address: %s", verb, subject, out)
 			}
 		}
+	}
+}
+
+// duplicateMember puts a second copy of a member in front of the real one, the
+// way an attacker with write access would: Go's decoder keeps the last, so the
+// prepended copy is the one a reader taking the first member would see, and
+// the one headerAAD would not authenticate.
+func duplicateMember(t *testing.T, path, member, prefix string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := bytes.Index(data, []byte(member))
+	if i < 0 {
+		t.Fatalf("the keystore has no member %s", member)
+	}
+	out := append(append(append([]byte(nil), data[:i]...), prefix...), data[i:]...)
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The edit has to be a file the standard parser still accepts, or the test
+	// would be pinning a syntax error rather than the duplicate rule.
+	var any map[string]any
+	if err := json.Unmarshal(out, &any); err != nil {
+		t.Fatalf("the edited file is not valid JSON, so this case tests nothing: %v", err)
 	}
 }

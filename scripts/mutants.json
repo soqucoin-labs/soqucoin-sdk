@@ -139,7 +139,7 @@
       "test": "TestKDFParamsOutsideTheRangeAreRefused",
       "find": "\tcase p.Memory < minMemoryKiB || p.Memory > maxMemoryKiB:",
       "replace": "\tcase p.Memory < 1:",
-      "why": "Version 2 takes the Argon2id parameters from the file, so whoever can write the file chooses the work factor unless a floor refuses them. Without it a keystore rewritten with 8 MiB of memory still opens, and the passphrase behind it is cheap to guess offline."
+      "why": "Version 2 takes the Argon2id parameters from the file, so a file written with a weak work factor opens as readily as a strong one unless a floor refuses it. Not an edit: editing the parameters changes the derived key and the file stops opening. What is caught is a keystore legitimately created weak, by an older writer or another implementation, whose holder would never learn that its at-rest protection is worth much less than they believe."
     },
     {
       "id": "keystore-header-not-bound-into-the-aead",
@@ -197,7 +197,7 @@
     },
     {
       "id": "keystore-unknown-header-field-accepted",
-      "file": "keys/keys.go",
+      "file": "keys/keystore.go",
       "package": "./keys",
       "test": "TestContentThisBuildDoesNotKnowIsRefused",
       "find": "\tdec.DisallowUnknownFields()",
@@ -206,12 +206,21 @@
     },
     {
       "id": "keystore-content-after-the-object-accepted",
-      "file": "keys/keys.go",
+      "file": "keys/keystore.go",
       "package": "./keys",
       "test": "TestContentThisBuildDoesNotKnowIsRefused",
       "find": "\tif err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {",
-      "replace": "\tif err := dec.Decode(&trailing); !errors.Is(err, err) {",
+      "replace": "\tif err := dec.Decode(&trailing); !errors.Is(err, io.EOF) && false {",
       "why": "A json.Decoder reads one value and ignores whatever follows it, where json.Unmarshal refuses it. Without this the refusal of unknown fields covers only the inside of the object, and bytes appended to the file sit outside everything the header's tamper-evidence covers."
+    },
+    {
+      "id": "keystore-member-named-twice-accepted",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestContentThisBuildDoesNotKnowIsRefused",
+      "find": "\t\t\tif seen[name] {",
+      "replace": "\t\t\tif false && seen[name] {",
+      "why": "Go's decoder keeps the last of two members with the same name, and headerAAD authenticates what the decoder kept. A copy of pubkeys prepended before the real one therefore loads cleanly and is authenticated away, while a reader that takes the first member sees the address the person who edited the file chose."
     }
   ]
 }

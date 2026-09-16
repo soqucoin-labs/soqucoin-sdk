@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -135,6 +136,86 @@ var (
 	// file where the two disagree is refused rather than served.
 	ErrPubKeyList = errors.New("keys: the keystore's public key list does not match the keys it holds")
 )
+
+// strictDecode parses a keystore file and is the one statement of what a
+// keystore file is allowed to be: exactly one JSON object, carrying exactly the
+// members this build knows, each named exactly once.
+//
+// All three rules exist for one reason. What the AEAD binds is the canonical
+// re-encoding of the values this build decoded (headerAAD), so anything in the
+// file that does not survive into those values is content the header's
+// tamper-evidence does not cover, and a different reader can see it. Each rule
+// closes one way of putting it there, and each was found separately after the
+// previous one was closed, which is why they are stated together here rather
+// than added one at a time where they happened to be noticed:
+//
+//   - an unknown member would be dropped;
+//   - anything after the object would be ignored, because a json.Decoder reads
+//     one value and stops, where json.Unmarshal refuses the remainder;
+//   - a member named twice keeps the last, so a copy prepended before the real
+//     one is authenticated away while a reader taking the first sees it.
+func strictDecode(data []byte) (Keystore, error) {
+	if err := checkNoDuplicateMembers(json.NewDecoder(bytes.NewReader(data))); err != nil {
+		return Keystore{}, err
+	}
+	var ks Keystore
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ks); err != nil {
+		return Keystore{}, err
+	}
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return Keystore{}, fmt.Errorf("%w: content after the keystore object", ErrKeystoreHeader)
+	}
+	return ks, nil
+}
+
+// checkNoDuplicateMembers walks one JSON value and refuses an object that names
+// the same member twice, at any depth: the public key entries and the KDF
+// parameters are objects too. Recursion is bounded by the decoder's own
+// nesting limit.
+func checkNoDuplicateMembers(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("parse keystore: %w", err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil // a scalar, nothing to check
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]bool)
+		for dec.More() {
+			nameTok, err := dec.Token()
+			if err != nil {
+				return fmt.Errorf("parse keystore: %w", err)
+			}
+			name, ok := nameTok.(string)
+			if !ok {
+				return fmt.Errorf("%w: member name is not a string", ErrKeystoreHeader)
+			}
+			if seen[name] {
+				return fmt.Errorf("%w: the member %q is named more than once", ErrKeystoreHeader, name)
+			}
+			seen[name] = true
+			if err := checkNoDuplicateMembers(dec); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for dec.More() {
+			if err := checkNoDuplicateMembers(dec); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil { // the closing brace or bracket
+		return fmt.Errorf("parse keystore: %w", err)
+	}
+	return nil
+}
 
 // checkPubKeyList compares the file's unencrypted public key list against the
 // records that came out of the ciphertext. Version 2 binds the list into the
