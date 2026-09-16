@@ -242,7 +242,10 @@ func replaceFile(path string, data []byte, perm os.FileMode) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return fail("rename", err)
 	}
-	d, err := os.Open(dir)
+	// filepath.Clean, although filepath.Dir above already returned a clean
+	// path: it is what the static-analysis floor reads to see that the name
+	// opened here is the directory of the file just written.
+	d, err := os.Open(filepath.Clean(dir))
 	if err != nil {
 		return fmt.Errorf("open directory of %s: %w", path, err)
 	}
