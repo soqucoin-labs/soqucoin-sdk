@@ -722,9 +722,9 @@ func main() {
 			// against the cap. A one-input, two-output payment is about
 			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB, so
 			// asking for utxo.MaxInputsPerTX inputs' worth demands about
-			// 0.77 SOQ of headroom at the recommended rate: a wallet holding
+			// 0.78 SOQ of headroom at the recommended rate: a wallet holding
 			// 25 SOQ in one output could not then pay 24.99, and the last
-			// 0.77 SOQ of any hot wallet would be unspendable. Ask for n
+			// 0.78 SOQ of any hot wallet would be unspendable. Ask for n
 			// inputs' worth and ask again when the answer needs more; n only
 			// grows, and MaxInputsPerTX bounds the loop.
 			var selected []types.UTXO

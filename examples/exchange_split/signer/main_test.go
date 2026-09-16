@@ -243,7 +243,7 @@ func (failingStore) List(context.Context, ...withdraw.State) ([]*withdraw.Intent
 
 // The fee target. A wallet holding one output must be able to pay nearly all of
 // it: the fee of a one-input payment is about 1,073 vB, so charging every
-// payout for utxo.MaxInputsPerTX made the last 0.77 SOQ of any hot wallet
+// payout for utxo.MaxInputsPerTX made the last 0.78 SOQ of any hot wallet
 // unspendable at the recommended rate. This is the case that refused the
 // verification transaction of PR 57 before the fix.
 func TestSelectForFeeChargesTheInputsItTakes(t *testing.T) {

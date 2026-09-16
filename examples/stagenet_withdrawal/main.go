@@ -185,7 +185,7 @@ func run(ctx context.Context, dir string, keystore *keys.Manager, inputList, to 
 			}
 			// Budget the fee against vsize: a one-input, two-output payment is about
 			// 1,073 vB and each further ML-DSA-44 input adds about 976 vB.
-			budget := amount + (1100+950*int64(len(funding)))*feeRate
+			budget := amount + (1100+976*int64(len(funding)))*feeRate
 			selected, _, err := selector.SelectUTXOs(funding, budget, 1, tip, []string{hot})
 			if err != nil {
 				return nil, err
