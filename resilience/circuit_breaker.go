@@ -33,6 +33,7 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
+	"github.com/soqucoin-labs/soqucoin-sdk/withdraw"
 )
 
 // CircuitBreakerState represents the circuit breaker's current state.
@@ -97,29 +98,47 @@ type CircuitBreaker struct {
 
 	// PerRequestErrors extends the set of errors that describe ONE request
 	// rather than the system, and so must never count as a failure. Address,
-	// amount and node-rejection errors from this SDK are always in the set.
+	// amount, node-rejection and withdrawal-state errors from this SDK are
+	// always in the set (see perRequestSentinels).
 	PerRequestErrors []error
 }
 
-// perRequest reports whether err is about the request, not the system. A
-// malformed address, an amount below the floor, insufficient funds or a
-// node rejection of one transaction says nothing about whether the next
-// withdrawal can succeed; feeding such errors to the breaker lets an
-// unauthenticated user halt every withdrawal with three bad requests. A
+// perRequestSentinels are the errors this SDK raises about one request. A
+// malformed address, an amount below the floor, insufficient funds or a node
+// rejection of one transaction says nothing about whether the next withdrawal
+// can succeed. Neither does a withdrawal the engine refuses to act on: an
+// intent in a state that does not allow the call (most often a second worker
+// that lost the build race for one id), an id that is unknown or malformed,
+// or an idempotency key reused for a different payment. Each is a fact about
+// that request, and counting them lets a caller with a worker pool, or an
+// unauthenticated user with three bad requests, halt every withdrawal.
+//
+// withdraw.ErrHeld and withdraw.ErrReservationLost are deliberately absent:
+// each means an operator must resolve a transaction before anything else is
+// sent, so each counts and the breaker is the thing that stops the run.
+var perRequestSentinels = []error{
+	context.Canceled,
+	rpc.ErrPermanent,
+	soqaddr.ErrInvalidChecksum, soqaddr.ErrInvalidLength, soqaddr.ErrInvalidHRP,
+	soqaddr.ErrInvalidChar, soqaddr.ErrUnsupportedWitnessVersion, soqaddr.ErrInvalidVersion,
+	tx.ErrInvalidAmount, tx.ErrBelowDust, tx.ErrFeeTooHigh, tx.ErrInsufficientFunds, tx.ErrInputOverflow,
+	withdraw.ErrWrongState, withdraw.ErrInvalidIntent, withdraw.ErrConflict,
+}
+
+// perRequest reports whether err is about the request, not the system:
+// perRequestSentinels, and whatever the caller added to PerRequestErrors. A
 // cancelled context is the caller's own stop signal and says nothing about
 // the system either; a deadline that expired does, and counts.
 func (cb *CircuitBreaker) perRequest(err error) bool {
 	if err == nil {
 		return false
 	}
-	builtin := []error{
-		context.Canceled,
-		rpc.ErrPermanent,
-		soqaddr.ErrInvalidChecksum, soqaddr.ErrInvalidLength, soqaddr.ErrInvalidHRP,
-		soqaddr.ErrInvalidChar, soqaddr.ErrUnsupportedWitnessVersion, soqaddr.ErrInvalidVersion,
-		tx.ErrInvalidAmount, tx.ErrBelowDust, tx.ErrFeeTooHigh, tx.ErrInsufficientFunds, tx.ErrInputOverflow,
+	for _, e := range perRequestSentinels {
+		if errors.Is(err, e) {
+			return true
+		}
 	}
-	for _, e := range append(builtin, cb.PerRequestErrors...) {
+	for _, e := range cb.PerRequestErrors {
 		if errors.Is(err, e) {
 			return true
 		}
