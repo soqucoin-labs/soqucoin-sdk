@@ -5,15 +5,17 @@
 // Two ways to hold keys: FromSeed with DeriveSeed derives one key per index
 // from a master secret kept in your own key-management system, which is the
 // per-user deposit-address path; Manager is the hot-wallet store, randomly
-// generated keys in a file encrypted with AES-256-GCM under an Argon2id-derived
-// key, and also signs for a derived key imported in memory at sweep time.
+// generated keys in a file encrypted with AES-256-GCM, and also signs for a
+// derived key imported in memory at sweep time.
+//
+// The keystore's encryption key comes from one of two places: a passphrase,
+// stretched by Argon2id (NewManager), or a 32-byte key held in a
+// key-management system (NewManagerWithKey). The file records which, along
+// with the KDF parameters it was written with (keystore.go).
 package keys
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,7 +28,6 @@ import (
 	"github.com/cloudflare/circl/sign/mldsa/mldsa44"
 	soqaddr "github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/internal/atomicfile"
-	"golang.org/x/crypto/argon2"
 )
 
 // DilithiumKeySize constants matching Soqucoin's FIPS 204 ML-DSA-44 parameters.
@@ -66,35 +67,43 @@ func (k KeyPair) String() string {
 // a KeyPair where a struct dump can reach it that way.
 func (k KeyPair) Format(f fmt.State, verb rune) { io.WriteString(f, k.String()) }
 
-// Keystore holds encrypted key material on disk.
-type Keystore struct {
-	Version    int       `json:"version"`    // Format version (1)
-	KDF        string    `json:"kdf"`        // "argon2id"
-	Salt       []byte    `json:"salt"`       // 32-byte random salt
-	Nonce      []byte    `json:"nonce"`      // 12-byte AES-GCM nonce
-	Ciphertext []byte    `json:"ciphertext"` // AES-256-GCM encrypted key material
-	PubKeys    []KeyPair `json:"pubkeys"`    // Public keys (unencrypted, for address tracking)
+// plaintextKey is one decrypted record. plaintextKeys is what the ciphertext
+// holds.
+type plaintextKey struct {
+	PrivateKey []byte `json:"sk"`
+	PublicKey  []byte `json:"pk"`
+	Address    string `json:"addr"`
+	Index      uint32 `json:"index"`
 }
 
-// plaintextKeys is the decrypted inner structure.
+// String and Format keep the guarantee KeyPair makes: this type exists only to
+// hold private keys, and it is passed between two files, so a struct dump that
+// reaches one must not print 2560 bytes of key material. The reasoning and the
+// two shapes fmt prints raw regardless are on KeyPair.Format.
+func (k plaintextKey) String() string {
+	return fmt.Sprintf("keys.plaintextKey{Address: %s, PubKeyHash: %s, Index: %d}", k.Address, PubKeyHashHex(k.PublicKey), k.Index)
+}
+
+func (k plaintextKey) Format(f fmt.State, verb rune) { _, _ = io.WriteString(f, k.String()) }
+
 type plaintextKeys struct {
-	Keys []struct {
-		PrivateKey []byte `json:"sk"`
-		PublicKey  []byte `json:"pk"`
-		Address    string `json:"addr"`
-		Index      uint32 `json:"index"`
-	} `json:"keys"`
+	Keys []plaintextKey `json:"keys"`
 }
 
 // Manager manages Dilithium keypairs with encrypted storage.
+//
+// Exactly one of passwd and extKey is the key source: NewManager sets passwd
+// and leaves extKey nil, NewManagerWithKey the reverse. kdfName is the one
+// place that decides which of the two a manager holds, and deriveKey the one
+// place either is read as a secret.
 type Manager struct {
 	mu      sync.RWMutex
 	keys    []KeyPair
 	keyFile string
 	passwd  []byte
+	extKey  []byte
 }
 
-// NewManager creates a new key manager.
 var (
 	// ErrInvalidPublicKey marks an ML-DSA-44 public key whose first byte is
 	// 0xFF. The node's CPubKey uses that byte as its invalid-key sentinel
@@ -200,11 +209,39 @@ func checkKeyRecord(privKey, pubKey []byte, address string) error {
 	return nil
 }
 
+// NewManager creates a key manager whose keystore is encrypted under a key
+// derived from passwd by Argon2id. The passphrase is held for the life of the
+// manager, because Save re-derives from it.
 func NewManager(keyFile string, passwd string) *Manager {
 	return &Manager{
 		keyFile: keyFile,
 		passwd:  []byte(passwd),
 	}
+}
+
+// NewManagerWithKey creates a key manager whose keystore is encrypted under a
+// 32-byte key held somewhere else: a Vault transit key, an HSM-wrapped key, a
+// key unsealed into the process at start. It is the deployment where no
+// passphrase exists to be prompted for, typed or left in an environment
+// variable, and the operator's at-rest protection is whatever their
+// key-management system gives them rather than Argon2id over a human secret.
+//
+// The key must be ExternalKeySize bytes of secret random data
+// (ErrExternalKeySize). The manager keeps its own copy, so the caller may
+// zero its buffer as soon as the call returns.
+//
+// A manager built this way reads and writes only keystores written under an
+// external key: handed a passphrase keystore it reports ErrKDFMismatch rather
+// than a decryption failure. Version 1 files are passphrase-only, so they are
+// opened with NewManager.
+func NewManagerWithKey(keyFile string, key []byte) (*Manager, error) {
+	if len(key) != ExternalKeySize {
+		return nil, fmt.Errorf("%w: got %d", ErrExternalKeySize, len(key))
+	}
+	return &Manager{
+		keyFile: keyFile,
+		extKey:  bytes.Clone(key),
+	}, nil
 }
 
 // Load decrypts and loads keys from the keystore file. A file that does not
@@ -243,30 +280,42 @@ func (m *Manager) load(create bool) error {
 		return m.saveLocked()
 	}
 
-	var ks Keystore
-	if err := json.Unmarshal(data, &ks); err != nil {
+	// strictDecode, not json.Unmarshal: a keystore file has to have exactly
+	// one meaning, and it has to be the one headerAAD authenticates.
+	ks, err := strictDecode(data)
+	if err != nil {
 		return fmt.Errorf("parse keystore: %w", err)
 	}
 
-	if ks.Version != 1 {
-		return fmt.Errorf("unsupported keystore version: %d", ks.Version)
+	// The additional data is the header as the file carries it, so it is
+	// taken before upgradeV1 rewrites the header into the version 2 shape.
+	aad, err := aadFor(ks)
+	if err != nil {
+		return err
+	}
+	if ks.Version == keystoreVersionV1 {
+		if err := upgradeV1(&ks); err != nil {
+			return err
+		}
+	}
+	if err := checkHeader(&ks); err != nil {
+		return err
 	}
 
-	// Derive encryption key from passphrase via Argon2id
-	encKey := argon2.IDKey(m.passwd, ks.Salt, 3, 64*1024, 4, 32)
-
-	// Decrypt with AES-256-GCM
-	block, err := aes.NewCipher(encKey)
+	encKey, err := m.deriveKey(&ks)
 	if err != nil {
-		return fmt.Errorf("create cipher: %w", err)
+		return err
 	}
-	gcm, err := cipher.NewGCM(block)
+	gcm, err := openAEAD(encKey)
 	if err != nil {
-		return fmt.Errorf("create gcm: %w", err)
+		return err
 	}
-	plaintext, err := gcm.Open(nil, ks.Nonce, ks.Ciphertext, nil)
+	plaintext, err := gcm.Open(nil, ks.Nonce, ks.Ciphertext, aad)
 	if err != nil {
-		return fmt.Errorf("decrypt keystore (wrong passphrase?): %w", err)
+		// One failure covers a wrong key and an edited header alike: the
+		// AEAD cannot tell them apart, and the checks above have already
+		// reported every header fault that is decidable without the key.
+		return fmt.Errorf("decrypt keystore (wrong key, or the file was altered): %w", err)
 	}
 
 	// Parse decrypted key material
@@ -287,6 +336,16 @@ func (m *Manager) load(create bool) error {
 		if err := checkKeyRecord(k.PrivateKey, k.PublicKey, k.Address); err != nil {
 			return fmt.Errorf("keystore record rejected: %w", err)
 		}
+	}
+
+	// The unencrypted public key list is the part of the file an operator or
+	// an external tool reads, and it is the part that decides where money is
+	// sent. Version 2 binds it into the AEAD, but version 1 bound nothing, so
+	// checking it against the decrypted records here is the one test that
+	// holds for both formats. A list that disagrees with the keys is refused:
+	// whichever of the two is wrong, the file is not describing itself.
+	if err := checkPubKeyList(ks.PubKeys, pk.Keys); err != nil {
+		return err
 	}
 
 	m.keys = make([]KeyPair, len(pk.Keys))
@@ -312,72 +371,69 @@ func (m *Manager) Save() error {
 // saveLocked is Save with the lock held by the caller.
 func (m *Manager) saveLocked() error {
 	// Serialize key material
+	// plaintextKey is KeyPair's fields under the tags the ciphertext uses, so
+	// the conversion is the whole mapping. Adding or removing a field on
+	// either type stops it compiling, which is the point at which the two
+	// formats should be thought about rather than kept in step by hand.
+	// Reordering two fields of the same type would still compile and would
+	// exchange them; checkKeyRecord refuses the result on the next Load,
+	// because the public key would not derive from the private one.
 	pk := plaintextKeys{}
 	for _, k := range m.keys {
-		pk.Keys = append(pk.Keys, struct {
-			PrivateKey []byte `json:"sk"`
-			PublicKey  []byte `json:"pk"`
-			Address    string `json:"addr"`
-			Index      uint32 `json:"index"`
-		}{
-			PrivateKey: k.PrivateKey,
-			PublicKey:  k.PublicKey,
-			Address:    k.Address,
-			Index:      k.Index,
-		})
+		pk.Keys = append(pk.Keys, plaintextKey(k))
 	}
 
-	plaintext, err := json.Marshal(pk)
+	// A version 2 header for this manager's key source, with a fresh salt and
+	// nonce. Save always writes version 2, so a version 1 file that was read
+	// is rewritten in the new format by the first Save after it.
+	//
+	// The header is built before the key material is serialized so that every
+	// way this function can fail early fails before there is a plaintext copy
+	// of the keys on the heap to leave behind.
+	ks, err := m.newHeader()
 	if err != nil {
-		return fmt.Errorf("serialize keys: %w", err)
+		return err
 	}
 
-	// Generate salt and nonce
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		return fmt.Errorf("generate salt: %w", err)
-	}
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("generate nonce: %w", err)
-	}
-
-	// Derive encryption key
-	encKey := argon2.IDKey(m.passwd, salt, 3, 64*1024, 4, 32)
-
-	// Encrypt with AES-256-GCM
-	block, err := aes.NewCipher(encKey)
-	if err != nil {
-		return fmt.Errorf("create cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return fmt.Errorf("create gcm: %w", err)
-	}
-	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
-
-	// Wipe plaintext
-	for i := range plaintext {
-		plaintext[i] = 0
-	}
-
-	// Build public key list (unencrypted metadata)
-	pubKeys := make([]KeyPair, len(m.keys))
+	// Build public key list (unencrypted metadata). It is bound into the
+	// AEAD with the rest of the header, so the addresses an operator reads
+	// out of the file cannot be swapped for an attacker's.
+	ks.PubKeys = make([]KeyPair, len(m.keys))
 	for i, k := range m.keys {
-		pubKeys[i] = KeyPair{
+		ks.PubKeys[i] = KeyPair{
 			PublicKey: k.PublicKey,
 			Address:   k.Address,
 			Index:     k.Index,
 		}
 	}
 
-	ks := Keystore{
-		Version:    1,
-		KDF:        "argon2id",
-		Salt:       salt,
-		Nonce:      nonce,
-		Ciphertext: ciphertext,
-		PubKeys:    pubKeys,
+	// The header is checked here, not only on the way in: whatever this
+	// package writes, it must be able to read back.
+	if err := checkHeader(&ks); err != nil {
+		return err
+	}
+	aad, err := headerAAD(ks)
+	if err != nil {
+		return err
+	}
+	encKey, err := m.deriveKey(&ks)
+	if err != nil {
+		return err
+	}
+	gcm, err := openAEAD(encKey)
+	if err != nil {
+		return err
+	}
+
+	plaintext, err := json.Marshal(pk)
+	if err != nil {
+		return fmt.Errorf("serialize keys: %w", err)
+	}
+	ks.Ciphertext = gcm.Seal(nil, ks.Nonce, plaintext, aad)
+
+	// Wipe plaintext
+	for i := range plaintext {
+		plaintext[i] = 0
 	}
 
 	data, err := json.MarshalIndent(ks, "", "  ")
