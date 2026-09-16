@@ -1228,3 +1228,57 @@ func duplicateMember(t *testing.T, path, member, prefix string) {
 		t.Fatalf("the edited file is not valid JSON, so this case tests nothing: %v", err)
 	}
 }
+
+// The committed version 2 keystore written under an external key. The
+// passphrase vector beside it does not cover this path: the AES key comes from
+// HKDF over the key with the file's salt, so the derivation, the info string
+// and the salt's part in it are pinned by nothing else that arrives from
+// outside the running build. If this fails, a file an integrator unsealed from
+// Vault yesterday does not open today.
+const v2ExternalFixturePath = "testdata/keystore-v2-external.json"
+
+var v2ExternalFixtureLabels = []string{
+	"soqucoin-sdk keystore v2 external fixture 0",
+	"soqucoin-sdk keystore v2 external fixture 1",
+}
+
+var v2ExternalFixtureAddresses = []string{
+	"ssq1pz5k8h02qgef4u3yv3ur72lkdxjsfa2t99s78egjzmgnxqnwsun9qq46av3",
+	"ssq1pje9q3xlvnt68pp7a3egrwrn6uhjmv3pz86ug2t4fpzr446up29vq7xpaq0",
+}
+
+func TestExternalKeyV2FromAnEarlierBuildStillOpens(t *testing.T) {
+	on := readKeystore(t, v2ExternalFixturePath)
+	if on.Version != keystoreVersion || on.KDF != KDFHKDFSHA256 || on.KDFParams != nil {
+		t.Fatalf("fixture is version %d kdf %q params %+v", on.Version, on.KDF, on.KDFParams)
+	}
+
+	key := sha256.Sum256([]byte("soqucoin-sdk keystore v2 external fixture key"))
+	m := newManagerWithKey(t, v2ExternalFixturePath, key[:])
+	if err := m.Load(); err != nil {
+		t.Fatalf("Load of the external-key fixture: %v", err)
+	}
+	if got := m.GetAddresses(); !reflect.DeepEqual(got, v2ExternalFixtureAddresses) {
+		t.Fatalf("addresses = %v, want %v", got, v2ExternalFixtureAddresses)
+	}
+	for i, label := range v2ExternalFixtureLabels {
+		want, err := FromSeed("ssq", sha256.Sum256([]byte(label)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := m.ExportPrivateKey(want.Address)
+		if err != nil {
+			t.Fatalf("ExportPrivateKey %s: %v", want.Address, err)
+		}
+		if !bytes.Equal(got, want.PrivateKey) {
+			t.Errorf("key %d from the external-key fixture is not the key the seed derives", i)
+		}
+	}
+
+	// Another external key does not open it, so this is a test about the key
+	// and the derivation rather than about the file parsing.
+	other := sha256.Sum256([]byte("another vault key"))
+	if err := newManagerWithKey(t, v2ExternalFixturePath, other[:]).Load(); err == nil {
+		t.Error("the external-key fixture opened under a different key")
+	}
+}
