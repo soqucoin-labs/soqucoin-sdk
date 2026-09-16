@@ -220,7 +220,20 @@ var (
 	// never submitted). The reservation is kept; a Built intent that the lost
 	// store knew may have its bytes in a mempool.
 	ErrUnknownReservation = errors.New("withdraw: reservation held by an intent the store does not know; intent store and spent set disagree")
+	// ErrFailed is returned by Process for an intent that was already Failed
+	// when it was called. Failed is terminal: the inputs are released and
+	// nothing was sent. Submit answers the same id with no error, so a caller
+	// that retries a payout would otherwise read a nil error from Process and
+	// record a withdrawal that has no transaction behind it.
+	ErrFailed = errors.New("withdraw: intent failed permanently and was not sent")
 )
+
+// beforeBuild runs between Process's read of the intent and the Build call it
+// makes, a variable so a test can occupy that window. Two workers that have
+// both read one intent as Created before either builds is the race Build
+// settles by re-reading the stored state under its lock, and this is the only
+// place another goroutine can get between the read and the build.
+var beforeBuild = func() {}
 
 // DefaultReservationTTL applies when Engine.ReservationTTL is zero.
 const DefaultReservationTTL = 4 * time.Hour
@@ -295,6 +308,25 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// The check above reads the caller's copy of the intent, which another
+	// worker can have advanced between the caller's read and this lock. The
+	// stored state is the one that decides. Without this re-read, two workers
+	// each holding a Created copy of one intent both pass the check, and the
+	// lock then serialises them into two builds: each selects different inputs
+	// because the other's are reserved, each signs, and each broadcasts. That
+	// pays the recipient twice from different inputs, which is the first of the
+	// two failure modes this package exists to prevent.
+	stored, ok, err := e.Store.Get(ctx, in.ID)
+	if err != nil {
+		return fmt.Errorf("re-read %s: %w", in.ID, err)
+	}
+	if !ok {
+		return fmt.Errorf("%w: unknown intent %s", ErrInvalidIntent, in.ID)
+	}
+	if stored.State != StateCreated {
+		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, stored.State)
+	}
 
 	inputs, err := e.Select(ctx, in.Amount, in.FeeRate)
 	if err != nil {
@@ -461,14 +493,35 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 		return nil, fmt.Errorf("%w: unknown intent %s", ErrInvalidIntent, id)
 	}
 	if in.State == StateCreated {
+		beforeBuild()
 		if err := e.Build(ctx, in); err != nil {
-			return in, err
+			if !errors.Is(err, ErrWrongState) {
+				return in, err
+			}
+			// Another worker advanced this intent between the read above and
+			// Build's lock. Carry on from where the intent actually is, rather
+			// than reporting a state error for work that was done.
+			in, ok, err = e.Store.Get(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, fmt.Errorf("%w: unknown intent %s", ErrInvalidIntent, id)
+			}
 		}
 	}
 	if in.State == StateBuilt {
 		if err := e.Broadcast(ctx, in); err != nil {
 			return in, err
 		}
+	}
+	if in.State == StateFailed {
+		// Terminal, and reached only when the intent was already Failed before
+		// this call: a Build or Broadcast that fails it here returns its own
+		// error above. Submit answers a Failed id with no error, so a caller
+		// that retries a payout arrives here, and returning nil would report a
+		// withdrawal as sent with an empty txid.
+		return in, fmt.Errorf("%w: %s: %s", ErrFailed, in.ID, in.LastError)
 	}
 	return in, nil
 }
@@ -531,8 +584,12 @@ func (e *Engine) Recover(ctx context.Context) error {
 			e.log().Warn("recover: re-reserve failed", "intent", in.ID, "err", err)
 		}
 		if err := ctx.Err(); err != nil {
+			// The context stops the sending, not the re-reserving. Breaking
+			// here left every Built intent after the first one unreserved,
+			// against what this method's documentation promises, and their
+			// inputs belong to signed transactions that may be in a mempool.
 			note(fmt.Errorf("recover %s: not sent: %w", in.ID, err))
-			break
+			continue
 		}
 		if err := e.Broadcast(ctx, in); err != nil {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
