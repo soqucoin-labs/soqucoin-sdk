@@ -55,3 +55,39 @@ jobs:
           python3 .github/scripts/register-lint.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The step above proves nothing about the checker this pull request ships, because it
+      # never runs it. A diff that weakens a pattern therefore passes its own run and takes
+      # effect on every pull request after it merges, and the only thing in front of that is
+      # someone reading the diff.
+      #
+      # So run the BASE corpus against the HEAD checker. The corpus resolves the checker from
+      # its own directory, so copying the base corpus in beside the head checker is the whole
+      # mechanism. A pull request that weakens a pattern fails here, because the base fixture
+      # for that pattern still demands the block. Weakening the checker and its fixture in the
+      # same pull request fails too: the fixture that runs is the base's. Getting a weaker
+      # checker in takes two merges, the first of which deletes a fixture and nothing else.
+      #
+      # The cost is that tightening a pattern so that it reclassifies an existing positive
+      # fixture also takes two merges. That is rare, and it is deliberate when it happens.
+      #
+      # The cases this step is meant to catch are fixtures, not a claim in this comment:
+      # .github/scripts/register-crossrun-selftest.py, run by the Test workflow.
+      #
+      # This executes a file from the head, so it is confined to `pull_request`, which carries
+      # a read-only token and no secrets, and it is given no token of its own.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          persist-credentials: false
+      - name: The base corpus against this pull request's checker
+        if: github.event_name == 'pull_request'
+        run: |
+          test -f head/.github/scripts/register-lint.py || {
+            echo "::error title=Register check::this pull request removes or renames the register checker, so the base corpus has nothing to run against, and this fails closed."
+            exit 1
+          }
+          cp .github/scripts/register-lint-selftest.py head/.github/scripts/
+          python3 head/.github/scripts/register-lint-selftest.py

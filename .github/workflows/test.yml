@@ -66,6 +66,13 @@ jobs:
       - name: Static analysis
         run: make lint
 
+      # The cross-run step in the Register workflow has a corpus of its own: four
+      # head checkers, one of them weakened, one of them weakened in step with
+      # its own fixture. It runs here because it belongs to the head, and the
+      # step it describes runs the base copy of everything it touches.
+      - name: Register cross-run cases
+        run: python3 .github/scripts/register-crossrun-selftest.py
+
       # Every declared mutant must be caught by the one test that pins it: a
       # test that cannot fail is not coverage.
       - name: Mutants
