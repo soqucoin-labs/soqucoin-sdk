@@ -4,10 +4,30 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
+
+// slowFirstSend keeps the winner of a race inside Broadcast long enough for the
+// loser to re-read the intent while it is still Built. Without that the winner
+// has already saved Broadcast by the time the loser looks, and the loser's own
+// state check hides the defect the test below is for.
+type slowFirstSend struct {
+	inner *fakeNet
+	calls atomic.Int32
+	delay time.Duration
+}
+
+func (s *slowFirstSend) Broadcast(ctx context.Context, rawHex, txid string) (string, error) {
+	if s.calls.Add(1) == 1 {
+		time.Sleep(s.delay)
+	}
+	return s.inner.Broadcast(ctx, rawHex, txid)
+}
 
 // A withdrawal worker pool is the ordinary shape for an exchange, so two
 // workers can take the same job. Intent's documentation calls ID an
@@ -22,14 +42,16 @@ import (
 func TestConcurrentProcessOfOneIntentBuildsOneTransaction(t *testing.T) {
 	net := &fakeNet{mode: "ok"}
 	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), net, coins())
+	e.Broadcaster = &slowFirstSend{inner: net, delay: 200 * time.Millisecond}
 	ctx := context.Background()
 	if _, _, err := e.Submit(ctx, "w1", dst, 1_000_000, 1000); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 
 	// Hold both workers in the window between reading the intent as Created
-	// and building it, so the race is a test rather than a matter of timing:
-	// without the barrier this defect showed in four runs out of five.
+	// and building it, so the race is a test rather than a matter of timing.
+	// Without the barrier the interleaving is left to the scheduler and the
+	// defect escapes some runs, which makes the test unable to pin it.
 	var arrived sync.WaitGroup
 	arrived.Add(2)
 	beforeBuild = func() { arrived.Done(); arrived.Wait() }
@@ -52,12 +74,14 @@ func TestConcurrentProcessOfOneIntentBuildsOneTransaction(t *testing.T) {
 	if builds != 1 {
 		t.Errorf("built %d transactions for one intent, want 1", builds)
 	}
-	// A second send of the same bytes is what Recover does by design and costs
-	// the recipient nothing. A second set of bytes is the double payment.
-	for _, raw := range sent {
-		if raw != sent[0] {
-			t.Fatalf("two different transactions went out for one intent: %v", sent)
-		}
+	// One send, not merely one set of bytes sent twice. The worker that loses
+	// the build race stops on the state error rather than following the intent
+	// into Broadcast: two workers in Broadcast at once on separate copies would
+	// have the second re-reserve inputs the first had already marked spent,
+	// raise ErrReservationLost naming a withdrawal that does not exist, and save
+	// Built over the Broadcast state the first recorded.
+	if len(sent) != 1 {
+		t.Fatalf("broadcast %d times for one intent, want 1: %v", len(sent), sent)
 	}
 }
 
@@ -86,7 +110,15 @@ func TestProcessOfAnAlreadyFailedIntentReportsTheFailure(t *testing.T) {
 	if !errors.Is(err, ErrFailed) {
 		t.Fatalf("second Process on a Failed intent returned %v, want ErrFailed", err)
 	}
-	if in.TxID != "" {
-		t.Fatalf("a failed intent carries txid %q", in.TxID)
+	// One withdrawal that cannot succeed says nothing about the node or the
+	// indexer. resilience.CircuitBreaker reads rpc.ErrPermanent to decide that,
+	// and counts anything it does not recognise as a systemic failure, so
+	// without the wrapped sentinel three retries of one bad payout would open
+	// the breaker and stop every withdrawal for its cooldown.
+	if !errors.Is(err, rpc.ErrPermanent) {
+		t.Fatalf("a failed intent is not reported as a per-request fault: %v", err)
+	}
+	if in.State != StateFailed {
+		t.Fatalf("intent is %s on the second call, want %s", in.State, StateFailed)
 	}
 }

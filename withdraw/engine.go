@@ -221,11 +221,22 @@ var (
 	// store knew may have its bytes in a mempool.
 	ErrUnknownReservation = errors.New("withdraw: reservation held by an intent the store does not know; intent store and spent set disagree")
 	// ErrFailed is returned by Process for an intent that was already Failed
-	// when it was called. Failed is terminal: the inputs are released and
-	// nothing was sent. Submit answers the same id with no error, so a caller
-	// that retries a payout would otherwise read a nil error from Process and
+	// when it was called. Failed is terminal and nothing of it is on the
+	// network. Submit answers the same id with no error, so a caller that
+	// retries a payout would otherwise read a nil error from Process and
 	// record a withdrawal that has no transaction behind it.
-	ErrFailed = errors.New("withdraw: intent failed permanently and was not sent")
+	//
+	// It wraps rpc.ErrPermanent because one withdrawal that cannot succeed is
+	// a fact about that withdrawal and not about the node or the indexer.
+	// resilience.CircuitBreaker reads the wrapped sentinel and leaves itself
+	// untouched, so a caller retrying one bad payout cannot halt every
+	// withdrawal, which is what that breaker's own documentation says it
+	// exists to prevent.
+	//
+	// A Failed intent reached through a permanent rejection at broadcast keeps
+	// its TxID and RawHex, so Failed does not mean the bytes never reached a
+	// node, only that the node refused them and the inputs were released.
+	ErrFailed = fmt.Errorf("withdraw: intent failed permanently and was not sent (%w)", rpc.ErrPermanent)
 )
 
 // beforeBuild runs between Process's read of the intent and the Build call it
@@ -495,19 +506,15 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 	if in.State == StateCreated {
 		beforeBuild()
 		if err := e.Build(ctx, in); err != nil {
-			if !errors.Is(err, ErrWrongState) {
-				return in, err
-			}
-			// Another worker advanced this intent between the read above and
-			// Build's lock. Carry on from where the intent actually is, rather
-			// than reporting a state error for work that was done.
-			in, ok, err = e.Store.Get(ctx, id)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				return nil, fmt.Errorf("%w: unknown intent %s", ErrInvalidIntent, id)
-			}
+			// ErrWrongState here means another worker holds this intent and
+			// advanced it between the read above and Build's lock. It is
+			// returned rather than followed, because carrying on would put two
+			// workers into Broadcast at once on separate copies: the second
+			// would re-reserve inputs the first had already marked spent, raise
+			// ErrReservationLost naming a withdrawal that does not exist, and
+			// save Built over the Broadcast state the first had recorded. A
+			// later call reads the intent fresh and sends it.
+			return in, err
 		}
 	}
 	if in.State == StateBuilt {
