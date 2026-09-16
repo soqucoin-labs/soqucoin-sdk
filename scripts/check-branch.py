@@ -6,14 +6,19 @@ miss.
 
 1. The branch is current with main, decided by comparing the patch text of
    the two diffs rather than the ancestry or their line counts. The repository
-   uses merge commits (squash and rebase are off), so `git merge-base
-   --is-ancestor` is meaningful again: a merge commit is an ancestor of both
-   sides. The patch-text check survives the change of method because it tests
-   what matters regardless of how main advances: the diff a reviewer is shown
-   (three dot, from the merge base) must equal the diff that will land (two
-   dot, against main's tip). When the two differ, the branch is behind and
-   part of what is on screen is already on main. A branch still has to merge
-   main before opening.
+   uses merge commits (squash and rebase are off), so ancestry carries
+   information again: a merge commit has both sides as parents, so merging a
+   branch into main makes that branch's tip an ancestor of main, and merging
+   main into a branch makes main's tip an ancestor of the branch. Under squash
+   neither held, and `git merge-base --is-ancestor` gave the wrong answer on a
+   branch that was stale.
+
+   The patch-text check stays all the same, because it tests the thing that
+   matters however main advances: the diff a reviewer is shown (three dot,
+   from the merge base) must equal the diff that will land (two dot, against
+   main's tip). When the two differ, the branch is behind and part of what is
+   on screen is already on main. A branch still has to merge main before
+   opening.
 
 2. The change is one mechanism, measured in lines of non-test Go. The override
    is a line in the pull request body, `ALLOW_LARGE_DIFF: <why it is not
