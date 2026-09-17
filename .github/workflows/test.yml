@@ -74,10 +74,12 @@ jobs:
       - name: Register patterns are pinned
         run: python3 .github/scripts/register-pin-selftest.py
 
-      # The cross-run step in the Register workflow, applied to a set of head
-      # checkers built to defeat it. It runs here rather than there because it
-      # belongs to the head, and it has no part in the trust that step rests on:
-      # the corpus that step runs comes from the base either way.
+      # The two steps of the Register check, read out of their workflows and run
+      # against workspaces built to defeat them: the required step in
+      # register.yml, and the cross-run step in register-crossrun.yml applied to
+      # a set of head checkers. They run here rather than there because they
+      # belong to the head, and they have no part in the trust either step rests
+      # on: what those steps run comes from the trusted ref either way.
       - name: Register cross-run cases
         run: python3 .github/scripts/register-crossrun-selftest.py
 
