@@ -66,6 +66,23 @@ jobs:
       - name: Static analysis
         run: make lint
 
+      # The register checker's patterns are only as good as the fixtures that
+      # pin them. This requires every pattern to be caught by a fixture that no
+      # other pattern catches, so a pattern cannot be deleted while the corpus
+      # stays green. It runs off the head, so a pull request that adds a pattern
+      # adds its fixture in the same change.
+      - name: Register patterns are pinned
+        run: python3 .github/scripts/register-pin-selftest.py
+
+      # The two steps of the Register check, read out of their workflows and run
+      # against workspaces built to defeat them: the required step in
+      # register.yml, and the cross-run step in register-crossrun.yml applied to
+      # a set of head checkers. They run here rather than there because they
+      # belong to the head, and they have no part in the trust either step rests
+      # on: what those steps run comes from the trusted ref either way.
+      - name: Register cross-run cases
+        run: python3 .github/scripts/register-crossrun-selftest.py
+
       # Every declared mutant must be caught by the one test that pins it: a
       # test that cannot fail is not coverage.
       - name: Mutants
