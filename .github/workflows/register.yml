@@ -69,8 +69,8 @@ jobs:
       # What this catches: the removal of a pattern, or a change that stops it matching,
       # because register-pin-selftest.py requires
       # every pattern to be pinned by a fixture, so the base corpus carries one for each. A
-      # pattern narrowed until it still catches its own fixture and nothing else in the world
-      # is not covered by that, and reading the diff is what catches it. Also caught: an
+      # pattern narrowed until it catches its own fixture and no other text is not covered
+      # by that, and reading the diff is what catches it. Also caught: an
       # edit to main(), which the corpus drives end to end; a checker that fails to import,
       # exits at import, or is missing a callable. The pin requirement holds only while that
       # check runs, and today it runs in the Test workflow, off the head. Running it here as
