@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,9 @@ type scriptedStub struct {
 	mu      sync.Mutex
 	conns   []net.Conn
 	genesis string
+	// features counts server.features requests, so a test can measure how
+	// often the genesis check goes out rather than assume it is cached.
+	features atomic.Int64
 }
 
 func newScriptedStub(t testing.TB, genesis string, handler func(req request) []string) *scriptedStub {
@@ -105,6 +109,7 @@ func (s *scriptedStub) serve() {
 				case "server.version":
 					out = []string{reply(req.ID, `"ElectrumX 1.16"`)}
 				case "server.features":
+					s.features.Add(1)
 					out = []string{reply(req.ID, fmt.Sprintf(`{"genesis_hash":%q}`, s.genesis))}
 				case "blockchain.headers.subscribe":
 					// Connect subscribes to headers; a handler that does not

@@ -181,9 +181,37 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
+// ensureGenesisLocked is the gate every call passes: it verifies the genesis
+// hash once per connection and network prefix, and refuses the call when the
+// server indexes another chain. Caller holds the connection lock.
+//
+// The prefix can arrive after the connection, through SetHRP or inferred by
+// TrackAddresses, and Connect's own verification is then long past. Script
+// hashes carry nothing about which chain a script belongs to, so a wrong-chain
+// server answers listunspent with a well-formed empty list: no credit, no
+// mismatch, no alarm, and a freshness record that says the pass succeeded.
+// That is the condition this check exists to prevent, so it belongs on the
+// call rather than only on the connect.
+//
+// With no prefix set there is nothing to verify against, and nothing to
+// verify: every call that reads money needs a script hash, which needs an
+// address, which needs a prefix.
+func (c *Client) ensureGenesisLocked(ctx context.Context) error {
+	hrp := c.hrp()
+	if hrp == "" {
+		return nil
+	}
+	if c.genesisHRP == hrp && c.genesisGen == c.gen {
+		return nil
+	}
+	return c.verifyGenesisLocked(ctx)
+}
+
 // verifyGenesisLocked refuses a server that indexes a chain other than the one
-// the client's addresses belong to. Skipped only while the HRP is still unknown
-// (before TrackAddresses), in which case TrackAddresses is the gate.
+// the client's addresses belong to, and records the connection and prefix it
+// verified so ensureGenesisLocked can skip the call next time. Caller holds the
+// connection lock. Skipped only while the prefix is still unknown, in which
+// case no address-derived call can be made either.
 func (c *Client) verifyGenesisLocked(ctx context.Context) error {
 	hrp := c.hrp()
 	if hrp == "" {
@@ -206,6 +234,9 @@ func (c *Client) verifyGenesisLocked(ctx context.Context) error {
 	got := strings.ToLower(strings.TrimPrefix(features.Genesis, "0x"))
 	for _, w := range want {
 		if got == strings.ToLower(w) {
+			// Recorded as the pair it is true of. A later generation or a
+			// later prefix does not inherit this result.
+			c.genesisGen, c.genesisHRP = c.gen, hrp
 			return nil
 		}
 	}
@@ -252,6 +283,12 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (j
 
 // callGen is call reporting the connection generation the request went over,
 // for callers that record state per connection (subscriptions, freshness).
+//
+// This is the one funnel every call outside the connect handshake passes
+// through, which is why the genesis gate sits here rather than at each caller:
+// listunspent, the address subscribe, get_history, the broadcast, the tip and
+// the exported Call all arrive here. The handshake and the verification itself
+// use callLocked and are not gated, so the check cannot recurse into itself.
 func (c *Client) callGen(ctx context.Context, method string, params interface{}) (json.RawMessage, uint64, error) {
 	if err := c.lockConn(ctx); err != nil {
 		return nil, 0, err
@@ -260,6 +297,10 @@ func (c *Client) callGen(ctx context.Context, method string, params interface{})
 	if conn == nil {
 		c.unlockConn()
 		return nil, 0, ErrNotConnected
+	}
+	if err := c.ensureGenesisLocked(ctx); err != nil {
+		c.unlockConn()
+		return nil, gen, err
 	}
 	id, p, err := c.sendLocked(ctx, conn, gen, method, params)
 	c.unlockConn()

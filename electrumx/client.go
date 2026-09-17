@@ -85,6 +85,15 @@ type Client struct {
 	connSem  chan struct{}
 	liveGen  atomic.Uint64
 
+	// The genesis verification that has been done, as the pair it is true of:
+	// the connection generation it was done on and the network prefix it was
+	// done against. Guarded by connSem, like gen itself, and read by the gate
+	// in callGen. A reconnect moves gen and a SetHRP or TrackAddresses moves
+	// the prefix, and either makes the recorded pair stale, which is what
+	// makes the check run again rather than once per process.
+	genesisGen uint64
+	genesisHRP string
+
 	// pending pairs each in-flight request id with its waiting call.
 	pendMu  sync.Mutex
 	pending map[int64]pendingCall
