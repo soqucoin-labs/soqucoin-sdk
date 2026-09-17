@@ -55,3 +55,83 @@ jobs:
           python3 .github/scripts/register-lint.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The step above runs the base's checker. This one runs the checker the pull request
+      # ships, against the base's corpus, so the check covers the checker as well as the text.
+      #
+      # The corpus resolves the checker from its own directory, so the mechanism is to place
+      # the base corpus and the head checker together. The directory is created here, and the
+      # checker has to be a plain file inside the head's own tree, so that what runs is what
+      # the pull request ships.
+      #
+      # The corpus is the base's, so what it requires of a checker is fixed by main rather
+      # than by the pull request: every pattern pinned by a fixture, which
+      # .github/scripts/register-pin-selftest.py keeps true, and main() driven on each event
+      # the checker branches on. Coverage is recorded as fixtures rather than as claims here:
+      # register-lint-selftest.py, register-pin-selftest.py, and
+      # register-crossrun-selftest.py, which reads the block below out of this file and runs
+      # it. Scope and open items are in the tracker.
+      #
+      # Tightening a pattern so that it reclassifies an existing positive fixture takes two
+      # merges, because the corpus that runs here is the base's.
+      #
+      # The body of this step is the step. A new file beside it would not do: this job checks
+      # out the base, and the base of the change that adds such a file does not carry it, so
+      # the step would fail on its own run. The workflow definition comes from the merge ref,
+      # so what is written here is available the first time it runs.
+      #
+      # This executes a file from the head. `pull_request` is the trigger, so a fork run gets
+      # no secrets beyond the token itself; a same-repository branch gets them all. What keeps
+      # the token harmless either way is the read-only `permissions` block above rather than
+      # the trigger. The step is given no token of its own.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          persist-credentials: false
+      - name: The base corpus against this pull request's checker
+        if: github.event_name == 'pull_request'
+        run: |
+          checker=head/.github/scripts/register-lint.py
+          if [ ! -f "$checker" ]; then
+            echo "::error title=Register check::this pull request removes or renames the register checker, so the base corpus has nothing to run against, and this fails closed."
+            exit 1
+          fi
+          # `test -f` follows links, and so does `cp`. A checker that is a link, or that sits
+          # under a linked directory, can resolve to the base's own trusted copy, and the run
+          # would then judge a file this pull request does not ship. `pwd -P` resolves the
+          # directory, and `-L` covers the file itself.
+          head_real=$(cd head && pwd -P)
+          checker_dir=$(cd "$(dirname "$checker")" && pwd -P)
+          case "$checker_dir/" in
+            "$head_real"/*) ;;
+            *) echo "::error title=Register check::the register checker in this pull request resolves outside the pull request's own tree, so running it would judge a file the pull request does not ship, and this fails closed."
+               exit 1 ;;
+          esac
+          if [ -L "$checker" ]; then
+            echo "::error title=Register check::the register checker in this pull request is a link rather than a file, so what runs is not what the pull request ships, and this fails closed."
+            exit 1
+          fi
+          # The directory is made here rather than in the head's tree. A head that chose the
+          # destination could make the corpus path a symlink to /dev/null, take the write, and
+          # leave an empty file to run.
+          work="$RUNNER_TEMP/crossrun"
+          mkdir "$work"
+          cp "$checker" "$work/"
+          cp .github/scripts/register-lint-selftest.py "$work/"
+          if ! python3 "$work/register-lint-selftest.py" > "$work/out" 2>&1; then
+            cat "$work/out"
+            echo "::error title=Register check::the base corpus does not behave against the checker this pull request ships."
+            exit 1
+          fi
+          cat "$work/out"
+          # An exit status on its own is not a result. A run that reached no verdict line did
+          # not get to the end of the corpus, and its zero says nothing about the checker. The
+          # two counts have to agree as well: the corpus prints its tally before it exits, so
+          # a checker that neutralises the exit leaves an honest tally behind a clean status.
+          if ! awk -F'[/ ]' '/ fixtures behave$/ && $1 == $2 { found = 1 }
+                             END { exit !found }' "$work/out"; then
+            echo "::error title=Register check::the base corpus reached no verdict, so its exit status says nothing about the checker this pull request ships."
+            exit 1
+          fi
