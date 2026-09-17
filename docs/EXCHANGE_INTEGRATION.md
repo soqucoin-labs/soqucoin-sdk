@@ -124,7 +124,7 @@ SDK reads or broadcasts goes through them.
 
 | | |
 |---|---|
-| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a v2.5.0 build before the v0.3.5 tag, and the release notes record that binary's digest. |
+| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.5.0`**, built per its `INSTALL.md` or `Dockerfile`. Every node we operate runs this tag. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a build of the `v2.5.0` tag commit (`9d3ceb4f2d0fe41`) before this SDK tag. Build the node from that tag yourself; a digest of our build would identify our build machine as much as the software. |
 | `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
 | `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every node we operate runs with it. |
 | `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC is plaintext. Bind it to localhost, where `rpc.Client` connects with no further setting. For a node on another host the client refuses the URL until `AllowRemote` is set (`rpc.ErrRemoteNode`), and with the flag set refuses `http://` to it (`rpc.ErrPlaintextRemote`); the route is a tunnel that ends on this machine or an `https://` TLS terminator in front of the node ([Security Guide](SECURITY.md#network-security)). Loopback is read from the URL as written, the name `localhost` or a dotted-quad or bracketed IPv6 literal in `127.0.0.0/8` or `::1`, and nothing is resolved: a Docker service name, `host.docker.internal` or a Kubernetes service is a remote host to the client and needs the same route. |
@@ -962,7 +962,10 @@ integration.
 Every package carries unit tests. The figures below are one run of `go test -cover ./...` on the
 commit this document ships with, library packages only: the `examples/` programs and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
-Re-run the command to check any row.
+Re-run the command to check any row. Nine of the ten reproduce exactly. The `electrumx`
+figure moves between about 88.7 and 89.2 across runs, because several of its tests drive
+the reader goroutine, the ping loop and the refresher at once, and which branches run
+depends on how those are scheduled.
 
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
@@ -970,7 +973,7 @@ Re-run the command to check any row.
 | `utxo` | **94.7%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `rpc` | **85.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **88.5%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `electrumx` | **88.7%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
 | `tx` | **91.6%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **89.6%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **84.3%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
