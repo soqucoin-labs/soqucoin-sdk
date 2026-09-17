@@ -38,6 +38,12 @@ def literals(checker_text):
         found += [(name, p) for p in getattr(mod, name)]
     found += [("REGISTER", p) for p, _ in mod.REGISTER]
 
+    for name in ("ATTRIBUTION", "NARRATIVE", "PATHS", "REGISTER"):
+        if not [x for x in found if x[0] == name]:
+            print(f"::error title=Register pins::{name} is empty, so this check would report "
+                  f"every pattern in it pinned by saying nothing about any")
+            return None
+
     out = []
     for name, pat in found:
         forms = [f'r"{pat}"', f"r'{pat}'"]
@@ -70,13 +76,17 @@ def main():
             r = subprocess.run(
                 [sys.executable, os.path.join(d, "register-lint-selftest.py")],
                 capture_output=True, text=True)
-            if r.returncode == 0:
-                unpinned.append((name, pat))
+            # A non-zero status is not enough. Neutralising a pattern has to flip a named
+            # fixture; a corpus that crashed instead says nothing about coverage.
+            if r.returncode == 0 or "FAIL |" not in r.stdout:
+                unpinned.append((name, pat, r.returncode))
     finally:
         subprocess.run(["rm", "-rf", tmp], check=False)
 
-    for name, pat in unpinned:
-        print(f"::error title=Register pins::{name} pattern {pat!r} is pinned by no fixture. "
+    for name, pat, rc in unpinned:
+        why = ("is pinned by no fixture" if rc == 0
+               else "breaks the corpus when neutralised rather than flipping a fixture")
+        print(f"::error title=Register pins::{name} pattern {pat!r} {why}. "
               f"Add one to register-lint-selftest.py that this pattern alone catches.")
     print(f"\n{len(pats) - len(unpinned)}/{len(pats)} patterns pinned by a fixture")
     return 1 if unpinned else 0

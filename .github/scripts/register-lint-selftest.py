@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Fixture corpus for register-lint.py. Offline: no event payload and no API call.
+"""Fixture corpus for register-lint.py. Offline: it builds its own event payload and stubs
+the API call.
 
-Every negative case below is a text that was published from this repository before the check
-existed. Every positive case is one a check has to let through, and each cost something
-before it did: a review bot's prose, and a commit message naming the manifest file it changes.
+The first negative cases are texts that were published from this repository before the check
+existed. The rest were written to pin one pattern each, so that no pattern can be removed
+while this corpus still reports that every fixture behaves. Every positive case is one a
+check has to let through, and each cost something before it did: a review bot's prose, and a
+commit message naming the manifest file it changes.
 """
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 
@@ -84,6 +88,14 @@ TEXTS = [
     ("an instruction to read the body", "See the pr body for the reason.", True),
     ("a filler phrase", "It's worth noting that the cache is shared.", True),
     ("a metaphor for a literal phrase", "The check was blind to the empty case.", True),
+    # Every fixture above is short, so a lint() that reads only the start of a text would
+    # pass all of them and miss a trailer at the foot of a real body.
+    ("a trailer at the end of a body of ordinary length",
+     "The deposit reconciler reads the confirmed set once per interval and compares it "
+     "against the set it recorded on the pass before. Addresses that gained a confirmation "
+     "move to the settled table, and addresses that lost one return to the pending table. "
+     "The interval is configurable and the default is thirty seconds."
+     "\n\nCo-Authored-By: a <a@b.c>", True),
 ]
 
 PATHS = [
@@ -117,20 +129,35 @@ for name, path, must_fail in PATHS:
 # finding into an exit status, and what decides whose text counts as ours. A checker whose
 # lint() is intact and whose main() returns 0 on findings prints every error and passes.
 # These run main() against a review event, which reads the event file and calls no API.
-EVENTS = [
-    ("our text, with a finding", "someone", "User", "x\n\nCo-Authored-By: a <a@b.c>", 1),
-    ("our text, clean", "someone", "User", "withdraw: one intent builds one transaction", 0),
-    ("a bot's text, with a finding", "some-bot", "Bot", "x\n\nCo-Authored-By: a <a@b.c>", 0),
+REVIEWS = [
+    ("a review comment of ours, with a finding", "someone", "User",
+     "x\n\nCo-Authored-By: a <a@b.c>", 1),
+    ("a review comment of ours, clean", "someone", "User",
+     "withdraw: one intent builds one transaction", 0),
+    ("a review comment from a bot, with a finding", "some-bot", "Bot",
+     "x\n\nCo-Authored-By: a <a@b.c>", 0),
+]
+
+CLEAN = "withdraw: one intent builds one transaction"
+DIRTY = "x\n\nCo-Authored-By: a <a@b.c>"
+
+# The pull request branch of main() reads four kinds of text, and a checker that drops any
+# one of them keeps every fixture above behaving. One event per kind, each with the finding
+# in a different place.
+PULLS = [
+    ("a pull request title with a finding", DIRTY, CLEAN, CLEAN, "withdraw/engine.go", 1),
+    ("a pull request body with a finding", CLEAN, DIRTY, CLEAN, "withdraw/engine.go", 1),
+    ("a commit message with a finding", CLEAN, CLEAN, DIRTY, "withdraw/engine.go", 1),
+    ("a changed path with a finding", CLEAN, CLEAN, CLEAN, "deposit/round2_test.go", 1),
+    ("a pull request with nothing in it", CLEAN, CLEAN, CLEAN, "withdraw/engine.go", 0),
 ]
 
 env_tmp = tempfile.mkdtemp(prefix="register-corpus-")
-for name, login, kind, body, want in EVENTS:
-    path = os.path.join(env_tmp, "event.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"review": {"body": body, "user": {"login": login, "type": kind}}}, fh)
-    os.environ["GITHUB_EVENT_PATH"] = path
-    os.environ["GITHUB_REPOSITORY"] = "owner/repo"
-    os.environ["GITHUB_EVENT_NAME"] = "pull_request_review"
+
+
+def _verdict(name, want):
+    """Run main() under the event already written, and report what it returned."""
+    global bad
     try:
         got = mod.main()
     except BaseException as exc:  # a checker that exits or raises is not a passing checker
@@ -140,6 +167,32 @@ for name, login, kind, body, want in EVENTS:
     print(("PASS" if ok else "FAIL"), "|", name, "| main() returned", got,
           "" if ok else f"| expected {want}")
 
-total = len(TEXTS) + len(PATHS) + len(EVENTS)
+
+def _event(payload, event_name):
+    path = os.path.join(env_tmp, "event.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    os.environ["GITHUB_EVENT_PATH"] = path
+    os.environ["GITHUB_REPOSITORY"] = "owner/repo"
+    os.environ["GITHUB_EVENT_NAME"] = event_name
+
+
+for name, login, kind, body, want in REVIEWS:
+    _event({"review": {"body": body, "user": {"login": login, "type": kind}}},
+           "pull_request_review")
+    _verdict(name, want)
+
+for name, title, body, message, path, want in PULLS:
+    _event({"pull_request": {"number": 1, "title": title, "body": body}}, "pull_request")
+    # Stand in for the two API reads. A checker that reaches the network instead of calling
+    # api() finds no token and raises, which _verdict reports as a failure.
+    mod.api = lambda p, _m=message, _p=path: (
+        [{"sha": "0" * 40, "commit": {"message": _m}}] if p.endswith("/commits")
+        else [{"filename": _p}])
+    _verdict(name, want)
+
+shutil.rmtree(env_tmp, ignore_errors=True)
+
+total = len(TEXTS) + len(PATHS) + len(REVIEWS) + len(PULLS)
 print(f"\n{total - bad}/{total} fixtures behave")
 sys.exit(1 if bad else 0)

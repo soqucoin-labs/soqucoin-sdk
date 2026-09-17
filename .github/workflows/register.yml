@@ -66,8 +66,11 @@ jobs:
       # the destination is: a corpus path that is a symlink to /dev/null takes the write and
       # leaves an empty file to run.
       #
-      # What this catches: any edit to a pattern, because register-pin-selftest.py requires
-      # every pattern to be pinned by a fixture, so the base corpus carries one for each; an
+      # What this catches: the removal of a pattern, or a change that stops it matching,
+      # because register-pin-selftest.py requires
+      # every pattern to be pinned by a fixture, so the base corpus carries one for each. A
+      # pattern narrowed until it still catches its own fixture and nothing else in the world
+      # is not covered by that, and reading the diff is what catches it. Also caught: an
       # edit to main(), which the corpus drives end to end; a checker that fails to import,
       # exits at import, or is missing a callable. The pin requirement holds only while that
       # check runs, and today it runs in the Test workflow, off the head. Running it here as
@@ -95,10 +98,10 @@ jobs:
       # .github/scripts/register-crossrun-selftest.py reads this block out of this file and
       # runs it against a set of head checkouts built to defeat it.
       #
-      # This executes a file from the head. `pull_request` is the trigger, so on a fork there
-      # are no secrets; on a same-repository branch there are, and what keeps the token
-      # harmless is the read-only `permissions` block above rather than the trigger. The step
-      # is given no token of its own.
+      # This executes a file from the head. `pull_request` is the trigger, so a fork run gets
+      # no secrets beyond the token itself; a same-repository branch gets them all. What keeps
+      # the token harmless either way is the read-only `permissions` block above rather than
+      # the trigger. The step is given no token of its own.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
@@ -126,8 +129,11 @@ jobs:
           fi
           cat "$work/out"
           # An exit status on its own is not a result. A run that reached no verdict line did
-          # not get to the end of the corpus, and its zero says nothing about the checker.
-          if ! grep -qE '^[0-9]+/[0-9]+ fixtures behave$' "$work/out"; then
+          # not get to the end of the corpus, and its zero says nothing about the checker. The
+          # two counts have to agree as well: the corpus prints its tally before it exits, so
+          # a checker that neutralises the exit leaves an honest tally behind a clean status.
+          if ! awk -F'[/ ]' '/ fixtures behave$/ && $1 == $2 { found = 1 }
+                             END { exit !found }' "$work/out"; then
             echo "::error title=Register check::the base corpus reached no verdict, so its exit status says nothing about the checker this pull request ships."
             exit 1
           fi

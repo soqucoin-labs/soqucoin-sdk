@@ -11,7 +11,7 @@ base of the pull request, and the base of the change that would add a script bes
 not carry that script, so the step would fail on its own run. Reading the block back is what
 keeps these cases honest about the thing that actually runs.
 
-Offline: no event payload and no API call. It runs in the Test workflow, off the pull request
+Offline: nothing here reaches the network. It runs in the Test workflow, off the pull request
 head, and has no part in the trust the step rests on. The corpus that step runs comes from
 the base either way, so a pull request that rewrites this file still faces the step.
 """
@@ -104,7 +104,21 @@ CASES = [
      {"edit": lambda t: "import sys\nsys.exit(0)\n" + t}, True, "does not import"),
     ("the head checker is emptied", {"edit": lambda t: ""}, True, "no callable"),
     ("the head deletes the checker", {"delete": True}, True, "removes or renames"),
-    ("a hostile corpus path in the head does not take the write",
+    ("the head turns the checker off for pull request events and leaves review events alone",
+     {"edit": sub('    name = os.environ.get("GITHUB_EVENT_NAME", "")\n',
+                  '    name = os.environ.get("GITHUB_EVENT_NAME", "")\n'
+                  '    if name == "pull_request":\n        return 0\n')},
+     True, "main() returned 0"),
+    ("the head stops reading the pull request body",
+     {"edit": drop('        texts.append(("the pull request body", pr.get("body") or ""))\n')},
+     True, "a pull request body with a finding"),
+    ("the head neutralises its own exit so the corpus reports and passes",
+     {"edit": lambda t: "import sys\nsys.exit = lambda *a, **k: None\n"
+                        + t.replace('    r"co-authored-by",\n', "", 1)},
+     True, "fixtures behave"),
+    # The step never touches the head's corpus path, so this is a guard against that changing
+    # rather than evidence the step handled a write.
+    ("a corpus path planted in the head is not the one that runs",
      {"edit": drop('    r"co-authored-by",\n'), "corpus_symlink": "/dev/null"},
      True, "a co-author trailer"),
 ]
