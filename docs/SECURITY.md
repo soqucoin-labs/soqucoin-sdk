@@ -548,7 +548,7 @@ Reporters are credited in release notes with their permission.
 
   ```bash
   gpg --recv-keys 5C3055F9F9866B237D69A24732ED260F83A0BA88
-  git tag -v v0.3.4
+  git tag -v v0.4.0
   ```
 
 - **Reproducibility.** The module is pure Go with no cgo and no code generation, so a build from a
