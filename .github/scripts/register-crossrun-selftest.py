@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Fixture corpus for register-crossrun.sh, the cross-run step of the Register workflow.
+"""Fixture corpus for the cross-run step of the Register workflow.
 
 Each case builds a head checkout whose checker has been edited the way a pull request could
-edit it, runs register-crossrun.sh against it, and requires the script to reach the right
-verdict for the right reason. The script under test is the one the workflow runs, not a
-transcription of it, so an edit to the step is an edit to what these cases exercise.
+edit it, runs the step against it, and requires the step to reach the right verdict for the
+right reason.
+
+The step under test is read out of .github/workflows/register.yml and executed, rather than
+restated here. The step's body has to live in the workflow: the Register job checks out the
+base of the pull request, and the base of the change that would add a script beside it does
+not carry that script, so the step would fail on its own run. Reading the block back is what
+keeps these cases honest about the thing that actually runs.
 
 Offline: no event payload and no API call. It runs in the Test workflow, off the pull request
 head, and has no part in the trust the step rests on. The corpus that step runs comes from
@@ -19,35 +24,58 @@ import tempfile
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(HERE, "register-crossrun.sh")
+REPO = os.path.dirname(os.path.dirname(HERE))
+WORKFLOW = os.path.join(REPO, ".github", "workflows", "register.yml")
+STEP_NAME = "The base corpus against this pull request's checker"
 CHECKER = open(os.path.join(HERE, "register-lint.py"), encoding="utf-8").read()
+CORPUS = os.path.join(HERE, "register-lint-selftest.py")
+
+
+def step_script():
+    """The `run:` block of the cross-run step, as the runner would execute it."""
+    lines = open(WORKFLOW, encoding="utf-8").read().splitlines()
+    try:
+        at = next(i for i, l in enumerate(lines) if l.strip() == f"- name: {STEP_NAME}")
+        start = next(i for i in range(at + 1, len(lines)) if lines[i].strip() == "run: |")
+    except StopIteration:
+        raise SystemExit(f"FAIL | no step named {STEP_NAME!r} with a literal run block in "
+                         f"{WORKFLOW}; this corpus cannot speak for a step it cannot find")
+    indent = len(lines[start]) - len(lines[start].lstrip()) + 2
+    body = []
+    for line in lines[start + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        body.append(line[indent:] if line.strip() else "")
+    if not body:
+        raise SystemExit("FAIL | the cross-run step has an empty run block")
+    return "\n".join(body)
+
+
+SCRIPT = step_script()
 
 
 def build(root, edit=None, delete=False, corpus_symlink=None):
-    """A head checkout, with the checker edited as a pull request might edit it."""
-    d = os.path.join(root, "head", ".github", "scripts")
-    os.makedirs(d)
+    """A workspace shaped like the runner's: the base checkout, with head/ beside it."""
+    base = os.path.join(root, "base", ".github", "scripts")
+    os.makedirs(base)
+    shutil.copy(CORPUS, base)
+    head = os.path.join(root, "base", "head", ".github", "scripts")
+    os.makedirs(head)
     if not delete:
-        with open(os.path.join(d, "register-lint.py"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(head, "register-lint.py"), "w", encoding="utf-8") as fh:
             fh.write(edit(CHECKER) if edit else CHECKER)
     if corpus_symlink:
-        os.symlink(corpus_symlink, os.path.join(d, "register-lint-selftest.py"))
-    return os.path.join(root, "head")
+        os.symlink(corpus_symlink, os.path.join(head, "register-lint-selftest.py"))
+    runner_temp = os.path.join(root, "runner-temp")
+    os.makedirs(runner_temp)
+    return os.path.join(root, "base"), runner_temp
 
 
-def run(head, root):
-    r = subprocess.run(["bash", SCRIPT, head, os.path.join(root, "work"), HERE],
+def run(cwd, runner_temp):
+    env = dict(os.environ, RUNNER_TEMP=runner_temp)
+    r = subprocess.run(["bash", "-e", "-c", SCRIPT], cwd=cwd, env=env,
                        capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
-
-
-def drop(needle):
-    def edit(text):
-        out = text.replace(needle, "", 1)
-        if out == text:
-            raise AssertionError(f"this corpus edits {needle!r}, which the checker no longer has")
-        return out
-    return edit
 
 
 def sub(old, new):
@@ -59,8 +87,12 @@ def sub(old, new):
     return edit
 
 
+def drop(needle):
+    return sub(needle, "")
+
+
 CASES = [
-    # (name, build kwargs, expected failure, a string the output must contain)
+    # (name, build kwargs, the step must refuse, a string its output must contain)
     ("the head checker is unchanged", {}, False, "fixtures behave"),
     ("the head drops the co-author pattern",
      {"edit": drop('    r"co-authored-by",\n')}, True, "a co-author trailer"),
@@ -80,25 +112,25 @@ CASES = [
 
 def main():
     bad = 0
-    for name, kwargs, want_fail, needle in CASES:
+    for name, kwargs, want_refuse, needle in CASES:
         root = tempfile.mkdtemp(prefix="register-crossrun-")
         try:
             try:
-                head = build(root, **kwargs)
+                cwd, runner_temp = build(root, **kwargs)
             except AssertionError as exc:
                 print("FAIL |", name, "| the case could not be built |", exc)
                 bad += 1
                 continue
-            rc, out = run(head, root)
-            failed = rc != 0
-            ok = failed == want_fail and needle in out
+            rc, out = run(cwd, runner_temp)
+            refused = rc != 0
+            ok = refused == want_refuse and needle in out
             bad += 0 if ok else 1
             why = ""
             if not ok:
-                why = (f"| exit {rc}, expected {'nonzero' if want_fail else 'zero'}"
-                       f"{'' if needle in out else f'; output does not contain {needle!r}'}")
+                why = (f"| exit {rc}, expected {'nonzero' if want_refuse else 'zero'}"
+                       + ("" if needle in out else f"; output lacks {needle!r}"))
             print(("PASS" if ok else "FAIL"), "|", name, "|",
-                  "refused" if failed else "accepted", why)
+                  "refused" if refused else "accepted", why)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

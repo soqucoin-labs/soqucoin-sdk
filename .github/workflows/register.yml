@@ -86,8 +86,14 @@ jobs:
       # The cost is that tightening a pattern so that it reclassifies an existing positive
       # fixture takes two merges. That is rare, and it is deliberate when it happens.
       #
+      # The body of this step is the step. A new file beside it would not do: this job checks
+      # out the base, and the base of the change that adds such a file does not carry it, so
+      # the step would fail on its own run. The workflow definition comes from the merge ref,
+      # so what is written here is available the first time it runs.
+      #
       # The cases are fixtures, not a claim in this comment:
-      # .github/scripts/register-crossrun-selftest.py, run by the Test workflow.
+      # .github/scripts/register-crossrun-selftest.py reads this block out of this file and
+      # runs it against a set of head checkouts built to defeat it.
       #
       # This executes a file from the head. `pull_request` is the trigger, so on a fork there
       # are no secrets; on a same-repository branch there are, and what keeps the token
@@ -100,5 +106,28 @@ jobs:
           path: head
           persist-credentials: false
       - name: The base corpus against this pull request's checker
-        run: bash .github/scripts/register-crossrun.sh head "$RUNNER_TEMP/crossrun" .github/scripts
         if: github.event_name == 'pull_request'
+        run: |
+          if [ ! -f head/.github/scripts/register-lint.py ]; then
+            echo "::error title=Register check::this pull request removes or renames the register checker, so the base corpus has nothing to run against, and this fails closed."
+            exit 1
+          fi
+          # The directory is made here rather than in the head's tree. A head that chose the
+          # destination could make the corpus path a symlink to /dev/null, take the write, and
+          # leave an empty file to run.
+          work="$RUNNER_TEMP/crossrun"
+          mkdir "$work"
+          cp head/.github/scripts/register-lint.py "$work/"
+          cp .github/scripts/register-lint-selftest.py "$work/"
+          if ! python3 "$work/register-lint-selftest.py" > "$work/out" 2>&1; then
+            cat "$work/out"
+            echo "::error title=Register check::the base corpus does not behave against the checker this pull request ships."
+            exit 1
+          fi
+          cat "$work/out"
+          # An exit status on its own is not a result. A run that reached no verdict line did
+          # not get to the end of the corpus, and its zero says nothing about the checker.
+          if ! grep -qE '^[0-9]+/[0-9]+ fixtures behave$' "$work/out"; then
+            echo "::error title=Register check::the base corpus reached no verdict, so its exit status says nothing about the checker this pull request ships."
+            exit 1
+          fi
