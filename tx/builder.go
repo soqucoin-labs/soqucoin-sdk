@@ -646,10 +646,28 @@ func BuildMintUSDSOQTransaction(
 		totalInput += u.Value
 	}
 
-	// Estimate fee (pessimistic: assume 3 outputs — recipient + authority + change)
-	tx.Outputs = make([]TxOutput, 3) // temporary for weight estimation
+	// Fee for the three-output form, measured on the real scripts: the
+	// recipient's witness v7 program, the authority marker's witness v5
+	// program, and the native change. Three zero-value TxOutputs with nil
+	// scripts measured 9 bytes each where these measure 43, so the fee was
+	// sized over 27 bytes of outputs instead of 129 and a mint could pay
+	// under the minimum relay rate for the transaction actually broadcast.
+	//
+	// The outputs are built here rather than through AddOutputUSDSOQ and
+	// AddOutputWitnessV5 because measurement needs the script bytes and
+	// nothing else, and those two panic on a script of the wrong shape: a
+	// caller that passes no change script would take that panic during a
+	// measurement instead of at the output it asked for.
+	tx.Outputs = []TxOutput{
+		{Value: amount, ScriptPubKey: recipientScriptPubKey},
+		{Value: 0, ScriptPubKey: ScriptWitnessV5(authorityPKHash)},
+		{Value: 0, ScriptPubKey: changeScriptPubKey},
+	}
 	fee := tx.EstimateFee(feeRate)
-	tx.Outputs = nil // reset
+	tx.Outputs = nil
+	if err := checkFee(fee, feeRate); err != nil {
+		return nil, err
+	}
 
 	// Calculate change (inputs are SOQ for fees, USDSOQ amount is created ex nihilo)
 	// The fee is paid from SOQ inputs. The USDSOQ amount is NOT deducted from inputs.
@@ -730,10 +748,20 @@ func BuildSendUSDSOQTransaction(
 		totalSOQ += u.Value
 	}
 
-	// Estimate fee (pessimistic: assume 3 outputs — recipient + usdsoq change + soq change)
-	tx.Outputs = make([]TxOutput, 3) // temporary for weight estimation
+	// Fee for the three-output form, measured on the real scripts: the
+	// recipient's witness v7 program, the asset change and the native change.
+	// See BuildMintUSDSOQTransaction for why the outputs are built here rather
+	// than through the validating adders, and for what three nil scripts cost.
+	tx.Outputs = []TxOutput{
+		{Value: amount, ScriptPubKey: recipientScriptPubKey},
+		{Value: 0, ScriptPubKey: usdsoqChangeScriptPubKey},
+		{Value: 0, ScriptPubKey: soqChangeScriptPubKey},
+	}
 	fee := tx.EstimateFee(feeRate)
-	tx.Outputs = nil // reset
+	tx.Outputs = nil
+	if err := checkFee(fee, feeRate); err != nil {
+		return nil, err
+	}
 
 	// Validate USDSOQ balance
 	if totalUSDSOQ < amount {

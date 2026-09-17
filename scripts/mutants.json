@@ -477,6 +477,42 @@
       "find": "func vsizeFor(n int) int64 { return 1100 + 976*int64(n-1) }",
       "replace": "func vsizeFor(n int) int64 { return 1100 + 950*int64(n-1) }",
       "why": "A fee target under the real vsize makes the selection accept inputs that cannot pay their own fee. BuildSendTransaction then computes a negative change and returns ErrInsufficientFunds, which is neither transient nor a context error, so the engine fails the withdrawal permanently. The measured figure is 976 vB per further input; 950 was short from three inputs up. The constant now appears in this example and in the split signer, so each is pinned where it stands."
+    },
+    {
+      "id": "electrumx-genesis-gate-lets-a-wrong-chain-server-answer",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestCallIsRefusedWhenTheChainIsWrongAndThePrefixArrivedAfterTheConnection",
+      "find": "\tif err := c.ensureGenesisLocked(ctx); err != nil {",
+      "replace": "\tif err := error(nil); err != nil {",
+      "why": "A script hash carries nothing about which chain its script belongs to, so a server indexing another chain answers listunspent with a well-formed empty list. Without the gate on the call, a client that connected before its network prefix was known is never verified at all: it reports no deposits for the life of the process, records every pass as successful, and the reconciler compares an empty cache against an empty answer and finds no mismatch."
+    },
+    {
+      "id": "electrumx-genesis-verdict-outlives-its-connection",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestTheRecordedVerificationDoesNotOutliveItsConnection",
+      "find": "\tif c.genesisHRP == hrp && c.genesisGen == c.gen {",
+      "replace": "\tif c.genesisHRP == hrp {",
+      "why": "The recorded verification is true of one connection to one server. Keyed by the prefix alone it would carry over to a connection that was never verified, which is a verdict about a different server."
+    },
+    {
+      "id": "usdsoq-mint-fee-sized-over-empty-outputs",
+      "file": "tx/builder.go",
+      "package": "./tx",
+      "test": "TestUSDSOQBuildersSizeTheFeeOverTheOutputsTheyEmit",
+      "find": "\t\t{Value: 0, ScriptPubKey: ScriptWitnessV5(authorityPKHash)},",
+      "replace": "\t\t{Value: 0, ScriptPubKey: nil},",
+      "why": "An output with a nil script serialises as 9 bytes where a witness v5 or v7 program serialises as 43. A fee measured over empty placeholders is under the minimum relay rate for the transaction actually broadcast, so the mint is signed and not relayed."
+    },
+    {
+      "id": "usdsoq-send-fee-caps-not-applied",
+      "file": "tx/builder.go",
+      "package": "./tx",
+      "test": "TestUSDSOQBuildersCapFees",
+      "find": "\tfee := tx.EstimateFee(feeRate)\n\ttx.Outputs = nil\n\tif err := checkFee(fee, feeRate); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Validate USDSOQ balance",
+      "replace": "\tfee := tx.EstimateFee(feeRate)\n\ttx.Outputs = nil\n\n\t// Validate USDSOQ balance",
+      "why": "checkFee is what refuses a rate above MaxFeeRateShorsPerVB and a fee above MaxFeeShors. Without it a fee-rate typo is paid, and docs/SECURITY.md tells the reader the builders cap both."
     }
   ]
 }
