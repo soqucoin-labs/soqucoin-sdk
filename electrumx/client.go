@@ -217,8 +217,11 @@ var (
 	// ErrNetworkMismatch is returned when a tracked address is on a different
 	// network than the client's HRP, or when addresses in one call disagree.
 	ErrNetworkMismatch = errors.New("electrumx: address network does not match the client's")
-	// ErrGenesisMismatch is returned by Connect when the server's reported
-	// genesis hash is not one of the chains the client's HRP belongs to.
+	// ErrGenesisMismatch is returned when the server's reported genesis hash
+	// is not one of the chains the client's HRP belongs to: by Connect, and by
+	// any later call, before the requested method is sent. The prefix can be
+	// set after the connection, so the first verification of a chain can fall
+	// on an ordinary call rather than on Connect.
 	ErrGenesisMismatch = errors.New("electrumx: server is indexing a different chain")
 )
 
