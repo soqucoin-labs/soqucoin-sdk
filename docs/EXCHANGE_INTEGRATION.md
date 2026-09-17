@@ -803,6 +803,14 @@ func main() {
 		// withdraw.ErrFailed: the intent was already Failed when this call
 		// began. Terminal, no payment is on the network, and the breaker does
 		// not count it. Resolve the payout; never reuse the id.
+		// Two of these returns pair a nil intent with the error: an unknown
+		// id, and a store read that failed before there was an intent to
+		// return. The state is read only when there is something to read it
+		// from.
+		if intent == nil {
+			log.Printf("process %s: %v", requestID, err)
+			return
+		}
 		log.Printf("process %s: state %s: %v", requestID, intent.State, err)
 		return
 	}
@@ -951,27 +959,30 @@ integration.
 
 ## Test Coverage, current status
 
-Every package now carries unit tests. Measured with `go test -cover ./...`:
+Every package carries unit tests. The figures below are one run of `go test -cover ./...` on the
+commit this document ships with, library packages only: the `examples/` programs and
+`internal/atomicfile` are in that run too and are not part of the API you integrate against.
+Re-run the command to check any row.
 
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
-| `utxo` | **94.3%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
-| `client` | **86.8%** | soq-signer auth, error propagation, SOQ-to-shor conversion |
-| `rpc` | **85.0%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
+| `utxo` | **94.7%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
+| `rpc` | **85.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **85.9%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
-| `tx` | **80.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
-| `keys` | **89.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
-| `withdraw` | **82.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
-| `resilience` | **62.1%** | Circuit breaker transitions and classification, reconciler against the node |
+| `electrumx` | **88.5%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `tx` | **91.6%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
+| `keys` | **89.6%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
+| `withdraw` | **84.3%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
+| `types` | **85.7%** | Amount parsing and formatting exact at every value the node prints, network records, asset constants |
+| `resilience` | **65.0%** | Circuit breaker transitions and classification, reconciler against the node |
 
 Also passes under the race detector (`go test -race`), which matters for `electrumx` because its
 UTXO cache is shared between the reader goroutine, the refresher and caller threads.
 
 **Where the coverage is thin, and why.** These numbers are reported rather than rounded up:
 
-- **`resilience` (62.1%)**: the breaker and the reconciler are covered against fakes; the Slack
+- **`resilience` (65.0%)**: the breaker and the reconciler are covered against fakes; the Slack
   alerter's HTTP path is not, and it is an operational convenience rather than part of the money path.
 - **`electrumx`**: the protocol path is driven by a scripted fake server, including the
   notification-in-front-of-reply case, pushed changes, a reconnect and a dropped notification

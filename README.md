@@ -144,7 +144,6 @@ if err := spentSet.MarkBroadcast(verified, sentTxID); err != nil {
 | [`withdraw`](./withdraw) | Durable withdrawal state machine: idempotency, reservation, same-bytes retry, recovery |
 | [`deposit`](./deposit) | Deposit crediting verified against your own node |
 | [`resilience`](./resilience) | Circuit breaker, reconciler against the node, Slack webhook alerter |
-| [`client`](./client) | HTTP client for the internal soq-signer REST service; exchanges do not need it |
 
 ## Provenance
 
@@ -179,15 +178,17 @@ can check rather than provenance you have to trust.
 
 Every package carries unit tests, and the suite passes under the race detector.
 
-| `address` | `utxo` | `client` | `rpc` | `deposit` | `electrumx` | `tx` | `keys` | `withdraw` | `resilience` |
-|:---------:|:------:|:--------:|:-----:|:---------:|:-----------:|:----:|:------:|:----------:|:------------:|
-| 92.4% | 88.1% | 86.8% | 78.3% | 77.3% | 76.2% | 76.1% | 75.3% | 73.1% | 62.1% |
-
 ```bash
 go test ./...
 go test -race ./...
 go test -cover ./...
 ```
+
+Per-package figures, what each package's tests cover, and where coverage is thin with the reason,
+are in one table in
+[Exchange Integration](docs/EXCHANGE_INTEGRATION.md#test-coverage-current-status). They are kept
+in one place rather than two so that the two cannot disagree, and every row is one run of the
+command above.
 
 The tests target invariants whose failure is *silent* rather than a coverage percentage: txid byte
 order, per-input BIP143 sighash separation, USDSOQ never counted as native SOQ, stale UTXOs both
