@@ -963,7 +963,7 @@ Every package carries unit tests. The figures below are one run of `go test -cov
 commit this document ships with, library packages only: the `examples/` programs and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Nine of the ten reproduce exactly. The `electrumx`
-figure moves between about 88.7 and 89.2 across runs, because several of its tests drive
+figure moves between about 88.5 and 89.2 across runs, because several of its tests drive
 the reader goroutine, the ping loop and the refresher at once, and which branches run
 depends on how those are scheduled.
 
@@ -973,7 +973,7 @@ depends on how those are scheduled.
 | `utxo` | **94.7%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `rpc` | **85.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **88.7%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `electrumx` | **88.5%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
 | `tx` | **91.6%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **89.6%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **84.3%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
