@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Fixture corpus for the cross-run step in .github/workflows/register.yml.
+"""Fixture corpus for register-crossrun.sh, the cross-run step of the Register workflow.
 
-The step runs the base corpus against the checker a pull request ships. This builds four
-head checkers in a scratch directory and applies the step to each, so what the step does is
-a fixture rather than a claim in a comment. Offline: no event payload and no API call.
+Each case builds a head checkout whose checker has been edited the way a pull request could
+edit it, runs register-crossrun.sh against it, and requires the script to reach the right
+verdict for the right reason. The script under test is the one the workflow runs, not a
+transcription of it, so an edit to the step is an edit to what these cases exercise.
 
-It runs in the Test workflow, off the pull request head, and has no part in the trust that
-the step itself rests on. A pull request that neuters this file still faces the step, whose
-corpus comes from the base.
+Offline: no event payload and no API call. It runs in the Test workflow, off the pull request
+head, and has no part in the trust the step rests on. The corpus that step runs comes from
+the base either way, so a pull request that rewrites this file still faces the step.
 """
-import importlib.util
 import os
 import shutil
 import subprocess
@@ -19,74 +19,90 @@ import tempfile
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CHECKER = os.path.join(HERE, "register-lint.py")
-CORPUS = os.path.join(HERE, "register-lint-selftest.py")
+SCRIPT = os.path.join(HERE, "register-crossrun.sh")
+CHECKER = open(os.path.join(HERE, "register-lint.py"), encoding="utf-8").read()
 
 
-def step(head_dir):
-    """The step, in Python: refuse an absent checker, else run the base corpus against it."""
-    if not os.path.exists(os.path.join(head_dir, "register-lint.py")):
-        return 1, "the step refuses: this pull request removes or renames the checker"
-    shutil.copy(CORPUS, head_dir)
-    r = subprocess.run([sys.executable, os.path.join(head_dir, "register-lint-selftest.py")],
+def build(root, edit=None, delete=False, corpus_symlink=None):
+    """A head checkout, with the checker edited as a pull request might edit it."""
+    d = os.path.join(root, "head", ".github", "scripts")
+    os.makedirs(d)
+    if not delete:
+        with open(os.path.join(d, "register-lint.py"), "w", encoding="utf-8") as fh:
+            fh.write(edit(CHECKER) if edit else CHECKER)
+    if corpus_symlink:
+        os.symlink(corpus_symlink, os.path.join(d, "register-lint-selftest.py"))
+    return os.path.join(root, "head")
+
+
+def run(head, root):
+    r = subprocess.run(["bash", SCRIPT, head, os.path.join(root, "work"), HERE],
                        capture_output=True, text=True)
-    tail = [l for l in r.stdout.splitlines() if l.startswith("FAIL") or "fixtures behave" in l]
-    return r.returncode, " / ".join(tail) or (r.stderr.strip() or "no output").splitlines()[-1]
+    return r.returncode, r.stdout + r.stderr
 
 
-def head(tmp, checker_edit=None, corpus_edit=None, delete_checker=False):
-    d = tempfile.mkdtemp(dir=tmp)
-    if not delete_checker:
-        text = open(CHECKER, encoding="utf-8").read()
-        open(os.path.join(d, "register-lint.py"), "w", encoding="utf-8").write(
-            checker_edit(text) if checker_edit else text)
-    if corpus_edit:
-        text = open(CORPUS, encoding="utf-8").read()
-        open(os.path.join(d, "register-lint-selftest.py"), "w", encoding="utf-8").write(
-            corpus_edit(text))
-    return d
+def drop(needle):
+    def edit(text):
+        out = text.replace(needle, "", 1)
+        if out == text:
+            raise AssertionError(f"this corpus edits {needle!r}, which the checker no longer has")
+        return out
+    return edit
 
 
-def drop_trailer_pattern(text):
-    out = text.replace('    r"co-authored-by",\n', "")
-    assert out != text, "the pattern this proof edits is no longer in the checker"
-    return out
+def sub(old, new):
+    def edit(text):
+        out = text.replace(old, new, 1)
+        if out == text:
+            raise AssertionError(f"this corpus edits {old!r}, which the checker no longer has")
+        return out
+    return edit
 
 
-def drop_trailer_fixture(text):
-    out = "\n".join(l for l in text.splitlines() if "a co-author trailer" not in l)
-    assert out != text, "the fixture this proof edits is no longer in the corpus"
-    return out
+CASES = [
+    # (name, build kwargs, expected failure, a string the output must contain)
+    ("the head checker is unchanged", {}, False, "fixtures behave"),
+    ("the head drops the co-author pattern",
+     {"edit": drop('    r"co-authored-by",\n')}, True, "a co-author trailer"),
+    ("the head drops a vendor name, which no fixture pinned before this change",
+     {"edit": drop('r"\\bclaude\\b", ')}, True, "a vendor name, claude"),
+    ("the head weakens main() and leaves lint() intact",
+     {"edit": sub("    if findings:\n", "    if False:\n")}, True, "main() returned 0"),
+    ("the head checker exits at import",
+     {"edit": lambda t: "import sys\nsys.exit(0)\n" + t}, True, "does not import"),
+    ("the head checker is emptied", {"edit": lambda t: ""}, True, "no callable"),
+    ("the head deletes the checker", {"delete": True}, True, "removes or renames"),
+    ("a hostile corpus path in the head does not take the write",
+     {"edit": drop('    r"co-authored-by",\n'), "corpus_symlink": "/dev/null"},
+     True, "a co-author trailer"),
+]
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="register-crossrun-")
-    cases = [
-        ("the head checker is unchanged", head(tmp), 0),
-        ("the head drops one attribution pattern", head(tmp, checker_edit=drop_trailer_pattern), 1),
-        ("the head drops the pattern and its own fixture together",
-         head(tmp, checker_edit=drop_trailer_pattern, corpus_edit=drop_trailer_fixture), 1),
-        ("the head deletes the checker", head(tmp, delete_checker=True), 1),
-    ]
     bad = 0
-    for name, d, want in cases:
-        rc, detail = step(d)
-        ok = (rc != 0) == (want != 0)
-        bad += 0 if ok else 1
-        print(("PASS" if ok else "FAIL"), "|", name, "| exit", rc, "|", detail)
+    for name, kwargs, want_fail, needle in CASES:
+        root = tempfile.mkdtemp(prefix="register-crossrun-")
+        try:
+            try:
+                head = build(root, **kwargs)
+            except AssertionError as exc:
+                print("FAIL |", name, "| the case could not be built |", exc)
+                bad += 1
+                continue
+            rc, out = run(head, root)
+            failed = rc != 0
+            ok = failed == want_fail and needle in out
+            bad += 0 if ok else 1
+            why = ""
+            if not ok:
+                why = (f"| exit {rc}, expected {'nonzero' if want_fail else 'zero'}"
+                       f"{'' if needle in out else f'; output does not contain {needle!r}'}")
+            print(("PASS" if ok else "FAIL"), "|", name, "|",
+                  "refused" if failed else "accepted", why)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
-    # The third case is worth seeing twice: judged by its own corpus and its own checker,
-    # which is what the check amounted to before this step, the same head reads clean.
-    spec = importlib.util.spec_from_file_location(
-        "head_checker", os.path.join(cases[2][1], "register-lint.py"))
-    head_checker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(head_checker)
-    verdict = head_checker.lint("x\n\nCo-Authored-By: a <a@b.c>")
-    print("\nthe same head, judged by its own corpus and its own checker:",
-          "finding" if verdict else "clean")
-
-    shutil.rmtree(tmp)
-    print(f"\n{len(cases) - bad}/{len(cases)} cases behave")
+    print(f"\n{len(CASES) - bad}/{len(CASES)} cases behave")
     return 1 if bad else 0
 
 

@@ -6,8 +6,10 @@ existed. Every positive case is one a check has to let through, and each cost so
 before it did: a review bot's prose, and a commit message naming the manifest file it changes.
 """
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 
 # Loading the checker by path would otherwise leave a __pycache__ directory beside it, in a
 # directory this repository tracks.
@@ -15,7 +17,19 @@ sys.dont_write_bytecode = True
 
 _spec = importlib.util.spec_from_file_location(
     "lint", os.path.join(os.path.dirname(os.path.abspath(__file__)), "register-lint.py"))
-mod = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(mod)
+mod = importlib.util.module_from_spec(_spec)
+# BaseException, not Exception: a checker carrying `sys.exit(0)` at module scope raises
+# SystemExit here, and letting that propagate would end this corpus with the exit status of
+# a clean run and no output at all.
+try:
+    _spec.loader.exec_module(mod)
+except BaseException as _exc:
+    print(f"FAIL | the checker does not import | {type(_exc).__name__}: {_exc}")
+    sys.exit(1)
+for _name in ("lint", "lint_path", "main"):
+    if not callable(getattr(mod, _name, None)):
+        print(f"FAIL | the checker has no callable {_name}()")
+        sys.exit(1)
 
 TEXTS = [
     # (name, text, must_fail)
@@ -38,6 +52,38 @@ TEXTS = [
      "scripts: declare the guards\n\nEach change is declared in scripts/mutants.json, and "
      "check-mutants.py asks whether one test catches it.", False),
     ("a title in register", "withdraw: one intent builds one transaction", False),
+    # One fixture per pattern below. The fixtures above each trip several patterns at once,
+    # so removing any one of them left the fixture failing for a different reason and the
+    # corpus noticed nothing. register-pin-selftest.py is what keeps this list complete.
+    ("the vendor footer wording", "The summary was generated with the exporter.", True),
+    ("the robot marker", "Closes item 5.\n\n\U0001F916\n", True),
+    ("a vendor name, claude", "This body names claude.", True),
+    ("a vendor name, anthropic", "This body names anthropic.", True),
+    ("a vendor name, gemini", "This body names gemini.", True),
+    ("a vendor name, chatgpt", "This body names chatgpt.", True),
+    ("a vendor attribution, copilot", "The body says copilot wrote the helper.", True),
+    ("a reading named as clean-room", "The reading was clean-room.", True),
+    ("a numbered round", "The finding came from round 2.", True),
+    ("a spelled round", "The finding came from round two.", True),
+    ("the phrase review round", "The change survived a review round.", True),
+    ("review triage, nits", "Two nits remain.", True),
+    ("a merge verdict", "Nothing here blocks merge.", True),
+    ("a clean verdict", "On this reading nothing blocks.", True),
+    ("a numbered gate", "This is gate 9.", True),
+    ("release eligibility", "The work is post-freeze-eligible.", True),
+    ("a fleet artifact", "The binary is a fleet artifact.", True),
+    ("the soak clock", "It rides the soak clock.", True),
+    ("an absent soak", "The change went in with no soak.", True),
+    ("a freeze candidate", "The tag is a freeze candidate.", True),
+    ("a session attribution", "The defect is introduced-this-session.", True),
+    ("a pre-existing gap", "This is a pre-existing gap.", True),
+    ("a definition of done", "It meets the definition-of-done.", True),
+    ("an earlier draft", "An earlier draft said otherwise.", True),
+    ("a previous attempt", "The previous attempt failed.", True),
+    ("a pointer into the body", "The reason is in the pr body.", True),
+    ("an instruction to read the body", "See the pr body for the reason.", True),
+    ("a filler phrase", "It's worth noting that the cache is shared.", True),
+    ("a metaphor for a literal phrase", "The check was blind to the empty case.", True),
 ]
 
 PATHS = [
@@ -46,6 +92,11 @@ PATHS = [
     ("a path named for a review round, underscore", "electrumx/round_2_test.go", True),
     ("a path with a number that is not a round", "crypto/mldsa44_test.go", False),
     ("a source path", "withdraw/engine.go", False),
+    ("a path named clean-room", "deposit/cleanroom_test.go", True),
+    ("a path named for a review round, spelled", "deposit/review_round_test.go", True),
+    ("a path named for triage", "deposit/shouldfix_test.go", True),
+    ("a path named pre-existing", "deposit/preexisting_test.go", True),
+    ("a path naming the session", "deposit/introduced_this_session_test.go", True),
 ]
 
 bad = 0
@@ -62,6 +113,33 @@ for name, path, must_fail in PATHS:
     print(("PASS" if ok else "FAIL"), "|", name, "|", "finding" if failed else "clean",
           "" if ok else f"| {mod.lint_path(path)}")
 
-total = len(TEXTS) + len(PATHS)
+# lint() deciding correctly is not the same as the check failing. main() is what turns a
+# finding into an exit status, and what decides whose text counts as ours. A checker whose
+# lint() is intact and whose main() returns 0 on findings prints every error and passes.
+# These run main() against a review event, which reads the event file and calls no API.
+EVENTS = [
+    ("our text, with a finding", "someone", "User", "x\n\nCo-Authored-By: a <a@b.c>", 1),
+    ("our text, clean", "someone", "User", "withdraw: one intent builds one transaction", 0),
+    ("a bot's text, with a finding", "some-bot", "Bot", "x\n\nCo-Authored-By: a <a@b.c>", 0),
+]
+
+env_tmp = tempfile.mkdtemp(prefix="register-corpus-")
+for name, login, kind, body, want in EVENTS:
+    path = os.path.join(env_tmp, "event.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"review": {"body": body, "user": {"login": login, "type": kind}}}, fh)
+    os.environ["GITHUB_EVENT_PATH"] = path
+    os.environ["GITHUB_REPOSITORY"] = "owner/repo"
+    os.environ["GITHUB_EVENT_NAME"] = "pull_request_review"
+    try:
+        got = mod.main()
+    except BaseException as exc:  # a checker that exits or raises is not a passing checker
+        got = f"raised {type(exc).__name__}"
+    ok = got == want
+    bad += 0 if ok else 1
+    print(("PASS" if ok else "FAIL"), "|", name, "| main() returned", got,
+          "" if ok else f"| expected {want}")
+
+total = len(TEXTS) + len(PATHS) + len(EVENTS)
 print(f"\n{total - bad}/{total} fixtures behave")
 sys.exit(1 if bad else 0)

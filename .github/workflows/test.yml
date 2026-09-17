@@ -66,10 +66,18 @@ jobs:
       - name: Static analysis
         run: make lint
 
-      # The cross-run step in the Register workflow has a corpus of its own: four
-      # head checkers, one of them weakened, one of them weakened in step with
-      # its own fixture. It runs here because it belongs to the head, and the
-      # step it describes runs the base copy of everything it touches.
+      # The register checker's patterns are only as good as the fixtures that
+      # pin them. This requires every pattern to be caught by a fixture that no
+      # other pattern catches, so a pattern cannot be deleted while the corpus
+      # stays green. It runs off the head, so a pull request that adds a pattern
+      # adds its fixture in the same change.
+      - name: Register patterns are pinned
+        run: python3 .github/scripts/register-pin-selftest.py
+
+      # The cross-run step in the Register workflow, applied to a set of head
+      # checkers built to defeat it. It runs here rather than there because it
+      # belongs to the head, and it has no part in the trust that step rests on:
+      # the corpus that step runs comes from the base either way.
       - name: Register cross-run cases
         run: python3 .github/scripts/register-crossrun-selftest.py
 

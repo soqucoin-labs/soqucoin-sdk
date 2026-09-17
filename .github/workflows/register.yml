@@ -57,25 +57,42 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # The step above proves nothing about the checker this pull request ships, because it
-      # never runs it. A diff that weakens a pattern therefore passes its own run and takes
-      # effect on every pull request after it merges, and the only thing in front of that is
-      # someone reading the diff.
+      # never runs it. A diff that weakens a pattern would otherwise pass its own run and take
+      # effect on every pull request after it merges.
       #
-      # So run the BASE corpus against the HEAD checker. The corpus resolves the checker from
-      # its own directory, so copying the base corpus in beside the head checker is the whole
-      # mechanism. A pull request that weakens a pattern fails here, because the base fixture
-      # for that pattern still demands the block. Weakening the checker and its fixture in the
-      # same pull request fails too: the fixture that runs is the base's. Getting a weaker
-      # checker in takes two merges, the first of which deletes a fixture and nothing else.
+      # So run the BASE corpus against the HEAD checker, in a directory this job creates. The
+      # corpus resolves the checker from its own directory, so placing the two together is the
+      # whole mechanism. Copying into the head's tree instead would let the head decide what
+      # the destination is: a corpus path that is a symlink to /dev/null takes the write and
+      # leaves an empty file to run.
+      #
+      # What this catches: any edit to a pattern, because register-pin-selftest.py requires
+      # every pattern to be pinned by a fixture, so the base corpus carries one for each; an
+      # edit to main(), which the corpus drives end to end; a checker that fails to import,
+      # exits at import, or is missing a callable. The pin requirement holds only while that
+      # check runs, and today it runs in the Test workflow, off the head. Running it here as
+      # well, off the base, needs a base that already carries the file.
+      #
+      # What it does not catch: the corpus imports the head's checker into its own process, so
+      # module-level code in that checker can tamper with the corpus and report whatever it
+      # likes. Closing that needs the checker driven as a subprocess behind a fixed contract,
+      # which it does not have. The residual is a diff carrying module-level code that
+      # interferes with its own test harness, which is conspicuous in a way that deleting a
+      # regex is not. Nor does it cover an edit to this workflow: on `pull_request` the
+      # definition comes from the merge ref, so deleting these steps and weakening the checker
+      # is one merge. Only a required review over .github/ closes that, which no workflow can
+      # supply for itself.
       #
       # The cost is that tightening a pattern so that it reclassifies an existing positive
-      # fixture also takes two merges. That is rare, and it is deliberate when it happens.
+      # fixture takes two merges. That is rare, and it is deliberate when it happens.
       #
-      # The cases this step is meant to catch are fixtures, not a claim in this comment:
+      # The cases are fixtures, not a claim in this comment:
       # .github/scripts/register-crossrun-selftest.py, run by the Test workflow.
       #
-      # This executes a file from the head, so it is confined to `pull_request`, which carries
-      # a read-only token and no secrets, and it is given no token of its own.
+      # This executes a file from the head. `pull_request` is the trigger, so on a fork there
+      # are no secrets; on a same-repository branch there are, and what keeps the token
+      # harmless is the read-only `permissions` block above rather than the trigger. The step
+      # is given no token of its own.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
@@ -83,11 +100,5 @@ jobs:
           path: head
           persist-credentials: false
       - name: The base corpus against this pull request's checker
+        run: bash .github/scripts/register-crossrun.sh head "$RUNNER_TEMP/crossrun" .github/scripts
         if: github.event_name == 'pull_request'
-        run: |
-          test -f head/.github/scripts/register-lint.py || {
-            echo "::error title=Register check::this pull request removes or renames the register checker, so the base corpus has nothing to run against, and this fails closed."
-            exit 1
-          }
-          cp .github/scripts/register-lint-selftest.py head/.github/scripts/
-          python3 head/.github/scripts/register-lint-selftest.py
