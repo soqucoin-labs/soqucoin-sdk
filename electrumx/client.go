@@ -631,8 +631,13 @@ func endedErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// GetBalance returns the total confirmed and unconfirmed balance across all tracked addresses.
-// Only counts native SOQ UTXOs (AssetType=0). USDSOQ and future types have separate accounting.
+// GetBalance returns the total confirmed and unconfirmed balance across all
+// tracked addresses, as the indexer reports it. Only native SOQ UTXOs
+// (AssetType=0) are counted; USDSOQ and future types have separate accounting.
+// It is the indexer's view: an input this process has reserved or sent is
+// counted until the indexer sees the spend. What can be spent is what
+// utxo.CoinSelector accepts against the spent set, and a payout budget reads
+// that, never this figure.
 func (c *Client) GetBalance(minConf int, tipHeight int64) (confirmed, unconfirmed int64) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -711,7 +716,9 @@ func (c *Client) SetAssetType(txid string, vout uint32, assetType uint8) {
 	}
 }
 
-// UTXOCount returns the total number of spendable native SOQ UTXOs.
+// UTXOCount returns the number of native SOQ UTXOs in the cache, as the
+// indexer reports them; inputs this process has reserved or sent are
+// included until the indexer sees the spend (see GetBalance).
 func (c *Client) UTXOCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

@@ -95,7 +95,9 @@ client.Start(ctx) // subscribes to every address; ends with ctx or Stop
 
 // Credit through deposit.Monitor, which checks every candidate against your
 // own node before crediting; see docs/EXCHANGE_INTEGRATION.md Step 2. The
-// confirmation table starts at 30 for small amounts, never 6.
+// confirmation table starts at 30 for small amounts, never 6. The balance is
+// the indexer's view; what a payout can spend is what the selector accepts
+// against the spent set.
 confirmed, _ := client.GetBalance(30, tipHeight)
 ```
 
