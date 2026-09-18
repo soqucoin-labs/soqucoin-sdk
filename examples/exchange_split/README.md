@@ -89,6 +89,10 @@ go run ./examples/exchange_split/broadcaster -dir state \
     -state broadcaster-state -network stagenet -confirmations 1
 ```
 
+`-confirmations 1` is for this walk-through, so that it finishes in a minute. The default is the
+chain's finality horizon, `types.MaxReorgDepth` (288), the figure the integration guide's Step 4
+gives for withdrawal release.
+
 Ask for a withdrawal by writing one file. The name must be the id:
 
 ```bash
@@ -120,4 +124,5 @@ is built at all:
 2. `watcher/main.go`: the conditions under which a snapshot is withheld.
 3. `signer/main.go`: the reconcile pass, which stops the pass and builds nothing when two sent
    withdrawals claim one input, and why a signer cannot call `withdraw.Engine.Recover`.
-4. `broadcaster/main.go`: `Recover` at startup, then send and confirm.
+4. `broadcaster/main.go`: `Recover` at startup as a repair that sends nothing, then send, which
+   refuses while an intent is held, and confirm.

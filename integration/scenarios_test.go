@@ -98,7 +98,10 @@ func (f *fixture) monitor(t *testing.T, led *memLedger, required int64) *deposit
 func (f *fixture) monitorOver(t *testing.T, cache deposit.Cache, led *memLedger, required int64, addrs ...string) *deposit.Monitor {
 	return &deposit.Monitor{
 		Network: types.Regtest, // coinbase maturity 60; every harness deposit is a coinbase
-		Cache:   cache, Node: f.n.rpc, Ledger: led,
+		// The push scenarios' client pings once an hour so that a ping cannot
+		// land inside a call count; the window has to hold two of them.
+		MaxCacheAge: 3 * time.Hour,
+		Cache:       cache, Node: f.n.rpc, Ledger: led,
 		Addresses: func(context.Context) []string { return addrs },
 		Required:  func(int64) int64 { return required },
 		OnAlert: func(k deposit.AlertKind, m string) {
@@ -116,7 +119,7 @@ func (f *fixture) engine(t *testing.T, store withdraw.Store, spent *utxo.SpentSe
 	}
 	sel := utxo.NewCoinSelector(spent)
 	return &withdraw.Engine{
-		Store: store, Spent: spent, Broadcaster: bc,
+		Store: store, Spent: spent, Broadcaster: bc, Network: types.Regtest,
 		Confirmer:             withdraw.RPCConfirmer{Client: f.n.rpc},
 		RequiredConfirmations: 3, ReservationTTL: time.Minute,
 		Select: func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
@@ -352,12 +355,16 @@ func TestRefusedInputsNeverReachTheNode(t *testing.T) {
 	_, recipient := newKey(t)
 	e := f.engine(t, withdraw.NewMemStore(), utxo.NewSpentSet("", nil), f.n.rpc)
 
-	// A v5 (USDSOQ authority) address is not a payment destination.
+	// A v5 (USDSOQ authority) address is not a payment destination: Submit
+	// refuses it against the engine's network and records nothing, so there
+	// is no intent for Process to find.
 	prog := make([]byte, 32)
 	v5, _ := address.Encode(types.Regtest.HRP, 5, prog)
-	e.Submit(context.Background(), "v5", v5, types.ShorsPerSOQ, types.RecommendedFeeRate)
-	if in, err := e.Process(context.Background(), "v5"); err == nil || in.State != withdraw.StateFailed {
-		t.Fatalf("v5 destination accepted: %v %+v", err, in)
+	if _, created, err := e.Submit(context.Background(), "v5", v5, types.ShorsPerSOQ, types.RecommendedFeeRate); !errors.Is(err, withdraw.ErrInvalidIntent) || created {
+		t.Fatalf("v5 destination accepted at Submit: %v created=%v", err, created)
+	}
+	if in, err := e.Process(context.Background(), "v5"); !errors.Is(err, withdraw.ErrInvalidIntent) || in != nil {
+		t.Fatalf("v5 destination has an intent: %v %+v", err, in)
 	}
 	// Below the node's relay floor.
 	e.Submit(context.Background(), "dust", recipient, 100_000, types.RecommendedFeeRate)

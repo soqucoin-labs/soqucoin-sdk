@@ -46,58 +46,20 @@ func TestPruneKeepsTheEntriesOfAStaleAddress(t *testing.T) {
 	}
 }
 
-// failingNode answers gettxout with an error for one outpoint.
+// failingNode answers gettxout with an error for one outpoint: a transport
+// failure, or failErr when set.
 type failingNode struct {
 	*fakeNode
 	failKey string
+	failErr error
 }
 
 func (n *failingNode) GetTxOut(ctx context.Context, txid string, vout uint32, mem bool) (*rpc.TxOut, error) {
 	if key(txid, vout) == n.failKey {
+		if n.failErr != nil {
+			return nil, n.failErr
+		}
 		return nil, errors.New("node: connection refused")
 	}
 	return n.fakeNode.GetTxOut(ctx, txid, vout, mem)
-}
-
-// A node error on the depth lookup adds nothing to the final set: the node's
-// word was not obtained. The credit stands, no alert is raised, and the
-// ledger is asked again next scan.
-func TestNodeErrorOnTheDepthLookupAddsNothingToTheFinalSet(t *testing.T) {
-	m, cache, node, led, al, a := setup(t)
-	cl := &countingLedger{fakeLedger: led}
-	m.Ledger = cl
-	cache.utxos[a] = []types.UTXO{{TxID: "aa", Vout: 0, Value: 1000, Height: node.tip - 40, Address: a}}
-	node.outs[key("aa", 0)] = txout(t, a, 1000, types.MaxReorgDepth+1, false)
-	if got, err := m.Scan(context.Background()); err != nil || len(got) != 1 {
-		t.Fatalf("credit: %v %+v", err, got)
-	}
-	// Mark it final in the ledger by the recheck path, then forget it in the
-	// Monitor, as a restart would.
-	if _, err := m.Scan(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	m.finalMu.Lock()
-	m.final = nil
-	m.finalMu.Unlock()
-	m.Node = &failingNode{fakeNode: node, failKey: key("aa", 0)}
-	asked := cl.isCredited
-	if _, err := m.Scan(context.Background()); err != nil {
-		t.Fatalf("scan with a failing depth lookup: %v", err)
-	}
-	if m.finalCount() != 0 {
-		t.Fatal("an outpoint entered the final set without the node's word")
-	}
-	if cl.isCredited != asked+1 {
-		t.Fatalf("ledger asked %d times, want once", cl.isCredited-asked)
-	}
-	if len(al.kinds) != 0 {
-		t.Fatalf("alerts on a failed depth lookup: %v", al.kinds)
-	}
-	m.Node = node
-	if _, err := m.Scan(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if m.finalCount() != 1 {
-		t.Fatal("the outpoint did not enter the set once the node answered")
-	}
 }

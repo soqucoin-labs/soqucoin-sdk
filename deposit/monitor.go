@@ -15,7 +15,11 @@
 // (the finality horizon is not enforced then), leaves immature coinbase
 // outputs alone, and re-checks every credited-but-not-final outpoint on each
 // scan so a reorg that removes a credited deposit is alarmed rather than
-// missed.
+// missed. A node that does not answer has not disagreed with the indexer: a
+// gettxout that fails to complete ends the pass and is returned, wherever in
+// the pass the node was asked, and raises no alert. A node that answers a
+// gettxout with an error of its own (a malformed txid) has refused the
+// question it was asked, and that outpoint is alarmed and skipped.
 package deposit
 
 import (
@@ -51,17 +55,34 @@ type AddressFreshness interface {
 	LastRefreshOf(addr string) (time.Time, error)
 }
 
-// Node is the exchange's own soqucoind. *rpc.Client satisfies it.
+// Node is the exchange's own soqucoind. *rpc.Client satisfies it. A wrapper
+// of the exchange's own forwards all four methods; RequireChain is how Scan
+// asks which chain the node serves, and it is part of the interface so that
+// a wrapper cannot leave the question unasked.
 type Node interface {
 	RequireSynced(ctx context.Context) error
+	RequireChain(ctx context.Context, chainID string) error
 	GetBlockCount(ctx context.Context) (int64, error)
 	GetTxOut(ctx context.Context, txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error)
 }
 
+// FreshnessCadence is the optional part of Cache that reports how long a quiet
+// address goes between two advances of its freshness; *electrumx.Client
+// reports its ping interval. When the Cache has it, Scan refuses to run with
+// a MaxCacheAge shorter than two of those intervals (ErrCacheAgeBelowPings):
+// the ping is what advances a quiet address's freshness, and a window that
+// cannot hold one missed ping reads every quiet address as stale between
+// pings and alarms on each pass. Without it the relation is not checked.
+type FreshnessCadence interface {
+	FreshnessInterval() time.Duration
+}
+
 // Ledger is the exchange's book. Credit must be idempotent on (txid, vout):
-// the same outpoint will be presented on every scan until it is final, and
-// after a restart. Pending returns credited outpoints that have not yet been
-// reported final, so Monitor can re-verify them.
+// IsCredited is asked about an outpoint on every scan until the node puts it
+// past the horizon, and again after a restart, and Credit is called for one
+// the answer was false for, so a book that answers false for an outpoint it
+// holds is offered it again. Pending returns credited outpoints that have not
+// yet been reported final, so Monitor can re-verify them.
 //
 // Pending must leave out outputs the exchange has spent itself, such as a
 // deposit swept to the hot wallet before it was final. Monitor asks the node
@@ -109,17 +130,20 @@ type Monitor struct {
 
 	// Network supplies the chain's coinbase maturity: a mined-to deposit is
 	// credited only once consensus lets it be spent. The zero value is
-	// types.Mainnet. When it is set and Node can report its chain (as
-	// *rpc.Client does through RequireChain), Scan refuses to credit anything
-	// while the node serves another chain, so the maturity applied and the
-	// node consulted cannot drift apart.
+	// types.Mainnet, and so is any value with no ChainID, whatever its other
+	// fields. Every pass asks the node (Node.RequireChain) for this
+	// chain and refuses to credit anything while it serves another, so the
+	// maturity applied and the node consulted cannot drift apart; a Monitor
+	// left with no Network over a regtest node is refused for that reason.
 	Network types.Network
 
 	// MaxCacheAge bounds how stale the indexer cache may be before a scan is
 	// skipped entirely (default 5 minutes). A stale cache is an outage, not
-	// "no deposits". With electrumx.Client it must exceed that client's
-	// PingInterval with room for one missed ping: the ping is what advances a
-	// quiet address's freshness, so a lost connection ages every address out.
+	// "no deposits". It must hold two of the cache's freshness intervals
+	// (with electrumx.Client, two PingIntervals): the ping is what advances a
+	// quiet address's freshness, so the window must survive one missed ping,
+	// and a lost connection ages every address out within it. Scan refuses to
+	// run with a shorter window when the Cache reports its cadence.
 	MaxCacheAge time.Duration
 
 	// OnAlert receives every condition a human should see: indexer and node
@@ -191,13 +215,18 @@ const (
 	AlertCacheStale      AlertKind = "cache_stale"      // indexer has not refreshed; crediting paused, or skipped for the stale addresses
 	AlertIndexerMismatch AlertKind = "indexer_mismatch" // indexer and node disagree on an output; NOT credited
 	AlertDepositVanished AlertKind = "deposit_vanished" // a credited, non-final output is gone from the node
-	AlertLedgerError     AlertKind = "ledger_error"     // the exchange's own book returned an error
+	AlertLedgerError     AlertKind = "ledger_error"     // the exchange's own book returned an error, or holds a record the node refuses
 )
 
 var (
 	// ErrPaused is returned by Scan when nothing was credited because the node
 	// or the indexer is not in a state that allows safe crediting.
 	ErrPaused = errors.New("deposit: crediting paused")
+	// ErrCacheAgeBelowPings is returned by Scan, before anything is asked of
+	// the node or the indexer, when the Cache reports its freshness cadence
+	// and MaxCacheAge is shorter than two of them. A configuration, not a
+	// pause: it is returned on every pass until one of the two changes.
+	ErrCacheAgeBelowPings = errors.New("deposit: MaxCacheAge is shorter than two freshness intervals of the cache")
 )
 
 func (m *Monitor) alert(kind AlertKind, format string, args ...interface{}) {
@@ -238,6 +267,16 @@ func ended(ctx context.Context, err error) bool {
 	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// refused reports whether the node answered a lookup with an error of its own
+// (rpc.ErrPermanent: a malformed txid, a method it does not have) rather than
+// failing to answer. The node has then disagreed with the question, and the
+// outpoint it was asked about is alarmed and skipped; a lookup that did not
+// complete ends the pass instead. *rpc.Client wraps the node's code so that
+// errors.Is reads it through the wrapping.
+func refused(err error) bool {
+	return errors.Is(err, rpc.ErrPermanent)
+}
+
 func (m *Monitor) maxCacheAge() time.Duration {
 	if m.MaxCacheAge > 0 {
 		return m.MaxCacheAge
@@ -245,21 +284,27 @@ func (m *Monitor) maxCacheAge() time.Duration {
 	return 5 * time.Minute
 }
 
-// chainChecker is the optional part of Node that reports which chain the node
-// serves; *rpc.Client implements it.
-type chainChecker interface {
-	RequireChain(ctx context.Context, chainID string) error
-}
-
 // Scan performs one pass. It returns the deposits credited in this pass, or
 // ErrPaused (wrapped with the reason) when crediting was not safe. A node on
 // the wrong chain is returned as rpc.ErrWrongChain, a permanent error, not as
-// a pause. Other errors from the node are returned as-is; the pass credits
-// nothing in that case. A context that ends mid-pass is returned as its own
-// error, never as a pause and never as an alert: the deposits credited
-// before it are credited and returned with it, the rest wait for the next
-// pass.
+// a pause; a node that cannot say whether it is synced is alarmed and paused.
+// Once RequireSynced has passed, a call of the pass that fails to complete is
+// returned as it is, unalarmed, from whichever call raised it: the
+// deposits credited before it are credited and returned with it, the rest wait
+// for the next pass. A context that ends mid-pass is returned the same way,
+// never as a pause and never as an alert. A gettxout the node answers with an
+// error of its own is a disagreement about that outpoint: alarmed, skipped,
+// and the pass goes on.
+// A MaxCacheAge the cache's cadence cannot fit is ErrCacheAgeBelowPings, with
+// nothing asked of anyone.
 func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
+	// 0. The window must hold two freshness intervals of a cache that reports
+	//    them, or every quiet address reads stale between two advances.
+	if cadence, ok := m.Cache.(FreshnessCadence); ok {
+		if every := cadence.FreshnessInterval(); every > 0 && m.maxCacheAge() < 2*every {
+			return nil, fmt.Errorf("%w: MaxCacheAge %v, cadence %v", ErrCacheAgeBelowPings, m.maxCacheAge(), every)
+		}
+	}
 	// 1. The node must serve this Monitor's chain and must have caught up.
 	//    During initial block download the finality horizon is not enforced
 	//    and gettxout is incomplete.
@@ -276,15 +321,14 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 		m.alert(AlertNodeSyncing, "%v", err)
 		return nil, fmt.Errorf("%w: %v", ErrPaused, err)
 	}
-	if want := m.Network.ChainID; want != "" {
-		if cc, ok := m.Node.(chainChecker); ok {
-			if err := cc.RequireChain(ctx, want); err != nil {
-				if errors.Is(err, rpc.ErrWrongChain) {
-					m.alert(AlertNodeWrongChain, "%v", err)
-				}
-				return nil, err
-			}
+	// The chain asked for is the one whose maturity is applied, mainnet when
+	// Network is unset; an rpc.Client whose own Network was set has answered
+	// already through RequireSynced, and answers the same here.
+	if err := m.Node.RequireChain(ctx, m.network().ChainID); err != nil {
+		if errors.Is(err, rpc.ErrWrongChain) {
+			m.alert(AlertNodeWrongChain, "%v", err)
 		}
+		return nil, err
 	}
 	// 2. The indexer must be fresh. A cache that stopped refreshing looks
 	//    exactly like "no new deposits". A cache that reports freshness per
@@ -368,10 +412,13 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 				if !pending[outpointKey(u.TxID, u.Vout)] {
 					out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 					if err != nil {
-						if ended(ctx, err) {
-							return credited, err
+						if refused(err) {
+							m.alert(AlertIndexerMismatch, "%s:%d for %s: the node refused the lookup: %v", u.TxID, u.Vout, addr, err)
+							continue
 						}
-						continue // asked again next scan; the credit stands
+						// The credit stands; the node did not answer, and the
+						// pass ends here as it does at every gettxout.
+						return credited, err
 					}
 					if out != nil && out.Confirmations > types.MaxReorgDepth {
 						m.markFinal(u.TxID, u.Vout, addr)
@@ -411,17 +458,20 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 
 // verifyWithNode asks the exchange's own node for the exact output and
 // requires agreement on existence, value, destination script, confirmation
-// depth and coinbase maturity. Any disagreement is alarmed and not credited.
-// A lookup ended by the context is returned as that error, unalarmed: the
-// node has not disagreed, it has not been asked.
+// depth and coinbase maturity. Any disagreement is alarmed and not credited,
+// and a lookup the node refuses is one: the indexer named an output the node
+// will not be asked about. A lookup that does not complete, ended by the
+// context or by the transport, is returned as that error, unalarmed: the node
+// has not disagreed, it has not answered, and AlertIndexerMismatch names a
+// disagreement.
 func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u types.UTXO, confs int64) (Deposit, bool, error) {
 	out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 	if err != nil {
-		if ended(ctx, err) {
-			return Deposit{}, false, err
+		if refused(err) {
+			m.alert(AlertIndexerMismatch, "%s:%d for %s: the node refused the lookup: %v", u.TxID, u.Vout, addr, err)
+			return Deposit{}, false, nil
 		}
-		m.alert(AlertIndexerMismatch, "%s:%d for %s: node lookup failed: %v", u.TxID, u.Vout, addr, err)
-		return Deposit{}, false, nil
+		return Deposit{}, false, err
 	}
 	switch {
 	case out == nil:
@@ -462,6 +512,13 @@ func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 		keys[outpointKey(d.TxID, d.Vout)] = true
 		out, err := m.Node.GetTxOut(ctx, d.TxID, d.Vout, false)
 		if err != nil {
+			if refused(err) {
+				// The book named an outpoint the node will not be asked
+				// about; the book's problem, alarmed as one, and the pass
+				// goes on to the next.
+				m.alert(AlertLedgerError, "gettxout %s:%d refused by the node: %v", d.TxID, d.Vout, err)
+				continue
+			}
 			return nil, err
 		}
 		if out == nil {

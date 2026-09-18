@@ -52,15 +52,19 @@ func (c *fakeCache) GetUTXOs(a string) []types.UTXO  { return c.utxos[a] }
 func (c *fakeCache) LastRefresh() (time.Time, error) { return c.at, c.err }
 
 type fakeNode struct {
-	synced  bool
-	syncErr error  // returned by RequireSynced when set, in place of ErrNodeSyncing
-	chain   string // what getblockchaininfo would report
-	tip     int64
-	outs    map[string]*rpc.TxOut // "txid:vout"
-	calls   int
+	synced   bool
+	syncErr  error  // returned by RequireSynced when set, in place of ErrNodeSyncing
+	chainErr error  // returned by RequireChain when set: the call did not complete
+	chain    string // what getblockchaininfo would report
+	tip      int64
+	outs     map[string]*rpc.TxOut // "txid:vout"
+	calls    int
 }
 
 func (n *fakeNode) RequireChain(_ context.Context, want string) error {
+	if n.chainErr != nil {
+		return n.chainErr
+	}
 	if want != "" && n.chain != want {
 		return fmt.Errorf("%w: node reports %q, configured for %q", rpc.ErrWrongChain, n.chain, want)
 	}
@@ -127,6 +131,15 @@ func (c *fakeCachePerAddr) LastRefreshOf(a string) (time.Time, error) { return c
 type alerts struct{ kinds []AlertKind }
 
 func (a *alerts) fn(k AlertKind, _ string) { a.kinds = append(a.kinds, k) }
+func (a *alerts) count(k AlertKind) int {
+	n := 0
+	for _, x := range a.kinds {
+		if x == k {
+			n++
+		}
+	}
+	return n
+}
 func (a *alerts) has(k AlertKind) bool {
 	for _, x := range a.kinds {
 		if x == k {
@@ -375,8 +388,8 @@ func TestPolicyAppliedFromNodeDepth(t *testing.T) {
 // coinbase 228 blocks before consensus lets it be spent. The refusal is a
 // permanent deployment error with its own alert, not a syncing pause, whether
 // the node itself reports the mismatch (an rpc.Client with Network set) or the
-// Monitor asks (an rpc.Client whose Network was left unset). An unset Monitor
-// Network performs no chain check, as documented.
+// Monitor asks (an rpc.Client whose Network was left unset). A Monitor with no
+// Network asks for mainnet; see TestUnsetNetworkIsMainnetForTheChainCheckToo.
 func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 	deposit := func(m *Monitor, cache *fakeCache, node *fakeNode, a string) {
 		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
@@ -407,15 +420,6 @@ func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 	node.syncErr = fmt.Errorf("%w: node reports %q, configured for %q", rpc.ErrWrongChain, "main", "regtest")
 	deposit(m, cache, node, a)
 	check("node reports", m, led, al)
-
-	// Unset Monitor Network: mainnet rules, no chain check; the 60-deep
-	// coinbase waits without an alarm.
-	m, cache, node, led, al, a = setup(t)
-	node.chain = types.Regtest.ChainID
-	deposit(m, cache, node, a)
-	if got, err := m.Scan(context.Background()); err != nil || len(got) != 0 || len(al.kinds) != 0 {
-		t.Fatalf("unset network: got %+v, err %v, alerts %v; want no credit, no error, no alert", got, err, al.kinds)
-	}
 }
 
 // With per-address freshness, one address the indexer has not refreshed is

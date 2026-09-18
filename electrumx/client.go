@@ -142,8 +142,9 @@ type Client struct {
 	// PingInterval is how often Start pings the server: it keeps the server's
 	// idle timer from closing the session and advances the freshness of every
 	// subscribed address with no change pending. Zero means 60 seconds.
-	// deposit.Monitor.MaxCacheAge must exceed it, or every address reads stale
-	// between pings.
+	// deposit.Monitor.MaxCacheAge must hold two of them, or every quiet
+	// address reads stale between pings; the Monitor reads the value in force
+	// through FreshnessInterval and refuses a shorter window.
 	PingInterval time.Duration
 
 	// OnRefresh is called after each successful UTXO refresh with the address
@@ -483,6 +484,11 @@ func (c *Client) LastRefresh() (time.Time, error) {
 	defer c.mu.RUnlock()
 	return c.lastRefreshAt, c.lastRefreshErr
 }
+
+// FreshnessInterval is how long a quiet address goes between two advances of
+// its freshness: the ping interval in force, PingInterval or its default.
+// deposit.Monitor reads it to refuse a MaxCacheAge that cannot hold two.
+func (c *Client) FreshnessInterval() time.Duration { return c.pingInterval() }
 
 // LastRefreshOf reports the last moment one tracked address's UTXO set was
 // known current, and the error of the most recent attempt for it, nil on

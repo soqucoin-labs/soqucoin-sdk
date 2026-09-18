@@ -10,14 +10,28 @@
 //
 // Recover runs first, once, and it is this process's job rather than the
 // signer's: it re-marks the inputs of every intent the store holds as
-// Broadcast, releases reservations that belong to nothing built, and re-sends
-// the persisted bytes of every Built intent. It never rebuilds, so the same
-// transaction goes out and a lost reply cannot become a second payment.
+// Broadcast, releases reservations that belong to nothing built, and
+// re-reserves every Built intent. It runs under a context that has already
+// ended, so it sends nothing: Recover attempts every Built intent it can
+// re-reserve whatever the others returned, and the send pass, the one sender
+// here, applies the hold rule below. Nothing is ever rebuilt, so the same
+// bytes go out and a lost reply cannot become a second payment.
+//
+// While the store holds a held intent (the node accepted other bytes for it,
+// or rejected bytes an earlier attempt may have relayed) nothing is sent: the
+// condition is read from the store before every send pass, so it survives a
+// restart and ends when an operator has moved the intent on through
+// withdraw.Engine.Abandon, and a hold that arises inside a pass ends the
+// pass. Confirmations are still read meanwhile.
 //
 // Usage:
 //
 //	go run ./examples/exchange_split/broadcaster -dir state -network stagenet \
-//	    -state broadcaster-state -confirmations 6
+//	    -state broadcaster-state
+//
+// -confirmations defaults to the chain's finality horizon, types.MaxReorgDepth
+// (288), the figure the integration guide's Step 4 gives for withdrawal
+// release; pass a lower one only on a network where a demo has to finish.
 //
 // Environment: SOQ_RPC_USER, SOQ_RPC_PASSWORD and SOQ_RPC_URL (default is the
 // network's own RPC port on localhost). The node needs txindex=1 to report
@@ -48,7 +62,7 @@ func main() {
 	dir := flag.String("dir", "", "the shared directory (required)")
 	state := flag.String("state", "", "this process's own directory, for its spent set (required)")
 	networkName := flag.String("network", "", "mainnet, stagenet or regtest (required)")
-	confirmations := flag.Int64("confirmations", 6, "confirmations before a withdrawal is Confirmed")
+	confirmations := flag.Int64("confirmations", types.MaxReorgDepth, "confirmations before a withdrawal is Confirmed (default: the finality horizon)")
 	interval := flag.Duration("interval", 10*time.Second, "how often to send and to check confirmations")
 	flag.Parse()
 	if *dir == "" || *state == "" || *networkName == "" || *confirmations < 1 {
@@ -92,6 +106,7 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 	engine := &withdraw.Engine{
 		Store:                 store,
 		Spent:                 spent,
+		Network:               network,
 		Broadcaster:           node,
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
 		Chain:                 withdraw.RPCChain{Client: node}, // Abandon's node checks
@@ -102,13 +117,9 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 	}
 
 	// Startup: re-mark what was sent, release what was reserved for nothing,
-	// re-send what was built. Every error is reported and none of them stops
-	// the loop; ErrHeld in particular is a withdrawal a person must resolve.
-	if err := engine.Recover(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return err
-		}
-		logger.Error("recover", "err", err)
+	// re-reserve what was built. The first send pass sends it.
+	if err := recoverAtStartup(ctx, engine); err != nil {
+		return err
 	}
 
 	logger.Info("broadcaster started", "dir", string(dir), "state", state, "confirmations", confirmations)
@@ -123,27 +134,95 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 	}
 }
 
+// recoverAtStartup runs the engine's Recover as a repair and nothing more.
+// Recover attempts every Built intent it can re-reserve whatever an earlier
+// one returned, so a hold that arose inside it would not stop the ones after
+// it; run under a context that has already ended, its repair passes
+// (re-marking sent inputs, releasing orphan reservations, re-reserving Built
+// intents) still run, because they do not read the context, and the sending,
+// which does, sends nothing. The send pass then sends under the hold rule.
+// The entries Recover adds for the intents it did not send are dropped from
+// the report; every other error is reported and does not stop the process,
+// and the process's own context ending does.
+func recoverAtStartup(ctx context.Context, engine *withdraw.Engine) error {
+	repair, stop := context.WithCancel(ctx)
+	stop()
+	err := engine.Recover(repair)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err := withoutNotSent(err); err != nil {
+		logger.Error("recover", "err", err)
+	}
+	return nil
+}
+
+// withoutNotSent drops from Recover's joined report the entries that say a
+// Built intent was not sent because the context had ended: under the repair
+// context that is every Built intent, and the send pass sends them. The
+// repair passes run under a context that cannot end, so no other entry
+// carries the context's error.
+func withoutNotSent(err error) error {
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		if err != nil && errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+	var kept []error
+	for _, e := range joined.Unwrap() {
+		if !errors.Is(e, context.Canceled) {
+			kept = append(kept, e)
+		}
+	}
+	return errors.Join(kept...)
+}
+
 // send broadcasts every Built intent. The engine decides what each outcome
 // means: a lost reply keeps the intent Built with its reservation renewed and
 // the same bytes go out next pass, a permanent rejection fails it and releases
 // the inputs unless an earlier reply was lost, and a txid mismatch or a
 // rejection after a lost reply holds it for a person.
+//
+// A held intent stops the sending, as the integration guide's Step 3 says:
+// nothing is sent while the store holds one, and a hold that arises inside a
+// pass ends the pass, so an intent listed after it is not sent either. The
+// store is the record of the hold, so the rule is the same after a restart.
 func send(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) {
 	built, err := store.List(ctx, withdraw.StateBuilt)
 	if err != nil {
 		logger.Error("send: the store could not be read", "err", err)
 		return
 	}
+	if n := heldCount(built); n > 0 {
+		logger.Error("withdrawals halted: held intents must be resolved by hand before anything is sent", "held", n)
+		return
+	}
 	for _, in := range built {
-		if in.NodeTxID != "" || in.Hold != "" {
-			continue // held; Recover has already reported it
-		}
 		if err := engine.Broadcast(ctx, in); err != nil {
+			if errors.Is(err, withdraw.ErrHeld) || errors.Is(err, rpc.ErrTxIDMismatch) {
+				logger.Error("withdrawals halted: the intent is held; resolve it by hand before anything else is sent", "id", in.ID, "err", err)
+				return
+			}
 			logger.Warn("not sent", "id", in.ID, "state", in.State, "err", err)
 			continue
 		}
 		logger.Info("sent", "id", in.ID, "txid", in.TxID)
 	}
+}
+
+// heldCount is how many of the Built intents are held: the node accepted
+// other bytes for them (NodeTxID) or rejected bytes an earlier attempt may
+// have relayed (Hold), the engine's own definition.
+func heldCount(built []*withdraw.Intent) int {
+	n := 0
+	for _, in := range built {
+		if in.NodeTxID != "" || in.Hold != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // confirm advances every Broadcast intent. A confirmation count that cannot be

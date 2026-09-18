@@ -133,7 +133,10 @@ func run(ctx context.Context, cfg config) error {
 	// others need are absent on purpose: this engine has no spent set, no
 	// signer and no broadcaster, because a reservation taken here would live
 	// in a file no other process reads.
-	engine := &withdraw.Engine{Store: store, Logger: logger}
+	// Bound to the network so that Submit refuses a destination that is not
+	// an address on it; the prefix is not part of the script and nothing
+	// downstream would.
+	engine := &withdraw.Engine{Store: store, Network: cfg.network, Logger: logger}
 
 	logger.Info("watcher started", "dir", string(cfg.dir), "hot", cfg.hot, "network", cfg.network.Name)
 	for {
@@ -156,15 +159,13 @@ func accept(ctx context.Context, cfg config, engine *withdraw.Engine) {
 		logger.Error("request refused", "err", err)
 	}
 	for _, r := range reqs {
-		if err := address.Validate(cfg.network.HRP, r.Address); err != nil {
-			logger.Error("request refused", "id", r.ID, "err", err)
-			continue
-		}
 		_, created, err := engine.Submit(ctx, r.ID, r.Address, r.AmountShors, r.FeeRate)
 		if err != nil {
-			// ErrConflict means this id was already used for a different
-			// payment. It stays on disk and is never overwritten: one of the
-			// two is a mistake and only the exchange knows which.
+			// ErrInvalidIntent: the destination is not an address on this
+			// network; nothing was recorded. ErrConflict: this id was already
+			// used for a different payment. Either stays on disk and is never
+			// overwritten: the request is a mistake and only the exchange
+			// knows what it meant.
 			logger.Error("submit", "id", r.ID, "err", err)
 			continue
 		}

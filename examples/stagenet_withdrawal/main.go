@@ -139,9 +139,6 @@ func createKeys(keystore *keys.Manager) error {
 }
 
 func run(ctx context.Context, dir string, keystore *keys.Manager, inputList, to string, amount, required int64) error {
-	if err := address.Validate(network.HRP, to); err != nil {
-		return err
-	}
 	node := rpc.NewClient(rpcURL(), os.Getenv("SOQ_RPC_USER"), os.Getenv("SOQ_RPC_PASSWORD"), logger)
 	node.Network = network
 	if err := node.RequireSynced(ctx); err != nil {
@@ -170,6 +167,7 @@ func run(ctx context.Context, dir string, keystore *keys.Manager, inputList, to 
 	engine := &withdraw.Engine{
 		Store:                 store,
 		Spent:                 spent,
+		Network:               network, // Submit refuses a destination that is not an address on it
 		Broadcaster:           node,
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
 		RequiredConfirmations: required,
