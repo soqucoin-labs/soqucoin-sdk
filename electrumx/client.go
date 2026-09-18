@@ -7,7 +7,7 @@
 //   - PF-018: 4MB read buffer for addresses with 18,000+ UTXOs
 //   - F5: TCP keepalive at 30s to survive NAT/firewall timeouts
 //   - PF-018b: Serialised writes, one reader, replies paired with calls by id
-//   - Defense 12: Merge-based UTXO refresh that preserves SpentPending flags
+//   - Defense 12: Merge-based UTXO refresh that preserves the AssetType stamp
 //   - Panic recovery: the refresher goroutine auto-restarts after crashes
 //
 // Usage:
@@ -67,7 +67,7 @@ import (
 //
 // It maintains a persistent connection, tracks addresses by subscription,
 // and provides battle-tested UTXO caching with merge-based refresh
-// (Defense 12) that preserves spend-pending state across refreshes.
+// (Defense 12) that preserves the asset type stamped after node verification.
 type Client struct {
 	mu    sync.RWMutex
 	utxos map[string][]types.UTXO // address -> UTXOs
@@ -475,10 +475,9 @@ func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
 // the attempt in the address's freshness record.
 //
 // Defense 12 (Merge Refresh): Uses a MERGE strategy instead of full replacement.
-// The old code wiped SpentPending flags on every poll, creating a race where a
-// UTXO could be re-selected while its prior TX was still in the mempool.
-// The new code:
-//  1. Preserves SpentPending and AssetType flags on UTXOs that still appear
+// The indexer does not send an asset type; SetAssetType stamps it after node
+// verification, and a replacement would drop the stamp on every poll. The merge:
+//  1. Preserves the AssetType stamp on UTXOs that still appear
 //  2. Removes UTXOs that ElectrumX no longer reports (confirmed spent)
 //  3. Adds new UTXOs that appeared since last refresh (change outputs, new coinbases)
 func (c *Client) refreshAddress(ctx context.Context, addr string) error {
@@ -524,11 +523,10 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 }
 
 // commitRefresh merges one listunspent reply into the cache under mu and
-// reports the size of the merged set and whether it was committed. A merge,
-// not a replacement: the old code wiped SpentPending on every pass, so a UTXO
-// could be selected again while the transaction that spent it was still in
-// the mempool. Outputs the reply no longer lists are dropped as spent, and
-// outputs it lists for the first time are added.
+// reports the size of the merged set and whether it was committed. A merge
+// rather than a replacement, so the AssetType stamp survives the pass.
+// Outputs the reply no longer lists are dropped as spent, and outputs it
+// lists for the first time are added.
 func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool) {
 	type utxoKey struct {
 		TxID string
@@ -553,8 +551,8 @@ func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, fresh
 	for _, u := range existing {
 		key := utxoKey{u.TxID, u.Vout}
 		if fresh, stillExists := freshSet[key]; stillExists {
-			// Preserve our flags (SpentPending, AssetType) but take the server's
-			// height and value on every pass. Height must be allowed to fall
+			// Preserve our AssetType stamp but take the server's height and
+			// value on every pass. Height must be allowed to fall
 			// back to 0 (a reorg returned the tx to the mempool) or move (it
 			// was re-mined elsewhere); value must be allowed to correct a
 			// wrongly injected change output, because the amount is committed
@@ -641,9 +639,6 @@ func (c *Client) GetBalance(minConf int, tipHeight int64) (confirmed, unconfirme
 
 	for _, utxos := range c.utxos {
 		for _, u := range utxos {
-			if u.SpentPending {
-				continue
-			}
 			if u.AssetType != types.AssetTypeSOQ {
 				continue
 			}
@@ -678,36 +673,6 @@ func (c *Client) GetAllUTXOs() []types.UTXO {
 		all = append(all, utxos...)
 	}
 	return all
-}
-
-// MarkSpentPending marks a UTXO as spent-pending (used in transit, awaiting confirmation).
-func (c *Client) MarkSpentPending(txid string, vout uint32) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for addr, utxos := range c.utxos {
-		for i, u := range utxos {
-			if u.TxID == txid && u.Vout == vout {
-				c.utxos[addr][i].SpentPending = true
-				return
-			}
-		}
-	}
-}
-
-// UnmarkSpentPending reverses a spent-pending mark (e.g., if broadcast failed).
-func (c *Client) UnmarkSpentPending(txid string, vout uint32) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for addr, utxos := range c.utxos {
-		for i, u := range utxos {
-			if u.TxID == txid && u.Vout == vout {
-				c.utxos[addr][i].SpentPending = false
-				return
-			}
-		}
-	}
 }
 
 // EvictUTXO permanently removes a UTXO from the in-memory cache.
@@ -754,7 +719,7 @@ func (c *Client) UTXOCount() int {
 	count := 0
 	for _, utxos := range c.utxos {
 		for _, u := range utxos {
-			if !u.SpentPending && u.AssetType == types.AssetTypeSOQ {
+			if u.AssetType == types.AssetTypeSOQ {
 				count++
 			}
 		}

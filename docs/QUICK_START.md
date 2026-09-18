@@ -273,7 +273,8 @@ For production systems (exchanges, pools, services), add these layers:
 ```go
 import "github.com/soqucoin-labs/soqucoin-sdk/resilience"
 
-// Circuit breaker, halt after 3 failures, 15 min cooldown; logger nil discards
+// Circuit breaker, halt after 3 failures, 15 min cooldown; logger nil discards.
+// A reconciler trip halts it until cb.Reset (see the exchange guide).
 cb := resilience.NewCircuitBreaker(3, 15*time.Minute, logger)
 
 // Webhook alerter, Slack notifications on CB state changes

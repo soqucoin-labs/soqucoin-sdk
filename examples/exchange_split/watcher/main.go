@@ -226,10 +226,7 @@ func publish(ctx context.Context, cfg config, elx indexer, node *rpc.Client) {
 	// is not decided here, because the indexer does not send one.
 	var candidates []types.UTXO
 	for _, u := range elx.GetUTXOs(cfg.hot) {
-		switch {
-		case u.Height <= 0, tip-u.Height+1 < cfg.minConf:
-			continue
-		case u.SpentPending:
+		if u.Height <= 0 || tip-u.Height+1 < cfg.minConf {
 			continue
 		}
 		candidates = append(candidates, u)

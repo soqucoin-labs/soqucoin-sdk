@@ -5,7 +5,6 @@
 // defenses from DL-SIGNER-SPENT-TRACKING:
 //
 //   - Defense 11: gettxout pre-verification before signing
-//   - Defense 12: Merge-based refresh (preserves SpentPending flags)
 //   - Change becomes an input once it has confirmed and the indexer reports it
 //   - Persistent spent set: Survives process restarts
 //   - Largest-first coin selection: Minimizes TX weight
@@ -570,7 +569,6 @@ func NewCoinSelector(spentSet *SpentSet) *CoinSelector {
 //
 // This implements the same algorithm as soq-signer's production coin selection,
 // with all defensive filters:
-//   - Skips SpentPending UTXOs
 //   - Skips UTXOs in the persistent spent set (DL-SIGNER-SPENT-TRACKING)
 //   - Skips non-SOQ asset types (SOQ-ARCH-001)
 //   - Skips UTXOs below MinUTXOValue (SOQ-ARCH-003 dust filter)
@@ -617,9 +615,6 @@ func (cs *CoinSelector) selectByAssetType(
 	// Collect all spendable UTXOs matching criteria
 	var candidates []types.UTXO
 	for _, u := range utxos {
-		if u.SpentPending {
-			continue
-		}
 		// DL-SIGNER-SPENT-TRACKING: Skip UTXOs in the persistent spent set.
 		if cs.SpentSet != nil && cs.SpentSet.IsSpent(u.TxID, u.Vout) {
 			continue
@@ -688,9 +683,6 @@ func (cs *CoinSelector) SelectSmallestUTXOs(
 
 	var candidates []types.UTXO
 	for _, u := range utxos {
-		if u.SpentPending {
-			continue
-		}
 		if cs.SpentSet != nil && cs.SpentSet.IsSpent(u.TxID, u.Vout) {
 			continue
 		}

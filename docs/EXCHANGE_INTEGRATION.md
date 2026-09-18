@@ -293,7 +293,15 @@ exchange.
 and reported, but it neither alerts nor trips the breaker; a run that had already recorded a
 mismatch when the context ended alerts and trips like any other. `CircuitBreaker.RecordResult`
 treats `context.Canceled` as a per-request error that does not count; `context.DeadlineExceeded`
-counts.
+counts. A trip puts the breaker in `HALTED`: no cooldown and no later success clears it,
+`Allow` returns `resilience.ErrHalted` with the reason, and `CircuitBreaker.Reset` is the exit,
+reported through `OnStateChange` as the halt was. Give the reconciler the engine's spent set
+(`Reconciler.Spent`): an output the node no longer has because this process spent it is
+counted in `Report.OwnSpends` and is not a finding; without the set every own spend halts payouts.
+The breaker is memory, so a restart closes it and the first run after `InitialDelay` halts it
+again while the book still disagrees; a restart is not the response to a halt. The webhook the
+alerter posts names the transition and the failure count; the reason, which can carry
+transaction ids and amounts, stays in the process log.
 
 Every component takes a `*log/slog.Logger` in its constructor (`rpc.NewClient`,
 `electrumx.NewClient`, `utxo.OpenSpentSet`, `resilience.NewCircuitBreaker`, `NewAlerter`,
@@ -727,7 +735,7 @@ func main() {
 
 	// Halts only for systemic failures (RecordResult never counts a bad
 	// request), and the reconciler trips it when the book and the chain
-	// disagree.
+	// disagree, into a halt that only cb.Reset clears.
 	cb := resilience.NewCircuitBreaker(3, 15*time.Minute, logger)
 
 	// Inputs are reserved here at build time, and unconfirmed spends survive
@@ -737,6 +745,15 @@ func main() {
 		log.Fatal(err) // a file that exists but cannot be read must not start empty
 	}
 	selector := utxo.NewCoinSelector(spent)
+
+	// The book against the chain, daily by default. A mismatch halts the
+	// breaker until an operator has looked and called cb.Reset. This
+	// process's own unconfirmed spends are read from the spent set and are
+	// not findings.
+	recon := resilience.NewReconciler(elx, node, cb, resilience.DefaultReconciliationConfig(), logger)
+	recon.Spent = spent
+	recon.Start(ctx)
+	defer recon.Stop()
 
 	// Durable intents: persisted before anything is broadcast. An exchange
 	// with a database implements withdraw.Store over it and keeps the same
@@ -1025,30 +1042,30 @@ Every package carries unit tests. The figures below are one run of `go test -cov
 commit this document ships with, library packages only: the `examples/` programs and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Nine of the ten reproduce exactly. The `electrumx`
-figure moves between about 88.5 and 89.2 across runs, because several of its tests drive
+figure moves between about 88.4 and 89.2 across runs, because several of its tests drive
 the reader goroutine, the ping loop and the refresher at once, and which branches run
 depends on how those are scheduled.
 
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
-| `utxo` | **94.7%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
+| `utxo` | **90.9%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `rpc` | **85.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **88.5%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `electrumx` | **88.4%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
 | `tx` | **91.6%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **89.6%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **84.3%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `types` | **85.7%** | Amount parsing and formatting exact at every value the node prints, network records, asset constants |
-| `resilience` | **65.0%** | Circuit breaker transitions and classification, reconciler against the node |
+| `resilience` | **81.9%** | Circuit breaker transitions, classification and the halt, reconciler against the node with the spent set, the webhook body |
 
 Also passes under the race detector (`go test -race`), which matters for `electrumx` because its
 UTXO cache is shared between the reader goroutine, the refresher and caller threads.
 
 **Where the coverage is thin, and why.** These numbers are reported rather than rounded up:
 
-- **`resilience` (65.0%)**: the breaker and the reconciler are covered against fakes; the Slack
-  alerter's HTTP path is not, and it is an operational convenience rather than part of the money path.
+- **`resilience` (81.9%)**: the breaker and the reconciler are covered against fakes and the
+  alerter's post against a local server; the reconciler's timers are exercised at short intervals.
 - **`electrumx`**: the protocol path is driven by a scripted fake server, including the
   notification-in-front-of-reply case, pushed changes, a reconnect and a dropped notification
   covered by the reconcile. The refresher's timers are exercised at short intervals, not at the
@@ -1056,8 +1073,8 @@ UTXO cache is shared between the reader goroutine, the refresher and caller thre
 
 **What the tests deliberately target.** Rather than chasing a percentage, they pin the invariants
 whose failure is silent: transaction ID byte-order reversal, per-input BIP143 sighash separation,
-exclusion of witness data from the txid, USDSOQ never counted as native SOQ, spent-pending UTXOs
-never double-selected, a stale UTXO both dropped *and* evicted from cache, and RPC errors never
+exclusion of witness data from the txid, USDSOQ never counted as native SOQ, an input in the spent
+set never selected again, a stale UTXO both dropped *and* evicted from cache, and RPC errors never
 surfacing as usable zero values.
 
 Serialization is additionally pinned to the node's own format vectors, address derivation to

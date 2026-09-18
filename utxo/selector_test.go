@@ -150,27 +150,6 @@ func TestSelectUTXOsSkipsSpentSet(t *testing.T) {
 	}
 }
 
-func TestSelectUTXOsSkipsSpentPending(t *testing.T) {
-	cs := NewCoinSelector(nil)
-
-	utxos := []types.UTXO{
-		{TxID: "tx1", Vout: 0, Value: 500000, Height: 10, AssetType: types.AssetTypeSOQ, SpentPending: true},
-		{TxID: "tx2", Vout: 0, Value: 300000, Height: 10, AssetType: types.AssetTypeSOQ},
-	}
-
-	selected, total, err := cs.SelectUTXOs(utxos, 200000, 1, 20, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(selected) != 1 {
-		t.Errorf("expected 1 UTXO (pending skipped), got %d", len(selected))
-	}
-	if total != 300000 {
-		t.Errorf("expected 300000, got %d", total)
-	}
-}
-
 func TestSelectUTXOsSkipsWrongAssetType(t *testing.T) {
 	cs := NewCoinSelector(nil)
 

@@ -91,42 +91,6 @@ func TestEvictUTXOUnknownOutpointIsANoOp(t *testing.T) {
 	}
 }
 
-// ── SpentPending (Defense 12) ──────────────────────────────────────────────
-
-func TestMarkAndUnmarkSpentPending(t *testing.T) {
-	c := newTestClient(map[string][]types.UTXO{
-		adr: {utxo(txA, 0, 100, 10, types.AssetTypeSOQ)},
-	})
-	c.MarkSpentPending(txA, 0)
-	if !c.GetUTXOs(adr)[0].SpentPending {
-		t.Fatal("MarkSpentPending did not set the flag")
-	}
-	c.UnmarkSpentPending(txA, 0)
-	if c.GetUTXOs(adr)[0].SpentPending {
-		t.Error("UnmarkSpentPending did not clear the flag")
-	}
-}
-
-// A UTXO marked spent-pending must not be counted as spendable balance, or a
-// second payment selects an input the first payment already consumed.
-func TestGetBalanceExcludesSpentPending(t *testing.T) {
-	c := newTestClient(map[string][]types.UTXO{
-		adr: {
-			utxo(txA, 0, 100, 10, types.AssetTypeSOQ),
-			utxo(txB, 0, 400, 10, types.AssetTypeSOQ),
-		},
-	})
-	confirmed, _ := c.GetBalance(1, 100)
-	if confirmed != 500 {
-		t.Fatalf("confirmed = %d, want 500", confirmed)
-	}
-	c.MarkSpentPending(txB, 0)
-	confirmed, _ = c.GetBalance(1, 100)
-	if confirmed != 100 {
-		t.Errorf("confirmed after marking = %d, want 100", confirmed)
-	}
-}
-
 // ── GetBalance: asset and confirmation filtering ───────────────────────────
 
 // USDSOQ must never be counted as native SOQ. Mixing them would let a caller
