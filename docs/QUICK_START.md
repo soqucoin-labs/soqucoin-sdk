@@ -95,6 +95,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// The indexer's view of the addresses. A payout budget comes from the
+	// selector against the spent set, never from this figure.
 	confirmed, unconfirmed := client.GetBalance(30, tipHeight)
 	fmt.Printf("Confirmed:   %.8f SOQ\n", float64(confirmed)/float64(types.ShorsPerSOQ))
 	fmt.Printf("Unconfirmed: %.8f SOQ\n", float64(unconfirmed)/float64(types.ShorsPerSOQ))
@@ -273,7 +275,8 @@ For production systems (exchanges, pools, services), add these layers:
 ```go
 import "github.com/soqucoin-labs/soqucoin-sdk/resilience"
 
-// Circuit breaker, halt after 3 failures, 15 min cooldown; logger nil discards
+// Circuit breaker, halt after 3 failures, 15 min cooldown; logger nil discards.
+// A reconciler trip halts it until cb.Reset (see the exchange guide).
 cb := resilience.NewCircuitBreaker(3, 15*time.Minute, logger)
 
 // Webhook alerter, Slack notifications on CB state changes

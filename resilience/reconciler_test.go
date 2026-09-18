@@ -104,8 +104,8 @@ func TestReconcilerDetectsMismatchAndHalts(t *testing.T) {
 		if len(*alerts) != 1 {
 			t.Errorf("%s: alerts %v", tc.name, *alerts)
 		}
-		if st, _, _, _ := cb.State(); st != CircuitOpen {
-			t.Errorf("%s: HaltOnMismatch did not open the breaker", tc.name)
+		if st, _, _, _ := cb.State(); st != CircuitHalted {
+			t.Errorf("%s: HaltOnMismatch did not halt the breaker", tc.name)
 		}
 		if err := cb.Allow(); err == nil {
 			t.Errorf("%s: withdrawals still allowed after a book mismatch", tc.name)
@@ -253,11 +253,11 @@ func TestTripOpensImmediately(t *testing.T) {
 	}
 	cb.Trip(errors.New("reconciler mismatch"))
 	if cb.Allow() == nil {
-		t.Fatal("Trip did not open the breaker")
+		t.Fatal("Trip did not halt the breaker")
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(transitions) != 1 || transitions[0] != "CLOSED>OPEN" {
+	if len(transitions) != 1 || transitions[0] != "CLOSED>HALTED" {
 		t.Errorf("transitions %v", transitions)
 	}
 }
@@ -326,13 +326,13 @@ func TestRunEndedByTheContextDoesNotTripOrAlert(t *testing.T) {
 	if alerted2 == "" || !strings.Contains(alerted2, rTxA) {
 		t.Fatalf("a mismatch found before the context ended was not alerted with its full txid: %q", alerted2)
 	}
-	if st, _, _, _ := cb2.State(); st != CircuitOpen {
-		t.Fatalf("breaker %s after a run that found a mismatch and was then cancelled, want OPEN", st)
+	if st, _, _, _ := cb2.State(); st != CircuitHalted {
+		t.Fatalf("breaker %s after a run that found a mismatch and was then cancelled, want HALTED", st)
 	}
 	// The control: the same Incomplete report under a live context trips it.
 	src.refreshErr = errors.New("indexer down")
 	r.Run(context.Background())
-	if st, _, _, _ := cb.State(); st != CircuitOpen || !alerted {
-		t.Fatalf("breaker %s alerted=%v after a real incomplete run, want OPEN and alerted", st, alerted)
+	if st, _, _, _ := cb.State(); st != CircuitHalted || !alerted {
+		t.Fatalf("breaker %s alerted=%v after a real incomplete run, want HALTED and alerted", st, alerted)
 	}
 }

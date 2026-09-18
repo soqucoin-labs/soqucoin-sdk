@@ -828,6 +828,87 @@
       "find": "\tif errors.Is(err, rpc.ErrAlreadyInChain) {\n\t\terr = nil",
       "replace": "\tif false {\n\t\terr = nil",
       "why": "A re-send after the transaction mined is answered already in chain, which is the node saying it has the bytes. Read as a refusal it is recorded and returned as a failure on every pass and sends an operator to a payment that has confirmed."
+    },
+    {
+      "id": "breaker-trip-opens-instead-of-halting",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestTripIsNotClearedByTheCooldownProbe",
+      "find": "\tcb.state = CircuitHalted\n\tcb.haltReason = err.Error()",
+      "replace": "\tcb.state = CircuitOpen\n\tcb.haltReason = err.Error()",
+      "why": "A reconciler trip says the book does not match the chain, which time does not repair. Left Open, the cooldown admits a probe, the probe succeeds because the node is fine, and payouts resume on a mismatched book after fifteen minutes."
+    },
+    {
+      "id": "breaker-success-clears-a-halt",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestTripIsNotClearedByAnInFlightSuccess",
+      "find": "\tif cb.state == CircuitHalted {\n\t\tcb.mu.Unlock()\n\t\treturn\n\t}",
+      "replace": "\tif cb.state == CircuitHalted && cb.consecutiveFailures < 0 {\n\t\tcb.mu.Unlock()\n\t\treturn\n\t}",
+      "why": "A worker admitted before the trip completes its withdrawal and records a success. The node worked; the halt is about the book. Closing on that success ends the halt within seconds of the reconciler raising it."
+    },
+    {
+      "id": "breaker-allow-admits-while-halted",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestAllowWhileHaltedIsRefusedWithTheReason",
+      "find": "\tcase CircuitHalted:\n\t\treturn fmt.Errorf(\"%w: %s\", ErrHalted, cb.haltReason)",
+      "replace": "\tcase CircuitHalted:\n\t\treturn nil",
+      "why": "HALTED exists so that Allow refuses every withdrawal until an operator has looked. Admitting while halted makes the state a label."
+    },
+    {
+      "id": "breaker-failure-demotes-a-halt-to-open",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestFailuresWhileHaltedChangeNoState",
+      "find": "\tcase cb.state == CircuitHalted:\n\t\t// Counted, and the halt stands: an Open would let the cooldown end it.",
+      "replace": "\tcase cb.state == CircuitHalted && cb.consecutiveFailures < 0:\n\t\t// Counted, and the halt stands: an Open would let the cooldown end it.",
+      "why": "A failure recorded while halted must not move the breaker to Open, because Open ends with the cooldown and a halt ends with Reset."
+    },
+    {
+      "id": "breaker-reset-does-not-report-the-exit",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestResetAfterAHaltClosesAndReportsIt",
+      "find": "\tif prev != CircuitClosed && notify != nil {\n\t\tnotify(prev.String(), \"CLOSED\", 0, \"\")",
+      "replace": "\tif prev == CircuitHalfOpen && notify != nil {\n\t\tnotify(prev.String(), \"CLOSED\", 0, \"\")",
+      "why": "The alerter announced the halt through OnStateChange. Reset is the halt's only exit, and an exit the channel never hears of leaves the operator reading a stale alarm."
+    },
+    {
+      "id": "reconciler-own-spend-is-a-finding",
+      "file": "resilience/reconciler.go",
+      "package": "./resilience",
+      "test": "TestReconcilerExcludesAnOutpointThisProcessSpent",
+      "find": "\t\tif out == nil && r.Spent != nil && r.Spent.IsSpent(u.TxID, u.Vout) {",
+      "replace": "\t\tif out == nil && r.Spent != nil && r.Spent.IsSpent(u.TxID, u.Vout) && u.Value < 0 {",
+      "why": "An output this process spent after the snapshot is absent from the node's UTXO set for a reason the spent set records. Counted as Missing, a daily reconciliation during any withdrawal trips the breaker and halts payouts on a book that is right."
+    },
+    {
+      "id": "reconciler-excludes-every-missing-output-once-a-set-is-wired",
+      "file": "resilience/reconciler.go",
+      "package": "./resilience",
+      "test": "TestReconcilerStillFindsAnOutpointNobodyHereSpent",
+      "find": "\t\tif out == nil && r.Spent != nil && r.Spent.IsSpent(u.TxID, u.Vout) {",
+      "replace": "\t\tif out == nil && r.Spent != nil {",
+      "why": "The exclusion is for outputs the set records as this process's spends. Excluding every missing output once a set is wired hides a spend nobody here made, which is the finding the reconciler exists for."
+    },
+    {
+      "id": "alerter-webhook-carries-the-error-text",
+      "file": "resilience/alerter.go",
+      "package": "./resilience",
+      "test": "TestBreakerWebhookCarriesNoErrorTextAndNamesTheHalt",
+      "find": "\tif toState != \"CLOSED\" {\n\t\ttext += \"\\n> The reason is in the process log.\"",
+      "replace": "\tif toState != \"CLOSED\" {\n\t\ttext += \"\\n> \" + clip(lastErr)",
+      "why": "The tripping error's text names transaction ids, vouts and amounts, or carries part of a proxy's error page. A webhook is a post to a third party; the log is where the reason belongs."
+    },
+    {
+      "id": "breaker-trip-fabricates-the-failure-count",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestBreakerWebhookCarriesNoErrorTextAndNamesTheHalt",
+      "find": "\tn := cb.consecutiveFailures // the real count; a halt is not a failure tally",
+      "replace": "\tn := cb.maxFailures // the real count; a halt is not a failure tally",
+      "why": "A halt is not a failure tally. Reporting the threshold as the count on a breaker with no failures puts a number the breaker never recorded into the webhook and the callback, and an operator reads three node failures where there were none."
     }
   ]
 }

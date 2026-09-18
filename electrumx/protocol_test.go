@@ -309,7 +309,7 @@ func TestMergeTakesFreshHeightAndValue(t *testing.T) {
 		}
 	}
 	set(100, 1000)
-	c.MarkSpentPending(txA, 0) // a flag the merge must preserve
+	c.SetAssetType(txA, 0, types.AssetTypeUSDSOQ) // the stamp the merge must preserve
 	set(0, 1000)
 	if u := c.GetUTXOs(a1)[0]; u.Height != 0 {
 		t.Errorf("reorg to mempool not reflected: height %d, want 0", u.Height)
@@ -323,8 +323,8 @@ func TestMergeTakesFreshHeightAndValue(t *testing.T) {
 	if u.Value != 999 {
 		t.Errorf("value not corrected: %d, want 999", u.Value)
 	}
-	if !u.SpentPending {
-		t.Error("merge dropped the SpentPending flag")
+	if u.AssetType != types.AssetTypeUSDSOQ {
+		t.Error("merge dropped the AssetType stamp")
 	}
 }
 

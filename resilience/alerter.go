@@ -54,17 +54,23 @@ type attachment struct {
 
 // WireToCircuitBreaker connects this alerter to a circuit breaker's
 // OnStateChange callback. After calling this, the alerter automatically
-// fires webhooks on CB state transitions.
+// fires webhooks on CB state transitions. Safe while the breaker is in use.
 func (a *Alerter) WireToCircuitBreaker(cb *CircuitBreaker) {
 	if a.webhookURL == "" {
 		return // No-op
 	}
+	cb.mu.Lock()
 	cb.OnStateChange = a.SendCircuitBreakerAlert
+	cb.mu.Unlock()
 }
 
 // SendCircuitBreakerAlert fires a Slack webhook when the circuit breaker
-// transitions to OPEN (failures) or back to CLOSED (recovered).
+// transitions to OPEN (failures), HALTED (a trip) or back to CLOSED. The
+// message names the transition and the failure count and says the log holds
+// the reason; the error's text, which can carry transaction ids, amounts or
+// a proxy's error page, goes to a third party otherwise.
 func (a *Alerter) SendCircuitBreakerAlert(fromState, toState string, consecutiveFailures int, lastErr string) {
+	_ = lastErr // the breaker logged it; it is not posted
 	if a == nil || a.webhookURL == "" {
 		return
 	}
@@ -75,6 +81,10 @@ func (a *Alerter) SendCircuitBreakerAlert(fromState, toState string, consecutive
 		color = "danger"
 		emoji = "🚨"
 		title = "Circuit Breaker OPEN — Operations Halted"
+	case "HALTED":
+		color = "danger"
+		emoji = "🚨"
+		title = "Circuit Breaker HALTED — Operations Stopped Until Reset"
 	case "CLOSED":
 		color = "good"
 		emoji = "✅"
@@ -90,8 +100,8 @@ func (a *Alerter) SendCircuitBreakerAlert(fromState, toState string, consecutive
 	}
 
 	text := fmt.Sprintf("%s *soqucoin-sdk*: %s → %s", emoji, fromState, toState)
-	if lastErr != "" {
-		text += fmt.Sprintf("\n> Last error: `%s`", clip(lastErr))
+	if toState != "CLOSED" {
+		text += "\n> The reason is in the process log."
 	}
 	if consecutiveFailures > 0 {
 		text += fmt.Sprintf("\n> Consecutive failures: %d", consecutiveFailures)

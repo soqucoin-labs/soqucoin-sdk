@@ -7,8 +7,10 @@
 // Components:
 //   - CircuitBreaker: Prevents cascading failures by halting operations after
 //     consecutive failures, then gradually recovering (standard CB pattern).
-//   - Reconciler: Periodically verifies UTXO state against fresh data to detect
-//     balance discrepancies, stale UTXOs, or missed spends.
+//     A Trip, which the Reconciler uses, halts it until an operator's Reset.
+//   - Reconciler: Periodically verifies the indexer cache against the node,
+//     outpoint by outpoint; given the spent set, it excludes this process's
+//     own spends.
 //   - Alerter: Sends webhook notifications (Slack-compatible) on important state
 //     changes like circuit breaker transitions.
 //
@@ -46,6 +48,9 @@ const (
 	CircuitOpen
 	// CircuitHalfOpen — cooldown elapsed, allowing ONE probe attempt.
 	CircuitHalfOpen
+	// CircuitHalted — tripped by a caller that found a reason to stop
+	// outright; no cooldown and no success leaves it, only Reset.
+	CircuitHalted
 )
 
 func (s CircuitBreakerState) String() string {
@@ -56,10 +61,16 @@ func (s CircuitBreakerState) String() string {
 		return "OPEN"
 	case CircuitHalfOpen:
 		return "HALF-OPEN"
+	case CircuitHalted:
+		return "HALTED"
 	default:
 		return "UNKNOWN"
 	}
 }
+
+// ErrHalted is what Allow returns while the breaker is halted. The error
+// carries the reason Trip was given; Reset is the only exit.
+var ErrHalted = errors.New("resilience: circuit breaker halted; Reset is the only exit")
 
 // CircuitBreaker prevents cascading failures in automated payment systems.
 //
@@ -69,10 +80,14 @@ func (s CircuitBreakerState) String() string {
 //	OPEN   → (cooldown elapses)               → HALF-OPEN
 //	HALF-OPEN → (probe succeeds)              → CLOSED
 //	HALF-OPEN → (probe fails)                 → OPEN
+//	any    → (Trip)                           → HALTED
+//	HALTED → (Reset)                          → CLOSED
 //
 // Defense 14 (DL-ENTERPRISE-PAYOUT): This is the standard circuit breaker
 // pattern adapted for blockchain payout systems. Without it, a node outage
-// causes infinite payout retries, burning fees on doomed transactions.
+// causes infinite payout retries, burning fees on doomed transactions. The
+// cooldown is for a node that may have recovered; HALTED is for a book that
+// does not match the chain, which time does not repair.
 type CircuitBreaker struct {
 	mu sync.Mutex
 
@@ -80,7 +95,8 @@ type CircuitBreaker struct {
 	consecutiveFailures int
 	maxFailures         int
 	cooldownDuration    time.Duration
-	probing             bool // HALF-OPEN: one probe is in flight
+	probing             bool   // HALF-OPEN: one probe is in flight
+	haltReason          string // HALTED: what Trip was told
 
 	lastFailure time.Time
 	lastSuccess time.Time
@@ -93,7 +109,9 @@ type CircuitBreaker struct {
 	// OnStateChange is called whenever the CB transitions between states.
 	// Signature: func(fromState, toState string, consecutiveFailures int, lastErr string)
 	// May be nil. Used by the Alerter for webhook notifications. It is invoked
-	// after the breaker's lock is released, so it may read the breaker.
+	// after the breaker's lock is released, so it may read the breaker. Set it
+	// before the breaker is in use, or through Alerter.WireToCircuitBreaker,
+	// which takes the lock.
 	OnStateChange func(from, to string, consecutiveFailures int, lastErr string)
 
 	// PerRequestErrors extends the set of errors that describe ONE request
@@ -172,22 +190,27 @@ func (cb *CircuitBreaker) RecordResult(err error) bool {
 	}
 }
 
-// Trip forces the breaker OPEN regardless of the failure count, for callers
-// that have found a reason to halt outright (the reconciler on a mismatch).
+// Trip halts the breaker regardless of the failure count, for callers that
+// have found a reason to stop outright (the reconciler on a mismatch). A halt
+// outlasts the cooldown and every recorded success; Reset is the only exit.
+// The callback fires whenever the breaker was not already halted, so a
+// breaker that was Open from failures still reports that it will not recover
+// on its own.
 func (cb *CircuitBreaker) Trip(err error) {
+	if err == nil {
+		err = errors.New("unspecified reason")
+	}
 	cb.mu.Lock()
 	prev := cb.state
-	cb.state = CircuitOpen
+	cb.state = CircuitHalted
+	cb.haltReason = err.Error()
 	cb.probing = false
-	cb.lastFailure = time.Now()
-	if cb.consecutiveFailures < cb.maxFailures {
-		cb.consecutiveFailures = cb.maxFailures
-	}
-	n := cb.consecutiveFailures
+	n := cb.consecutiveFailures // the real count; a halt is not a failure tally
+	notify := cb.OnStateChange
 	cb.mu.Unlock()
-	cb.logger().Error("circuit breaker tripped open", "from", prev.String(), "err", err)
-	if prev != CircuitOpen && cb.OnStateChange != nil {
-		cb.OnStateChange(prev.String(), "OPEN", n, err.Error())
+	cb.logger().Error("circuit breaker halted", "from", prev.String(), "err", err)
+	if prev != CircuitHalted && notify != nil {
+		notify(prev.String(), CircuitHalted.String(), n, err.Error())
 	}
 }
 
@@ -220,6 +243,9 @@ func (cb *CircuitBreaker) Allow() error {
 	case CircuitClosed:
 		return nil
 
+	case CircuitHalted:
+		return fmt.Errorf("%w: %s", ErrHalted, cb.haltReason)
+
 	case CircuitOpen:
 		if time.Since(cb.lastFailure) >= cb.cooldownDuration {
 			cb.state = CircuitHalfOpen
@@ -245,21 +271,29 @@ func (cb *CircuitBreaker) Allow() error {
 	}
 }
 
-// RecordSuccess records a successful operation. Resets failure count and closes the circuit.
+// RecordSuccess records a successful operation. Resets failure count and
+// closes the circuit. While halted it counts the success and changes
+// nothing: a withdrawal that went through says the node works, and the halt
+// is about the book.
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	previousState := cb.state
-	cb.consecutiveFailures = 0
 	cb.lastSuccess = time.Now()
 	cb.TotalSuccesses++
+	if cb.state == CircuitHalted {
+		cb.mu.Unlock()
+		return
+	}
+	cb.consecutiveFailures = 0
 	cb.state = CircuitClosed
 	cb.probing = false
+	notify := cb.OnStateChange
 	cb.mu.Unlock()
 
 	if previousState != CircuitClosed {
 		cb.logger().Info("circuit breaker closed", "from", previousState.String())
-		if cb.OnStateChange != nil {
-			cb.OnStateChange(previousState.String(), "CLOSED", 0, "")
+		if notify != nil {
+			notify(previousState.String(), "CLOSED", 0, "")
 		}
 	}
 }
@@ -279,6 +313,8 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 	var from string
 	tripped := false
 	switch {
+	case cb.state == CircuitHalted:
+		// Counted, and the halt stands: an Open would let the cooldown end it.
 	case cb.state == CircuitHalfOpen:
 		cb.state = CircuitOpen
 		cb.probing = false
@@ -287,6 +323,7 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 		cb.state = CircuitOpen
 		from, tripped = "CLOSED", true
 	}
+	notify := cb.OnStateChange
 	cb.mu.Unlock()
 
 	if !tripped {
@@ -294,8 +331,8 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 		return
 	}
 	cb.logger().Error("circuit breaker open", "from", from, "failures", n, "err", err, "cooldown", cb.cooldownDuration)
-	if cb.OnStateChange != nil {
-		cb.OnStateChange(from, "OPEN", n, err.Error())
+	if notify != nil {
+		notify(from, "OPEN", n, err.Error())
 	}
 }
 
@@ -306,12 +343,19 @@ func (cb *CircuitBreaker) State() (CircuitBreakerState, int, int64, int64) {
 	return cb.state, cb.consecutiveFailures, cb.TotalSuccesses, cb.TotalFailures
 }
 
-// Reset forces the circuit breaker back to CLOSED state.
+// Reset forces the circuit breaker back to CLOSED state. It is the only exit
+// from HALTED, and the exit is reported through OnStateChange as the halt was.
 func (cb *CircuitBreaker) Reset() {
 	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	prev := cb.state
 	cb.state = CircuitClosed
 	cb.consecutiveFailures = 0
 	cb.probing = false
-	cb.logger().Info("circuit breaker reset to closed")
+	cb.haltReason = ""
+	notify := cb.OnStateChange
+	cb.mu.Unlock()
+	cb.logger().Info("circuit breaker reset to closed", "from", prev.String())
+	if prev != CircuitClosed && notify != nil {
+		notify(prev.String(), "CLOSED", 0, "")
+	}
 }

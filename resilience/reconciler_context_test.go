@@ -56,8 +56,8 @@ func TestRunEndedByTheContextIsReadFromTheContextNotTheError(t *testing.T) {
 	alerted2 := false
 	r2.OnAlert = func(string) { alerted2 = true }
 	r2.Run(context.Background())
-	if st, _, _, _ := cb2.State(); st != CircuitOpen || !alerted2 {
-		t.Fatalf("breaker %s alerted=%v after a real indexer failure, want OPEN and alerted", st, alerted2)
+	if st, _, _, _ := cb2.State(); st != CircuitHalted || !alerted2 {
+		t.Fatalf("breaker %s alerted=%v after a real indexer failure, want HALTED and alerted", st, alerted2)
 	}
 }
 

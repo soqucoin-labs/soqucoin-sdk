@@ -64,8 +64,8 @@ options and the full walkthrough.
 | **Persistent spent set** | Never re-spend a UTXO: inputs reserved at build time, unconfirmed spends survive restarts |
 | **Withdrawal state machine** | `withdraw.Engine`: idempotency keys, persist-before-broadcast, same-bytes retry on a lost reply, recovery without rebuilding |
 | **Deposit crediting** | `deposit.Monitor`: credits only what your own node confirms; pauses while syncing or stale; alarms on a vanished credit |
-| **Circuit breaker** | Halt on systemic failures only (per-request errors never count), one probe, recover |
-| **Reconciliation** | Verifies the indexer cache against the node outpoint by outpoint; halts withdrawals on a mismatch |
+| **Circuit breaker** | Halts on systemic failures only (per-request errors never count), one probe, recovers; a reconciler trip halts it until an operator's `Reset` |
+| **Reconciliation** | Verifies the indexer cache against the node outpoint by outpoint, reading this process's own spends from the spent set; halts withdrawals on a mismatch |
 | **Webhook alerting** | Slack-compatible notifications for circuit breaker transitions |
 
 ## Quick Example
@@ -95,7 +95,9 @@ client.Start(ctx) // subscribes to every address; ends with ctx or Stop
 
 // Credit through deposit.Monitor, which checks every candidate against your
 // own node before crediting; see docs/EXCHANGE_INTEGRATION.md Step 2. The
-// confirmation table starts at 30 for small amounts, never 6.
+// confirmation table starts at 30 for small amounts, never 6. The balance is
+// the indexer's view; what a payout can spend is what the selector accepts
+// against the spent set.
 confirmed, _ := client.GetBalance(30, tipHeight)
 ```
 
@@ -124,7 +126,7 @@ rawTx, txid, err := tx.BuildAndSign(verified, recipientSPK, amount, changeSPK, t
 //    it for real withdrawals (Step 3 of the exchange guide).
 sentTxID, err := rpcClient.Broadcast(ctx, rawTx, txid)
 
-// 5. Mark spent (Defense 12). A failed write is an alert: the payment is out.
+// 5. Mark spent. A failed write is an alert: the payment is out.
 if err := spentSet.MarkBroadcast(verified, sentTxID); err != nil {
     log.Printf("ALERT spent set not written: %v", err)
 }
@@ -154,7 +156,7 @@ because of a specific incident:
 | Defense | What it prevents | Origin |
 |---------|-----------------|--------|
 | **Defense 11** | Stale UTXO signing, via `gettxout` pre-verification | 2 weeks of failed payouts |
-| **Defense 12** | SpentPending flag loss, via merge refresh instead of replace | Race condition during refresh |
+| **Defense 12** | Loss of a per-output stamp on refresh (originally a spent-pending flag, now the asset type stamped after node verification), via merge refresh instead of replace | Race condition during refresh |
 | **PF-018** | Bufio panic on large responses, via a 4MB read buffer | 18,000+ UTXO address |
 | **F5** | Broken pipe after idle, via TCP keepalive at 30s | NAT/firewall timeout |
 | **PF-018b** | TCP stream corruption, via a connection mutex | Concurrent broadcast+poll |

@@ -27,7 +27,8 @@ type ReconciliationConfig struct {
 	// HaltOnMismatch trips the circuit breaker when a run finds a mismatch or
 	// cannot complete a verification. This is the right default for a system
 	// that moves money: a book that does not match the chain must stop paying
-	// until a human has looked.
+	// until a human has looked. A trip halts the breaker until its Reset; no
+	// cooldown and no later success clears it.
 	HaltOnMismatch bool
 }
 
@@ -50,6 +51,13 @@ type Node interface {
 	GetTxOut(ctx context.Context, txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error)
 }
 
+// SpentSet is this process's record of the inputs it has reserved or spent.
+// *utxo.SpentSet satisfies it; give the reconciler the same set the
+// withdraw.Engine writes.
+type SpentSet interface {
+	IsSpent(txid string, vout uint32) bool
+}
+
 // Finding is one disagreement between the cache and the node.
 type Finding struct {
 	TxID     string
@@ -65,6 +73,7 @@ type Finding struct {
 type Report struct {
 	At         time.Time
 	Checked    int   // outpoints verified against the node
+	OwnSpends  int   // outpoints the node lacks and this process's SpentSet records; not findings, not in the totals
 	CacheTotal int64 // spendable shors per the cache
 	NodeTotal  int64 // shors the node confirmed for the same outpoints
 	Findings   []Finding
@@ -100,6 +109,13 @@ type Reconciler struct {
 	// clean. OnReport, if set, receives every report.
 	OnAlert  func(message string)
 	OnReport func(Report)
+
+	// Spent is the withdraw.Engine's spent set. An output the node no longer
+	// has because this process spent it is not a disagreement between the
+	// cache and the chain; without Spent every such output is a finding and,
+	// with HaltOnMismatch, halts payouts. Set before Start, and Start after
+	// the engine's Recover has re-marked the set from the intent store.
+	Spent SpentSet
 }
 
 // NewReconciler wires a reconciler. cb may be nil, in which case
@@ -172,7 +188,7 @@ func (r *Reconciler) Run(ctx context.Context) Report {
 		r.OnReport(rep)
 	}
 	if rep.Clean() {
-		r.log.Info("reconciliation clean", "outpoints", rep.Checked, "node_total_shors", rep.NodeTotal)
+		r.log.Info("reconciliation clean", "outpoints", rep.Checked, "own_spends", rep.OwnSpends, "node_total_shors", rep.NodeTotal)
 		return rep
 	}
 	if len(rep.Findings) == 0 && (ctx.Err() != nil || errors.Is(rep.Incomplete, context.Canceled) || errors.Is(rep.Incomplete, context.DeadlineExceeded)) {
@@ -232,16 +248,23 @@ func (r *Reconciler) reconcile(ctx context.Context) Report {
 	}
 
 	for _, u := range r.source.GetAllUTXOs() {
-		if u.SpentPending || u.AssetType != types.AssetTypeSOQ {
+		if u.AssetType != types.AssetTypeSOQ {
 			continue
 		}
-		rep.Checked++
-		rep.CacheTotal += u.Value
 		out, err := r.node.GetTxOut(ctx, u.TxID, u.Vout, true)
 		if err != nil {
 			rep.Incomplete = fmt.Errorf("gettxout %s:%d: %w", u.TxID, u.Vout, err)
 			return rep
 		}
+		// Read after the lookup: the engine writes the set before it sends,
+		// so whenever the node answers null for our own spend, the entry is
+		// already there, including for a spend made during this pass.
+		if out == nil && r.Spent != nil && r.Spent.IsSpent(u.TxID, u.Vout) {
+			rep.OwnSpends++
+			continue
+		}
+		rep.Checked++
+		rep.CacheTotal += u.Value
 		switch {
 		case out == nil:
 			rep.Findings = append(rep.Findings, Finding{TxID: u.TxID, Vout: u.Vout, Address: u.Address,
