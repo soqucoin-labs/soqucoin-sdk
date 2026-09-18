@@ -9,7 +9,8 @@
 //     consecutive failures, then gradually recovering (standard CB pattern).
 //     A Trip, which the Reconciler uses, halts it until an operator's Reset.
 //   - Reconciler: Periodically verifies the indexer cache against the node,
-//     outpoint by outpoint, excluding the spends this process made itself.
+//     outpoint by outpoint; given the spent set, it excludes this process's
+//     own spends.
 //   - Alerter: Sends webhook notifications (Slack-compatible) on important state
 //     changes like circuit breaker transitions.
 //
@@ -205,10 +206,7 @@ func (cb *CircuitBreaker) Trip(err error) {
 	cb.haltReason = err.Error()
 	cb.probing = false
 	cb.lastFailure = time.Now()
-	if cb.consecutiveFailures < cb.maxFailures {
-		cb.consecutiveFailures = cb.maxFailures
-	}
-	n := cb.consecutiveFailures
+	n := cb.consecutiveFailures // the real count; a halt is not a failure tally
 	notify := cb.OnStateChange
 	cb.mu.Unlock()
 	cb.logger().Error("circuit breaker halted", "from", prev.String(), "err", err)

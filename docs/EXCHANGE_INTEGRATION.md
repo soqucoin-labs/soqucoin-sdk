@@ -298,7 +298,10 @@ counts. A trip puts the breaker in `HALTED`: no cooldown and no later success cl
 reported through `OnStateChange` as the halt was. Give the reconciler the engine's spent set
 (`Reconciler.Spent`): an output the node no longer has because this process spent it is
 counted in `Report.OwnSpends` and is not a finding; without the set every own spend halts payouts.
-The breaker is memory, so a restart closes it and the first run after `InitialDelay` halts it
+Start the reconciler after `Recover`, which re-marks into the set the spends the intent store
+knows. The exclusion covers reservations as well as sends, so a spend of a reserved input by
+another holder of the key is not a finding for that run; the engine reports it itself, as a
+rejection at the send or a held intent. The breaker is memory, so a restart closes it and the first run after `InitialDelay` halts it
 again while the book still disagrees; a restart is not the response to a halt. The webhook the
 alerter posts names the transition and the failure count; the reason, which can carry
 transaction ids and amounts, stays in the process log.
@@ -310,7 +313,7 @@ everything; the SDK writes nothing to the process's default logger. Levels: `Inf
 connections, cache evictions, spent-set writes and clean reconciliations; `Warn` for a reorg seen in
 the cache, a refresh that failed, a reservation that could not be renewed, a reconciliation the
 context ended, a webhook the server did not accept, and, on `deposit.Monitor`, every alert when
-`OnAlert` is nil; `Error` for a circuit breaker opening, a reconciliation that found a mismatch
+`OnAlert` is nil; `Error` for a circuit breaker opening or halting, a reconciliation that found a mismatch
 or could not complete, a webhook that could not be sent, and a panic in the refresher goroutine.
 Identifiers are logged whole, as attributes or in the message, never truncated.
 
@@ -746,15 +749,6 @@ func main() {
 	}
 	selector := utxo.NewCoinSelector(spent)
 
-	// The book against the chain, daily by default. A mismatch halts the
-	// breaker until an operator has looked and called cb.Reset. This
-	// process's own unconfirmed spends are read from the spent set and are
-	// not findings.
-	recon := resilience.NewReconciler(elx, node, cb, resilience.DefaultReconciliationConfig(), logger)
-	recon.Spent = spent
-	recon.Start(ctx)
-	defer recon.Stop()
-
 	// Durable intents: persisted before anything is broadcast. An exchange
 	// with a database implements withdraw.Store over it and keeps the same
 	// rules: Create and Update are durable before they return, Create fails
@@ -828,6 +822,15 @@ func main() {
 	if err := engine.Recover(ctx); err != nil {
 		log.Fatalf("recover: %v", err)
 	}
+
+	// The book against the chain, daily by default, started after Recover has
+	// re-marked the set. A mismatch halts the breaker until an operator has
+	// looked and called cb.Reset. This process's own reservations and
+	// unconfirmed spends are read from the spent set and are not findings.
+	recon := resilience.NewReconciler(elx, node, cb, resilience.DefaultReconciliationConfig(), logger)
+	recon.Spent = spent
+	recon.Start(ctx)
+	defer recon.Stop()
 
 	// A withdrawal request. The id is your idempotency key: the same id never
 	// produces a second transaction, and a different amount under the same id

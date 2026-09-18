@@ -113,7 +113,8 @@ type Reconciler struct {
 	// Spent is the withdraw.Engine's spent set. An output the node no longer
 	// has because this process spent it is not a disagreement between the
 	// cache and the chain; without Spent every such output is a finding and,
-	// with HaltOnMismatch, halts payouts. Set before Start.
+	// with HaltOnMismatch, halts payouts. Set before Start, and Start after
+	// the engine's Recover has re-marked the set from the intent store.
 	Spent SpentSet
 }
 

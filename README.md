@@ -154,7 +154,7 @@ because of a specific incident:
 | Defense | What it prevents | Origin |
 |---------|-----------------|--------|
 | **Defense 11** | Stale UTXO signing, via `gettxout` pre-verification | 2 weeks of failed payouts |
-| **Defense 12** | Loss of the asset type stamped after node verification, via merge refresh instead of replace | Race condition during refresh |
+| **Defense 12** | Loss of a per-output stamp on refresh (originally a spent-pending flag, now the asset type stamped after node verification), via merge refresh instead of replace | Race condition during refresh |
 | **PF-018** | Bufio panic on large responses, via a 4MB read buffer | 18,000+ UTXO address |
 | **F5** | Broken pipe after idle, via TCP keepalive at 30s | NAT/firewall timeout |
 | **PF-018b** | TCP stream corruption, via a connection mutex | Concurrent broadcast+poll |

@@ -664,7 +664,7 @@ func (cs *CoinSelector) selectByAssetType(
 // outputs with at least minConf confirmations at tipHeight, ascending by
 // value, for consolidation into one output (tx.BuildSweepTransaction). Unlike
 // SelectUTXOs it applies no MinUTXOValue filter: the small outputs are the
-// point. Outputs in the spent set or marked spent-pending are skipped. It
+// point. Outputs in the spent set are skipped. It
 // returns ErrNoCandidates when nothing qualifies.
 func (cs *CoinSelector) SelectSmallestUTXOs(
 	utxos []types.UTXO,

@@ -240,7 +240,8 @@ func TestBreakerWebhookCarriesNoErrorTextAndNamesTheHalt(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &payload); err != nil {
 		t.Fatalf("payload: %v\n%s", err, body)
 	}
-	for _, secret := range []string{rTxA, "150000000", "disagree"} {
+	// A trip on a breaker with no failures reports none: the count is real.
+	for _, secret := range []string{rTxA, "150000000", "disagree", "Consecutive failures"} {
 		if strings.Contains(body, secret) {
 			t.Errorf("webhook carries %q:\n%s", secret, body)
 		}

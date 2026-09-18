@@ -230,7 +230,7 @@ func run(ctx context.Context, cfg runConfig) error {
 		logger.Info("payout", "n", i+1, "of", len(payouts), "soq", soq(payout.Amount), "address", payout.Address)
 
 		if err := cb.Allow(); err != nil {
-			logger.Error("circuit breaker open, stopping", "err", err, "sent", sent, "failed", failed, "not_attempted", len(payouts)-i)
+			logger.Error("circuit breaker refused, stopping", "err", err, "sent", sent, "failed", failed, "not_attempted", len(payouts)-i)
 			return fmt.Errorf("circuit breaker stopped the run after %d payouts", i)
 		}
 
