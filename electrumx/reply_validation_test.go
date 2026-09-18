@@ -66,6 +66,12 @@ func TestAMalformedListunspentReplyIsRefusedAndTheCacheKept(t *testing.T) {
 	}
 	ceiling := strconv.FormatInt(types.MaxMoney, 10)
 	over := strconv.FormatInt(types.MaxMoney+1, 10)
+	// Five outputs at the ceiling sum past an int64, which no honest chain
+	// state reaches: the supply is above one ceiling and far below five.
+	var atCeiling []string
+	for v := 0; v < 5; v++ {
+		atCeiling = append(atCeiling, entry(txA, v, ceiling, 3))
+	}
 	for _, tc := range []struct{ name, reply string }{
 		{"null", `null`},
 		{"an-object", `{"tx_hash":"` + txA + `","tx_pos":0,"value":5,"height":3}`},
@@ -73,7 +79,7 @@ func TestAMalformedListunspentReplyIsRefusedAndTheCacheKept(t *testing.T) {
 		{"a-non-hex-txid", `[` + entry(strings.Repeat("z", 64), 0, "5", 3) + `]`},
 		{"a-negative-value", `[` + entry(txA, 0, "-500", 3) + `]`},
 		{"a-value-above-the-ceiling", `[` + entry(txA, 0, over, 3) + `]`},
-		{"values-summing-above-the-ceiling", `[` + entry(txA, 0, ceiling, 3) + `,` + entry(txA, 1, "1", 3) + `]`},
+		{"values-overflowing-an-int64", `[` + strings.Join(atCeiling, ",") + `]`},
 		{"a-negative-height", `[` + entry(txA, 0, "5", -7) + `]`},
 		{"a-duplicate-outpoint", `[` + entry(txA, 0, "5", 3) + `,` + entry(txA, 0, "7", 3) + `]`},
 	} {
@@ -97,9 +103,11 @@ func TestAMalformedListunspentReplyIsRefusedAndTheCacheKept(t *testing.T) {
 }
 
 // The bounds are the protocol's, so what the protocol permits is accepted: a
-// mempool output has height 0, an output may carry no value, and a server
-// that prints its ids in upper case is read, with the id stored in the form
-// the node prints and the cache compares.
+// mempool output has height 0, an output may carry no value, a server that
+// prints its ids in upper case is read with the id stored in the form the node
+// prints and the cache compares, and an address whose outputs sum past the
+// node's per-output ceiling is an address, since the supply is above that
+// ceiling.
 func TestAWellFormedListunspentReplyIsAcceptedAsTheProtocolPermits(t *testing.T) {
 	a := craftAddr(t, 0x34)
 	sh := scripthashOf(t, a)
@@ -119,5 +127,14 @@ func TestAWellFormedListunspentReplyIsAcceptedAsTheProtocolPermits(t *testing.T)
 	}
 	if _, err := c.LastRefreshOf(a); err != nil {
 		t.Fatalf("the address records %v after an accepted reply", err)
+	}
+
+	ceiling := strconv.FormatInt(types.MaxMoney, 10)
+	answer.Store(`[{"tx_hash":"` + txA + `","tx_pos":0,"value":` + ceiling + `,"height":3},{"tx_hash":"` + txA + `","tx_pos":1,"value":` + ceiling + `,"height":4}]`)
+	if err := c.RefreshAll(context.Background()); err != nil {
+		t.Fatalf("an address holding two outputs at the per-output ceiling was refused: %v", err)
+	}
+	if conf, _ := c.GetBalance(1, 100); conf != 2*types.MaxMoney {
+		t.Fatalf("balance after two outputs at the ceiling: %d, want %d", conf, 2*types.MaxMoney)
 	}
 }

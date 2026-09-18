@@ -978,8 +978,8 @@
       "file": "electrumx/client.go",
       "package": "./electrumx",
       "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-negative-value",
-      "find": "\t\tif u.Value < 0 {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: value %d is negative\", i, u.Value)\n\t\t}\n",
-      "replace": "",
+      "find": "\t\tif u.Value < 0 || u.Value > types.MaxMoney {",
+      "replace": "\t\tif u.Value > types.MaxMoney {",
       "why": "A negative value entered the cache and GetBalance summed it: the audit's proof."
     },
     {
@@ -987,18 +987,18 @@
       "file": "electrumx/client.go",
       "package": "./electrumx",
       "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-value-above-the-ceiling",
-      "find": "\t\tif total > types.MaxMoney-u.Value {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: value %d takes the reply above %d\", i, u.Value, types.MaxMoney)\n\t\t}\n",
-      "replace": "",
-      "why": "The same check bounds a single entry: the sum before it is at least zero, so one value above the ceiling fails it alone. There is no separate per-entry ceiling to remove, which is why this entry mutates the sum."
+      "find": "\t\tif u.Value < 0 || u.Value > types.MaxMoney {",
+      "replace": "\t\tif u.Value < 0 {",
+      "why": "No output holds more than the node's per-output ceiling (MAX_MONEY, consensus on one output). A value above it is not money, and it is the bound that keeps a handful of entries from overflowing an int64 sum."
     },
     {
-      "id": "electrumx-sum-above-the-ceiling-accepted",
+      "id": "electrumx-sum-overflowing-an-int64-accepted",
       "file": "electrumx/client.go",
       "package": "./electrumx",
-      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/values-summing-above-the-ceiling",
-      "find": "\t\tif total > types.MaxMoney-u.Value {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: value %d takes the reply above %d\", i, u.Value, types.MaxMoney)\n\t\t}\n",
-      "replace": "",
-      "why": "Values are summed against the node's ceiling as they are read: a reply whose entries cross it is refused, and the comparison cannot overflow because the sum before each entry is already bounded."
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/values-overflowing-an-int64",
+      "find": "\t\tif u.Value > math.MaxInt64-total {",
+      "replace": "\t\tif u.Value > math.MaxInt64 {",
+      "why": "Values are summed as they are read and a reply whose sum would overflow an int64 is refused before it does; the guard is written so a negative value does not trip it, which leaves the sign check as the one refusal of a negative value. Five outputs at the per-output ceiling overflow the sum; the supply is decades from one address holding that."
     },
     {
       "id": "electrumx-negative-height-accepted",

@@ -405,11 +405,12 @@ client.AllowPlaintext = true // the host is not loopback and the segment is priv
 
 Every `listunspent` reply is validated as a whole before it reaches the cache
 (`electrumx/client.go`, `parseUnspent`): a transaction id that is not 64 hexadecimal
-digits, a negative value, a value above the node's ceiling (`types.MaxMoney`, for one
-output and for the reply's sum), a negative height, an outpoint listed twice, or a result
-that is not a list is refused. The cache keeps its previous set and the address records
-the error, so `deposit.Monitor` skips and alarms it. The bound is per reply; the balance
-across addresses is the indexer's view, and credit reads your node.
+digits, a negative value, a value above the node's per-output ceiling (`types.MaxMoney`,
+consensus on one output and not a bound on an address), a negative height, an outpoint
+listed twice, a sum that would not fit in an int64, or a result that is not a list is
+refused. The cache keeps its previous set and the address records the error, so
+`deposit.Monitor` skips and alarms it. The balance across addresses is the indexer's view,
+and credit reads your node.
 
 ### soqucoind RPC
 

@@ -59,6 +59,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -564,12 +565,15 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 
 // parseUnspent is the one reader of a listunspent result. It refuses a null
 // result, a result that is not a list, and any list with an entry whose
-// tx_hash is not 64 hexadecimal digits, whose value is negative, whose height
-// is negative, or whose outpoint appears twice, and a list whose values sum
-// above the node's ceiling, which bounds each entry as well since the sum
-// before it is never negative. The caller refuses the whole reply on any of
-// these and keeps the previous set. Transaction ids are lower-cased, the form
-// the node prints and the cache compares.
+// tx_hash is not 64 hexadecimal digits, whose value is negative or above the
+// node's per-output ceiling, whose height is negative, or whose outpoint
+// appears twice, and a list whose values do not fit in an int64. The ceiling
+// is consensus on one output (MAX_MONEY, src/amount.h) and is not a bound on
+// an address: the head supply is above two ceilings, so an address's set may
+// sum past it and is refused only when the sum would overflow, a bound the
+// supply is decades from. The caller refuses the whole reply on any of these
+// and keeps the previous set. Transaction ids are lower-cased, the form the
+// node prints and the cache compares.
 //
 // The height is not compared with the connection's last tip: the server
 // processes a batch of blocks between two header notifications while it
@@ -598,17 +602,18 @@ func parseUnspent(raw json.RawMessage) ([]types.UTXO, error) {
 			return nil, fmt.Errorf("entry %d: tx_hash %q is not 64 hexadecimal digits", i, u.TxID)
 		}
 		u.TxID = strings.ToLower(u.TxID)
-		if u.Value < 0 {
-			return nil, fmt.Errorf("entry %d: value %d is negative", i, u.Value)
+		if u.Value < 0 || u.Value > types.MaxMoney {
+			return nil, fmt.Errorf("entry %d: value %d is outside 0 to %d", i, u.Value, types.MaxMoney)
 		}
 		if u.Height < 0 {
 			return nil, fmt.Errorf("entry %d: height %d is negative", i, u.Height)
 		}
-		// total is at least 0 and at most MaxMoney here, and u.Value is at
-		// least 0, so the subtraction cannot overflow; an entry above the
-		// ceiling fails this on its own, and so does a sum that crosses it.
-		if total > types.MaxMoney-u.Value {
-			return nil, fmt.Errorf("entry %d: value %d takes the reply above %d", i, u.Value, types.MaxMoney)
+		// total is at least 0 here, so the subtraction cannot overflow, and
+		// a sum that would is refused before it does. The supply is decades
+		// from this bound; the per-output ceiling above is what keeps a
+		// handful of hostile entries from reaching it.
+		if u.Value > math.MaxInt64-total {
+			return nil, fmt.Errorf("entry %d: the values do not fit in an int64", i)
 		}
 		total += u.Value
 		key := outpoint{u.TxID, u.Vout}
