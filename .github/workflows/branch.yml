@@ -1,0 +1,64 @@
+name: Branch
+
+# The branch must be current with main, the change must be one mechanism, and every
+# function the change touches must be named in the pull request body. The three checks
+# are scripts/check-branch.py and scripts/check-delta.py; their reasons are in their
+# docstrings.
+#
+# This runs against the pull request's own head, not the merge commit GitHub checks out
+# by default: the merge commit already contains main, so the staleness this catches would
+# be invisible from there.
+#
+# Two of the three checks read the body, and the body arrives in the event payload. A
+# payload is the pull request as it stood when the event fired, so a run started by a
+# push reads the body as it was at the push, and a re-run of that run replays the same
+# payload. `edited` is in the list so that a body edit starts a run that carries the
+# edited text, which is the text the pull request now publishes. The Register check has
+# `edited` in its list for the same reason.
+#
+# This is its own workflow rather than a job in test.yml because `edited` belongs to
+# this check alone. A body edit changes nothing the test, mutation and secret jobs
+# measure, and a job that an `if` skips on the edit event still publishes a check under
+# its name with a passing conclusion, so a test run that had failed on a head could be
+# followed by one that passed having run nothing.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, reopened, synchronize]
+
+# Least privilege: the check reads the repository and nothing else.
+permissions:
+  contents: read
+
+# A push and a body edit can start two runs on one head, and the earlier run can finish
+# second. Only the later text is the text the pull request carries, so the earlier run is
+# cancelled rather than left to stand as the verdict.
+concurrency:
+  group: branch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Full history: the currency check compares the branch against origin/main, which
+      # the checkout leaves in place, so the scripts fetch nothing. The token is not
+      # persisted: the step below runs scripts from the pull request's own tree, and they
+      # have no use for it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      # The body arrives as an environment variable and never as shell text: an author
+      # controls it, and interpolating it into `run:` would put that text in the runner's
+      # shell.
+      - name: Branch is current and one mechanism
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 scripts/check-branch-selftest.py
+          python3 scripts/check-delta-selftest.py
+          python3 scripts/check-branch.py

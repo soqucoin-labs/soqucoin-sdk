@@ -18,7 +18,8 @@ jobs:
       contents: read
     steps:
       # Full history: the static-analysis ratchet compares against origin/main.
-      # The branch check runs in its own job below, off the pull request head.
+      # The branch check runs in its own workflow, branch.yml, off the pull
+      # request head, because it also runs when the pull request body is edited.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -95,31 +96,6 @@ jobs:
         with:
           go-version-file: go.mod
           go-package: ./...
-
-  # The branch must be current with main and the change must be one mechanism.
-  # This runs against the pull request's own head, not the merge commit GitHub
-  # checks out by default: the merge commit already contains main, so the
-  # staleness this catches would be invisible from there.
-  branch:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-      # The body arrives as an environment variable and never as shell text:
-      # an author controls it, and interpolating it into `run:` would put that
-      # text in the runner's shell.
-      - name: Branch is current and one mechanism
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          python3 scripts/check-branch-selftest.py
-          python3 scripts/check-delta-selftest.py
-          python3 scripts/check-branch.py
 
   secrets:
     runs-on: ubuntu-latest
