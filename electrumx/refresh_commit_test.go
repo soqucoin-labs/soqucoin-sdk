@@ -2,6 +2,7 @@ package electrumx
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -151,5 +152,50 @@ func TestASubscribeReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	}
 	if st != "the live connection's status" {
 		t.Errorf("the status recorded is %q", st)
+	}
+}
+
+// A listunspent reply from a connection that has been replaced commits
+// nothing, as a subscribe reply from one commits nothing: the set was true
+// when the server wrote it, the record would date it now against a generation
+// that is gone, and the live connection's subscribe reply decides whether the
+// address changed while the client was away. The stale reply is recorded as a
+// lost connection so the pass ends and the next one runs on the live
+// connection.
+func TestAListunspentReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
+	a := craftAddr(t, 0x11)
+	c := NewClient("127.0.0.1:1", time.Hour, nil)
+	setHRP(t, c, types.Stagenet.HRP)
+	if err := c.TrackAddresses([]string{a}); err != nil {
+		t.Fatal(err)
+	}
+	c.liveGen.Store(2)
+	fresh := []types.UTXO{{TxID: txA, Vout: 0, Value: 100, Height: 10}}
+
+	n, committed, err := c.commitRefresh(a, 1, 0, 1, fresh)
+	if committed || n != 0 {
+		t.Fatalf("a reply from generation 1 committed %d outputs while generation 2 is live", n)
+	}
+	if !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("a stale reply reported %v, want an error wrapping ErrNotConnected so the pass ends", err)
+	}
+	if got := c.GetUTXOs(a); len(got) != 0 {
+		t.Fatalf("a reply from a replaced connection reached the cache: %+v", got)
+	}
+	at, rerr := c.LastRefreshOf(a)
+	if rerr == nil || !at.IsZero() {
+		t.Fatalf("after a stale reply the record reads at=%v err=%v, want the zero time and the error", at, rerr)
+	}
+
+	n, committed, err = c.commitRefresh(a, 2, 0, 2, fresh)
+	if err != nil || !committed || n != 1 {
+		t.Fatalf("the live connection's reply: n=%d committed=%v err=%v", n, committed, err)
+	}
+	if got := c.GetUTXOs(a); len(got) != 1 {
+		t.Fatalf("the live connection's reply did not reach the cache: %+v", got)
+	}
+	at, rerr = c.LastRefreshOf(a)
+	if rerr != nil || at.IsZero() {
+		t.Fatalf("after the live reply the record reads at=%v err=%v", at, rerr)
 	}
 }

@@ -58,7 +58,7 @@ options and the full walkthrough.
 | **Address generation** | Derive Dilithium keypairs and encode bech32m addresses |
 | **Transaction construction** | Build, serialize, and deserialize SOQ transactions |
 | **Dilithium signing** | Sign and verify with NIST FIPS 204 ML-DSA-44 |
-| **ElectrumX UTXO tracking** | Production-hardened TCP client with 4MB buffer, merge refresh, auto-reconnect |
+| **ElectrumX UTXO tracking** | Production-hardened TCP client with 4MB buffer, merge refresh, auto-reconnect; every `listunspent` reply validated as a whole; plaintext only to a loopback host unless allowed |
 | **Node RPC client** | JSON-RPC client for `soqucoind` with Defense 11 (gettxout pre-verify) |
 | **UTXO coin selection** | Largest-first, smallest-first (consolidation), asset-type-aware, dust filtering |
 | **Persistent spent set** | Never re-spend a UTXO: inputs reserved at build time, unconfirmed spends survive restarts |

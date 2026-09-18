@@ -127,6 +127,13 @@ const ShorsPerSOQ int64 = 100_000_000
 // Deprecated: use ShorsPerSOQ. The base unit is called the shor.
 const SatoshisPerSOQ = ShorsPerSOQ
 
+// MaxMoney is the node's ceiling on any single amount, in shors: 20 billion
+// SOQ (MAX_MONEY, src/amount.h:68). It bounds one output and one
+// transaction's total; it is not the supply cap. The transaction builder
+// refuses an amount above it, and the indexer client refuses a listunspent
+// reply that carries one.
+const MaxMoney int64 = 20_000_000_000 * ShorsPerSOQ
+
 // Fee rates in shors per virtual byte, from the node's policy:
 //
 //	RecommendedFeeRate is the miner's default block-inclusion floor

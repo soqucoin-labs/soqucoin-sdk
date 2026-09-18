@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/loopback"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
@@ -25,13 +26,15 @@ import (
 // it, and a server notification is dispatched the moment it arrives, not when
 // the next call happens to read it.
 
-// callDeadline bounds one request's write and one reply's wait when the
-// context does not end them first.
-const callDeadline = 30 * time.Second
+// defaultCallDeadline bounds one request's write and one reply's wait when
+// the context does not end them first. It is Client.callDeadline, which a test
+// shortens.
+const defaultCallDeadline = 30 * time.Second
 
-// errNoReply is wrapped by a call whose reply did not arrive within
-// callDeadline: the connection may be hung, and two in a row make the
-// refresher rebuild it. An application error from the server is not this.
+// errNoReply is wrapped by a call whose reply did not arrive within the call
+// deadline: the connection may be hung. The pass the call belongs to ends
+// there (endsPass), and two in a row make the refresher rebuild the
+// connection. An application error from the server is not this.
 var errNoReply = errors.New("electrumx: no reply within the call deadline")
 
 // pendingCall is one caller waiting for the reply to one id on one connection
@@ -70,11 +73,20 @@ func (c *Client) unlockConn() { <-c.connSem }
 // dial opens the transport. Keepalive is set on the TCP connection underneath
 // any TLS layer, so it survives the wrapping.
 //
+// Plaintext is refused before anything is dialled when the host is not
+// loopback and AllowPlaintext is not set: the server would see every tracked
+// address and the path could alter every set the selector and the reconciler
+// read. Connect and Reconnect both come through here, so a reconnect cannot
+// reach a host the first connection could not.
+//
 // The TLS handshake carries its own deadline. Without one a server that accepts
 // the TCP connection and then stalls would hang Connect indefinitely, which is
 // exactly how a reconnect loop wedges. Both the dial and the handshake end
 // early when ctx ends.
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
+	if c.TLSConfig == nil && !c.AllowPlaintext && !loopbackHostPort(c.host) {
+		return nil, fmt.Errorf("%w: host %q", ErrPlaintextRemote, c.host)
+	}
 	// F5: TCP keepalive at 30 s, so an idle connection survives NAT and
 	// firewall timeouts between pings.
 	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -350,7 +362,7 @@ func (c *Client) sendLocked(ctx context.Context, conn net.Conn, gen uint64, meth
 	c.pending[id] = p
 	c.pendMu.Unlock()
 
-	if err := conn.SetWriteDeadline(time.Now().Add(callDeadline)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(c.callDeadline)); err != nil {
 		// A socket that refuses a deadline is closed or broken underneath.
 		c.unregister(id)
 		c.dropLocked()
@@ -415,7 +427,7 @@ func (c *Client) recordTipIfLive(gen uint64, result json.RawMessage) {
 // holding the connection lock Stop needs: a shutdown must not wait for a
 // silent server's call deadline.
 func (c *Client) await(ctx context.Context, id int64, p pendingCall, method string) (json.RawMessage, error) {
-	timer := time.NewTimer(callDeadline)
+	timer := time.NewTimer(c.callDeadline)
 	defer timer.Stop()
 	deliver := func(in incoming) (json.RawMessage, error) {
 		if len(in.Error) > 0 && string(in.Error) != "null" {
@@ -653,4 +665,26 @@ func errIsConnection(err error) bool {
 // the connection may be hung, though the server may only be slow.
 func errIsNoReply(err error) bool {
 	return errors.Is(err, errNoReply)
+}
+
+// endsPass reports an error after which a pass makes no further call on the
+// connection: the connection is lost, or a reply did not arrive within the
+// call deadline and the connection is in doubt. Before the second case was
+// here, a server that held the socket open and stopped answering cost one
+// call deadline per tracked address before the pass returned and the policy
+// could rebuild the connection. An application error from the server ends
+// nothing: the connection answered.
+func endsPass(err error) bool {
+	return errIsConnection(err) || errIsNoReply(err)
+}
+
+// loopbackHostPort reports whether a host:port names this machine's loopback
+// interface, by the one rule rpc.Client applies to a node URL. A string that
+// is not host:port is read whole.
+func loopbackHostPort(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	return loopback.Host(host)
 }

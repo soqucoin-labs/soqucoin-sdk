@@ -73,8 +73,8 @@
       "file": "electrumx/client.go",
       "package": "./electrumx",
       "test": "TestARefreshForAnUntrackedAddressWritesNothing",
-      "find": "\tif !c.trackedSet[addr] {\n\t\t// TrackAddresses dropped the address while this listunspent was in\n\t\t// flight; committing now would put an untracked address's outputs\n\t\t// back into the cache the balance and the selector read.\n\t\treturn 0, false\n\t}",
-      "replace": "\tif false {\n\t\treturn 0, false\n\t}",
+      "find": "\tif !c.trackedSet[addr] {\n\t\t// TrackAddresses dropped the address while this listunspent was in\n\t\t// flight; committing now would put an untracked address's outputs\n\t\t// back into the cache the balance and the selector read.\n\t\treturn 0, false, nil\n\t}",
+      "replace": "\tif false {\n\t\treturn 0, false, nil\n\t}",
       "why": "A listunspent already in flight when TrackAddresses drops its address must not commit, or it undoes the pruning above and makes the output selectable again."
     },
     {
@@ -909,6 +909,150 @@
       "find": "\tn := cb.consecutiveFailures // the real count; a halt is not a failure tally",
       "replace": "\tn := cb.maxFailures // the real count; a halt is not a failure tally",
       "why": "A halt is not a failure tally. Reporting the threshold as the count on a breaker with no failures puts a number the breaker never recorded into the webhook and the callback, and an operator reads three node failures where there were none."
+    },
+    {
+      "id": "electrumx-timeout-continues-the-subscribe-pass",
+      "file": "electrumx/subscribe.go",
+      "package": "./electrumx",
+      "test": "TestAReplyTimeoutEndsThePassAndTwoInARowRebuildTheConnection",
+      "find": "\t\t\tif endsPass(err) || ctx.Err() != nil {",
+      "replace": "\t\t\tif errIsConnection(err) || ctx.Err() != nil {",
+      "why": "A reply that does not arrive within the call deadline ends the pass; the connection is in doubt. Continuing to the next address costs one deadline per address before the policy can rebuild the connection, and with 60,000 addresses the first rebuild is weeks away."
+    },
+    {
+      "id": "electrumx-timeout-continues-the-refresh",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAReplyTimeoutEndsTheRefreshWhereItIs",
+      "find": "\t\t\tif ctx.Err() != nil || endsPass(err) {",
+      "replace": "\t\t\tif ctx.Err() != nil || errIsConnection(err) {",
+      "why": "The same rule at the listunspent site: a timeout ends the refresh where it is, and the addresses not reached keep their change pending for the next pass."
+    },
+    {
+      "id": "electrumx-plaintext-to-a-remote-host-dialled",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestPlaintextToAHostThatIsNotLoopbackIsRefusedBeforeTheDial",
+      "find": "\tif c.TLSConfig == nil && !c.AllowPlaintext && !loopbackHostPort(c.host) {",
+      "replace": "\tif c.TLSConfig == nil && c.AllowPlaintext && !loopbackHostPort(c.host) {",
+      "why": "Plaintext to a host that is not loopback is refused before the dial unless the operator has set AllowPlaintext. Dialled, the server sees every tracked address and the path can alter every set the selector and the reconciler read."
+    },
+    {
+      "id": "electrumx-loopback-read-without-the-port-split",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestLoopbackSpellingsTakePlaintextAndOtherHostsDoNot",
+      "find": "\thost, _, err := net.SplitHostPort(hostport)\n\tif err != nil {\n\t\thost = hostport\n\t}\n\treturn loopback.Host(host)",
+      "replace": "\treturn loopback.Host(hostport)",
+      "why": "The host is host:port; the loopback rule reads the host alone. Read whole, 127.0.0.1:50001 is not a loopback literal and every localhost deployment is refused."
+    },
+    {
+      "id": "electrumx-null-listunspent-reads-as-empty",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/null",
+      "find": "\tif string(bytes.TrimSpace(raw)) == \"null\" {",
+      "replace": "\tif len(bytes.TrimSpace(raw)) == 0 {",
+      "why": "A null result unmarshals into a nil slice with no error, so without this a reply that is not a list commits an empty set and dates the address fresh."
+    },
+    {
+      "id": "electrumx-short-txid-accepted",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-short-txid",
+      "find": "\t\tif len(u.TxID) != 64 {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: tx_hash %q is not 64 hexadecimal digits\", i, u.TxID)\n\t\t}\n",
+      "replace": "",
+      "why": "A transaction id is 64 hexadecimal digits. Anything else in the cache is an outpoint no node call can answer for, and the selector and the reconciler read it as money."
+    },
+    {
+      "id": "electrumx-non-hex-txid-accepted",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-non-hex-txid",
+      "find": "\t\tif _, err := hex.DecodeString(u.TxID); err != nil {",
+      "replace": "\t\tif _, err := hex.DecodeString(u.TxID[:0]); err != nil {",
+      "why": "Length alone does not make a transaction id; the digits must decode. Decoding an empty prefix accepts any 64 characters."
+    },
+    {
+      "id": "electrumx-negative-value-accepted",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-negative-value",
+      "find": "\t\tif u.Value < 0 {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: value %d is negative\", i, u.Value)\n\t\t}\n",
+      "replace": "",
+      "why": "A negative value entered the cache and GetBalance summed it: the audit's proof."
+    },
+    {
+      "id": "electrumx-value-above-the-ceiling-accepted",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-value-above-the-ceiling",
+      "find": "\t\tif total > types.MaxMoney-u.Value {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: value %d takes the reply above %d\", i, u.Value, types.MaxMoney)\n\t\t}\n",
+      "replace": "",
+      "why": "The same check bounds a single entry: the sum before it is at least zero, so one value above the ceiling fails it alone. There is no separate per-entry ceiling to remove, which is why this entry mutates the sum."
+    },
+    {
+      "id": "electrumx-sum-above-the-ceiling-accepted",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/values-summing-above-the-ceiling",
+      "find": "\t\tif total > types.MaxMoney-u.Value {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: value %d takes the reply above %d\", i, u.Value, types.MaxMoney)\n\t\t}\n",
+      "replace": "",
+      "why": "Values are summed against the node's ceiling as they are read: a reply whose entries cross it is refused, and the comparison cannot overflow because the sum before each entry is already bounded."
+    },
+    {
+      "id": "electrumx-negative-height-accepted",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-negative-height",
+      "find": "\t\tif u.Height < 0 {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: height %d is negative\", i, u.Height)\n\t\t}\n",
+      "replace": "",
+      "why": "listunspent reports 0 for a mempool output and a block height otherwise; a negative height is not in the protocol and reads as confirmed to GetBalance's arithmetic."
+    },
+    {
+      "id": "electrumx-duplicate-outpoint-accepted",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedListunspentReplyIsRefusedAndTheCacheKept/a-duplicate-outpoint",
+      "find": "\t\tif seen[key] {\n\t\t\treturn nil, fmt.Errorf(\"entry %d: outpoint %s:%d appears twice\", i, u.TxID, u.Vout)\n\t\t}\n",
+      "replace": "",
+      "why": "One outpoint listed twice with two values is a server that does not know what it holds; the merge would keep whichever came last."
+    },
+    {
+      "id": "electrumx-application-error-paces-the-wakes",
+      "file": "electrumx/refreshpolicy.go",
+      "package": "./electrumx",
+      "test": "TestRefreshPolicyHoldsItsProperties",
+      "find": "\t\tp.consecutive = 0\n\t\treturn r",
+      "replace": "\t\tp.paced = true\n\t\tp.consecutive = 0\n\t\treturn r",
+      "why": "An application error says nothing about the connection and paces nothing. Paced, one address the server refuses on every pass holds every other address's notification for a backoff the refusal keeps at the 60 s ceiling for the life of the process. This is the policy as it shipped in v0.4.0; the kick liveness property catches it."
+    },
+    {
+      "id": "electrumx-application-error-holds-a-push",
+      "file": "electrumx/refreshpolicy.go",
+      "package": "./electrumx",
+      "test": "TestARefusedAddressDoesNotDelayAPushForAnotherAddress",
+      "find": "\t\tp.consecutive = 0\n\t\treturn r",
+      "replace": "\t\tp.paced = true\n\t\tp.consecutive = 0\n\t\treturn r",
+      "why": "The same mutation against a real refresher and a real server: a notification for a healthy address during a refused address's wait must be refreshed at once."
+    },
+    {
+      "id": "electrumx-start-twice-runs-two-refreshers",
+      "file": "electrumx/subscribe.go",
+      "package": "./electrumx",
+      "test": "TestStartTwiceRunsOneRefresher",
+      "find": "\tc.startOnce.Do(func() {\n\t\tstarted = true\n\t\tpingErr := make(chan error, 1)\n\t\tgo c.pingLoop(ctx, pingErr)\n\t\tgo c.run(ctx, pingErr)\n\t})",
+      "replace": "\tfunc() {\n\t\tstarted = true\n\t\tpingErr := make(chan error, 1)\n\t\tgo c.pingLoop(ctx, pingErr)\n\t\tgo c.run(ctx, pingErr)\n\t}()",
+      "why": "Start runs one refresher and one ping loop however often it is called. Two refreshers subscribe and refresh every address twice on every pass against the one cache."
+    },
+    {
+      "id": "electrumx-stale-listunspent-reply-committed",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAListunspentReplyFromAReplacedConnectionCommitsNothing",
+      "find": "\tif live := c.liveGen.Load(); gen != live {\n\t\terr := fmt.Errorf(\"%w: the connection was replaced before the listunspent reply for %s was committed\", ErrNotConnected, addr)\n\t\tc.recordRefreshLocked(addr, gen, seqBefore, ticket, err)\n\t\treturn 0, false, err\n\t}\n",
+      "replace": "",
+      "why": "A listunspent reply from a connection that has been replaced commits nothing, as a subscribe reply from one commits nothing: the record would date a dead generation's set as current now."
     }
   ]
 }

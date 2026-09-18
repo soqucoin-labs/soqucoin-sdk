@@ -9,6 +9,10 @@
 //   - PF-018b: Serialised writes, one reader, replies paired with calls by id
 //   - Defense 12: Merge-based UTXO refresh that preserves the AssetType stamp
 //   - Panic recovery: the refresher goroutine auto-restarts after crashes
+//   - Reply validation: a malformed listunspent reply is refused as a whole
+//     and the cache keeps its set (parseUnspent)
+//   - Plaintext only to a loopback host unless AllowPlaintext says the path
+//     is private (dial)
 //
 // Usage:
 //
@@ -47,13 +51,16 @@ package electrumx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,8 +114,10 @@ type Client struct {
 
 	addresses         []string
 	reconcileInterval time.Duration
+	callDeadline      time.Duration // defaultCallDeadline; a test shortens it
 	stopCh            chan struct{}
 	stopOnce          sync.Once
+	startOnce         sync.Once     // Start launches the refresher and the ping loop once
 	kickCh            chan struct{} // wakes the refresher; one slot
 	log               *slog.Logger
 
@@ -153,6 +162,17 @@ type Client struct {
 	// tls.Config verifies the server certificate against the system roots,
 	// which is what you want; see UseTLS.
 	TLSConfig *tls.Config
+
+	// AllowPlaintext permits a plaintext connection to a host that is not
+	// loopback. Until it is set, Connect returns ErrPlaintextRemote with
+	// nothing dialled for such a host while TLSConfig is nil. Loopback is the
+	// name "localhost" or an IP literal in 127.0.0.0/8 or ::1, read from the
+	// host as written; nothing is resolved, so a Docker service name or a LAN
+	// address is not loopback even when it reaches this machine. Setting it
+	// states that the path to the server is private: a tunnel that ends
+	// elsewhere, or a network segment nothing else can read. It does not
+	// change what TLSConfig does when set.
+	AllowPlaintext bool
 }
 
 // UseTLS enables TLS with certificate verification against the system roots.
@@ -223,6 +243,11 @@ var (
 	// set after the connection, so the first verification of a chain can fall
 	// on an ordinary call rather than on Connect.
 	ErrGenesisMismatch = errors.New("electrumx: server is indexing a different chain")
+	// ErrPlaintextRemote is returned by Connect, with nothing dialled, for a
+	// host that is not loopback while TLSConfig is nil and AllowPlaintext is
+	// not set. The server sees every tracked address, and a plaintext path
+	// lets whoever is on it alter every set this client reports.
+	ErrPlaintextRemote = errors.New("electrumx: host is not loopback and TLSConfig is nil; call UseTLS, set TLSConfig, or set AllowPlaintext for a path that is private")
 )
 
 // NewClient creates a new ElectrumX client.
@@ -250,6 +275,7 @@ func NewClient(host string, reconcileInterval time.Duration, logger *slog.Logger
 		pending:           make(map[int64]pendingCall),
 		host:              host,
 		reconcileInterval: reconcileInterval,
+		callDeadline:      defaultCallDeadline,
 		stopCh:            make(chan struct{}),
 		kickCh:            make(chan struct{}, 1),
 		connSem:           make(chan struct{}, 1),
@@ -388,10 +414,13 @@ func (c *Client) SetHRP(hrp string) error {
 // is recorded for LastRefresh, which callers must consult before treating an
 // empty UTXO set as "no deposits", and per address for LastRefreshOf.
 //
-// When ctx ends mid-pass, or the connection is lost, the pass stops there:
-// the addresses reached keep their new records, the rest keep their old ones,
-// and the error names one address, the one whose call was cut short or,
-// between calls, the first not attempted.
+// When ctx ends mid-pass, the connection is lost, or a reply does not arrive
+// within the call deadline, the pass stops there: the addresses reached keep
+// their new records, the rest keep their old ones, and the error names one
+// address, the one whose call was cut short or, between calls, the first not
+// attempted. A server that has stopped answering therefore costs one call
+// deadline, whatever the address count; an address the server refuses costs
+// nothing to the others.
 func (c *Client) RefreshAll(ctx context.Context) error {
 	c.mu.RLock()
 	addrs := append([]string(nil), c.addresses...)
@@ -419,8 +448,10 @@ func (c *Client) refresh(ctx context.Context, addrs []string, full bool) ([]stri
 			failed = append(failed, addr)
 			// A context that ended during this address's call is already
 			// named through its error; so is a lost connection, which every
-			// later call would report the same way. The pass stops here.
-			if ctx.Err() != nil || errIsConnection(err) {
+			// later call would report the same way, and so is a reply that
+			// never came, after which the connection is in doubt. The pass
+			// stops here.
+			if ctx.Err() != nil || endsPass(err) {
 				failed = append(failed, addrs[i+1:]...)
 				break
 			}
@@ -505,13 +536,20 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 		return fmt.Errorf("listunspent: %w", err)
 	}
 
-	var freshUTXOs []types.UTXO
-	if err := json.Unmarshal(result, &freshUTXOs); err != nil {
+	freshUTXOs, err := parseUnspent(result)
+	if err != nil {
+		// The whole reply is refused and the cache keeps its previous set:
+		// a server that sends one malformed entry is not a server whose
+		// other entries are trusted. The error is on the address's record,
+		// so deposit.Monitor skips and alarms it.
 		c.recordRefresh(addr, gen, seqBefore, ticket, fmt.Errorf("parse utxos: %w", err))
 		return fmt.Errorf("parse utxos: %w", err)
 	}
 
-	count, committed := c.commitRefresh(addr, gen, seqBefore, ticket, freshUTXOs)
+	count, committed, err := c.commitRefresh(addr, gen, seqBefore, ticket, freshUTXOs)
+	if err != nil {
+		return err
+	}
 	if committed && c.OnRefresh != nil {
 		// Outside the lock: a slow OnRefresh must not hold the reader, which
 		// takes mu to note a change, and with it every reply on the
@@ -522,12 +560,78 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 	return nil
 }
 
+// parseUnspent is the one reader of a listunspent result. It refuses a null
+// result, a result that is not a list, and any list with an entry whose
+// tx_hash is not 64 hexadecimal digits, whose value is negative, whose height
+// is negative, or whose outpoint appears twice, and a list whose values sum
+// above the node's ceiling, which bounds each entry as well since the sum
+// before it is never negative. The caller refuses the whole reply on any of
+// these and keeps the previous set. Transaction ids are lower-cased, the form
+// the node prints and the cache compares.
+//
+// The height is not compared with the connection's last tip: the server
+// processes a batch of blocks between two header notifications while it
+// catches up, and the tip here is zero until the first header, so an honest
+// reply could be refused.
+func parseUnspent(raw json.RawMessage) ([]types.UTXO, error) {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return nil, errors.New("result is null, not a list")
+	}
+	var fresh []types.UTXO
+	if err := json.Unmarshal(raw, &fresh); err != nil {
+		return nil, err
+	}
+	type outpoint struct {
+		txid string
+		vout uint32
+	}
+	seen := make(map[outpoint]bool, len(fresh))
+	var total int64
+	for i := range fresh {
+		u := &fresh[i]
+		if len(u.TxID) != 64 {
+			return nil, fmt.Errorf("entry %d: tx_hash %q is not 64 hexadecimal digits", i, u.TxID)
+		}
+		if _, err := hex.DecodeString(u.TxID); err != nil {
+			return nil, fmt.Errorf("entry %d: tx_hash %q is not 64 hexadecimal digits", i, u.TxID)
+		}
+		u.TxID = strings.ToLower(u.TxID)
+		if u.Value < 0 {
+			return nil, fmt.Errorf("entry %d: value %d is negative", i, u.Value)
+		}
+		if u.Height < 0 {
+			return nil, fmt.Errorf("entry %d: height %d is negative", i, u.Height)
+		}
+		// total is at least 0 and at most MaxMoney here, and u.Value is at
+		// least 0, so the subtraction cannot overflow; an entry above the
+		// ceiling fails this on its own, and so does a sum that crosses it.
+		if total > types.MaxMoney-u.Value {
+			return nil, fmt.Errorf("entry %d: value %d takes the reply above %d", i, u.Value, types.MaxMoney)
+		}
+		total += u.Value
+		key := outpoint{u.TxID, u.Vout}
+		if seen[key] {
+			return nil, fmt.Errorf("entry %d: outpoint %s:%d appears twice", i, u.TxID, u.Vout)
+		}
+		seen[key] = true
+	}
+	return fresh, nil
+}
+
 // commitRefresh merges one listunspent reply into the cache under mu and
 // reports the size of the merged set and whether it was committed. A merge
 // rather than a replacement, so the AssetType stamp survives the pass.
 // Outputs the reply no longer lists are dropped as spent, and outputs it
 // lists for the first time are added.
-func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool) {
+//
+// Nothing is committed from a connection that is no longer live, as
+// commitSubscribe commits nothing from one: the reply was true when the
+// server wrote it, the record would date it now against a generation that is
+// gone, and the live connection's own subscribe reply decides whether the
+// address changed while the client was away. That case is returned as an
+// error wrapping ErrNotConnected, recorded on the address, so the pass ends
+// and the next one runs on the live connection.
+func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool, error) {
 	type utxoKey struct {
 		TxID string
 		Vout uint32
@@ -579,16 +683,21 @@ func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, fresh
 		// TrackAddresses dropped the address while this listunspent was in
 		// flight; committing now would put an untracked address's outputs
 		// back into the cache the balance and the selector read.
-		return 0, false
+		return 0, false, nil
 	}
 	if ticket < c.refreshed[addr].commit {
 		// A refresh that started later has already committed; this reply is
 		// older than what the cache holds.
-		return 0, false
+		return 0, false, nil
+	}
+	if live := c.liveGen.Load(); gen != live {
+		err := fmt.Errorf("%w: the connection was replaced before the listunspent reply for %s was committed", ErrNotConnected, addr)
+		c.recordRefreshLocked(addr, gen, seqBefore, ticket, err)
+		return 0, false, err
 	}
 	c.utxos[addr] = merged
 	c.recordRefreshLocked(addr, gen, seqBefore, ticket, nil)
-	return len(merged), true
+	return len(merged), true, nil
 }
 
 func (c *Client) recordRefresh(addr string, gen, seqBefore, ticket uint64, err error) {

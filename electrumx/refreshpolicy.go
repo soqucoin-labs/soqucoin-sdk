@@ -88,23 +88,32 @@ type refreshResult struct {
 
 // refreshPolicy holds the whole of the refresher's scheduling state.
 //
-// The three properties it is built to hold, each of them a sentence the code
+// The four properties it is built to hold, each of them a sentence the code
 // around it already claimed:
 //
-//   - Pacing: a wake arriving during a backoff never rebuilds the connection.
-//     Only the retry timer's own pass may. This bounds the dial rate against a
-//     server that hangs up after every handshake.
+//   - Pacing: a wake arriving during a connection backoff never rebuilds the
+//     connection. Only the retry timer's own pass may. This bounds the dial
+//     rate against a server that hangs up after every handshake.
 //   - Reconnect trigger: with no lost connection and no two reply timeouts in
 //     a row, nothing rebuilds the connection (conn.go, errNoReply).
-//   - Reconcile liveness: a reconcile tick delivered during a backoff is made
-//     up by the next pass that runs. The reconcile is the only safety net
-//     against a notification the server never sent, so it may not be starved
-//     by an address the indexer permanently refuses.
+//   - Reconcile liveness: a reconcile tick delivered during a connection
+//     backoff is made up by the next pass that runs. The reconcile is the only
+//     safety net against a notification the server never sent.
+//   - Kick liveness: a wake that arrives with no connection backoff pending
+//     runs a pass. An application error, one address the server refuses,
+//     says nothing about the connection, so it paces nothing: the refused
+//     address is asked again on the backoff ladder, and a notification for
+//     another address is refreshed at once. Before this held, one refused
+//     address kept the policy at the 60 s ceiling for the life of the process
+//     and every other address's notification waited for the timer.
+//
+// A connection backoff is one that follows a lost connection or a reply
+// timeout; it is the only kind that paces. paced says one is pending.
 type refreshPolicy struct {
 	backoff     time.Duration
 	consecutive int  // reply timeouts in a row
-	retrying    bool // a backoff timer is pending
-	pendingFull bool // a reconcile tick arrived during the backoff
+	paced       bool // a connection backoff is pending: wakes wait for its timer
+	pendingFull bool // a reconcile tick arrived during the connection backoff
 }
 
 func newRefreshPolicy() *refreshPolicy {
@@ -123,26 +132,26 @@ func (p *refreshPolicy) onEvent(ev refreshEvent) refreshAction {
 	case evStart:
 		return refreshAction{runPass: true, full: true}
 	case evKick:
-		if p.retrying {
+		if p.paced {
 			return refreshAction{}
 		}
 		return refreshAction{runPass: true, full: p.takeFull()}
 	case evReconcile:
-		if p.retrying {
+		if p.paced {
 			// Deferred, not dropped: the pass after the backoff runs full.
 			// Dropping it starved the reconcile for the life of the process
-			// whenever one address failed on every pass.
+			// whenever the connection failed on every pass.
 			p.pendingFull = true
 			return refreshAction{}
 		}
 		return refreshAction{runPass: true, full: true}
 	case evPingErr:
-		if p.retrying {
+		if p.paced {
 			return refreshAction{}
 		}
 		return refreshAction{report: true}
 	case evRetry:
-		p.retrying = false
+		p.paced = false
 		return refreshAction{runPass: true, full: p.takeFull()}
 	}
 	return refreshAction{}
@@ -150,24 +159,28 @@ func (p *refreshPolicy) onEvent(ev refreshEvent) refreshAction {
 
 func (p *refreshPolicy) onResult(out refreshOutcome) refreshResult {
 	if out == outOK {
-		p.consecutive, p.backoff, p.retrying = 0, time.Second, false
+		p.consecutive, p.backoff, p.paced = 0, time.Second, false
 		return refreshResult{}
 	}
+	// Every failure sets a retry on the ladder; only a connection failure
+	// paces the wakes until it fires.
 	r := refreshResult{setRetry: true, backoff: p.backoff}
-	p.retrying = true
 	if p.backoff *= 2; p.backoff > maxReconnectBackoff {
 		p.backoff = maxReconnectBackoff
 	}
 	switch out {
 	case outConnErr:
+		p.paced = true
 	case outNoReply:
+		p.paced = true
 		p.consecutive++
 		if p.consecutive < 2 {
 			return r
 		}
 	default:
-		// A reply that arrived is not a timeout, so it breaks the run. Without
-		// this, a timeout, one refused address and another timeout rebuilt a
+		// The server answered, so the connection is not in doubt: nothing is
+		// paced, and the reply breaks the run of timeouts. Without the reset,
+		// a timeout, one refused address and another timeout rebuilt a
 		// healthy connection, which errNoReply's own comment forbids.
 		p.consecutive = 0
 		return r

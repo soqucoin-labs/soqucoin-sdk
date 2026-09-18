@@ -70,9 +70,9 @@ func main() {
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	// Connect to ElectrumX (plaintext is acceptable only on localhost or a
-	// private network; call client.UseTLS() otherwise). The network is
-	// inferred from the addresses you track.
+	// Connect to ElectrumX. Plaintext is accepted for a loopback host; any
+	// other host needs client.UseTLS(), or client.AllowPlaintext = true on a
+	// private network. The network is inferred from the addresses you track.
 	client := electrumx.NewClient("localhost:50001", 15*time.Second, logger)
 	myAddr := "ssq1p..."
 	if err := client.TrackAddresses([]string{myAddr}); err != nil {

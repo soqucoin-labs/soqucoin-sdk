@@ -73,8 +73,8 @@ const (
 	DustThreshold int64 = UTXOCostPerByte * 43 // 279,500
 
 	// MaxMoney is the node's per-transaction ceiling on any amount
-	// (src/amount.h): 20e9 SOQ.
-	MaxMoney int64 = 20_000_000_000 * types.ShorsPerSOQ
+	// (src/amount.h): 20e9 SOQ. Defined once, in types.
+	MaxMoney = types.MaxMoney
 
 	// FeeMarginVBytes is added to the measured vsize before the fee is
 	// computed, so a rounding difference against the node's own vsize can

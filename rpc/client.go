@@ -25,13 +25,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/loopback"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
@@ -116,17 +116,13 @@ func NewClient(url, user, password string, logger *slog.Logger) *Client {
 // not loopback even if it resolves to this machine; the guard reads the URL
 // and resolves nothing. A URL that does not parse, or names no host, returns
 // "" and is left to fail in the request itself with that error.
-func hostOf(rawURL string) (host string, loopback bool) {
+func hostOf(rawURL string) (host string, isLoopback bool) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", false
 	}
 	host = u.Hostname()
-	if strings.EqualFold(host, "localhost") {
-		return host, true
-	}
-	ip := net.ParseIP(host)
-	return host, ip != nil && ip.IsLoopback()
+	return host, loopback.Host(host)
 }
 
 // schemeOf returns the scheme of rawURL, or "" for a URL that does not parse.
