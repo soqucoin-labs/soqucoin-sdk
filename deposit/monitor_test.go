@@ -375,8 +375,8 @@ func TestPolicyAppliedFromNodeDepth(t *testing.T) {
 // coinbase 228 blocks before consensus lets it be spent. The refusal is a
 // permanent deployment error with its own alert, not a syncing pause, whether
 // the node itself reports the mismatch (an rpc.Client with Network set) or the
-// Monitor asks (an rpc.Client whose Network was left unset). An unset Monitor
-// Network performs no chain check, as documented.
+// Monitor asks (an rpc.Client whose Network was left unset). A Monitor with no
+// Network asks for mainnet; see TestUnsetNetworkIsMainnetForTheChainCheckToo.
 func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 	deposit := func(m *Monitor, cache *fakeCache, node *fakeNode, a string) {
 		cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 8_800_000_000, Height: 950, Address: a}}
@@ -407,15 +407,6 @@ func TestMonitorRefusesANodeOnAnotherChain(t *testing.T) {
 	node.syncErr = fmt.Errorf("%w: node reports %q, configured for %q", rpc.ErrWrongChain, "main", "regtest")
 	deposit(m, cache, node, a)
 	check("node reports", m, led, al)
-
-	// Unset Monitor Network: mainnet rules, no chain check; the 60-deep
-	// coinbase waits without an alarm.
-	m, cache, node, led, al, a = setup(t)
-	node.chain = types.Regtest.ChainID
-	deposit(m, cache, node, a)
-	if got, err := m.Scan(context.Background()); err != nil || len(got) != 0 || len(al.kinds) != 0 {
-		t.Fatalf("unset network: got %+v, err %v, alerts %v; want no credit, no error, no alert", got, err, al.kinds)
-	}
 }
 
 // With per-address freshness, one address the indexer has not refreshed is

@@ -423,7 +423,9 @@ with no change pending. The ping runs on its own goroutine beside any pass in pr
 (`electrumx/subscribe.go`, `pingLoop`), so a long reconcile does not age the addresses it has not
 reached. A quiet address reads fresh for as long as the server answers pings; when the connection is
 lost, no ping is answered and every address ages out within `MaxCacheAge`. `MaxCacheAge` on
-`deposit.Monitor` (5 minutes by default) must exceed `PingInterval` with room for one missed ping.
+`deposit.Monitor` (5 minutes by default) must hold two `PingInterval`s, one of them missed: `Scan`
+reads the interval in force (`electrumx.Client.FreshnessInterval`) and refuses a shorter window
+with `deposit.ErrCacheAgeBelowPings` before it asks the node or the indexer anything.
 
 `deposit.Monitor` judges freshness per address (`LastRefreshOf`, `deposit/monitor.go`,
 `AddressFreshness`): an address the indexer has not answered for within `MaxCacheAge` is skipped and
@@ -644,7 +646,17 @@ cannot afford impossible by construction:
   rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
   node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
   refuse to send it again (`withdraw.ErrHeld`); stop withdrawals and investigate before anything
-  is rebuilt.
+  is rebuilt. The split example's broadcaster does this: while its store holds a held intent it
+  sends nothing, and a hold that arises inside a pass ends the pass.
+- **A destination on another network is refused where it enters.** The engine is bound to a
+  network (`withdraw.Engine.Network`, mainnet when unset, as for `deposit.Monitor`): `Submit`
+  refuses a destination that is not a witness version 1 address on its prefix with
+  `withdraw.ErrInvalidIntent` and records nothing, and `Build` applies the same check to the
+  stored record before anything is selected and fails an intent that does not pass. The prefix
+  is not part of the script, so nothing downstream would refuse it: `address.ScriptFor` builds
+  the script for any supported prefix and the node accepts the transaction, so a stagenet
+  destination would be paid on mainnet to whoever holds that program there. Regtest shares
+  mainnet's prefix; the address alone cannot tell them apart.
 - **A rejection after a lost reply holds the intent; it does not fail it.** Before every send the
   record is saved with `MaybeRelayed` set and `SentAt`, and nothing is sent when that save fails;
   the mark is taken back only on an answer that shows the node did not take the bytes on that
@@ -782,6 +794,7 @@ func main() {
 	engine := &withdraw.Engine{
 		Store:                 store,
 		Spent:                 spent,
+		Network:               types.Mainnet, // Submit and Build refuse a destination that is not an address on it
 		Broadcaster:           node, // rpc.Broadcast resolves lost replies against the node
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
 		Chain:                 withdraw.RPCChain{Client: node}, // Abandon's node checks
@@ -850,12 +863,10 @@ func main() {
 
 	// A withdrawal request. The id is your idempotency key: the same id never
 	// produces a second transaction, and a different amount under the same id
-	// is refused.
+	// is refused. A destination that is not a mainnet address is refused by
+	// Submit (withdraw.ErrInvalidIntent, per-request; the breaker ignores it)
+	// and nothing is recorded for it.
 	requestID, toAddress, amount := "wd-000123", "sq1p...", 25*types.ShorsPerSOQ
-	if err := address.Validate(types.Mainnet.HRP, toAddress); err != nil {
-		log.Printf("refuse %s: %v", requestID, err) // per-request; do not feed the breaker
-		return
-	}
 	if err := cb.Allow(); err != nil {
 		log.Printf("withdrawals halted: %v", err)
 		return
@@ -983,7 +994,7 @@ re-broadcasts, and re-broadcasting is the broadcaster's job.
 # Three terminals, one directory. Only -dir is shared between hosts.
 go run ./examples/exchange_split/watcher      -dir state -network stagenet -hot ssq1p... -electrumx 127.0.0.1:50001
 go run ./examples/exchange_split/signer       -dir state -network stagenet -state signer-state
-go run ./examples/exchange_split/broadcaster  -dir state -network stagenet -state broadcaster-state -confirmations 6
+go run ./examples/exchange_split/broadcaster  -dir state -network stagenet -state broadcaster-state
 ```
 
 ---
@@ -996,7 +1007,7 @@ than to a rule of thumb carried over from another chain:
 | Parameter | Value | Meaning |
 |-----------|:-----:|---------|
 | `nMaxReorgDepth` | **288 blocks** (~4.8 h) | The chain's own finality horizon, exposed as `types.MaxReorgDepth`. Nodes reject headers building on a fork deeper than this, once they have finished initial download |
-| `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus. Exposed per network as `types.Network.CoinbaseMaturity` (mainnet 288, stagenet 288, regtest 60); `rpc.Client` and `deposit.Monitor` apply it from their `Network` field, mainnet when unset. With `Network` set, `Monitor.Scan` refuses a node that reports another chain; if you wrap `*rpc.Client` behind your own `deposit.Node`, forward `RequireChain` so that check still reaches the node |
+| `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus. Exposed per network as `types.Network.CoinbaseMaturity` (mainnet 288, stagenet 288, regtest 60); `rpc.Client` and `deposit.Monitor` apply it from their `Network` field, mainnet when unset. `Monitor.Scan` asks the node for that chain on every pass and refuses one that reports another, mainnet included when `Network` is unset; `RequireChain` is part of `deposit.Node`, so a wrapper of your own around `*rpc.Client` forwards it or does not compile |
 
 Recommended thresholds:
 

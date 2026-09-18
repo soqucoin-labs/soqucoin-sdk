@@ -135,9 +135,10 @@ func run(ctx context.Context, cfg config) error {
 	// network, which this process does not have.
 	var snap split.Snapshot
 	engine := &withdraw.Engine{
-		Store:  store,
-		Spent:  spent,
-		Logger: logger,
+		Store:   store,
+		Spent:   spent,
+		Network: cfg.network, // Build refuses a destination that is not an address on it
+		Logger:  logger,
 		Select: func(_ context.Context, amount, feeRate int64) ([]types.UTXO, error) {
 			return selectForFee(selector, snap, amount, feeRate, cfg.minConf)
 		},
@@ -191,7 +192,7 @@ func run(ctx context.Context, cfg config) error {
 			} else if !keystore.HasKey(snap.HotAddress) {
 				logger.Error("snapshot refused: the keystore holds no key for the hot address", "hot", snap.HotAddress)
 			} else {
-				build(ctx, store, engine, cfg.network.HRP)
+				build(ctx, store, engine)
 			}
 		}
 		wait(ctx, cfg.interval)
@@ -370,24 +371,19 @@ func vsizeFor(n int) int64 { return 1100 + 976*int64(n-1) }
 // the pass: a selector error that the engine treats as transient leaves the
 // intent Created for the next pass, and a permanent one fails it.
 //
-// The destination is checked against the network here as well as in the
-// watcher, because the two run on different hosts and this is the one that
-// signs. A prefix is not part of the script, so an address carried over from
-// another network is not refused by anything downstream: the node would accept
-// the transaction and the coins would go to whoever holds that program on this
-// chain. The intent is left Created and reported rather than failed, since a
-// destination this wrong is a question for a person.
-func build(ctx context.Context, store withdraw.Store, engine *withdraw.Engine, hrp string) {
+// The engine, bound to this process's network, refuses a destination that is
+// not an address on it before anything is selected and fails the intent. The
+// check runs here as well as in the watcher because the two run on different
+// hosts and this is the one that signs: a prefix is not part of the script,
+// so an address carried over from another network is refused by nothing
+// downstream, and the coins would go to whoever holds that program here.
+func build(ctx context.Context, store withdraw.Store, engine *withdraw.Engine) {
 	created, err := store.List(ctx, withdraw.StateCreated)
 	if err != nil {
 		logger.Error("build: the store could not be read", "err", err)
 		return
 	}
 	for _, in := range created {
-		if err := address.Validate(hrp, in.Address); err != nil {
-			logger.Error("not built: the destination is not an address on this network", "id", in.ID, "address", in.Address, "err", err)
-			continue
-		}
 		if err := engine.Build(ctx, in); err != nil {
 			logger.Warn("not built", "id", in.ID, "state", in.State, "err", err)
 			continue

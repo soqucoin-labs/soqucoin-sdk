@@ -1143,6 +1143,78 @@
       "find": "\tif len(digest) != sha256.Size {",
       "replace": "\tif len(digest) > 64 {",
       "why": "The node signs and verifies a 32-byte SHA-256 sighash. A digest of another width is a signature over the wrong thing, learned at the node; Sign and Verify share the one check."
+    },
+    {
+      "id": "deposit-node-error-in-credit-loop-alarmed-as-mismatch",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestNodeErrorInsideTheCreditLoopEndsThePassWithTheError",
+      "find": "\tif err != nil {\n\t\treturn Deposit{}, false, err\n\t}\n\tswitch {",
+      "replace": "\tif err != nil {\n\t\tm.alert(AlertIndexerMismatch, \"%v\", err)\n\t\treturn Deposit{}, false, nil\n\t}\n\tswitch {",
+      "why": "A node that did not answer has not disagreed with the indexer. Alarming the transport error as indexer_mismatch and ending the pass clean routes a node outage to the runbook for a lying indexer while Scan reports nothing wrong; the error is returned instead, as at every other gettxout."
+    },
+    {
+      "id": "deposit-node-error-on-depth-lookup-skipped",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestNodeErrorOnTheDepthLookupEndsThePassAndAddsNothingToTheFinalSet",
+      "find": "\t\t\t\t\t\t// pass ends here as it does at every gettxout.\n\t\t\t\t\t\treturn credited, err",
+      "replace": "\t\t\t\t\t\t// pass ends here as it does at every gettxout.\n\t\t\t\t\t\tcontinue",
+      "why": "One rule at the three sites that ask the node for an output: a gettxout error that is not the context's ends the pass and is returned. Skipping it here asks the same failing node for the next output and reports the pass clean."
+    },
+    {
+      "id": "deposit-chain-check-skipped-when-network-unset",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestUnsetNetworkIsMainnetForTheChainCheckToo",
+      "find": "m.Node.RequireChain(ctx, m.network().ChainID)",
+      "replace": "m.Node.RequireChain(ctx, m.Network.ChainID)",
+      "why": "A Monitor with no Network applies mainnet's maturity, so it must ask the node for mainnet; asking for the empty chain passes any node, and a regtest node is then held to 288 where consensus says 60 with nothing said."
+    },
+    {
+      "id": "deposit-cache-age-holds-one-ping",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestMaxCacheAgeMustHoldTwoPingsOfACacheThatReportsThem",
+      "find": "m.maxCacheAge() < 2*every",
+      "replace": "m.maxCacheAge() < every",
+      "why": "The ping is what advances a quiet address's freshness, so the window has to survive one missed ping: a window of one interval reads every quiet address as stale on a scan just before the ping and alarms on each pass."
+    },
+    {
+      "id": "withdraw-submit-takes-a-destination-on-any-network",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitRefusesADestinationOnAnotherNetwork",
+      "find": "\tif err := e.checkDestination(id, address); err != nil {",
+      "replace": "\tif err := e.checkDestination(id, address); errors.Is(err, ErrConflict) {",
+      "why": "The prefix is not part of the script, so a stagenet destination accepted here is paid on mainnet to whoever holds that program there. Submit is where the destination enters and where it is refused with nothing recorded."
+    },
+    {
+      "id": "withdraw-build-signs-a-destination-on-any-network",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBuildFailsAStoredIntentWhoseDestinationIsOnAnotherNetwork",
+      "find": "\tif err := e.checkDestination(in.ID, in.Address); err != nil {",
+      "replace": "\tif err := e.checkDestination(in.ID, in.Address); errors.Is(err, ErrConflict) {",
+      "why": "Build is the transition that signs, and the stored record may have been created by a release that did not check or by an engine bound to another network; the check at Submit does not cover it."
+    },
+    {
+      "id": "broadcaster-sends-while-an-intent-is-held",
+      "file": "examples/exchange_split/broadcaster/main.go",
+      "package": "./examples/exchange_split/broadcaster",
+      "test": "TestNothingIsSentWhileAnIntentIsHeld",
+      "find": "if n := heldCount(built); n > 0 {",
+      "replace": "if n := heldCount(built); n < 0 {",
+      "why": "The guide says stop withdrawals and investigate while an intent is held; the reference broadcaster that sends past one teaches an exchange the opposite."
+    },
+    {
+      "id": "broadcaster-continues-past-a-hold-inside-the-pass",
+      "file": "examples/exchange_split/broadcaster/main.go",
+      "package": "./examples/exchange_split/broadcaster",
+      "test": "TestATxIDMismatchEndsThePassAndTheNextOneSendsNothing",
+      "find": "if errors.Is(err, withdraw.ErrHeld) || errors.Is(err, rpc.ErrTxIDMismatch) {",
+      "replace": "if errors.Is(err, withdraw.ErrHeld) && errors.Is(err, rpc.ErrTxIDMismatch) {",
+      "why": "A hold that arises inside a pass must end the pass, or the intent listed after it is sent before the store check of the next pass can refuse it."
     }
   ]
 }

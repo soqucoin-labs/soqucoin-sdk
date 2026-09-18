@@ -98,7 +98,10 @@ func (f *fixture) monitor(t *testing.T, led *memLedger, required int64) *deposit
 func (f *fixture) monitorOver(t *testing.T, cache deposit.Cache, led *memLedger, required int64, addrs ...string) *deposit.Monitor {
 	return &deposit.Monitor{
 		Network: types.Regtest, // coinbase maturity 60; every harness deposit is a coinbase
-		Cache:   cache, Node: f.n.rpc, Ledger: led,
+		// The push scenarios' client pings once an hour so that a ping cannot
+		// land inside a call count; the window has to hold two of them.
+		MaxCacheAge: 3 * time.Hour,
+		Cache:       cache, Node: f.n.rpc, Ledger: led,
 		Addresses: func(context.Context) []string { return addrs },
 		Required:  func(int64) int64 { return required },
 		OnAlert: func(k deposit.AlertKind, m string) {
@@ -116,7 +119,7 @@ func (f *fixture) engine(t *testing.T, store withdraw.Store, spent *utxo.SpentSe
 	}
 	sel := utxo.NewCoinSelector(spent)
 	return &withdraw.Engine{
-		Store: store, Spent: spent, Broadcaster: bc,
+		Store: store, Spent: spent, Broadcaster: bc, Network: types.Regtest,
 		Confirmer:             withdraw.RPCConfirmer{Client: f.n.rpc},
 		RequiredConfirmations: 3, ReservationTTL: time.Minute,
 		Select: func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {

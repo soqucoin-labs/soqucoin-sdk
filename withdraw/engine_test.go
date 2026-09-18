@@ -19,7 +19,9 @@ const (
 	txA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	txB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	txC = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-	dst = "ssq1pdestination"
+	// dst is a witness version 1 address on stagenet, the network newEngine
+	// binds every engine to; a fabricated string is refused at Submit.
+	dst = "ssq1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqnme6cj"
 )
 
 // fakeNet records every broadcast and answers according to mode.
@@ -63,7 +65,7 @@ func newEngine(t *testing.T, store Store, spent *utxo.SpentSet, net *fakeNet, co
 	t.Helper()
 	cs := &utxo.CoinSelector{SpentSet: spent}
 	e := &Engine{
-		Store: store, Spent: spent, Broadcaster: net,
+		Store: store, Spent: spent, Broadcaster: net, Network: types.Stagenet,
 		RequiredConfirmations: 3, ReservationTTL: time.Hour,
 		Select: func(_ context.Context, amount, feeRate int64) ([]types.UTXO, error) {
 			sel, _, err := cs.SelectUTXOs(coins, amount+1000, 1, 1000, nil)

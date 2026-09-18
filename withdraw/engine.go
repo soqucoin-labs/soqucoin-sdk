@@ -76,6 +76,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
@@ -242,6 +243,18 @@ type Engine struct {
 	Confirmer   Confirmer // optional
 	Chain       Chain     // optional; Abandon refuses without it
 
+	// Network is the chain every destination must be an address on. The zero
+	// value is types.Mainnet, as for deposit.Monitor. Submit refuses a
+	// destination that is not a witness version 1 address on its prefix and
+	// records nothing (ErrInvalidIntent); Build applies the same check to the
+	// stored record before anything is selected and fails an intent that does
+	// not pass, since the record then came from a Submit that did not check.
+	// The prefix is not part of the script, so nothing downstream would refuse
+	// a destination from another network: address.ScriptFor builds the script
+	// for any supported prefix and the node accepts the transaction. Regtest
+	// shares mainnet's prefix and its addresses pass a mainnet engine.
+	Network types.Network
+
 	// RequiredConfirmations before an intent is Confirmed. The exchange's own
 	// policy; docs/EXCHANGE_INTEGRATION.md discusses the horizon.
 	RequiredConfirmations int64
@@ -268,8 +281,10 @@ type Engine struct {
 }
 
 var (
-	// ErrInvalidIntent is returned for a submission with an empty id, an empty
-	// address or a non-positive amount.
+	// ErrInvalidIntent is returned for a submission with an empty id, a
+	// destination that is not an address on Network, or a non-positive amount
+	// or fee rate; by Build for a stored intent whose destination is not; and
+	// by every transition for an id the store does not hold.
 	ErrInvalidIntent = errors.New("withdraw: invalid intent")
 	// ErrWrongState is returned when an operation is applied to an intent in a
 	// state that does not allow it.
@@ -376,6 +391,24 @@ func (e *Engine) abandonAfter() time.Duration {
 	return DefaultAbandonAfter
 }
 
+// network returns the chain in force: Network when set, else mainnet.
+func (e *Engine) network() types.Network {
+	if e.Network.ChainID == "" {
+		return types.Mainnet
+	}
+	return e.Network
+}
+
+// checkDestination refuses a destination that is not a witness version 1
+// address on the engine's network, with ErrInvalidIntent. It is the one
+// reading of a destination the engine makes, at Submit and again at Build.
+func (e *Engine) checkDestination(id, addr string) error {
+	if err := address.Validate(e.network().HRP, addr); err != nil {
+		return fmt.Errorf("%w: %s: destination %s is not an address on %s: %v", ErrInvalidIntent, id, addr, e.network().Name, err)
+	}
+	return nil
+}
+
 // heldErr is ErrHeld naming why in is held, or nil for an intent that is not.
 func heldErr(in *Intent) error {
 	switch {
@@ -432,7 +465,8 @@ func (e *Engine) reread(ctx context.Context, in *Intent, want ...State) (*Intent
 
 // Submit registers a withdrawal. Calling it again with the same id returns
 // the existing intent (created=false); with the same id and different
-// parameters it returns ErrConflict.
+// parameters it returns ErrConflict. A destination that is not an address on
+// Network is ErrInvalidIntent, and nothing is recorded for it.
 //
 // The registration is one Store.Create, which the store refuses for an id it
 // holds, so a second Submit of one id can never write over the first one's
@@ -442,6 +476,9 @@ func (e *Engine) reread(ctx context.Context, in *Intent, want ...State) (*Intent
 func (e *Engine) Submit(ctx context.Context, id, address string, amount, feeRate int64) (intent *Intent, created bool, err error) {
 	if id == "" || address == "" || amount <= 0 || feeRate <= 0 {
 		return nil, false, fmt.Errorf("%w: id=%q address=%q amount=%d feeRate=%d", ErrInvalidIntent, id, address, amount, feeRate)
+	}
+	if err := e.checkDestination(id, address); err != nil {
+		return nil, false, err
 	}
 	now := e.now()
 	in := &Intent{ID: id, Address: address, Amount: amount, FeeRate: feeRate, State: StateCreated, CreatedAt: now, UpdatedAt: now}
@@ -480,7 +517,8 @@ func (e *Engine) Submit(ctx context.Context, id, address string, amount, feeRate
 // stopped the attempt, and the intent is not judged on an attempt that was
 // stopped. Any other selector error (insufficient funds, a wrong chain) fails
 // the intent. A signer error is the same, except that the reservation taken
-// before signing is released.
+// before signing is released. A stored destination that is not an address on
+// Network fails the intent before anything is selected.
 func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -498,6 +536,12 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	// or a last error another worker recorded is carried rather than lost.
 	*in = *stored
 
+	// The stored destination is checked here as well as at Submit: this is
+	// the transition that signs, and the record may have been created by an
+	// engine bound to another network, or by a release that did not check.
+	if err := e.checkDestination(in.ID, in.Address); err != nil {
+		return e.fail(ctx, in, err, false, StateCreated)
+	}
 	inputs, err := e.Select(ctx, in.Amount, in.FeeRate)
 	if err != nil {
 		err = fmt.Errorf("select inputs: %w", err)
