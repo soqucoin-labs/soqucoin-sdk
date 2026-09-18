@@ -50,9 +50,10 @@ type Cache interface {
 // addresses the indexer has not answered for within MaxCacheAge are skipped
 // and alarmed, the others are credited, and Scan pauses only when every
 // address is stale. An address the indexer has never answered for (the zero
-// time) is awaiting its first reply for one MaxCacheAge from the pass that
-// first found it so, skipped and not alarmed; after that it is stale like any
-// other. Without the interface one failed address in a pass makes the whole
+// time and no error) is awaiting its first reply for one MaxCacheAge from the
+// pass that first found it so, skipped and not alarmed; after that it is
+// stale like any other. A zero time with an error is a refresh that failed,
+// which is stale at once. Without the interface one failed address in a pass makes the whole
 // pass stale and nothing is credited until a pass succeeds for all of them.
 type AddressFreshness interface {
 	LastRefreshOf(addr string) (time.Time, error)
@@ -302,9 +303,9 @@ func (m *Monitor) regressed(out *rpc.TxOut, value int64) bool {
 	return out != nil && out.Confirmations < m.Required(value)
 }
 
-// awaiting is true while an address the indexer has never answered for is
-// inside one MaxCacheAge of the pass that first found it so. Called under
-// scanMu.
+// awaiting is true while an address the indexer has never answered for, with
+// no reply and no error, is inside one MaxCacheAge of the pass that first
+// found it so. Called under scanMu.
 func (m *Monitor) awaiting(addr string) bool {
 	if m.firstListed == nil {
 		m.firstListed = map[string]time.Time{}
@@ -411,7 +412,7 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	for _, addr := range addrs {
 		if perAddress != nil {
 			at, err := perAddress.LastRefreshOf(addr)
-			if at.IsZero() && m.awaiting(addr) {
+			if at.IsZero() && err == nil && m.awaiting(addr) {
 				continue // the indexer has not answered for it yet; its deposits wait, quietly
 			}
 			if at.IsZero() || m.clock().Sub(at) > m.maxCacheAge() {

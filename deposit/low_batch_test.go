@@ -276,6 +276,23 @@ func TestAddressesAwaitingTheFirstReplyAreQuietForOneWindow(t *testing.T) {
 	}
 }
 
+// An address whose refresh failed has been answered, with an error, and is
+// stale at once: awaiting covers only an address the indexer has not replied
+// to at all.
+func TestAnAddressWhoseRefreshFailedIsStaleAtOnce(t *testing.T) {
+	m, cache, node, _, al, a := setup(t)
+	per := &fakeCachePerAddr{fakeCache: *cache, ats: map[string]time.Time{}, errs: map[string]error{a: errors.New("indexer: subscribe refused")}}
+	m.Cache = per
+	per.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 100, Height: 900, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 100, 101, false)
+	if _, err := m.Scan(context.Background()); !errors.Is(err, ErrPaused) {
+		t.Fatalf("a failed refresh on the only address: %v, want ErrPaused", err)
+	}
+	if al.count(AlertCacheStale) != 1 {
+		t.Fatalf("alerts %v", al.kinds)
+	}
+}
+
 // The asset gate is the node's script. An indexer that reports a USDSOQ
 // output as SOQ under a v1 address is refused because the node's script is a
 // v7 holding script, whatever the indexer's asset flag says.
