@@ -157,8 +157,10 @@ func TestFinalSetPrunesWhatTheCacheNoLongerLists(t *testing.T) {
 		t.Fatalf("setup: final=%v set=%d", led.final[key("aa", 0)], m.finalCount())
 	}
 
-	// The address is stale: nothing learned, the entry stays.
-	per := &fakeCachePerAddr{fakeCache: *cache, ats: map[string]time.Time{}, errs: map[string]error{}}
+	// The address is stale (its last refresh is older than the window; a
+	// zero time would be awaiting the first reply, which is quiet): nothing
+	// learned, the entry stays.
+	per := &fakeCachePerAddr{fakeCache: *cache, ats: map[string]time.Time{a: m.now().Add(-m.maxCacheAge() - time.Second)}, errs: map[string]error{}}
 	m.Cache = per
 	if _, err := m.Scan(context.Background()); err == nil {
 		t.Fatal("a scan with every address stale should pause")

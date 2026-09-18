@@ -196,9 +196,13 @@ the call that saved it returns without error. An error from `Save`, `MarkBroadca
 `Create` or `Update` means the write is not known to be durable. Whether the record stayed
 depends on the error: `ErrWrittenNotDurable` is reported after the file is in place
 and the record stays, `withdraw.ErrStale` writes nothing, and `withdraw.FileStore`
-puts its previous record back on any other failure. For the spent set, and for
-`ErrWrittenNotDurable`, keep the in-memory state (the engine does for a spent set
-it could not write); in every case, alert.
+puts its previous record back on any other failure. The spent set does two things:
+`Reserve` puts the set back as it was on any failure other than `ErrWrittenNotDurable`,
+so a reservation that would not survive a restart is never held, and `MarkBroadcast`
+keeps its entries whatever the write said, because the transaction is out and this
+process must go on refusing its inputs (the engine reports the write). For
+`ErrWrittenNotDurable` the record stays, in every file, and `errors.Is` finds it through
+`utxo.ErrPersist`. In every case, alert.
 
 ### Passphrase handling
 

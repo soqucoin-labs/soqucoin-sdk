@@ -53,12 +53,6 @@ var ErrNoCandidates = errors.New("utxo: no confirmed UTXOs available for consoli
 // can proceed with a reduced payment.
 var ErrInputLimitReached = errors.New("input limit reached")
 
-// MaxUTXOVerifyRetries is the number of times Defense 11 will retry
-// gettxout verification before giving up on a UTXO. Each retry waits
-// 2 seconds. This handles the race where a block is mined between
-// ElectrumX refresh and gettxout call.
-const MaxUTXOVerifyRetries = 8
-
 // SpentKey uniquely identifies a UTXO for the persistent spent set.
 type SpentKey struct {
 	TxID string
@@ -501,11 +495,17 @@ func (ss *SpentSet) persist() error {
 
 // load reads the spent set from disk on startup.
 //
-// Confirmed entries older than 2 hours and expired reservations are
-// discarded. Unconfirmed broadcast entries are kept whatever their age: an
-// earlier version dropped them after 2 hours, so a restart after a slow
-// confirmation re-exposed the inputs of a transaction that was still in the
-// mempool, and the next withdrawal double-spent them.
+// Confirmed entries older than 2 hours are discarded. Unconfirmed broadcast
+// entries are kept whatever their age: an earlier version dropped them after
+// 2 hours, so a restart after a slow confirmation re-exposed the inputs of a
+// transaction that was still in the mempool, and the next withdrawal
+// double-spent them. Reservations are kept whether or not they have expired:
+// withdraw.Engine.Recover decides what each one was, renewing a Built
+// intent's and releasing an orphan's, and an earlier version dropped the
+// expired ones here, so after a forward step of the clock Recover found
+// nothing to decide and nothing was logged. Reserve treats an expired entry
+// as free and Prune drops it on the periodic path, so keeping it changes
+// neither the backstop nor the file's growth.
 func (ss *SpentSet) load() error {
 	// Ensure directory exists
 	dir := filepath.Dir(ss.filePath)
@@ -530,19 +530,23 @@ func (ss *SpentSet) load() error {
 	now := time.Now()
 	cutoff := now.Add(-2 * time.Hour)
 	loaded := 0
+	dropped := 0
 	expired := 0
 
 	for _, entry := range file.Entries {
-		if (entry.Confirmed && entry.SpentAt.Before(cutoff)) || entry.expired(now) {
-			expired++
+		if entry.Confirmed && entry.SpentAt.Before(cutoff) {
+			dropped++
 			continue
+		}
+		if entry.expired(now) {
+			expired++ // kept for Recover
 		}
 		key := SpentKey{entry.TxID, entry.Vout}
 		ss.entries[key] = entry
 		loaded++
 	}
 
-	ss.log.Info("spent set loaded", "path", ss.filePath, "entries", len(file.Entries), "expired", expired, "active", loaded)
+	ss.log.Info("spent set loaded", "path", ss.filePath, "entries", len(file.Entries), "dropped_confirmed", dropped, "expired_reservations_kept", expired, "active", loaded)
 	return nil
 }
 

@@ -364,6 +364,14 @@ func (c *Client) Broadcast(ctx context.Context, rawTxHex, txid string) (string, 
 	}
 	result, err := c.Call(ctx, "sendrawtransaction", rawTxHex)
 	if err == nil {
+		if string(result) == "null" {
+			// The node answered with no txid at all. Nothing says the
+			// transaction was refused, so it is treated as accepted under a
+			// txid the caller cannot check, which is the hold a mismatch
+			// gets; the message says what came back rather than quoting an
+			// empty txid as the one the node accepted.
+			return "", fmt.Errorf("broadcast: %w: node returned no txid (a null result) for a transaction the caller computed as %s", ErrTxIDMismatch, txid)
+		}
 		var got string
 		if err := json.Unmarshal(result, &got); err != nil {
 			return "", fmt.Errorf("broadcast: parse txid: %w", err)
