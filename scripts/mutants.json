@@ -200,9 +200,9 @@
       "file": "keys/keystore.go",
       "package": "./keys",
       "test": "TestContentThisBuildDoesNotKnowIsRefused",
-      "find": "\tdec.DisallowUnknownFields()",
-      "replace": "\t_ = dec",
-      "why": "What the AEAD binds is the canonical re-encoding of the fields this build knows. A field it does not know would be dropped on the way in and never authenticated, so the file would carry content the header's tamper-evidence does not cover."
+      "find": "\t\t\tif !known {",
+      "replace": "\t\t\tif !known && len(names) == 0 {",
+      "why": "What the AEAD binds is the canonical re-encoding of the fields this build knows. A field it does not know would be dropped on the way in and never authenticated, so the file would carry content the header's tamper-evidence does not cover. checkMembers is the one guard since the decoder's own folded check was removed as the weaker of two."
     },
     {
       "id": "keystore-content-after-the-object-accepted",

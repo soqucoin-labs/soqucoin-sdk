@@ -160,9 +160,11 @@ func strictDecode(data []byte) (Keystore, error) {
 	if err := checkMembers(json.NewDecoder(bytes.NewReader(data)), reflect.TypeOf(Keystore{})); err != nil {
 		return Keystore{}, err
 	}
+	// No DisallowUnknownFields here: checkMembers has already refused every
+	// name that is not a tag, by exact spelling, which is stricter than the
+	// decoder's folded match; a second, weaker guard would show nowhere.
 	var ks Keystore
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&ks); err != nil {
 		return Keystore{}, err
 	}
@@ -176,13 +178,13 @@ func strictDecode(data []byte) (Keystore, error) {
 // checkMembers walks one JSON value beside the Go type the decoder will fill
 // and refuses, at any depth, a member whose name is not exactly one of that
 // type's JSON tags, and a member named twice. encoding/json matches a name to
-// a field case-insensitively with the last value winning, and
-// DisallowUnknownFields folds the same way, so a file naming "PubKeys" would
+// a field case-insensitively with the last value winning, and its own
+// unknown-field check folds the same way, so a file naming "PubKeys" would
 // decode into PubKeys while a reader that compares bytes saw a member this
-// build never wrote; requiring the tag's own spelling closes that and the
-// plain duplicate together. The public key entries and the KDF parameters are
-// objects too and are walked with their own types. Recursion is bounded by
-// the decoder's nesting limit.
+// build never wrote; requiring the tag's own spelling closes that, the
+// unknown member and the plain duplicate together. The public key entries and
+// the KDF parameters are objects too and are walked with their own types.
+// Recursion is bounded by the decoder's nesting limit.
 func checkMembers(dec *json.Decoder, typ reflect.Type) error {
 	tok, err := dec.Token()
 	if err != nil {
