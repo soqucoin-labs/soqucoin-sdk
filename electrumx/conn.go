@@ -561,14 +561,16 @@ func (c *Client) failPending(gen uint64) {
 // lock. The next call returns ErrNotConnected until Reconnect, or Start,
 // dials again; the reader ends on the closed socket and fails the waiters.
 func (c *Client) dropLocked() {
+	// No live connection: every subscription is void until Connect, and a
+	// notification still in flight from the old reader is ignored. The
+	// generation leaves before the socket closes, so no reader under mu sees
+	// a live generation on a connection that is already gone.
+	c.setLiveGen(0)
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
 	c.conn = nil
 	c.reader = nil
-	// No live connection: every subscription is void until Connect, and a
-	// notification still in flight from the old reader is ignored.
-	c.setLiveGen(0)
 }
 
 // setLiveGen publishes a connection change to the readers that hold mu.

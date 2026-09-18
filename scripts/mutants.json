@@ -1098,6 +1098,15 @@
       "find": "\t\treturn nil // superseded: the later refresh is the address's result\n",
       "replace": "\t\treturn err\n",
       "why": "A superseded reply is dropped by commitRefresh with no error and refreshAddress returns nil for it; the parse path must match, or the pass counts a failure, LastRefresh carries an error and a retry is scheduled for an address whose later refresh has already committed."
+    },
+    {
+      "id": "electrumx-reply-after-a-lost-connection-thrown-away",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAListunspentReplyFromAReplacedConnectionCommitsNothing",
+      "find": "\tif live := c.liveGen.Load(); live != 0 && gen != live {",
+      "replace": "\tif live := c.liveGen.Load(); gen != live {",
+      "why": "Stale means replaced by a newer connection, whose own writes the set would be dated after. A reply delivered from a connection that was merely lost, with nothing live since, is the address's own answer; refusing it costs a listunspent after the reconnect and puts a lost-connection error on an address the server answered."
     }
   ]
 }

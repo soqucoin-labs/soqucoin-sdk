@@ -155,12 +155,16 @@ func TestASubscribeReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	}
 }
 
-// A listunspent reply from a connection that has been replaced commits
-// nothing, as a subscribe reply from one commits nothing: the set was true
-// when the server wrote it and the record would date it now against a
-// generation that is gone. The stale reply is recorded as a lost connection so
-// the pass ends, and the error on the record makes the next pass on the live
-// connection refresh the address whatever status its subscribe reply carries.
+// A listunspent reply from a connection that a newer connection has replaced
+// commits nothing, as a subscribe reply from one commits nothing: the set was
+// true when the server wrote it and the record would date it after whatever
+// the live connection has written for the address. The stale reply is
+// recorded as a lost connection so the pass ends, and the error on the record
+// makes the next pass on the live connection refresh the address whatever
+// status its subscribe reply carries. A reply from a connection that was lost
+// with nothing live since is a different case and commits: no other connection
+// has written the address, and await delivers a reply queued before the loss
+// so that it is not thrown away.
 func TestAListunspentReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	a := craftAddr(t, 0x11)
 	c := NewClient("127.0.0.1:1", time.Hour, nil)
@@ -202,6 +206,21 @@ func TestAListunspentReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	at, rerr = c.LastRefreshOf(a)
 	if rerr != nil || at.IsZero() {
 		t.Fatalf("after the live reply the record reads at=%v err=%v", at, rerr)
+	}
+
+	// The connection is lost and nothing is live: a reply from generation 2
+	// delivered now is the address's own answer and commits.
+	c.liveGen.Store(0)
+	later := []types.UTXO{{TxID: txA, Vout: 0, Value: 100, Height: 10}, {TxID: txA, Vout: 1, Value: 7, Height: 11}}
+	n, committed, err = c.commitRefresh(a, 2, 0, 3, later)
+	if err != nil || !committed || n != 2 {
+		t.Fatalf("a reply delivered after the connection was lost, with nothing live: n=%d committed=%v err=%v; the server answered and no other connection has written the address", n, committed, err)
+	}
+	if got := c.GetUTXOs(a); len(got) != 2 {
+		t.Fatalf("the delivered reply did not reach the cache: %+v", got)
+	}
+	if _, rerr := c.LastRefreshOf(a); rerr != nil {
+		t.Fatalf("a delivered reply put %v on the record", rerr)
 	}
 }
 

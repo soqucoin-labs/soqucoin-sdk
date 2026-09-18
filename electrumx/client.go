@@ -631,13 +631,15 @@ func parseUnspent(raw json.RawMessage) ([]types.UTXO, error) {
 // Outputs the reply no longer lists are dropped as spent, and outputs it
 // lists for the first time are added.
 //
-// Nothing is committed from a connection that is no longer live, as
+// Nothing is committed from a connection a newer connection has replaced, as
 // commitSubscribe commits nothing from one: the reply was true when the
-// server wrote it and the record would date it now against a generation that
-// is gone. That case (staleReplyLocked) is returned as an error wrapping
-// ErrNotConnected and recorded on the address, so the pass ends; the address's
-// record carries the error, so the next pass on the live connection subscribes
-// it and refreshes it whatever status the subscribe reply carries.
+// server wrote it and the record would date it after whatever the live
+// connection has already written for the address. That case
+// (staleReplyLocked) is returned as an error wrapping ErrNotConnected and
+// recorded on the address, so the pass ends; the address's record carries the
+// error, so the next pass on the live connection subscribes it and refreshes
+// it whatever status the subscribe reply carries. A reply from a connection
+// that was lost with nothing live since is committed: see staleReplyLocked.
 func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool, error) {
 	type utxoKey struct {
 		TxID string
@@ -712,14 +714,23 @@ func (c *Client) recordRefresh(addr string, gen, seqBefore, ticket uint64, err e
 	c.recordRefreshLocked(addr, gen, seqBefore, ticket, err)
 }
 
-// staleReplyLocked reports a reply from a connection that is no longer live
-// as an error wrapping ErrNotConnected, or nil while gen is live. Caller holds
-// mu, under which liveGen cannot move (setLiveGen), so the answer holds for as
-// long as the caller keeps the lock. The two sites that handle a reply's
-// content call it: commitRefresh before it writes the cache, and
+// staleReplyLocked reports a reply from a connection that a newer connection
+// has replaced as an error wrapping ErrNotConnected, and nil otherwise. Caller
+// holds mu, under which liveGen cannot move (setLiveGen), so the answer holds
+// for as long as the caller keeps the lock. The two sites that handle a
+// reply's content call it: commitRefresh before it writes the cache, and
 // recordRefreshFailure for a reply that could not be parsed.
+//
+// Replaced is the case that matters: the newer connection's own subscribe
+// reply may already have committed for the address, and a set from before it
+// would then be dated after it. A reply delivered from a connection that was
+// lost with nothing live since (await drains a reply queued before the loss)
+// is the address's own answer and no other connection has written the
+// address, so it is committed like any other; refusing it cost one
+// listunspent after the reconnect and put a lost-connection error on an
+// address the server had answered.
 func (c *Client) staleReplyLocked(addr string, gen uint64) error {
-	if live := c.liveGen.Load(); gen != live {
+	if live := c.liveGen.Load(); live != 0 && gen != live {
 		return fmt.Errorf("%w: the connection was replaced before the listunspent reply for %s was handled", ErrNotConnected, addr)
 	}
 	return nil
