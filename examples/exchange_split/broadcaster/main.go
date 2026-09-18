@@ -5,7 +5,7 @@
 //
 // It owns two transitions, both of which need the node:
 //
-//	Built      -> Broadcast, or Failed on a permanent rejection
+//	Built      -> Broadcast, or Failed on a permanent rejection, or held
 //	Broadcast  -> Confirmed at -confirmations
 //
 // Recover runs first, once, and it is this process's job rather than the
@@ -94,6 +94,7 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 		Spent:                 spent,
 		Broadcaster:           node,
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
+		Chain:                 withdraw.RPCChain{Client: node}, // Abandon's node checks
 		RequiredConfirmations: confirmations,
 		Logger:                logger,
 		// No Select and no BuildSign: there is no key on this host, so Build
@@ -125,7 +126,8 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 // send broadcasts every Built intent. The engine decides what each outcome
 // means: a lost reply keeps the intent Built with its reservation renewed and
 // the same bytes go out next pass, a permanent rejection fails it and releases
-// the inputs, and a txid mismatch holds it for a person.
+// the inputs unless an earlier reply was lost, and a txid mismatch or a
+// rejection after a lost reply holds it for a person.
 func send(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) {
 	built, err := store.List(ctx, withdraw.StateBuilt)
 	if err != nil {
@@ -133,8 +135,8 @@ func send(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) {
 		return
 	}
 	for _, in := range built {
-		if in.NodeTxID != "" {
-			continue // held after a txid mismatch; Recover has already reported it
+		if in.NodeTxID != "" || in.Hold != "" {
+			continue // held; Recover has already reported it
 		}
 		if err := engine.Broadcast(ctx, in); err != nil {
 			logger.Warn("not sent", "id", in.ID, "state", in.State, "err", err)
@@ -146,7 +148,9 @@ func send(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) {
 
 // confirm advances every Broadcast intent. A confirmation count that cannot be
 // read is this intent's problem and not the pass's: the transaction is out
-// either way, and the next pass asks again.
+// either way, and the next pass asks again. A transaction the node no longer
+// knows (rpc.ErrUnknownOutcome) is sent again with the same bytes; an
+// operator abandons it through withdraw.Engine.Abandon after the wait.
 func confirm(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) {
 	sent, err := store.List(ctx, withdraw.StateBroadcast)
 	if err != nil {
@@ -157,6 +161,11 @@ func confirm(ctx context.Context, store *split.DirStore, engine *withdraw.Engine
 		before := in.State
 		if err := engine.UpdateConfirmations(ctx, in); err != nil {
 			logger.Warn("confirmations", "id", in.ID, "err", err)
+			if errors.Is(err, rpc.ErrUnknownOutcome) {
+				if err := engine.Rebroadcast(ctx, in); err != nil {
+					logger.Warn("rebroadcast", "id", in.ID, "err", err)
+				}
+			}
 			continue
 		}
 		if in.State != before {

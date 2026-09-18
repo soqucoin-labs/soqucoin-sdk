@@ -25,7 +25,7 @@ const (
 // fakeNet records every broadcast and answers according to mode.
 type fakeNet struct {
 	mu     sync.Mutex
-	mode   string // "ok", "lost", "reject", "transient", "mismatch", "mismatch-blank"
+	mode   string // "ok", "lost", "reject", "transient", "unauthorized", "inchain", "mismatch", "mismatch-blank"
 	sent   []string
 	builds int
 }
@@ -41,6 +41,10 @@ func (f *fakeNet) Broadcast(_ context.Context, rawHex, txid string) (string, err
 		return "", fmt.Errorf("broadcast: %w", &rpc.Error{Code: rpc.CodeVerifyRejected, Message: "min relay fee not met"})
 	case "transient":
 		return "", fmt.Errorf("broadcast: %w", rpc.ErrTransient)
+	case "inchain": // a third-party Broadcaster that passes the node's -27 through
+		return "", fmt.Errorf("broadcast: %w", &rpc.Error{Code: rpc.CodeTransactionAlreadyInChain, Message: "already in chain"})
+	case "unauthorized":
+		return "", fmt.Errorf("broadcast: %w", rpc.ErrUnauthorized)
 	case "mismatch":
 		return "node-" + txid, fmt.Errorf("broadcast: %w: node returned txid %s for a transaction the caller computed as %s", rpc.ErrTxIDMismatch, "node-"+txid, txid)
 	case "mismatch-blank": // a third-party Broadcaster that reports the kind without the txid

@@ -111,6 +111,16 @@ func (e SpentEntry) expired(now time.Time) bool {
 	return e.reserved() && now.After(e.ExpiresAt)
 }
 
+// sentByAnother reports whether e records an unconfirmed send that neither
+// intentID nor broadcastTxID owns. An empty intentID owns nothing, as in
+// Reserve.
+func (e SpentEntry) sentByAnother(broadcastTxID, intentID string) bool {
+	if e.reserved() || e.Confirmed || e.SpentInTx == broadcastTxID {
+		return false
+	}
+	return intentID == "" || e.IntentID != intentID
+}
+
 // spentSetFile is the JSON structure persisted to disk.
 type spentSetFile struct {
 	Version int          `json:"version"`
@@ -263,6 +273,60 @@ func (ss *SpentSet) Release(intentID string) error {
 	return nil
 }
 
+// Forget drops every entry intentID owns, reservations and broadcast entries
+// alike, and writes the file once: the one call that removes a broadcast
+// entry before the chain confirms it, for withdraw.Engine.Abandon after its
+// node checks, and for Recover when that call did not land. A write that
+// fails puts the entries back, as Reserve does, since the file still holds
+// them; one that landed without its durability confirmed keeps the drop. An
+// empty id is refused; it would drop every entry written without one.
+func (ss *SpentSet) Forget(intentID string) error {
+	if intentID == "" {
+		return errors.New("utxo: Forget needs an intent id")
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	dropped := map[SpentKey]SpentEntry{}
+	for key, e := range ss.entries {
+		if e.IntentID == intentID {
+			dropped[key] = e
+			delete(ss.entries, key)
+		}
+	}
+	if len(dropped) == 0 {
+		return nil
+	}
+	if err := ss.persist(); err != nil && !errors.Is(err, atomicfile.ErrWrittenNotDurable) {
+		for key, e := range dropped {
+			ss.entries[key] = e
+		}
+		return err
+	} else if err != nil {
+		return err
+	}
+	ss.log.Warn("spent set: entries of an abandoned withdrawal dropped", "intent", intentID, "dropped", len(dropped))
+	return nil
+}
+
+// SentIntents returns the id of every withdrawal that owns an unconfirmed
+// broadcast entry, each once, sorted; entries without an id do not appear.
+func (ss *SpentSet) SentIntents() []string {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	seen := map[string]bool{}
+	for _, e := range ss.entries {
+		if !e.reserved() && !e.Confirmed && e.IntentID != "" {
+			seen[e.IntentID] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // ReservedIntents returns the id of every withdrawal that holds a reservation
 // in the set, expired or not, each once, sorted. Broadcast entries are not
 // reservations and do not appear. withdraw.Engine.Recover uses it to release
@@ -296,10 +360,20 @@ func (ss *SpentSet) MarkBroadcastFor(inputs []types.UTXO, broadcastTxID, intentI
 	return ss.markBroadcast(inputs, broadcastTxID, intentID)
 }
 
+// markBroadcast is all-or-nothing: an input another withdrawal has recorded
+// as spent in an unconfirmed transaction refuses the whole call with
+// ErrAlreadyReserved and nothing is written, since writing over it would
+// attribute the input to the transaction that cannot confirm.
 func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID string) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
+	for _, u := range inputs {
+		key := SpentKey{u.TxID, u.Vout}
+		if e, exists := ss.entries[key]; exists && e.sentByAnother(broadcastTxID, intentID) {
+			return fmt.Errorf("%w: %s:%d is spent in %s by withdrawal %q", ErrAlreadyReserved, u.TxID, u.Vout, e.SpentInTx, e.IntentID)
+		}
+	}
 	now := time.Now()
 	for _, u := range inputs {
 		key := SpentKey{u.TxID, u.Vout}
@@ -421,7 +495,7 @@ func (ss *SpentSet) persist() error {
 	// spend marked just before a power loss is on disk when persist returns,
 	// so a restart cannot re-select an input of a transaction already sent.
 	if err := atomicfile.WriteFile(ss.filePath, buf, 0600); err != nil {
-		return fmt.Errorf("%w: %v", ErrPersist, err)
+		return fmt.Errorf("%w: %w", ErrPersist, err)
 	}
 	return nil
 }

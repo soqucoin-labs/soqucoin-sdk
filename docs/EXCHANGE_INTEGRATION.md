@@ -255,7 +255,8 @@ What a context that ends does to a withdrawal, state by state
 |---|---|---|
 | In the selector or the signer, intent Created | Stays Created, attempt recorded, nothing reserved or built | The node has said nothing about the payment; an interrupted attempt is not a verdict |
 | In `Broadcast`, intent Built | Stays Built, reservation renewed, `rpc.ErrUnknownOutcome` carrying the context's error | The node may hold the transaction; only the same bytes may go out again |
-| In `UpdateConfirmations` | Error returned, no state change | |
+| In `UpdateConfirmations` or `Abandon` | Error returned, no state change | |
+| In `Rebroadcast`, intent Broadcast | Stays Broadcast, attempt recorded, `SentAt` moved | The node may hold the transaction again |
 | In `Recover` | The passes that repair the spent set run to the end whatever the context says; the re-send loop stops at the first Built intent and reports it | Every Built intent is sent by the next `Recover` |
 
 `rpc.Client.Broadcast` treats a context ending during the send as a lost reply: the resolution
@@ -269,8 +270,8 @@ reads of `Submit` and `Process`. It does not govern the writes that record what 
 nor the reads that decide what the engine may do: every `withdraw.Store.Update` is made under
 `context.WithoutCancel(ctx)`, because the record (a broadcast accepted, a txid the node disagreed
 on, a lost reply's attempt) must land whether or not the caller is still waiting; so is the `Get`
-each of `Build`, `Broadcast` and `UpdateConfirmations` makes under the engine's lock to re-read the
-record it acts on, and so are the `Get` and `List` calls `Recover` makes to repair the spent set.
+each of `Build`, `Broadcast`, `UpdateConfirmations`, `Rebroadcast` and `Abandon` makes under the
+engine's lock to re-read the record it acts on, and so are the `Get` and `List` calls `Recover` makes to repair the spent set.
 `Submit`'s `Create` is bound to the caller's context, since nothing has happened yet and an
 abandoned registration must not become a payment. `WithoutCancel` carries no deadline, so a
 database-backed `Store` bounds every method with its own timeout and does not rely on the
@@ -618,9 +619,45 @@ cannot afford impossible by construction:
   node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
   refuse to send it again (`withdraw.ErrHeld`); stop withdrawals and investigate before anything
   is rebuilt.
+- **A rejection after a lost reply holds the intent; it does not fail it.** Before every send the
+  record is saved with `MaybeRelayed` set and `SentAt`, and nothing is sent when that save fails;
+  the mark is taken back only on an answer that shows the node did not take the bytes on that
+  attempt (a rejection, a transient error, refused credentials), so a lost reply, and a save that
+  fails after the send, leave it set. A permanent rejection on an intent that carries the mark (the node restarted with a higher minimum fee, or dropped its mempool) then
+  holds the intent instead of failing it: peers keep a relayed transaction for the node's mempool
+  expiry, 24 hours, and can mine it after the node forgot it, so releasing its inputs would let
+  the next withdrawal spend coins the first payment can still take. The intent stays Built with
+  `Hold` set and its inputs marked spent under its txid, `Broadcast` and `Recover` refuse it
+  (`withdraw.ErrHeld`), and `Abandon` is the way out. Failed therefore means: the intent could not
+  be built, or the node refused the bytes and no attempt's outcome was unknown, or an operator
+  abandoned the intent.
+- **A node that refuses the credentials** (`rpc.ErrUnauthorized`, a 401 or 403 before any handler
+  ran) has taken nothing: the intent stays Built with the mark put back to what earlier attempts
+  left, and the same bytes go out once the credential or the allowlist is fixed. It is not a lost reply, and it counts for the
+  breaker: nothing sent under it can succeed.
+- **A Broadcast intent whose transaction the node no longer knows has two exits.**
+  `UpdateConfirmations` returns `rpc.ErrUnknownOutcome` for it and changes nothing.
+  `Rebroadcast` sends the same bytes again and changes no state on any outcome: success says the
+  node has the transaction again, a refusal says the node does not have it now, which is not
+  proof that no peer does. `Abandon`, the operator's transition to Failed for a Broadcast intent
+  or a held Built one, refuses (`withdraw.ErrNotAbandonable`, nothing changed) unless `AbandonAfter`
+  (default `withdraw.DefaultAbandonAfter`, the node's mempool expiry) has passed since the last
+  send (`SentAt`, set before every send; a re-send the node refused puts the earlier time back),
+  the node does not know the transaction, and every input is unspent at the node; it needs a `withdraw.Chain` (`withdraw.RPCChain` over your node, which refuses to answer
+  while the node is behind). On success the intent is Failed with its bytes kept and its
+  spent-set entries dropped, so the inputs return to selection; when that drop fails, `Recover`
+  drops them at the next start (`AbandonedAt` marks the record; entries owned by any other Failed
+  intent are kept and reported). Records written by an earlier release carry no `SentAt` and no
+  mark: their attempts count as possibly relayed, and their last write stands for their last send. The residual risk is a peer that kept the bytes longer than the
+  node's expiry, which the node applies lazily, on its next mempool acceptance rather than on a
+  clock, so a quiet peer keeps them longer; the record keeps the txid so a reconciliation finds
+  the transaction if it mines. A `Rebroadcast` the node refused does not restart the wait; one it
+  took, or whose outcome is unknown, does.
 
 If `Process` returns an error that is `utxo.ErrPersist`, the node accepted the payment and the
-spent set could not be written: the intent is saved as `Broadcast`, the process still refuses those
+spent set could not be written (an `utxo.ErrAlreadyReserved` on the same path means the set and
+the store disagree about who owns an input, which a spent set and intent store that were not
+running as a pair produce): the intent is saved as `Broadcast`, the process still refuses those
 inputs, and `Recover` re-marks every Broadcast intent's inputs from the intent store at startup, so
 a restart does not re-expose them. That guarantee holds only if you stop when `Recover` returns an
 error: a failed `List` means nothing was re-marked. Open the spent set with `utxo.OpenSpentSet`,
@@ -634,8 +671,11 @@ withdrawal with three malformed requests. A withdrawal the engine refuses to act
 per-request error: `withdraw.ErrWrongState` when another worker holds the intent,
 `withdraw.ErrInvalidIntent`, `withdraw.ErrConflict` and `withdraw.ErrFailed`. A worker pool loses a
 race for the same id as a matter of course, and counting those losses would let three of them halt
-every payout. `withdraw.ErrHeld` and `withdraw.ErrReservationLost` do count: each names a
-transaction an operator resolves before anything else is sent, and halting is the point.
+every payout. `withdraw.ErrHeld`, `withdraw.ErrReservationLost` and `rpc.ErrUnauthorized` do
+count: the first two name a transaction an operator resolves before anything else is sent, the
+third a credential nothing can succeed under, and halting is the point. `ErrHeld` carries a
+rejection as text only, never wrapped, so the `rpc.ErrPermanent` inside it does not read to the
+breaker as one bad request.
 
 ```go
 package main
@@ -644,6 +684,7 @@ import (
 	"context"
 	"log"
 	"log/slog"
+	"errors"
 	"os"
 	"time"
 
@@ -716,6 +757,7 @@ func main() {
 		Spent:                 spent,
 		Broadcaster:           node, // rpc.Broadcast resolves lost replies against the node
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
+		Chain:                 withdraw.RPCChain{Client: node}, // Abandon's node checks
 		RequiredConfirmations: types.MaxReorgDepth,
 		Logger:                logger,
 		// ReservationTTL left at its default, withdraw.DefaultReservationTTL (4 hours).
@@ -790,14 +832,16 @@ func main() {
 	cb.RecordResult(err) // nil = success; per-request errors are ignored; systemic ones count
 	if err != nil {
 		// rpc.ErrTransient from the selector: the intent stays Created and the
-		// next Process builds it. rpc.ErrUnknownOutcome or rpc.ErrTransient
-		// from the broadcast, or a context that ended during it: the intent
-		// stays Built and the same bytes go out on the next Process. Check
-		// intent.State to tell them apart.
+		// next Process builds it. rpc.ErrUnknownOutcome, rpc.ErrTransient or
+		// rpc.ErrUnauthorized from the broadcast, or a context that ended
+		// during it: the intent stays Built and the same bytes go out on the
+		// next Process. Check intent.State to tell them apart.
 		// rpc.ErrTxIDMismatch: also Built, inputs held, intent.NodeTxID set;
 		// the breaker counts it, and every later Process of that intent
 		// returns withdraw.ErrHeld, which also counts. Stop and investigate,
-		// never rebuild.
+		// never rebuild. withdraw.ErrHeld on this call: the node rejected
+		// bytes an earlier attempt may have relayed; the intent is Built with
+		// intent.Hold set and its inputs marked spent. Abandon after the wait.
 		// withdraw.ErrWrongState: another worker advanced this intent between
 		// this call's read and Build's lock, so the withdrawal belongs to that
 		// worker. Nothing is wrong, the breaker does not count it, and a later
@@ -805,8 +849,9 @@ func main() {
 		// own copy, which is out of date whenever this error is the reason, so
 		// do not read its State here.
 		// withdraw.ErrFailed: the intent was already Failed when this call
-		// began. Terminal, no payment is on the network, and the breaker does
-		// not count it. Resolve the payout; never reuse the id.
+		// began. Terminal: it could not be built, the node refused the bytes
+		// and no attempt's outcome was unknown, or an operator abandoned it.
+		// The breaker does not count it. Resolve the payout; never reuse the id.
 		// Two of these returns pair a nil intent with the error: an unknown
 		// id, and a store read that failed before there was an intent to
 		// return. The state is read only when there is something to read it
@@ -820,9 +865,17 @@ func main() {
 	}
 	log.Printf("%s broadcast as %s", requestID, intent.TxID)
 
-	// Later, from a ticker: confirmations complete the intent.
+	// Later, from a ticker: confirmations complete the intent. A transaction
+	// the node no longer knows is sent again with the same bytes; the record
+	// does not change, and an operator calls engine.Abandon once the node has
+	// not known it for engine.AbandonAfter.
 	if err := engine.UpdateConfirmations(ctx, intent); err != nil {
 		log.Printf("confirmations %s: %v", requestID, err)
+		if errors.Is(err, rpc.ErrUnknownOutcome) {
+			if err := engine.Rebroadcast(ctx, intent); err != nil {
+				log.Printf("rebroadcast %s: %v", requestID, err)
+			}
+		}
 	}
 }
 ```
@@ -849,7 +902,7 @@ directory, and its README is the longer form of what follows.
 |---|---|---|
 | watcher | node RPC credential, indexer address, no key | → `Created`, and it publishes what may be spent |
 | signer | the keystore; it opens no socket and holds no credential | `Created` → `Built` |
-| broadcaster | node RPC credential, no key | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed` |
+| broadcaster | node RPC credential, no key | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed`, `Built` held |
 
 Three things decide whether a split is safe, and they are worth stating before you build your own.
 

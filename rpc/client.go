@@ -168,6 +168,13 @@ type rpcResponse struct {
 //	                  "failed" and rebuilds pays twice.
 //	ErrAlreadyInChain the transaction is already mined. For a broadcast that
 //	                  is success, not failure.
+//	ErrUnauthorized   the node, or a proxy in front of it, answered 401 or 403
+//	                  before any handler ran: the credentials or the allowlist
+//	                  are wrong. Nothing reached the node's RPC layer, so
+//	                  nothing took effect, and nothing will until the
+//	                  deployment is fixed. Neither transient nor permanent: a
+//	                  withdrawal must not be failed for it, and the breaker
+//	                  counts it.
 //	ErrTxIDMismatch   the node ACCEPTED the transaction but under a txid other
 //	                  than the one the caller computed. The payment is in the
 //	                  mempool; the caller's serialization or hashing disagrees
@@ -190,6 +197,7 @@ var (
 	// or a tunnel that ends on this machine.
 	ErrPlaintextRemote = fmt.Errorf("%w: node URL is not loopback and not https; the RPC password would cross the network in plaintext", ErrPermanent)
 	ErrTxIDMismatch    = errors.New("rpc: node accepted the transaction under a different txid")
+	ErrUnauthorized    = errors.New("rpc: the node refused the credentials")
 )
 
 // Node error codes this package interprets (src/rpc/protocol.h in the node).
@@ -285,6 +293,14 @@ func (c *Client) Call(ctx context.Context, method string, params ...interface{})
 	}
 	defer resp.Body.Close()
 
+	// The status is read before the body: the node answers a bad credential
+	// or a host outside rpcallowip with an empty 401 or 403, and read as a
+	// body that is not JSON it would be a lost reply, which at a broadcast is
+	// an outcome the caller must treat as possibly taken effect.
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: status %d from %s", ErrUnauthorized, resp.StatusCode, c.host)
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, &transportError{err: fmt.Errorf("read response: %w", err)}
@@ -371,15 +387,18 @@ func (c *Client) Broadcast(ctx context.Context, rawTxHex, txid string) (string, 
 	// Reply lost. Resolve against the node before reporting anything. When the
 	// context has ended the lookup ends with it and the outcome stays unknown;
 	// the caller keeps the bytes and sends them again (withdraw.Engine.Recover).
-	known, lookupErr := c.knowsTransaction(ctx, txid)
+	known, lookupErr := c.KnowsTransaction(ctx, txid)
 	if lookupErr == nil && known {
 		return txid, nil
 	}
 	return "", fmt.Errorf("broadcast of %s: %w: %w", txid, ErrUnknownOutcome, err)
 }
 
-// knowsTransaction reports whether the node has txid in its mempool or chain.
-func (c *Client) knowsTransaction(ctx context.Context, txid string) (bool, error) {
+// KnowsTransaction reports whether the node has txid in its mempool or chain.
+// Without -txindex a mined transaction whose every output is spent is not
+// found; call RequireSynced first when a false answer will be acted on, as
+// withdraw.RPCChain does.
+func (c *Client) KnowsTransaction(ctx context.Context, txid string) (bool, error) {
 	if _, err := c.Call(ctx, "getrawtransaction", txid); err == nil {
 		return true, nil
 	} else if errors.Is(err, ErrTransient) {

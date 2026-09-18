@@ -331,8 +331,10 @@ func TestBroadcastUnderAnEndedContextStillHoldsTheIntent(t *testing.T) {
 // record fails. Were the inputs released before the save, the store would
 // hold a Built intent with signed bytes whose inputs the next withdrawal can
 // select. The verdict lands first: a failed save leaves the intent Built with
-// its inputs held, and the next attempt reaches the same verdict and records
-// it.
+// its inputs held. The store then carries the mark the attempt set before the
+// send and no outcome for it, so the next attempt's rejection holds the
+// intent rather than failing it: the inputs stay spent, and Abandon is the
+// way out after the wait.
 func TestPermanentRejectionWhoseSaveFailsKeepsTheInputsReserved(t *testing.T) {
 	ctx := context.Background()
 	store := &updateFailOnce{MemStore: NewMemStore(), state: StateFailed}
@@ -362,12 +364,12 @@ func TestPermanentRejectionWhoseSaveFailsKeepsTheInputsReserved(t *testing.T) {
 	}
 
 	got, err := e.Process(ctx, "w1")
-	if !errors.Is(err, rpc.ErrPermanent) || got.State != StateFailed {
-		t.Fatalf("the next attempt: err=%v state=%s; want the same verdict, recorded", err, got.State)
+	if !errors.Is(err, ErrHeld) || got.State != StateBuilt || got.Hold == "" {
+		t.Fatalf("the next attempt: err=%v state=%s hold=%q; want the intent held", err, got.State, got.Hold)
 	}
 	for _, o := range stored.Inputs {
-		if spent.IsSpent(o.TxID, o.Vout) {
-			t.Fatalf("input %s:%d is still held after the Failed record landed", o.TxID, o.Vout)
+		if !spent.IsSpent(o.TxID, o.Vout) {
+			t.Fatalf("input %s:%d was released for an attempt the store shows no outcome for", o.TxID, o.Vout)
 		}
 	}
 }

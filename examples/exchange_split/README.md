@@ -9,7 +9,7 @@ nothing else.
 |---|---|---|---|
 | `watcher` | node RPC credential, indexer address. No key | accepted requests, `snapshot.json` | → `Created` |
 | `signer` | the keystore. **No socket, no credential** | intent files | `Created` → `Built` |
-| `broadcaster` | node RPC credential. No key | intent files | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed` |
+| `broadcaster` | node RPC credential. No key | intent files | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed`, `Built` held |
 
 The processes never speak to each other. Each reads the files the others left
 and writes only the files it owns, so there is no protocol to get wrong and
@@ -118,6 +118,6 @@ is built at all:
 1. `split/split.go`: the directory, the store, the snapshot, the request file.
    The reasoning about what may be trusted is in its comments.
 2. `watcher/main.go`: the conditions under which a snapshot is withheld.
-3. `signer/main.go`: the reconcile pass, and why a signer cannot call
-   `withdraw.Engine.Recover`.
+3. `signer/main.go`: the reconcile pass, which stops the pass and builds nothing when two sent
+   withdrawals claim one input, and why a signer cannot call `withdraw.Engine.Recover`.
 4. `broadcaster/main.go`: `Recover` at startup, then send and confirm.
