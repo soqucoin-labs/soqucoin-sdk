@@ -437,11 +437,14 @@ Monitor pauses only when every address is stale. The costs, each cited to the co
   handshake is redialled on a backoff from one second to a minute (`subscribe.go`, `run`; the
   schedule is `refreshpolicy.go`).
 - Failure: a call whose reply does not arrive within the 30-second call deadline ends the pass at
-  that call (`conn.go`, `endsPass`); the retry a second later makes the same call first, and a
-  second timeout rebuilds the connection (`refreshpolicy.go`, `onResult`), so a server that has
-  stopped answering costs about two deadlines whatever the address count. An address the server
-  refuses is asked again on the same backoff ladder and holds nothing else: a notification for
-  another address is refreshed at once (`onEvent`; the refusal sets no `paced`).
+  that call (`conn.go`, `endsPass`); the retry's pass asks a pending address first, against a
+  stalled server that call times out too, and the second timeout rebuilds the connection
+  (`refreshpolicy.go`, `onResult`), so a server that has stopped answering costs two deadlines
+  plus the backoff in force whatever the address count. An address the server refuses is asked
+  again on the same backoff ladder, on every pass another event runs and on the ladder's timer,
+  and holds nothing else: a notification for another address is refreshed at once (`onEvent`;
+  the refusal sets no `paced`). The ladder resets only on a clean pass, so while any address is
+  refused it sits at its one-minute ceiling and that is the backoff a later timeout waits out.
 - Reconcile: one `listunspent` per address (`subscribe.go`, `pass` with `full` set, through
   `client.go`, `refresh`); the interval must exceed the pass.
 - The client's own cost per address, over loopback against a server that answers at once, is

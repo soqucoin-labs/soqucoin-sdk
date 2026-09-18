@@ -384,9 +384,10 @@ both go through the one dial. This matters: the client reconnects automatically 
 the connection is lost, when two calls in a row time out waiting for a reply, and after
 a panic in the refresher goroutine, so a downgrade there would be silent and could last
 for days. There is a test that pins it. A call that times out ends the pass it belongs
-to, so the second timeout follows within one retry whatever the address count, and a
-server that has stopped answering while holding the socket open is replaced in about
-two call deadlines.
+to, so the second timeout follows on the retry whatever the address count, and a server
+that has stopped answering while holding the socket open is replaced after two call
+deadlines plus the backoff in force, which is one second after a clean pass and at most
+a minute.
 
 Do not set `InsecureSkipVerify`. An unverified TLS connection is worse than a
 plaintext one, because it looks secure while an on-path attacker can still

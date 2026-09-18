@@ -177,8 +177,9 @@ func (c *Client) touch(gen uint64, now time.Time) {
 // pass is one wake of the refresher: subscribe every tracked address not yet
 // subscribed on the live connection, then refresh the addresses with a change
 // pending, or every address when full (the reconcile, which also records
-// LastRefresh). A lost connection or an ended context stops the pass where
-// it is; the next pass picks up what is left.
+// LastRefresh). A lost connection, a reply that does not arrive within the
+// call deadline, or an ended context stops the pass where it is; the next pass
+// picks up what is left.
 func (c *Client) pass(ctx context.Context, full bool) (made bool, err error) {
 	if c.liveGen.Load() == 0 {
 		return false, ErrNotConnected // nothing to subscribe on; the refresher reconnects
@@ -266,7 +267,9 @@ func (c *Client) pingInterval() time.Duration {
 //
 // Start runs them once. A second call logs a warning and starts nothing, so a
 // caller that wires the client twice does not run two refreshers against one
-// cache.
+// cache. The one call is the first, whatever its context: a Start with a
+// context that has already ended, or after Stop, is that call, and the client
+// cannot be started again.
 //
 // Production lesson: the goroutine includes panic recovery and auto-reconnect.
 // Without this, a bufio panic kills the entire process. With recovery, the

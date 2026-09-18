@@ -16,7 +16,7 @@ import "time"
 // a tick dropped and never made up. Each is invisible on the line and plain
 // in the sequence. A reader cannot enumerate the sequences; a test can, and
 // refreshpolicy_model_test.go enumerates every sequence of four events and
-// outcomes against the three properties stated below.
+// outcomes against the four properties stated below.
 
 // refreshEvent is what wakes the refresher.
 type refreshEvent int

@@ -277,7 +277,7 @@ func (c *Client) Reconnect(ctx context.Context) error {
 // bufio's internal buffer, and a notification read as a reply puts every later
 // reply off by one.
 //
-// A call returns when its reply arrives, when ctx ends, or after callDeadline.
+// A call returns when its reply arrives, when ctx ends, or after the call deadline.
 // A call whose context ends returns ctx.Err() whether it is waiting to write
 // or waiting for the reply; the reply, if it arrives later, finds no waiter
 // and is dropped. A write cut short closes the connection, since part of a

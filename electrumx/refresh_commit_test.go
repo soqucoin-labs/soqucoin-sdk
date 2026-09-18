@@ -157,11 +157,10 @@ func TestASubscribeReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 
 // A listunspent reply from a connection that has been replaced commits
 // nothing, as a subscribe reply from one commits nothing: the set was true
-// when the server wrote it, the record would date it now against a generation
-// that is gone, and the live connection's subscribe reply decides whether the
-// address changed while the client was away. The stale reply is recorded as a
-// lost connection so the pass ends and the next one runs on the live
-// connection.
+// when the server wrote it and the record would date it now against a
+// generation that is gone. The stale reply is recorded as a lost connection so
+// the pass ends, and the error on the record makes the next pass on the live
+// connection refresh the address whatever status its subscribe reply carries.
 func TestAListunspentReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	a := craftAddr(t, 0x11)
 	c := NewClient("127.0.0.1:1", time.Hour, nil)

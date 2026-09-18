@@ -626,11 +626,11 @@ func parseUnspent(raw json.RawMessage) ([]types.UTXO, error) {
 //
 // Nothing is committed from a connection that is no longer live, as
 // commitSubscribe commits nothing from one: the reply was true when the
-// server wrote it, the record would date it now against a generation that is
-// gone, and the live connection's own subscribe reply decides whether the
-// address changed while the client was away. That case is returned as an
-// error wrapping ErrNotConnected, recorded on the address, so the pass ends
-// and the next one runs on the live connection.
+// server wrote it and the record would date it now against a generation that
+// is gone. That case is returned as an error wrapping ErrNotConnected and
+// recorded on the address, so the pass ends; the address's record carries the
+// error, so the next pass on the live connection subscribes it and refreshes
+// it whatever status the subscribe reply carries.
 func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool, error) {
 	type utxoKey struct {
 		TxID string
