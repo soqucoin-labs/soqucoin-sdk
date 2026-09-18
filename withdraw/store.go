@@ -20,8 +20,9 @@ import (
 var writeFile = atomicfile.WriteFile
 
 // ErrWrittenNotDurable reports a Create or Update whose record reached the
-// store but whose durability is unconfirmed: the content is at the path and a reader of the
-// store will find it, and only a power loss before the filesystem flushes its
+// store but whose durability is unconfirmed: the content is at the path and a
+// reader of the store will find it, and only a power loss before the
+// filesystem flushes its
 // directory entry would lose it.
 //
 // A Store that can tell the two apart should return it, wrapped, instead of a

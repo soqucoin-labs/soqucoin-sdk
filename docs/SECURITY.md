@@ -191,8 +191,9 @@ the call that saved it returns without error. An error from `Save`, `MarkBroadca
 or `Update` means the write is not known to be durable. Whether the record stayed
 depends on the error: `ErrWrittenNotDurable` is reported after the file is in place
 and the record stays, `withdraw.ErrStale` writes nothing, and `withdraw.FileStore`
-puts its previous record back on any other failure. Keep the in-memory state (the
-engine does for a spent set it could not write) and alert.
+puts its previous record back on any other failure. For the spent set, and for
+`ErrWrittenNotDurable`, keep the in-memory state (the engine does for a spent set
+it could not write); in every case, alert.
 
 ### Passphrase handling
 

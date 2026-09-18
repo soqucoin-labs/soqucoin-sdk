@@ -55,7 +55,7 @@ func TestPutKeepsARecordThatLandedButIsNotKnownDurable(t *testing.T) {
 	built.Inputs = []Outpoint{{TxID: txA, Vout: 0, Value: 1000, Address: "ssq1phot"}}
 	err = s.Update(context.Background(), &built, StateCreated)
 	if !errors.Is(err, atomicfile.ErrWrittenNotDurable) {
-		t.Fatalf("Put returned %v, want an error wrapping atomicfile.ErrWrittenNotDurable", err)
+		t.Fatalf("Update returned %v, want an error wrapping atomicfile.ErrWrittenNotDurable", err)
 	}
 
 	// Memory agrees with the file: the file holds the Built record, so Get

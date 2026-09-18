@@ -264,15 +264,18 @@ never a rejection. Nothing a context can do releases a Built intent's inputs, fa
 builds a second transaction. The harness proves it against the node: scenario 9 hands the
 broadcast to the node through a proxy that never returns the reply, cancels, restarts, and pays once.
 
-The context governs what the engine asks of the network and how long it waits for a store read.
-It does not govern the writes that record what the network did: every `withdraw.Store.Update`
-is made under `context.WithoutCancel(ctx)`, because the record (a broadcast
-accepted, a txid the node disagreed on, a lost reply's attempt) must land whether or not the
-caller is still waiting; so are the `Get` and `List` calls `Recover` makes to repair the spent
-set. `Submit`'s `Create` is bound to the caller's context, since nothing has happened yet and
-an abandoned registration must not become a payment. `WithoutCancel` carries no deadline, so a
+The context governs what the engine asks of the network and how long it waits for the store
+reads of `Submit` and `Process`. It does not govern the writes that record what the network did,
+nor the reads that decide what the engine may do: every `withdraw.Store.Update` is made under
+`context.WithoutCancel(ctx)`, because the record (a broadcast accepted, a txid the node disagreed
+on, a lost reply's attempt) must land whether or not the caller is still waiting; so is the `Get`
+each of `Build`, `Broadcast` and `UpdateConfirmations` makes under the engine's lock to re-read the
+record it acts on, and so are the `Get` and `List` calls `Recover` makes to repair the spent set.
+`Submit`'s `Create` is bound to the caller's context, since nothing has happened yet and an
+abandoned registration must not become a payment. `WithoutCancel` carries no deadline, so a
 database-backed `Store` bounds every method with its own timeout and does not rely on the
-context for that. `deposit.Ledger` follows the same rule: `IsCredited` and `Pending` receive
+context for that; the re-reads run with the engine's lock held, so a `Get` that hangs holds every
+transition in the process. `deposit.Ledger` follows the same rule: `IsCredited` and `Pending` receive
 `Scan`'s context, `Credit` and `MarkFinal` one the caller cannot end. `deposit.Monitor.Scan`
 returns a context error plainly, from whichever node or ledger read it ended, never as
 `ErrPaused` and never as an alert: a shutdown is not an indexer lying.
@@ -882,7 +885,8 @@ in the store is re-reserved, inputs of `Broadcast` intents are marked spent, ent
 holds for a `Confirmed` intent are marked confirmed so they age out, and a reservation held for
 something `Created` or `Failed` is released. In one process `withdraw.Engine.Recover` does this once
 at startup, and a `Built` intent whose inputs it cannot re-reserve is reported as
-`withdraw.ErrReservationLost` and not sent. In a split the facts change while the signer runs, so
+`withdraw.ErrReservationLost` and not sent; `Broadcast` re-reserves before every send and refuses
+for the same reason, so the rule holds at every send and not only at startup. In a split the facts change while the signer runs, so
 the repair runs every pass; the signer cannot call `Recover` itself, because `Recover` also
 re-broadcasts, and re-broadcasting is the broadcaster's job.
 

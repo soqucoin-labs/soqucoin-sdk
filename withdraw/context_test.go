@@ -274,7 +274,7 @@ func TestRecoverStopsSendingOnceTheContextEnds(t *testing.T) {
 }
 
 // ctxStore is a Store that honours its context, as a database-backed store
-// does: a Get, Put or List under an ended context fails with its error.
+// does: a Get, Create, Update or List under an ended context fails with its error.
 type ctxStore struct{ *MemStore }
 
 func (s ctxStore) Get(ctx context.Context, id string) (*Intent, bool, error) {

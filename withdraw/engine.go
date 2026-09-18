@@ -36,12 +36,13 @@
 // Built intent's inputs, fails it, or builds a second transaction.
 //
 // The context governs what the engine asks of the network and how long it
-// waits for the store to answer a read. It does not govern the writes that
-// record what the network did: those Store.Update calls, the re-read each
-// transition makes of the record it is about to act on, and the Get and List
-// calls Recover makes to repair the spent set, are made under
-// context.WithoutCancel(ctx), because the record must land, and the repair
-// must run, whether or not the caller is still waiting. Submit's Create is
+// waits for the store reads of Submit and Process. It does not govern the
+// writes that record what the network did, nor the reads that decide what the
+// engine may do: those Store.Update calls, the re-read each transition makes
+// of the record it is about to act on, and the Get and List calls Recover
+// makes to repair the spent set, are made under context.WithoutCancel(ctx),
+// because the record must land, the decision must be made on the record, and
+// the repair must run, whether or not the caller is still waiting. Submit's Create is
 // the one exception: it records nothing the network has done and is bound
 // to the caller's context. A Store bounds every call with a timeout of its
 // own; the engine's contexts carry no deadline on these paths.
@@ -133,9 +134,8 @@ type Intent struct {
 // with from equal to the record's own state, to record an attempt that
 // settled nothing, so the where clause must not demand that the state change.
 //
-// Which context each call receives: Create, and the Get and List calls of
-// Submit, Process and the re-send pass of Recover, receive the caller's
-// context. Every Update, the Get each of Build, Broadcast and
+// Which context each call receives: Create, and the Get calls of Submit and
+// Process, receive the caller's context. Every Update, the Get each of Build, Broadcast and
 // UpdateConfirmations makes under the engine's lock to re-read the record it
 // acts on, and the Get and List calls of Recover's repair passes, receive one
 // that does not end when the caller's does (context.WithoutCancel, which also
@@ -527,6 +527,8 @@ func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 		return fmt.Errorf("%w: %s computed %s, node accepted %s", ErrHeld, in.ID, in.TxID, in.NodeTxID)
 	}
 	if rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {
+		// Nothing was asked of the network, so Attempts does not advance;
+		// LastError carries the cause.
 		return e.holdBuilt(ctx, in, notReserved(rerr))
 	}
 	in.Attempts++
@@ -610,9 +612,9 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 		beforeBuild()
 		if err := e.Build(ctx, in); err != nil {
 			// ErrWrongState here means another worker moved this intent
-			// between the read above and Build's lock, to Built, Broadcast or
-			// Failed. It is returned rather than followed: that worker holds
-			// the intent, and a later call reads it fresh.
+			// between the read above and Build's lock, to any later state. It
+			// is returned rather than followed: that worker holds the intent,
+			// and a later call reads it fresh.
 			return in, err
 		}
 	}
