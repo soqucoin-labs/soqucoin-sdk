@@ -217,15 +217,8 @@ type Engine struct {
 	// that are not returned. nil discards.
 	Logger *slog.Logger
 
-	// mu covers every transition after Submit. Build, Broadcast and
-	// UpdateConfirmations each take it, re-read the stored record, act on
-	// that record and write it back naming the state they read, so two
-	// workers holding copies of one intent cannot both act on it, and the
-	// lock also keeps two Builds from picking the same inputs between select
-	// and reserve. It is held across the selector, the signer, the
-	// Broadcaster and the Confirmer, so none of those may call back into the
-	// Engine.
-	mu sync.Mutex
+	mu sync.Mutex // every transition after Submit; see the type doc
+
 }
 
 var (
@@ -329,12 +322,10 @@ func (e *Engine) save(ctx context.Context, in *Intent, from State) error {
 // before acting, because the caller's copy can be behind the store: another
 // worker may have advanced the intent between the caller's read and the lock.
 //
-// The read is not bound to the caller's context. It decides what the engine
-// may do, not what it asks of the network, and a store that honours the
-// context would otherwise turn an ended context into a transition that never
-// happened: a Broadcast that renews no reservation and records no attempt,
-// where the same context ending a moment later, inside the send, is a lost
-// reply that does both.
+// The read is not bound to the caller's context: it decides what the engine
+// may do, not what it asks of the network, and against a store that honours
+// the context an ended one would otherwise skip the renewal and the attempt
+// record that the same context ending inside the send would produce.
 func (e *Engine) reread(ctx context.Context, in *Intent, want State) (*Intent, error) {
 	stored, ok, err := e.Store.Get(context.WithoutCancel(ctx), in.ID)
 	if err != nil {
@@ -404,15 +395,11 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// The stored state is the one that decides, not the caller's copy: another
-	// worker can have advanced the intent between the caller's read and this
-	// lock, and a copy can also be ahead of the store, when a save failed
-	// after this method changed it. Without this re-read, two workers each
-	// holding a Created copy of one intent both build, and the lock then
-	// serialises them into two builds: each selects different inputs because
-	// the other's are reserved, each signs, and each broadcasts. That pays the
-	// recipient twice from different inputs, which is the first of the two
-	// failure modes this package exists to prevent.
+	// The stored state decides, not the caller's copy, which can be behind the
+	// store (another worker advanced the intent) or ahead of it (a save failed
+	// after this method changed the copy). Without the re-read two workers
+	// holding a Created copy of one intent both build, from different inputs,
+	// and the recipient is paid twice.
 	stored, err := e.reread(ctx, in, StateCreated)
 	if err != nil {
 		return err
@@ -496,22 +483,16 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 // the context's error in. The check for it comes before the permanent branch
 // so no wrapping can turn a cancel into a failure and a release.
 //
-// Broadcast runs under the engine's lock and acts on the stored record, not
-// the caller's copy. A worker whose copy says Built while the store says
-// Broadcast, because another worker sent it first, receives ErrWrongState
-// and sends nothing; without that, the second sender's lost reply would renew
-// a reservation over inputs the first had marked spent and save Built over
-// the Broadcast the first had recorded. The caller's copy is only the key:
-// one that says Broadcast while the store says Built, because the save after
-// a send failed, is sent again from the stored record.
+// Broadcast runs under the engine's lock and acts on the stored record; the
+// caller's copy is only the key. A copy that says Built while the store says
+// Broadcast (another worker sent it first) receives ErrWrongState and sends
+// nothing; one that says Broadcast while the store says Built (the save after
+// a send failed) is sent again from the stored record.
 //
-// Before the send the intent's inputs are re-reserved for another TTL, so a
-// Built intent retried at least once per ReservationTTL never loses them.
-// When that fails, because another withdrawal holds an input after the
-// reservation expired (ErrReservationLost) or the spent set cannot be
-// written, nothing is sent: the intent stays Built with its bytes and the
-// cause recorded, and the operator resolves it. This is the same rule
-// Recover applies, at the one place a send can start.
+// Before the send the inputs are re-reserved for another TTL. When that fails,
+// because another withdrawal holds an input (ErrReservationLost) or the spent
+// set cannot be written, nothing is sent: the intent stays Built with its
+// bytes and the cause recorded. Recover applies the same rule.
 func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
