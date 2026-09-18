@@ -185,6 +185,12 @@ func TestAListunspentReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	if rerr == nil || !at.IsZero() {
 		t.Fatalf("after a stale reply the record reads at=%v err=%v, want the zero time and the error", at, rerr)
 	}
+	c.mu.Lock()
+	pending := c.changed[a]
+	c.mu.Unlock()
+	if !pending {
+		t.Fatal("a stale reply left no refresh pending, so an address whose live subscribe had already committed clean would carry the error until the reconcile")
+	}
 
 	n, committed, err = c.commitRefresh(a, 2, 0, 2, fresh)
 	if err != nil || !committed || n != 1 {
@@ -196,5 +202,88 @@ func TestAListunspentReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	at, rerr = c.LastRefreshOf(a)
 	if rerr != nil || at.IsZero() {
 		t.Fatalf("after the live reply the record reads at=%v err=%v", at, rerr)
+	}
+}
+
+// The live generation is written under the cache lock as well as the
+// connection semaphore, so a check of it under the lock cannot be overtaken by
+// a replacement before the write that follows. Here the lock is held while a
+// Connect and then a Stop try to move it: neither completes until the lock is
+// released. Without this a reply from the old connection could pass the
+// stale check and commit after Connect had moved the generation.
+func TestTheLiveGenerationDoesNotMoveWhileTheCacheLockIsHeld(t *testing.T) {
+	stub := newStub(t, nil)
+	c := NewClient(stub.addr(), time.Hour, nil)
+
+	c.mu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- c.Connect(context.Background()) }()
+	select {
+	case err := <-done:
+		c.mu.Unlock()
+		t.Fatalf("Connect completed while the cache lock was held (err=%v): the generation moved outside the lock", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if g := c.liveGen.Load(); g != 0 {
+		c.mu.Unlock()
+		t.Fatalf("the live generation moved to %d while the cache lock was held", g)
+	}
+	c.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("Connect after the lock was released: %v", err)
+	}
+	if g := c.liveGen.Load(); g != 1 {
+		t.Fatalf("live generation after Connect: %d, want 1", g)
+	}
+
+	c.mu.Lock()
+	stopped := make(chan struct{})
+	go func() { c.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		c.mu.Unlock()
+		t.Fatal("Stop completed while the cache lock was held: the generation moved outside the lock")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if g := c.liveGen.Load(); g != 1 {
+		c.mu.Unlock()
+		t.Fatalf("the live generation moved to %d during Stop while the cache lock was held", g)
+	}
+	c.mu.Unlock()
+	<-stopped
+	if g := c.liveGen.Load(); g != 0 {
+		t.Fatalf("live generation after Stop: %d, want 0", g)
+	}
+}
+
+// A reply that could not be parsed, from a connection that has since been
+// replaced, is recorded as the replacement and not as a fault of the address:
+// the pass ends as it does for any lost connection, and the Monitor is not
+// alarmed for a parse error the replacement explains. From the live
+// connection the parse error itself is recorded.
+func TestAMalformedReplyFromAReplacedConnectionIsRecordedAsTheReplacement(t *testing.T) {
+	a := craftAddr(t, 0x11)
+	c := NewClient("127.0.0.1:1", time.Hour, nil)
+	setHRP(t, c, types.Stagenet.HRP)
+	if err := c.TrackAddresses([]string{a}); err != nil {
+		t.Fatal(err)
+	}
+	c.liveGen.Store(2)
+	parse := errors.New("parse utxos: entry 0: value -5 is negative")
+
+	err := c.recordRefreshFailure(a, 1, 0, 1, parse)
+	if !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("a malformed reply from generation 1 while 2 is live was recorded as %v, want ErrNotConnected", err)
+	}
+	if _, rerr := c.LastRefreshOf(a); !errors.Is(rerr, ErrNotConnected) {
+		t.Fatalf("the record reads %v, want ErrNotConnected", rerr)
+	}
+
+	err = c.recordRefreshFailure(a, 2, 0, 2, parse)
+	if !errors.Is(err, parse) {
+		t.Fatalf("a malformed reply from the live connection was recorded as %v, want the parse error", err)
+	}
+	if _, rerr := c.LastRefreshOf(a); !errors.Is(rerr, parse) {
+		t.Fatalf("the record reads %v, want the parse error", rerr)
 	}
 }

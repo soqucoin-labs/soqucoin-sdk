@@ -157,7 +157,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	c.gen++
 	gen := c.gen
-	c.liveGen.Store(gen)
+	c.setLiveGen(gen)
 	c.conn = conn
 	c.connDone = make(chan struct{})
 	// PF-018 FIX: Use 4MB buffer instead of default 4KB.
@@ -568,7 +568,21 @@ func (c *Client) dropLocked() {
 	c.reader = nil
 	// No live connection: every subscription is void until Connect, and a
 	// notification still in flight from the old reader is ignored.
-	c.liveGen.Store(0)
+	c.setLiveGen(0)
+}
+
+// setLiveGen publishes a connection change to the readers that hold mu.
+// Caller holds connSem. The write takes mu as well, so a reader that loads
+// liveGen under mu (commitSubscribe, commitRefresh, noteChange, the stale
+// test in staleReplyLocked) sees a value that cannot change until it releases
+// the lock, and a check followed by a write under mu is atomic against a
+// replacement. Without this a reply from the old connection could pass the
+// check and then commit after Connect had moved the generation. Lock order is
+// connSem then mu everywhere; nothing takes connSem while holding mu.
+func (c *Client) setLiveGen(gen uint64) {
+	c.mu.Lock()
+	c.liveGen.Store(gen)
+	c.mu.Unlock()
 }
 
 // handleNotification consumes a server push on connection gen. A headers

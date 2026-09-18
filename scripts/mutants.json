@@ -1050,9 +1050,36 @@
       "file": "electrumx/client.go",
       "package": "./electrumx",
       "test": "TestAListunspentReplyFromAReplacedConnectionCommitsNothing",
-      "find": "\tif live := c.liveGen.Load(); gen != live {\n\t\terr := fmt.Errorf(\"%w: the connection was replaced before the listunspent reply for %s was committed\", ErrNotConnected, addr)\n\t\tc.recordRefreshLocked(addr, gen, seqBefore, ticket, err)\n\t\treturn 0, false, err\n\t}\n",
+      "find": "\tif err := c.staleReplyLocked(addr, gen); err != nil {\n\t\tc.recordStaleLocked(addr, gen, seqBefore, ticket, err)\n\t\treturn 0, false, err\n\t}\n",
       "replace": "",
       "why": "A listunspent reply from a connection that has been replaced commits nothing, as a subscribe reply from one commits nothing: the record would date a dead generation's set as current now."
+    },
+    {
+      "id": "electrumx-connection-published-outside-the-cache-lock",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestTheLiveGenerationDoesNotMoveWhileTheCacheLockIsHeld",
+      "find": "\tc.mu.Lock()\n\tc.liveGen.Store(gen)\n\tc.mu.Unlock()",
+      "replace": "\tc.liveGen.Store(gen)",
+      "why": "The live generation is written under the cache lock so a stale check under that lock is atomic with the commit that follows. Written outside it, a replacement can land between the check and the write and a reply from the old connection commits."
+    },
+    {
+      "id": "electrumx-stale-malformed-reply-recorded-as-a-parse-error",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedReplyFromAReplacedConnectionIsRecordedAsTheReplacement",
+      "find": "\tif serr := c.staleReplyLocked(addr, gen); serr != nil {\n\t\tc.recordStaleLocked(addr, gen, seqBefore, ticket, serr)\n\t\treturn serr\n\t}\n",
+      "replace": "",
+      "why": "A malformed reply from a connection that has since been replaced is the replacement's doing. Recorded as a parse error, the pass continues on a connection this reply says nothing about and the Monitor alarms the address for a fault it does not have."
+    },
+    {
+      "id": "electrumx-stale-reply-leaves-no-refresh-pending",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAListunspentReplyFromAReplacedConnectionCommitsNothing",
+      "find": "\t\tc.changed[addr] = true // the stale reply leaves a refresh pending\n",
+      "replace": "",
+      "why": "A stale reply records an error on the address. When the live connection's subscribe reply for it has already committed clean, only this mark makes a pass refresh it before the reconcile; without it the Monitor skips and alarms the address for up to the reconcile interval."
     }
   ]
 }
