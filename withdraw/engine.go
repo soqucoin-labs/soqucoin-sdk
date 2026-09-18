@@ -526,9 +526,9 @@ func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	if in.NodeTxID != "" {
 		return fmt.Errorf("%w: %s computed %s, node accepted %s", ErrHeld, in.ID, in.TxID, in.NodeTxID)
 	}
+	// A refused reservation asks nothing of the network, so Attempts does not
+	// advance for it; LastError carries the cause.
 	if rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {
-		// Nothing was asked of the network, so Attempts does not advance;
-		// LastError carries the cause.
 		return e.holdBuilt(ctx, in, notReserved(rerr))
 	}
 	in.Attempts++
