@@ -728,7 +728,7 @@ func (c *Client) staleReplyLocked(addr string, gen uint64) error {
 func (c *Client) recordRefreshFailure(addr string, gen, seqBefore, ticket uint64, err error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if ticket < c.refreshed[addr].commit {
+	if last := c.refreshed[addr].commit; ticket < last {
 		// A later refresh of this address has already committed, as
 		// commitRefresh tests before its own stale check: this reply is
 		// superseded, records nothing and leaves nothing pending.

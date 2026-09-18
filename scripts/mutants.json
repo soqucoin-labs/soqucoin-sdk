@@ -1080,6 +1080,15 @@
       "find": "\t\tc.changed[addr] = true // the stale reply leaves a refresh pending\n",
       "replace": "",
       "why": "A stale reply records an error on the address. When the live connection's subscribe reply for it has already committed clean, only this mark makes a pass refresh it before the reconcile; without it the Monitor skips and alarms the address for up to the reconcile interval."
+    },
+    {
+      "id": "electrumx-superseded-malformed-reply-leaves-a-refresh-pending",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAMalformedReplyFromAReplacedConnectionIsRecordedAsTheReplacement",
+      "find": "\tif last := c.refreshed[addr].commit; ticket < last {\n\t\t// A later refresh of this address has already committed, as\n\t\t// commitRefresh tests before its own stale check: this reply is\n\t\t// superseded, records nothing and leaves nothing pending.\n\t\treturn err\n\t}\n",
+      "replace": "",
+      "why": "A reply a later refresh has superseded is dropped by the record, and the stale path must not mark it changed either, or a superseded stale reply costs one listunspent the later refresh already made. commitRefresh makes the same test before its stale check."
     }
   ]
 }
