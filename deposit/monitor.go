@@ -186,7 +186,9 @@ type Monitor struct {
 	// the outpoint twice; a second caller now waits. firstListed, read only
 	// under scanMu, records when a pass first found an address awaiting the
 	// indexer's first reply, so the address is quiet for one MaxCacheAge from
-	// then rather than alarmed from the first pass.
+	// then rather than alarmed from the first pass; an entry is removed once
+	// the address has been answered or has failed, so the map holds the
+	// addresses awaiting a reply and no others.
 	scanMu      sync.Mutex
 	firstListed map[string]time.Time
 }
@@ -295,10 +297,15 @@ func refused(err error) bool {
 }
 
 // regressed is true when the node reports a credited output shallower than
-// the policy required for its value: a reorganisation re-included it lower
-// down. It is read at both sites that ask the node about a credited output,
-// recheckPending and the credited branch of Scan; the credit stands and the
-// ledger decides, as for an output that vanished.
+// the policy now requires for its value: a reorganisation re-included it
+// lower down, or the policy was raised since the credit. It is read at both
+// sites that ask the node about a credited output, recheckPending and the
+// credited branch of Scan; the credit stands and the ledger decides, as for
+// an output that vanished. The Scan site sees the regression only while the
+// indexer still reports the depth the credit was given at; an indexer that
+// has followed the reorganisation reports the lower height, the pre-filter
+// on Required skips the output before IsCredited is asked, and only
+// recheckPending, for an output the ledger lists as pending, alarms it.
 func (m *Monitor) regressed(out *rpc.TxOut, value int64) bool {
 	return out != nil && out.Confirmations < m.Required(value)
 }
@@ -415,6 +422,7 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			if at.IsZero() && err == nil && m.awaiting(addr) {
 				continue // the indexer has not answered for it yet; its deposits wait, quietly
 			}
+			delete(m.firstListed, addr) // answered, or failed: the record has done its work
 			if at.IsZero() || m.clock().Sub(at) > m.maxCacheAge() {
 				if staleErr == nil {
 					staleErr = err
@@ -471,7 +479,7 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 						return credited, err
 					}
 					if m.regressed(out, u.Value) {
-						m.alert(AlertDepositRegressed, "credited deposit %s:%d (%d shors to %s) is at depth %d, required %d: a reorganisation re-included it lower down; the credit stands, verify it", u.TxID, u.Vout, u.Value, addr, out.Confirmations, m.Required(u.Value))
+						m.alert(AlertDepositRegressed, "credited deposit %s:%d (%d shors to %s) is at depth %d, required %d: a reorganisation re-included it lower down, or the policy was raised since it was credited; the credit stands, verify it", u.TxID, u.Vout, u.Value, addr, out.Confirmations, m.Required(u.Value))
 						continue
 					}
 					if out != nil && out.Confirmations > types.MaxReorgDepth {
@@ -584,7 +592,7 @@ func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 			continue
 		}
 		if m.regressed(out, d.Value) {
-			m.alert(AlertDepositRegressed, "credited deposit %s:%d (%d shors to %s) is at depth %d, required %d: a reorganisation re-included it lower down; the credit stands, verify it", d.TxID, d.Vout, d.Value, d.Address, out.Confirmations, m.Required(d.Value))
+			m.alert(AlertDepositRegressed, "credited deposit %s:%d (%d shors to %s) is at depth %d, required %d: a reorganisation re-included it lower down, or the policy was raised since it was credited; the credit stands, verify it", d.TxID, d.Vout, d.Value, d.Address, out.Confirmations, m.Required(d.Value))
 			continue
 		}
 		if out.Confirmations > types.MaxReorgDepth {

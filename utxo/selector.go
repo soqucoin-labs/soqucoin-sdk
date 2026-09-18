@@ -463,6 +463,11 @@ func (ss *SpentSet) Size() int {
 }
 
 // persist writes the spent set to disk atomically.
+// writeFile is atomicfile.WriteFile, a variable so a test can make the write
+// fail after the rename and see what Reserve does with a reservation that is
+// in the file and not known to be durable.
+var writeFile = atomicfile.WriteFile
+
 func (ss *SpentSet) persist() error {
 	if ss.filePath == "" {
 		return nil
@@ -487,7 +492,7 @@ func (ss *SpentSet) persist() error {
 	// Written, synced and renamed into place, then the directory synced: a
 	// spend marked just before a power loss is on disk when persist returns,
 	// so a restart cannot re-select an input of a transaction already sent.
-	if err := atomicfile.WriteFile(ss.filePath, buf, 0600); err != nil {
+	if err := writeFile(ss.filePath, buf, 0600); err != nil {
 		return fmt.Errorf("%w: %w", ErrPersist, err)
 	}
 	return nil
