@@ -152,8 +152,9 @@ break; putting them there is only safe with the rules below.
   its parameters, the salt, the nonce, and the unencrypted list of public keys
   and addresses. For that to mean anything the file has to have exactly one
   reading, so a keystore must be one JSON object, carrying only the members
-  this release knows, each named once and spelled as this release writes it,
-  with nothing after it. Anything else is refused rather than ignored, because
+  this release knows, each named once and, with JSON escapes decoded, spelled
+  as this release writes it, with nothing after it. Anything else is refused
+  rather than ignored, because
   content that does not survive into the values this release decodes is
   content the binding does not cover, and another tool reading the same file
   could see it. The spelling matters because Go's JSON decoder matches a member

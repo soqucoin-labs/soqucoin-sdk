@@ -391,8 +391,8 @@ Argon2id-derived key, loaded and rewritten as one document, sized for a hot wall
 rather than one per user. Back that file up; a generated key has no seed. Neither `FromSeed` nor the
 generator returns a key the node treats as invalid (a public key whose first byte is `0xFF`), and
 `Load` refuses a record whose address does not belong to its key or whose private key does not sign
-for its public key, and a passphrase manager refuses an empty passphrase at every entry point. Key
-handling in detail: [Security Guide](SECURITY.md).
+for its public key, and a passphrase manager refuses an empty passphrase wherever it would be used:
+`Load`, `LoadOrCreate` and `Save`. Key handling in detail: [Security Guide](SECURITY.md).
 
 ---
 
