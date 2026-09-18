@@ -34,9 +34,8 @@
 //
 // Failed means the intent could not be built, or the node refused the bytes
 // on an attempt and no attempt's outcome is unknown, or an operator
-// abandoned the intent after Abandon's checks. A held intent is one the engine will not send again and will not
-// fail on its own: its inputs are marked spent for good, and Abandon is the
-// way out.
+// abandoned the intent. A held intent is one the engine will not send again
+// and will not fail on its own; Abandon is the way out.
 //
 // Every method takes a context.Context. A context that ends is never a
 // verdict on a withdrawal: during Build it leaves the intent Created with
@@ -118,11 +117,9 @@ type Intent struct {
 	// otherwise.
 	NodeTxID string `json:"node_txid,omitempty"`
 	// MaybeRelayed says peers may hold the bytes whatever the node says now.
-	// Broadcast sets it, and saves, before every send, and takes it back only
-	// on an answer that shows the node did not take the bytes on that attempt
-	// (a rejection, a transient error, refused credentials) when no earlier
-	// attempt left it set. A permanent rejection on an intent with this set
-	// holds the intent instead of failing it.
+	// Broadcast saves it set before every send and takes it back only on an
+	// answer that shows the node did not take the bytes (a rejection, a
+	// transient error, refused credentials) when no earlier attempt left it.
 	MaybeRelayed bool `json:"maybe_relayed,omitempty"`
 	// SentAt is the last time the bytes were handed to the node: set and
 	// saved before every send by Broadcast, and by Rebroadcast, which puts
@@ -333,10 +330,8 @@ var (
 	// withdrawal, which is what that breaker's own documentation says it
 	// exists to prevent.
 	//
-	// A Failed intent reached through a permanent rejection at broadcast, or
-	// through Abandon, keeps its TxID and RawHex, so Failed does not mean the
-	// bytes never reached a node, only that the node refused them, or does not
-	// know them after the wait, and the inputs were released.
+	// A Failed intent reached through a rejection at broadcast, or through
+	// Abandon, keeps its TxID and RawHex: the bytes may have reached a node.
 	ErrFailed = fmt.Errorf("withdraw: intent failed permanently (%w)", rpc.ErrPermanent)
 )
 
@@ -568,15 +563,13 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 // bytes go out, never a new transaction. On a permanent rejection the intent
 // is Failed and its inputs released, unless an earlier attempt's outcome was
 // unknown (MaybeRelayed): peers may hold those bytes for the node's mempool
-// expiry and mine them after the node forgot them, so the intent is held
-// instead, Built with Hold set, its inputs marked spent under its txid, and
-// ErrHeld is returned. When the node accepted the transaction under a
-// different txid (rpc.ErrTxIDMismatch) the payment is in the mempool: the
-// inputs are marked spent under the node's txid so no later withdrawal can
-// select them however long this takes to resolve, the intent stays Built
-// with NodeTxID recording what the node said, and the error is returned for
-// the operator. Neither is a rejection and neither is treated as one. A held
-// intent is never sent again (ErrHeld); Abandon is the way out.
+// expiry, so the intent is held instead, Built with Hold set and its inputs
+// marked spent under its txid, and ErrHeld is returned. When the node
+// accepted the transaction under a different txid (rpc.ErrTxIDMismatch) the
+// payment is in the mempool: the inputs are marked spent under the node's
+// txid, the intent stays Built with NodeTxID recorded, and the error is
+// returned. Neither is a rejection. A held intent is never sent again;
+// Abandon is the way out.
 //
 // If the node accepted the transaction but the spent set could not be
 // written (utxo.ErrPersist), the intent is still saved as Broadcast and that
@@ -600,8 +593,8 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 // set cannot be written, nothing is sent: the intent stays Built with its
 // bytes and the cause recorded. Recover applies the same rule. Then the
 // attempt is saved, with MaybeRelayed set and SentAt, and only then sent: a
-// save that fails sends nothing, and a later rejection reads the store, so a
-// save that fails after the send cannot lose the mark.
+// save that fails sends nothing, and a save that fails after the send cannot
+// lose the mark.
 func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -941,8 +934,10 @@ func (e *Engine) UpdateConfirmations(ctx context.Context, in *Intent) error {
 // peer does. A refusal is recorded in LastError and returned, and does not
 // move SentAt, so it does not restart Abandon's wait; a send the node took,
 // or whose outcome is unknown, does. As in Broadcast, the attempt is saved
-// before the send and nothing is sent when that save fails. Runs under the
-// engine's lock and acts on the stored record.
+// before the send and nothing is sent when that save fails; when the save
+// after a refusal fails, the pre-send time stays on disk and Abandon waits
+// from it, at most one more AbandonAfter. Runs under the engine's lock and
+// acts on the stored record.
 func (e *Engine) Rebroadcast(ctx context.Context, in *Intent) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -986,13 +981,11 @@ func (e *Engine) Rebroadcast(ctx context.Context, in *Intent) error {
 // LastError record it, and every spent-set entry it owns is dropped
 // (utxo.SpentSet.Forget), so the inputs return to selection; logged at Warn.
 //
-// The wait is the node's own mempool expiry, and the residual risk is a peer
-// that kept the bytes longer: a transaction abandoned here can still be
-// mined, and its record keeps the bytes and the txid so the reconciler finds
-// it. A Built intent that is not held is refused (ErrWrongState). Runs under
-// the engine's lock, node calls included, and acts on the stored record, so
-// the second of two operators abandoning one intent reads Failed and is
-// refused.
+// The wait is the node's mempool expiry; the residual risk is a peer that
+// kept the bytes longer, and the record keeps the txid for the reconciler.
+// A Built intent that is not held is refused (ErrWrongState). Runs under the
+// engine's lock, node calls included, on the stored record, so the second of
+// two operators abandoning one intent reads Failed and is refused.
 func (e *Engine) Abandon(ctx context.Context, in *Intent) error {
 	if e.Chain == nil {
 		return errors.New("withdraw: no Chain configured")

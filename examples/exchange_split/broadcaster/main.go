@@ -94,6 +94,7 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 		Spent:                 spent,
 		Broadcaster:           node,
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
+		Chain:                 withdraw.RPCChain{Client: node}, // Abandon's node checks
 		RequiredConfirmations: confirmations,
 		Logger:                logger,
 		// No Select and no BuildSign: there is no key on this host, so Build
@@ -148,9 +149,8 @@ func send(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) {
 // confirm advances every Broadcast intent. A confirmation count that cannot be
 // read is this intent's problem and not the pass's: the transaction is out
 // either way, and the next pass asks again. A transaction the node no longer
-// knows (rpc.ErrUnknownOutcome) is sent again with the same bytes; the record
-// does not change, and an operator abandons it through withdraw.Engine.Abandon
-// once the node has not known it for the engine's wait.
+// knows (rpc.ErrUnknownOutcome) is sent again with the same bytes; an
+// operator abandons it through withdraw.Engine.Abandon after the wait.
 func confirm(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) {
 	sent, err := store.List(ctx, withdraw.StateBroadcast)
 	if err != nil {

@@ -274,36 +274,42 @@ func (ss *SpentSet) Release(intentID string) error {
 }
 
 // Forget drops every entry intentID owns, reservations and broadcast entries
-// alike, and writes the file once. It is the one call that removes a
-// broadcast entry before the chain confirms it. withdraw.Engine.Abandon calls
-// it after the node has been asked and does not know the transaction and
-// reports every input unspent, and Recover calls it for an abandoned intent
-// whose call did not land. An empty id is refused; it would drop every entry
-// written without one.
+// alike, and writes the file once: the one call that removes a broadcast
+// entry before the chain confirms it, for withdraw.Engine.Abandon after its
+// node checks, and for Recover when that call did not land. A write that
+// fails puts the entries back, as Reserve does, since the file still holds
+// them; one that landed without its durability confirmed keeps the drop. An
+// empty id is refused; it would drop every entry written without one.
 func (ss *SpentSet) Forget(intentID string) error {
 	if intentID == "" {
 		return errors.New("utxo: Forget needs an intent id")
 	}
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
-	dropped := 0
+	dropped := map[SpentKey]SpentEntry{}
 	for key, e := range ss.entries {
 		if e.IntentID == intentID {
+			dropped[key] = e
 			delete(ss.entries, key)
-			dropped++
 		}
 	}
-	if dropped == 0 {
+	if len(dropped) == 0 {
 		return nil
 	}
-	ss.log.Warn("spent set: entries of an abandoned withdrawal dropped", "intent", intentID, "dropped", dropped)
-	return ss.persist()
+	if err := ss.persist(); err != nil && !errors.Is(err, atomicfile.ErrWrittenNotDurable) {
+		for key, e := range dropped {
+			ss.entries[key] = e
+		}
+		return err
+	} else if err != nil {
+		return err
+	}
+	ss.log.Warn("spent set: entries of an abandoned withdrawal dropped", "intent", intentID, "dropped", len(dropped))
+	return nil
 }
 
 // SentIntents returns the id of every withdrawal that owns an unconfirmed
-// broadcast entry, each once, sorted; entries written without an id do not
-// appear. withdraw.Engine.Recover uses it to drop the entries of an
-// abandoned withdrawal whose Forget did not land.
+// broadcast entry, each once, sorted; entries without an id do not appear.
 func (ss *SpentSet) SentIntents() []string {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -355,11 +361,9 @@ func (ss *SpentSet) MarkBroadcastFor(inputs []types.UTXO, broadcastTxID, intentI
 }
 
 // markBroadcast is all-or-nothing: an input another withdrawal has recorded
-// as spent, in a transaction the chain has not confirmed, refuses the whole
-// call with ErrAlreadyReserved and nothing is written. Writing over it would
-// attribute the input to the transaction that cannot confirm. The caller's
-// own entries, entries of the same transaction, and confirmed entries are
-// replaced.
+// as spent in an unconfirmed transaction refuses the whole call with
+// ErrAlreadyReserved and nothing is written, since writing over it would
+// attribute the input to the transaction that cannot confirm.
 func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID string) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -491,7 +495,7 @@ func (ss *SpentSet) persist() error {
 	// spend marked just before a power loss is on disk when persist returns,
 	// so a restart cannot re-select an input of a transaction already sent.
 	if err := atomicfile.WriteFile(ss.filePath, buf, 0600); err != nil {
-		return fmt.Errorf("%w: %v", ErrPersist, err)
+		return fmt.Errorf("%w: %w", ErrPersist, err)
 	}
 	return nil
 }

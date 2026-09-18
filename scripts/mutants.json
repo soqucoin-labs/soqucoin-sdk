@@ -717,8 +717,8 @@
       "file": "utxo/selector.go",
       "package": "./utxo",
       "test": "TestForgetDropsOnlyTheWithdrawalsOwnEntries",
-      "find": "\t\tif e.IntentID == intentID {\n\t\t\tdelete(ss.entries, key)\n\t\t\tdropped++",
-      "replace": "\t\tif e.IntentID == intentID && e.reserved() {\n\t\t\tdelete(ss.entries, key)\n\t\t\tdropped++",
+      "find": "\t\tif e.IntentID == intentID {\n\t\t\tdropped[key] = e\n\t\t\tdelete(ss.entries, key)",
+      "replace": "\t\tif e.IntentID == intentID && e.reserved() {\n\t\t\tdropped[key] = e\n\t\t\tdelete(ss.entries, key)",
       "why": "Forget is the one call that removes a broadcast entry, for an abandoned withdrawal. Dropping only the reservations leaves the abandoned inputs locked, which is what Abandon exists to end."
     },
     {
@@ -801,6 +801,15 @@
       "find": "\t\tif in.AbandonedAt.IsZero() {",
       "replace": "\t\tif false {",
       "why": "A Failed intent that was not abandoned and owns broadcast entries is a store that never recorded a send the set did. Dropping the entries frees the inputs of a transaction the node took."
+    },
+    {
+      "id": "spent-set-forget-drops-in-memory-what-is-not-dropped-on-disk",
+      "file": "utxo/selector.go",
+      "package": "./utxo",
+      "test": "TestForgetPutsTheEntriesBackWhenTheWriteFails",
+      "find": "\t\tfor key, e := range dropped {\n\t\t\tss.entries[key] = e\n\t\t}\n\t\treturn err",
+      "replace": "\t\tfor key, e := range dropped {\n\t\t\t_ = key\n\t\t\t_ = e\n\t\t}\n\t\treturn err",
+      "why": "A drop that is not on disk must not take effect in memory: the process would select inputs the file still records as spent, and a restart would put the entries back under a record that says Failed."
     }
   ]
 }

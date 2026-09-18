@@ -2,6 +2,7 @@ package utxo
 
 import (
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -100,5 +101,37 @@ func TestForgetDropsOnlyTheWithdrawalsOwnEntries(t *testing.T) {
 	}
 	if err := ss.Forget("nobody"); err != nil {
 		t.Fatalf("Forget of an id with no entries: %v", err)
+	}
+}
+
+// A Forget whose write fails puts the entries back: the file still holds
+// them, and a process that stopped refusing them would select inputs the
+// disk says are spent. Nothing is dropped until the drop is on disk.
+func TestForgetPutsTheEntriesBackWhenTheWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := OpenSpentSet(dir+"/spent.json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := rUTXOs()[0]
+	if err := ss.MarkBroadcastFor([]types.UTXO{a}, "tx1", "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if err := ss.Forget("w1"); !errors.Is(err, ErrPersist) {
+		t.Fatalf("forget with the directory read-only: %v, want ErrPersist", err)
+	}
+	if !ss.IsSpent(a.TxID, a.Vout) {
+		t.Fatal("the entry was dropped in memory although the drop is not on disk")
+	}
+	os.Chmod(dir, 0o700)
+	if err := ss.Forget("w1"); err != nil {
+		t.Fatal(err)
+	}
+	if ss.IsSpent(a.TxID, a.Vout) {
+		t.Fatal("the entry survived a Forget that landed")
 	}
 }

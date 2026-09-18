@@ -757,6 +757,7 @@ func main() {
 		Spent:                 spent,
 		Broadcaster:           node, // rpc.Broadcast resolves lost replies against the node
 		Confirmer:             withdraw.RPCConfirmer{Client: node},
+		Chain:                 withdraw.RPCChain{Client: node}, // Abandon's node checks
 		RequiredConfirmations: types.MaxReorgDepth,
 		Logger:                logger,
 		// ReservationTTL left at its default, withdraw.DefaultReservationTTL (4 hours).
