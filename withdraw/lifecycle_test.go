@@ -524,3 +524,110 @@ func TestAbandonNeverAsksTheNodeAboutThePlaceholderTxID(t *testing.T) {
 		}
 	}
 }
+
+// legacyRecord rewrites the stored record as the released version wrote it:
+// no mark, no SentAt, no AbandonedAt, the attempts and state given.
+func legacyRecord(t *testing.T, store Store, id string, state State, attempts int) {
+	t.Helper()
+	in, _, err := store.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := in.State
+	in.State, in.Attempts, in.MaybeRelayed, in.SentAt = state, attempts, false, time.Time{}
+	in.UpdatedAt = in.UpdatedAt.Add(-(DefaultAbandonAfter + time.Minute))
+	if err := store.Update(context.Background(), in, from); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A record from before SentAt existed reads its last write as its last send,
+// so a refused re-send puts a real time back and Abandon stays reachable.
+func TestLegacyRecordKeepsAbandonReachableAfterARefusedRebroadcast(t *testing.T) {
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), net, coins())
+	e.Chain = &fakeChain{known: map[string]bool{}, spent: map[string]bool{}}
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w1, _ := e.Process(context.Background(), "w1")
+	legacyRecord(t, e.Store, "w1", StateBroadcast, 1)
+	net.setMode("reject")
+	if err := e.Rebroadcast(context.Background(), w1); err == nil {
+		t.Fatal("rejection not reported")
+	}
+	if err := e.Abandon(context.Background(), w1); err != nil {
+		t.Fatalf("abandon of a legacy record after a refused rebroadcast: %v", err)
+	}
+}
+
+// Rebroadcast records the attempt before it sends: nothing goes out when the
+// save fails, and a lost reply whose save after the send fails still leaves
+// the fresh SentAt on disk, so Abandon is refused.
+func TestRebroadcastRecordsTheAttemptBeforeItSends(t *testing.T) {
+	store := &updateFailWhen{MemStore: NewMemStore()}
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, store, utxo.NewSpentSet("", nil), net, coins())
+	e.Chain = &fakeChain{known: map[string]bool{}, spent: map[string]bool{}}
+	store.pick = func(*Intent) bool { return false }
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w1, _ := e.Process(context.Background(), "w1")
+	backdate(t, store, "w1", DefaultAbandonAfter+time.Minute)
+
+	store.pick = func(in *Intent) bool { return in.State == StateBroadcast && in.LastError == "" }
+	sent := net.sentCount()
+	if err := e.Rebroadcast(context.Background(), w1); !errors.Is(err, errDiskFull) || net.sentCount() != sent {
+		t.Fatalf("pre-send save failing: %v, sent %d", err, net.sentCount()-sent)
+	}
+
+	store.pick = func(in *Intent) bool { return strings.Contains(in.LastError, "rebroadcast") }
+	net.setMode("lost")
+	if err := e.Rebroadcast(context.Background(), w1); !errors.Is(err, rpc.ErrUnknownOutcome) {
+		t.Fatalf("lost reply: %v", err)
+	}
+	if err := e.Abandon(context.Background(), w1); !errors.Is(err, ErrNotAbandonable) {
+		t.Fatalf("abandon after a re-send whose outcome is unknown and whose save failed: %v, want the wait restarted", err)
+	}
+}
+
+// A record from before the mark existed carries attempts whose outcomes are
+// not on record; a rejection holds it rather than failing it.
+func TestLegacyRecordWithAttemptsIsHeldOnARejection(t *testing.T) {
+	spent := utxo.NewSpentSet("", nil)
+	net := &fakeNet{mode: "reject"}
+	e := newEngine(t, NewMemStore(), spent, net, coins())
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
+	if err := e.Build(context.Background(), w1); err != nil {
+		t.Fatal(err)
+	}
+	legacyRecord(t, e.Store, "w1", StateBuilt, 1)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, ErrHeld) {
+		t.Fatalf("rejection of a legacy record with an attempt: %v, want ErrHeld", err)
+	}
+	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("inputs released for a record whose earlier attempt is not on record")
+	}
+}
+
+// A Failed intent that was not abandoned and still owns spent entries is a
+// store that never recorded a send the set did. Recover keeps the entries and
+// reports it; only an abandoned intent's entries are dropped.
+func TestRecoverKeepsTheEntriesOfAFailedIntentThatWasNotAbandoned(t *testing.T) {
+	spent := utxo.NewSpentSet("", nil)
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, NewMemStore(), spent, net, coins())
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w1, _ := e.Process(context.Background(), "w1")
+	// The store is restored from before the send: Built, no attempt on record.
+	legacyRecord(t, e.Store, "w1", StateBuilt, 0)
+	net.setMode("reject")
+	if got, err := e.Process(context.Background(), "w1"); !errors.Is(err, rpc.ErrPermanent) || got.State != StateFailed {
+		t.Fatalf("retry of the restored record: %v %+v", err, got)
+	}
+	err := e.Recover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "w1") {
+		t.Fatalf("recover: %v, want the disagreement reported", err)
+	}
+	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("recover dropped the entries of a send the node took")
+	}
+}

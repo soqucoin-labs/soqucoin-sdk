@@ -735,8 +735,8 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestRecoverDropsTheEntriesOfAnAbandonedIntentWhoseForgetFailed",
-      "find": "\t\tif !ok || in.State != StateFailed {\n\t\t\tcontinue\n\t\t}\n\t\te.log().Warn(\"recover: dropping",
-      "replace": "\t\tif !ok || in.State != StateFailed || true {\n\t\t\tcontinue\n\t\t}\n\t\te.log().Warn(\"recover: dropping",
+      "find": "\t\tif !ok || in.State != StateFailed {\n\t\t\tcontinue\n\t\t}\n\t\tif in.AbandonedAt.IsZero() {",
+      "replace": "\t\tif !ok || in.State != StateFailed || true {\n\t\t\tcontinue\n\t\t}\n\t\tif in.AbandonedAt.IsZero() {",
       "why": "An Abandon whose Forget did not land leaves a Failed record and the entries on disk, and nothing else ever frees those inputs: Recover releases reservations only and Abandon refuses a Failed record."
     },
     {
@@ -762,9 +762,45 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestRefusedRebroadcastDoesNotRestartTheAbandonWait",
-      "find": "\tsentAt := in.SentAt\n\tif sentAt.IsZero() {",
-      "replace": "\tsentAt := in.UpdatedAt\n\tif sentAt.IsZero() {",
+      "find": "\tlastSent := in.SentAt\n\tif lastSent.IsZero() {",
+      "replace": "\tlastSent := in.UpdatedAt\n\tif lastSent.IsZero() {",
       "why": "Every save moves UpdatedAt, a refused Rebroadcast included. The wait is about bytes reaching peers, so it is measured from the last send the node did not refuse."
+    },
+    {
+      "id": "withdraw-legacy-attempts-count-as-answered",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestLegacyRecordWithAttemptsIsHeldOnARejection",
+      "find": "\tprior := in.MaybeRelayed || (in.Attempts > 0 && in.SentAt.IsZero())",
+      "replace": "\tprior := in.MaybeRelayed",
+      "why": "A record written before the mark existed carries attempts whose outcomes are not on record. Reading them as answered lets a rejection fail the intent and release inputs an earlier attempt may have relayed."
+    },
+    {
+      "id": "withdraw-legacy-record-loses-its-last-send-on-a-refused-rebroadcast",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestLegacyRecordKeepsAbandonReachableAfterARefusedRebroadcast",
+      "find": "\tif sentAt.IsZero() {\n\t\tsentAt = in.UpdatedAt // a record from before SentAt existed",
+      "replace": "\tif false {\n\t\tsentAt = in.UpdatedAt // a record from before SentAt existed",
+      "why": "Putting a zero SentAt back after a refused re-send sends Abandon to UpdatedAt, which the save just moved; a record from the released version that the node forgot is then never abandonable while the loop re-sends it."
+    },
+    {
+      "id": "withdraw-rebroadcast-sends-before-it-records",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRebroadcastRecordsTheAttemptBeforeItSends",
+      "find": "\tif err := e.save(ctx, in, StateBroadcast); err != nil {\n\t\treturn fmt.Errorf(\"record re-send",
+      "replace": "\tif err := e.save(ctx, in, StateBroadcast); err != nil && false {\n\t\treturn fmt.Errorf(\"record re-send",
+      "why": "A re-send whose reply is lost and whose save then fails leaves a stale SentAt on disk, and Abandon passes its wait on it a moment after the bytes went to peers."
+    },
+    {
+      "id": "withdraw-recover-drops-the-entries-of-any-failed-intent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRecoverKeepsTheEntriesOfAFailedIntentThatWasNotAbandoned",
+      "find": "\t\tif in.AbandonedAt.IsZero() {",
+      "replace": "\t\tif false {",
+      "why": "A Failed intent that was not abandoned and owns broadcast entries is a store that never recorded a send the set did. Dropping the entries frees the inputs of a transaction the node took."
     }
   ]
 }

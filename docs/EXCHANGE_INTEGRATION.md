@@ -632,8 +632,8 @@ cannot afford impossible by construction:
   be built, or the node refused the bytes and no attempt's outcome was unknown, or an operator
   abandoned the intent.
 - **A node that refuses the credentials** (`rpc.ErrUnauthorized`, a 401 or 403 before any handler
-  ran) has taken nothing: the intent stays Built, is not marked as relayed, and the same bytes go
-  out once the credential or the allowlist is fixed. It is not a lost reply, and it counts for the
+  ran) has taken nothing: the intent stays Built with the mark put back to what earlier attempts
+  left, and the same bytes go out once the credential or the allowlist is fixed. It is not a lost reply, and it counts for the
   breaker: nothing sent under it can succeed.
 - **A Broadcast intent whose transaction the node no longer knows has two exits.**
   `UpdateConfirmations` returns `rpc.ErrUnknownOutcome` for it and changes nothing.
@@ -642,11 +642,13 @@ cannot afford impossible by construction:
   proof that no peer does. `Abandon`, the operator's transition to Failed for a Broadcast intent
   or a held Built one, refuses (`withdraw.ErrNotAbandonable`, nothing changed) unless `AbandonAfter`
   (default `withdraw.DefaultAbandonAfter`, the node's mempool expiry) has passed since the last
-  send the node did not refuse (`SentAt`), the node does not know the transaction, and every
-  input is unspent at the node; it needs a `withdraw.Chain` (`withdraw.RPCChain` over your node, which refuses to answer
+  send (`SentAt`, set before every send; a re-send the node refused puts the earlier time back),
+  the node does not know the transaction, and every input is unspent at the node; it needs a `withdraw.Chain` (`withdraw.RPCChain` over your node, which refuses to answer
   while the node is behind). On success the intent is Failed with its bytes kept and its
   spent-set entries dropped, so the inputs return to selection; when that drop fails, `Recover`
-  drops them at the next start. The residual risk is a peer that kept the bytes longer than the
+  drops them at the next start (`AbandonedAt` marks the record; entries owned by any other Failed
+  intent are kept and reported). Records written by an earlier release carry no `SentAt` and no
+  mark: their attempts count as possibly relayed, and their last write stands for their last send. The residual risk is a peer that kept the bytes longer than the
   node's expiry, which the node applies lazily, on its next mempool acceptance rather than on a
   clock, so a quiet peer keeps them longer; the record keeps the txid so a reconciliation finds
   the transaction if it mines. A `Rebroadcast` the node refused does not restart the wait; one it

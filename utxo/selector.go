@@ -275,10 +275,11 @@ func (ss *SpentSet) Release(intentID string) error {
 
 // Forget drops every entry intentID owns, reservations and broadcast entries
 // alike, and writes the file once. It is the one call that removes a
-// broadcast entry before the chain confirms it, and withdraw.Engine.Abandon
-// is its one caller: it runs after the node has been asked and does not know
-// the transaction and reports every input unspent. An empty id is refused;
-// it would drop every entry written without one.
+// broadcast entry before the chain confirms it. withdraw.Engine.Abandon calls
+// it after the node has been asked and does not know the transaction and
+// reports every input unspent, and Recover calls it for an abandoned intent
+// whose call did not land. An empty id is refused; it would drop every entry
+// written without one.
 func (ss *SpentSet) Forget(intentID string) error {
 	if intentID == "" {
 		return errors.New("utxo: Forget needs an intent id")

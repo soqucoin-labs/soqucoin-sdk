@@ -33,8 +33,8 @@
 //	Broadcast, held Built ──Abandon (operator, after the checks)──► Failed
 //
 // Failed means the intent could not be built, or the node refused the bytes
-// on an attempt and no attempt's outcome is unknown, or an operator abandoned
-// the intent after Abandon's checks. A held intent is one the engine will not send again and will not
+// on an attempt and no attempt's outcome is unknown, or an operator
+// abandoned the intent after Abandon's checks. A held intent is one the engine will not send again and will not
 // fail on its own: its inputs are marked spent for good, and Abandon is the
 // way out.
 //
@@ -121,16 +121,19 @@ type Intent struct {
 	// Broadcast sets it, and saves, before every send, and takes it back only
 	// on an answer that shows the node did not take the bytes on that attempt
 	// (a rejection, a transient error, refused credentials) when no earlier
-	// attempt left it set. An unknown outcome, or a save that fails after
-	// the send, leaves it set. A permanent rejection on an intent with this
-	// set holds the intent instead of failing it.
+	// attempt left it set. A permanent rejection on an intent with this set
+	// holds the intent instead of failing it.
 	MaybeRelayed bool `json:"maybe_relayed,omitempty"`
-	// SentAt is the last time the bytes may have reached the network: set
-	// before every send by Broadcast, and by Rebroadcast when the node did
-	// not refuse its send. Abandon's wait is measured from it, so a refused
-	// Rebroadcast does not restart the wait. Zero on records written before
-	// this field existed; Abandon reads UpdatedAt then.
+	// SentAt is the last time the bytes were handed to the node: set and
+	// saved before every send by Broadcast, and by Rebroadcast, which puts
+	// the earlier value back when the node refused, so a loop of refused
+	// re-sends does not keep Abandon out of reach. Abandon's wait runs from
+	// it. Zero on records from before this field existed, which read UpdatedAt.
 	SentAt time.Time `json:"sent_at,omitempty"`
+	// AbandonedAt is set by Abandon. Recover drops the spent entries only of
+	// a Failed intent that carries it; any other Failed intent that owns
+	// entries is a store and spent set that disagree, and they are kept.
+	AbandonedAt time.Time `json:"abandoned_at,omitempty"`
 	// Hold names why a Built intent is held (HoldRejectedAfterUnknown); empty
 	// when it is not. NodeTxID set is a hold in its own right, so records
 	// written before this field existed keep their meaning.
@@ -184,9 +187,12 @@ type Store interface {
 
 // Broadcaster sends a signed transaction and reports the outcome using the
 // rpc error kinds. *rpc.Client satisfies it. A context that ends during the
-// send must be reported as rpc.ErrUnknownOutcome or as the context's error,
-// never as rpc.ErrPermanent: the bytes may be in a mempool. It is called with
-// the engine's lock held and must not call back into the Engine.
+// send, or a connection lost after the request was written, must be reported
+// as rpc.ErrUnknownOutcome or as the context's error, never as
+// rpc.ErrPermanent or rpc.ErrTransient: the bytes may be in a mempool, and
+// the engine reads ErrTransient as the node answering without taking them.
+// It is called with the engine's lock held and must not call back into the
+// Engine.
 type Broadcaster interface {
 	Broadcast(ctx context.Context, rawHex, txid string) (string, error)
 }
@@ -200,9 +206,9 @@ type Confirmer interface {
 
 // Chain answers Abandon's two questions from the node: whether it knows a
 // transaction, and whether an outpoint is unspent. A "no" to either is acted
-// on, so an implementation refuses to answer while the node is behind
-// (rpc.ErrNodeSyncing), as RPCChain does. It is called with the engine's lock
-// held and must not call back into the Engine.
+// on, so an implementation refuses to answer while the node is behind, as
+// RPCChain does. It is called with the engine's lock held and must not call
+// back into the Engine.
 type Chain interface {
 	KnowsTransaction(ctx context.Context, txid string) (bool, error)
 	Unspent(ctx context.Context, txid string, vout uint32) (bool, error)
@@ -281,13 +287,12 @@ var (
 	// intent the engine will not send again and will not fail: one the node
 	// accepted under a different txid (NodeTxID set), or one the node rejected
 	// after an attempt whose outcome is unknown (Hold set). Its inputs are
-	// marked spent for good. An operator resolves it: Abandon after the wait,
-	// or by hand when the node knows the transaction. It never wraps the
+	// marked spent for good; Abandon is the way out. It never wraps the
 	// rejection, which is rpc.ErrPermanent and would read to the breaker as a
 	// fault of one request; a held intent is a run that must stop.
 	ErrHeld = errors.New("withdraw: intent is held; resolve by hand")
 	// ErrNotAbandonable is returned by Abandon when one of its checks did not
-	// pass: the wait since UpdatedAt is not over, the node knows the
+	// pass: the wait since the last send is not over, the node knows the
 	// transaction, or an input is spent. Nothing changes.
 	ErrNotAbandonable = errors.New("withdraw: the checks for abandoning the intent did not pass")
 	// ErrReservationLost is returned by Broadcast and by Recover for a Built
@@ -573,10 +578,6 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 // the operator. Neither is a rejection and neither is treated as one. A held
 // intent is never sent again (ErrHeld); Abandon is the way out.
 //
-// rpc.ErrUnauthorized, the node refusing the credentials, holds the intent
-// Built like an unknown outcome does, without setting MaybeRelayed: nothing
-// reached the node.
-//
 // If the node accepted the transaction but the spent set could not be
 // written (utxo.ErrPersist), the intent is still saved as Broadcast and that
 // error is returned: the payment is out, this process refuses the inputs,
@@ -617,7 +618,9 @@ func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	if rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {
 		return e.holdBuilt(ctx, in, notReserved(rerr))
 	}
-	prior := in.MaybeRelayed
+	// A record from before the mark existed (no SentAt) with attempts on it
+	// has outcomes that are not on record; they count as possibly relayed.
+	prior := in.MaybeRelayed || (in.Attempts > 0 && in.SentAt.IsZero())
 	in.Attempts++
 	in.MaybeRelayed, in.SentAt = true, e.now()
 	if err := e.save(ctx, in, StateBuilt); err != nil {
@@ -672,9 +675,8 @@ func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 
 // holdMarked keeps a Built intent Built and held after the hold was set on
 // it: its inputs become permanent spent entries under holdTxID, the cause is
-// recorded and returned. Nothing is released and nothing is failed. A spent
-// set that could not be written is joined to the cause; the record still
-// lands, and Recover re-marks the inputs from it.
+// recorded and returned. A spent set that could not be written is joined to
+// the cause; the record still lands, and Recover re-marks the inputs from it.
 func (e *Engine) holdMarked(ctx context.Context, in *Intent, cause error) error {
 	if perr := e.Spent.MarkBroadcastFor(e.inputs(in), holdTxID(in), in.ID); perr != nil {
 		cause = errors.Join(cause, perr)
@@ -745,9 +747,9 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 
 // Recover is called once at startup. Broadcast intents have their inputs
 // re-marked spent from the intent store, so a spent-set write that failed
-// before the restart cannot re-expose them; broadcast entries owned by a
-// Failed intent are dropped, so an Abandon whose Forget failed cannot lock
-// them. Reservations held for an intent
+// before the restart cannot re-expose them; broadcast entries owned by an
+// abandoned intent are dropped, so an Abandon whose Forget failed cannot
+// lock them. Reservations held for an intent
 // the store knows as Created or Failed are released: the previous process
 // stopped between reserving and persisting a Built intent, so nothing signed
 // exists for them and the coins are free. A reservation held by an id the
@@ -792,10 +794,9 @@ func (e *Engine) Recover(ctx context.Context) error {
 			note(fmt.Errorf("recover %s: %w", in.ID, err))
 		}
 	}
-	// A Failed intent owns no spent entries: fail released its reservation
-	// and Abandon forgot its entries. One that still owns broadcast entries
-	// is an Abandon whose Forget did not land; nothing else would ever free
-	// those inputs.
+	// An abandoned intent whose Forget did not land still owns broadcast
+	// entries, and nothing else would ever free those inputs. Any other
+	// Failed intent that owns them is a store that missed a send; kept.
 	for _, id := range e.Spent.SentIntents() {
 		in, ok, err := e.Store.Get(repair, id)
 		if err != nil {
@@ -805,7 +806,11 @@ func (e *Engine) Recover(ctx context.Context) error {
 		if !ok || in.State != StateFailed {
 			continue
 		}
-		e.log().Warn("recover: dropping the spent entries of a failed intent", "intent", id)
+		if in.AbandonedAt.IsZero() {
+			note(fmt.Errorf("recover %s: entries kept: a failed intent that was not abandoned owns spent entries; the store and the spent set disagree", id))
+			continue
+		}
+		e.log().Warn("recover: dropping the spent entries of an abandoned intent", "intent", id)
 		if err := e.Spent.Forget(id); err != nil {
 			note(fmt.Errorf("recover %s: %w", id, err))
 		}
@@ -930,14 +935,13 @@ func (e *Engine) UpdateConfirmations(ctx context.Context, in *Intent) error {
 
 // Rebroadcast sends a Broadcast intent's stored bytes again, for a
 // transaction the node no longer knows (UpdateConfirmations returned
-// rpc.ErrUnknownOutcome: the node restarted without its mempool, or the
-// transaction expired from it). The same bytes go out and nothing else may.
-// The state does not change on any outcome: success and "already in chain"
-// say the node has it again, a refusal says the node does not have it now,
-// which is not proof that no peer does. A refusal is recorded in LastError
-// and returned, and does not move SentAt, so it does not restart Abandon's
-// wait; a send the node took, or whose outcome is unknown, does. The inputs
-// stay permanent spent entries; Abandon is the one way out. Runs under the
+// rpc.ErrUnknownOutcome). The same bytes go out and nothing else may. The
+// state does not change on any outcome: success says the node has it again,
+// a refusal says the node does not have it now, which is not proof that no
+// peer does. A refusal is recorded in LastError and returned, and does not
+// move SentAt, so it does not restart Abandon's wait; a send the node took,
+// or whose outcome is unknown, does. As in Broadcast, the attempt is saved
+// before the send and nothing is sent when that save fails. Runs under the
 // engine's lock and acts on the stored record.
 func (e *Engine) Rebroadcast(ctx context.Context, in *Intent) error {
 	e.mu.Lock()
@@ -949,7 +953,13 @@ func (e *Engine) Rebroadcast(ctx context.Context, in *Intent) error {
 	*in = *record
 	in.Attempts++
 	sentAt := in.SentAt
+	if sentAt.IsZero() {
+		sentAt = in.UpdatedAt // a record from before SentAt existed
+	}
 	in.SentAt = e.now()
+	if err := e.save(ctx, in, StateBroadcast); err != nil {
+		return fmt.Errorf("record re-send %d of %s, nothing sent: %w", in.Attempts, in.ID, err)
+	}
 	_, err = e.Broadcaster.Broadcast(ctx, in.RawHex, in.TxID)
 	in.LastError = ""
 	if err != nil {
@@ -971,19 +981,18 @@ func (e *Engine) Rebroadcast(ctx context.Context, in *Intent) error {
 // (ErrNotAbandonable, nothing changed) unless every check passes: AbandonAfter
 // has passed since the last send (SentAt; UpdatedAt on a record without it),
 // the node does not know TxID (nor NodeTxID when it is a txid), and every
-// input is unspent at the node. A Chain
-// error is returned as it is. On success the intent is Failed with its bytes
-// kept, LastError records the checks and the time, and every spent-set entry
-// it owns is dropped (utxo.SpentSet.Forget), so the inputs return to
-// selection; that is logged at Warn.
+// input is unspent at the node. A Chain error is returned as it is. On
+// success the intent is Failed with its bytes kept, AbandonedAt and
+// LastError record it, and every spent-set entry it owns is dropped
+// (utxo.SpentSet.Forget), so the inputs return to selection; logged at Warn.
 //
 // The wait is the node's own mempool expiry, and the residual risk is a peer
 // that kept the bytes longer: a transaction abandoned here can still be
 // mined, and its record keeps the bytes and the txid so the reconciler finds
-// it. A Built intent that is not held is refused (ErrWrongState); Broadcast
-// decides those. Runs under the engine's lock, node calls included, and acts
-// on the stored record, so two operators abandoning one intent see the
-// second refused as ErrWrongState.
+// it. A Built intent that is not held is refused (ErrWrongState). Runs under
+// the engine's lock, node calls included, and acts on the stored record, so
+// the second of two operators abandoning one intent reads Failed and is
+// refused.
 func (e *Engine) Abandon(ctx context.Context, in *Intent) error {
 	if e.Chain == nil {
 		return errors.New("withdraw: no Chain configured")
@@ -998,11 +1007,11 @@ func (e *Engine) Abandon(ctx context.Context, in *Intent) error {
 		return fmt.Errorf("%w: %s is Built and not held", ErrWrongState, in.ID)
 	}
 	*in = *stored
-	sentAt := in.SentAt
-	if sentAt.IsZero() {
-		sentAt = in.UpdatedAt
+	lastSent := in.SentAt
+	if lastSent.IsZero() {
+		lastSent = in.UpdatedAt
 	}
-	if wait, since := e.abandonAfter(), e.now().Sub(sentAt); since < wait {
+	if wait, since := e.abandonAfter(), e.now().Sub(lastSent); since < wait {
 		return fmt.Errorf("%w: %s was last sent %s ago; the wait is %s", ErrNotAbandonable, in.ID, since.Round(time.Second), wait)
 	}
 	for _, txid := range []string{in.TxID, in.NodeTxID} {
@@ -1027,8 +1036,8 @@ func (e *Engine) Abandon(ctx context.Context, in *Intent) error {
 		}
 	}
 	from := in.State
-	in.State = StateFailed
-	in.LastError = fmt.Sprintf("abandoned at %s from %s after %s: the node does not know the transaction and every input is unspent", e.now().Format(time.RFC3339), from, e.abandonAfter())
+	in.State, in.AbandonedAt = StateFailed, e.now()
+	in.LastError = fmt.Sprintf("abandoned at %s from %s after %s: the node does not know the transaction and every input is unspent", in.AbandonedAt.Format(time.RFC3339), from, e.abandonAfter())
 	if err := e.save(ctx, in, from); err != nil {
 		return err
 	}
@@ -1052,8 +1061,9 @@ func (e *Engine) release(in *Intent) {
 // its reservation. The verdict lands before the inputs are freed: were the
 // release first and the save then failed, the store would hold a Built intent
 // with signed bytes whose inputs the next withdrawal could select. With the
-// save first, a failed save leaves the intent as it was, inputs held, and the
-// next attempt reaches the same verdict.
+// save first, a failed save leaves the intent as it was, inputs held; on the
+// Broadcast path the next attempt holds the intent, since the store carries
+// the mark set before the send.
 func (e *Engine) fail(ctx context.Context, in *Intent, cause error, keepTx bool, from State) error {
 	in.State = StateFailed
 	in.LastError = cause.Error()
@@ -1113,15 +1123,12 @@ func (c RPCConfirmer) Confirmations(ctx context.Context, txid string) (int64, er
 	return out.Confirmations, nil
 }
 
-// RPCChain implements Chain over the node, each answer after RequireSynced: a
-// node behind its headers has an incomplete view of both the mempool and the
-// UTXO set, and a "no" from it would let Abandon free the inputs of a
-// transaction the network has. KnowsTransaction is getrawtransaction, then
-// gettxout on output 0; Unspent is gettxout with the mempool included, so an
-// input another transaction spends in the mempool reads as spent. Without
-// -txindex a mined transaction whose outputs are all spent is unknown to the
-// first; the inputs check refuses the abandon then, since a mined
-// transaction's inputs are spent.
+// RPCChain implements Chain over the node, each answer after RequireSynced,
+// since a "no" from a node behind its headers would let Abandon free the
+// inputs of a transaction the network has. KnowsTransaction is
+// getrawtransaction, then gettxout on output 0; Unspent is gettxout with the
+// mempool included. Without -txindex a mined transaction whose outputs are
+// all spent is unknown to the first; the inputs check refuses the abandon.
 type RPCChain struct{ Client *rpc.Client }
 
 // KnowsTransaction implements Chain.
