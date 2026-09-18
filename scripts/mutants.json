@@ -900,6 +900,15 @@
       "find": "\tif toState != \"CLOSED\" {\n\t\ttext += \"\\n> The reason is in the process log.\"",
       "replace": "\tif toState != \"CLOSED\" {\n\t\ttext += \"\\n> \" + clip(lastErr)",
       "why": "The tripping error's text names transaction ids, vouts and amounts, or carries part of a proxy's error page. A webhook is a post to a third party; the log is where the reason belongs."
+    },
+    {
+      "id": "breaker-trip-fabricates-the-failure-count",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestBreakerWebhookCarriesNoErrorTextAndNamesTheHalt",
+      "find": "\tn := cb.consecutiveFailures // the real count; a halt is not a failure tally",
+      "replace": "\tn := cb.maxFailures // the real count; a halt is not a failure tally",
+      "why": "A halt is not a failure tally. Reporting the threshold as the count on a breaker with no failures puts a number the breaker never recorded into the webhook and the callback, and an operator reads three node failures where there were none."
     }
   ]
 }

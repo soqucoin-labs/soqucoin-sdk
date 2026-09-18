@@ -205,7 +205,6 @@ func (cb *CircuitBreaker) Trip(err error) {
 	cb.state = CircuitHalted
 	cb.haltReason = err.Error()
 	cb.probing = false
-	cb.lastFailure = time.Now()
 	n := cb.consecutiveFailures // the real count; a halt is not a failure tally
 	notify := cb.OnStateChange
 	cb.mu.Unlock()
