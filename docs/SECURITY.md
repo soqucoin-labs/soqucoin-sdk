@@ -152,10 +152,14 @@ break; putting them there is only safe with the rules below.
   its parameters, the salt, the nonce, and the unencrypted list of public keys
   and addresses. For that to mean anything the file has to have exactly one
   reading, so a keystore must be one JSON object, carrying only the members
-  this release knows, each named once, with nothing after it. Anything else is
-  refused rather than ignored, because content that does not survive into the
-  values this release decodes is content the binding does not cover, and
-  another tool reading the same file could see it.
+  this release knows, each named once and spelled as this release writes it,
+  with nothing after it. Anything else is refused rather than ignored, because
+  content that does not survive into the values this release decodes is
+  content the binding does not cover, and another tool reading the same file
+  could see it. The spelling matters because Go's JSON decoder matches a member
+  to a field whatever its case: a file naming `PubKeys` would decode here as
+  the public key list while a tool comparing bytes saw a member the SDK never
+  wrote (`keys.ErrKeystoreHeader`).
 - **The address list is checked against the keys.** The unencrypted list is
   what you read to find an address to send to, so it is compared with the
   records that come out of the ciphertext, and a file where the two disagree is
@@ -209,6 +213,11 @@ expensive, not impossible.
 - An environment variable is readable from `/proc/<pid>/environ` by root and by
   anything that inherits it. It is acceptable for a container whose environment
   you control, and a poor choice on a shared host.
+- An unset variable is an empty passphrase, and an empty passphrase is refused
+  wherever it would be used (`keys.ErrPassphraseEmpty`): `Load`, `LoadOrCreate`
+  and `Save` all report it, so a keystore is never written under it and one
+  written under a real passphrase is never opened by a process that lost its
+  own. Nothing below that is enforced; the passphrase's strength is yours.
 - Never log it, and never include it in a crash report.
 
 ### Separate keys by role

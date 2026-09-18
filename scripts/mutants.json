@@ -1107,6 +1107,42 @@
       "find": "\tif live := c.liveGen.Load(); live != 0 && gen != live {",
       "replace": "\tif live := c.liveGen.Load(); gen != live {",
       "why": "Stale means replaced by a newer connection, whose own writes the set would be dated after. A reply delivered from a connection that was merely lost, with nothing live since, is the address's own answer; refusing it costs a listunspent after the reconnect and puts a lost-connection error on an address the server answered."
+    },
+    {
+      "id": "keys-empty-passphrase-accepted",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestEmptyPassphraseIsRefusedAtEveryEntryPoint",
+      "find": "\t\tif len(m.passwd) == 0 {",
+      "replace": "\t\tif len(m.passwd) < 0 {",
+      "why": "An unset environment variable is an empty passphrase. Argon2id runs over it as over any other, so a keystore written under it opens without a word and nothing says so; deriveKey is the one place the passphrase is read as a secret, and every entry point reaches it."
+    },
+    {
+      "id": "keys-record-self-test-result-ignored",
+      "file": "keys/keys.go",
+      "package": "./keys",
+      "test": "TestARecordThatCannotSignForItsKeyIsRefused",
+      "find": "\tif ok, err := Verify(pubKey, recordSelfTestDigest[:], sig); err != nil || !ok {",
+      "replace": "\tif ok, err := Verify(pubKey, recordSelfTestDigest[:], sig); err != nil && !ok {",
+      "why": "The public key is recomputed from rho, s1 and s2, so a private key with tr altered derives the right public key and address and signs signatures the node refuses on every attempt. Only signing and verifying tells; a manager that skips the verdict hands out an address it cannot spend from."
+    },
+    {
+      "id": "keystore-member-spelling-folded",
+      "file": "keys/keystore.go",
+      "package": "./keys",
+      "test": "TestMemberNamesAreTheOnesThisBuildWrites",
+      "find": "\t\t\tfield, known := names[name]",
+      "replace": "\t\t\tfield, known := names[strings.ToLower(name)]",
+      "why": "encoding/json matches a member to a field case-insensitively with the last value winning, so PubKeys beside pubkeys decodes as the real list here while a reader comparing bytes sees the decoy under the canonical name. Requiring the tag's own spelling is what closes it; a folded lookup is the decoder's behaviour again."
+    },
+    {
+      "id": "keys-digest-size-not-checked",
+      "file": "keys/keys.go",
+      "package": "./keys",
+      "test": "TestSignAndVerifyTakeA32ByteDigest",
+      "find": "\tif len(digest) != sha256.Size {",
+      "replace": "\tif len(digest) > 64 {",
+      "why": "The node signs and verifies a 32-byte SHA-256 sighash. A digest of another width is a signature over the wrong thing, learned at the node; Sign and Verify share the one check."
     }
   ]
 }

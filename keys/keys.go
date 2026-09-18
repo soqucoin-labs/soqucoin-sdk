@@ -148,6 +148,19 @@ var (
 	// ErrNoKey marks an address this manager holds no key for.
 	ErrNoKey = errors.New("keys: no key for address")
 
+	// ErrPassphraseEmpty marks a passphrase manager whose passphrase has no
+	// bytes: an unset environment variable, most often. It is not a weak
+	// secret, it is a missing one, and a keystore written under it would open
+	// without a word. Refused wherever the passphrase is read as a secret, so
+	// Load, LoadOrCreate and Save all report it; NewManagerWithKey has no
+	// passphrase and is not affected.
+	ErrPassphraseEmpty = errors.New("keys: the passphrase is empty")
+
+	// ErrDigestSize marks a digest handed to Sign or Verify that is not 32
+	// bytes. The node signs and verifies a SHA-256 sighash; anything else
+	// would be a signature over the wrong thing, learned at the node.
+	ErrDigestSize = errors.New("keys: digest must be 32 bytes")
+
 	// ErrKeystoreUnread marks a write to a keystore file that exists and that
 	// this manager has never read. It is the mirror of ErrKeysHeld: that one
 	// refuses to read over keys held in memory, this one refuses to write over
@@ -206,8 +219,10 @@ func AddressFor(hrp string, pubKey []byte) (string, error) {
 }
 
 // checkKeyRecord verifies that a record's private key derives its public key,
-// that the public key is acceptable to the node, and that the stored address
-// is the one that key derives on the address's own network.
+// that the private key signs a signature the public key verifies, that the
+// public key is acceptable to the node, and that the stored address is the
+// one that key derives on the address's own network. It is the one place a
+// record is judged acceptable; ImportPrivateKey and load both pass through it.
 func checkKeyRecord(privKey, pubKey []byte, address string) error {
 	if err := checkPublicKey(pubKey); err != nil {
 		return fmt.Errorf("%s: %w", address, err)
@@ -218,6 +233,21 @@ func checkKeyRecord(privKey, pubKey []byte, address string) error {
 	}
 	if string(derivedPK) != string(pubKey) {
 		return fmt.Errorf("%s: %w (public key is not derived from the private key)", address, ErrKeyMismatch)
+	}
+	// The derivation tests rho, s1 and s2. A signature also depends on tr and
+	// t0, which the packed key carries and nothing recomputes: with tr altered
+	// every signature fails, since the verifier hashes its own tr into the
+	// message; with t0 altered the hints shift and a fraction fails, growing
+	// with the size of the change. Signing once and verifying is the property
+	// itself, that the manager can spend for this address, and catches each
+	// fault at the rate a withdrawal would meet it. Deterministic, so there is
+	// no randomness to fail on; about 0.2 ms per record.
+	sig, err := signDigest(privKey, recordSelfTestDigest[:], false)
+	if err != nil {
+		return fmt.Errorf("%s: %w", address, err)
+	}
+	if ok, err := Verify(pubKey, recordSelfTestDigest[:], sig); err != nil || !ok {
+		return fmt.Errorf("%s: %w (the private key does not sign for the public key)", address, ErrKeyMismatch)
 	}
 	n, err := soqaddr.NetworkOf(address)
 	if err != nil {
@@ -608,35 +638,62 @@ func (m *Manager) ExportPrivateKey(address string) ([]byte, error) {
 	return bytes.Clone(kp.PrivateKey), nil
 }
 
-// Sign signs a message digest with the Dilithium private key for the given address.
-// Uses ML-DSA-44 (FIPS 204) via circl mldsa44 — returns 2420-byte signature.
+// recordSelfTestDigest is the fixed digest checkKeyRecord signs and verifies
+// to prove a record can spend for its address.
+var recordSelfTestDigest = sha256.Sum256([]byte("soqucoin-sdk/keys: record self-test"))
+
+// checkDigest is the one statement of what a digest is: the 32 bytes of a
+// SHA-256 sighash, which is what the node signs and verifies. Sign and Verify
+// both call it, so neither signs nor verifies over the wrong thing.
+func checkDigest(digest []byte) error {
+	if len(digest) != sha256.Size {
+		return fmt.Errorf("%w: got %d", ErrDigestSize, len(digest))
+	}
+	return nil
+}
+
+// signDigest is the one place a packed private key is unpacked and used to
+// sign. Sign uses the hedged variant; the record self-test the deterministic
+// one, so the check has no randomness to fail on. The unpacked array is wiped
+// before this returns.
+func signDigest(privKey []byte, digest []byte, hedged bool) ([]byte, error) {
+	if err := checkDigest(digest); err != nil {
+		return nil, err
+	}
+	if len(privKey) != PrivateKeySize {
+		return nil, fmt.Errorf("invalid private key size: got %d, want %d", len(privKey), PrivateKeySize)
+	}
+	var skArr [PrivateKeySize]byte
+	copy(skArr[:], privKey)
+	var sk mldsa44.PrivateKey
+	sk.Unpack(&skArr)
+	for i := range skArr {
+		skArr[i] = 0
+	}
+	sig := make([]byte, mldsa44.SignatureSize)
+	if err := mldsa44.SignTo(&sk, digest, nil, hedged, sig); err != nil {
+		return nil, fmt.Errorf("dilithium sign: %w", err)
+	}
+	return sig, nil
+}
+
+// Sign signs a 32-byte digest with the ML-DSA-44 (FIPS 204) private key for
+// the address and returns the 2420-byte signature. A digest of any other
+// width is ErrDigestSize.
+//
+// The signature is the hedged (randomized) variant FIPS 204 recommends for a
+// signer whose host an attacker may profile; no context string. Verification
+// does not depend on the randomizer, so the node accepts either form and two
+// signatures of one digest legitimately differ.
 func (m *Manager) Sign(address string, digest []byte) ([]byte, error) {
+	if err := checkDigest(digest); err != nil {
+		return nil, err
+	}
 	kp, err := m.keyFor(address)
 	if err != nil {
 		return nil, err
 	}
-
-	// Load raw bytes into FIPS 204 ML-DSA-44 PrivateKey
-	var skArr [PrivateKeySize]byte
-	copy(skArr[:], kp.PrivateKey)
-	var sk mldsa44.PrivateKey
-	sk.Unpack(&skArr)
-
-	// Wipe the array copy from stack
-	for i := range skArr {
-		skArr[i] = 0
-	}
-
-	// Sign the digest with the hedged (randomized) variant FIPS 204 recommends
-	// for a signer whose host an attacker may profile; no context string.
-	// Verification does not depend on the randomizer, so the node accepts
-	// either form and two signatures of one digest legitimately differ.
-	sig := make([]byte, mldsa44.SignatureSize)
-	if err := mldsa44.SignTo(&sk, digest, nil, true, sig); err != nil {
-		return nil, fmt.Errorf("dilithium sign: %w", err)
-	}
-
-	return sig, nil
+	return signDigest(kp.PrivateKey, digest, true)
 }
 
 // Verify verifies a Dilithium signature against a public key and message digest.
@@ -646,6 +703,9 @@ func (m *Manager) Sign(address string, digest []byte) ([]byte, error) {
 // with tx.VerifyInput, which reads the hashtype from the witness and recomputes
 // the sighash; use Verify for a signature over a digest you produced yourself.
 func Verify(pubKey []byte, digest []byte, signature []byte) (bool, error) {
+	if err := checkDigest(digest); err != nil {
+		return false, err
+	}
 	// Accept the witness forms as well as the raw ones: consensus requires the
 	// public key to be pushed as 0x00||pk (1313 bytes) and the signature to
 	// carry a trailing hashtype byte (2421); the interpreter strips both before
