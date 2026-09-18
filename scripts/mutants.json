@@ -612,6 +612,114 @@
       "find": "\tif stored.State != from {",
       "replace": "\tif false {",
       "why": "Update writes only over the state the caller read. In the shared directory the three processes hold no common lock, so this comparison is the only thing that refuses a process writing over a record another process has moved, and without it a late write puts a sent intent back to Built or a built one back to Created."
+    },
+    {
+      "id": "withdraw-rejection-after-a-lost-reply-fails-the-intent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRejectionAfterALostReplyHoldsTheIntent",
+      "find": "case errors.Is(err, rpc.ErrPermanent) && in.MaybeRelayed:",
+      "replace": "case errors.Is(err, rpc.ErrPermanent) && false:",
+      "why": "A rejection on the attempt after a lost reply must hold the intent. Failing it releases inputs the first transmission may still spend: peers keep a relayed transaction for the mempool expiry and can mine it after the node forgot it, and the exchange then pays the recipient again from other coins."
+    },
+    {
+      "id": "withdraw-lost-reply-is-not-remembered",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRejectionAfterALostReplyHoldsTheIntent",
+      "find": "\t\tin.MaybeRelayed = true\n",
+      "replace": "\t\tin.MaybeRelayed = false\n",
+      "why": "The record must carry that an attempt's outcome was unknown, because the hold rule on a later rejection reads it. Without the mark every later rejection fails the intent as if nothing had been sent."
+    },
+    {
+      "id": "withdraw-broadcast-sends-a-held-intent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRejectionAfterALostReplyHoldsTheIntent",
+      "find": "\tif err := heldErr(in); err != nil {\n\t\treturn err\n\t}\n\t// A refused reservation",
+      "replace": "\tif err := heldErr(in); err != nil && false {\n\t\treturn err\n\t}\n\t// A refused reservation",
+      "why": "A held intent is never sent again. Once the node has the payment under another txid, or under this one after a rejection, a re-send answers \"already in chain\" and the intent would become a Broadcast intent whose record disagrees with the network."
+    },
+    {
+      "id": "withdraw-abandon-ignores-the-wait",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestAbandonRefusesUntilEveryCheckPasses",
+      "find": "since < wait {",
+      "replace": "since < 0 {",
+      "why": "Abandon frees inputs whose transaction peers may still hold. The wait is the node's mempool expiry; freeing them earlier lets a second withdrawal spend inputs the first can still take."
+    },
+    {
+      "id": "withdraw-abandon-ignores-a-known-transaction",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestAbandonRefusesUntilEveryCheckPasses",
+      "find": "\t\tif known {",
+      "replace": "\t\tif known && false {",
+      "why": "A transaction the node knows is in its mempool or its chain. Abandoning it frees inputs that are spent, and marks a payment that is out, or confirmed, as Failed."
+    },
+    {
+      "id": "withdraw-abandon-ignores-a-spent-input",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestAbandonRefusesUntilEveryCheckPasses",
+      "find": "\t\tif !unspent {",
+      "replace": "\t\tif !unspent && false {",
+      "why": "An input the node reports spent has been taken by some transaction, this one or another. Abandoning over it puts a spent input back into selection and marks the payment Failed while the chain may hold it."
+    },
+    {
+      "id": "withdraw-abandon-keeps-the-spent-entries",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestAbandonRefusesUntilEveryCheckPasses",
+      "find": "\tif err := e.Spent.Forget(in.ID); err != nil {",
+      "replace": "\tif err := error(nil); err != nil {",
+      "why": "The point of Abandon is that the inputs return to selection. A Failed record whose entries stay in the spent set locks the coins for good, which is the condition Abandon exists to end."
+    },
+    {
+      "id": "withdraw-zero-required-confirmations-accepted",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestZeroRequiredConfirmationsIsRefused",
+      "find": "\tif e.RequiredConfirmations <= 0 {",
+      "replace": "\tif e.RequiredConfirmations < 0 {",
+      "why": "With RequiredConfirmations at zero no intent ever confirms and the spent set only grows. The misconfiguration must be refused rather than run silently."
+    },
+    {
+      "id": "withdraw-rebroadcast-accepts-a-built-intent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRebroadcastSendsTheSameBytesAndChangesNoState",
+      "find": "record, err := e.reread(ctx, in, StateBroadcast)",
+      "replace": "record, err := e.reread(ctx, in, StateBroadcast, StateBuilt)",
+      "why": "Rebroadcast bypasses the hold check and the reservation because a Broadcast intent's inputs are permanent entries already. A Built intent through it would be sent while held, or without its inputs re-reserved."
+    },
+    {
+      "id": "rpc-refused-credentials-read-as-a-lost-reply",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestUnauthorizedIsNeitherALostReplyNorARejection",
+      "find": "\tif resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {",
+      "replace": "\tif false {",
+      "why": "An empty 401 read as a body that is not JSON is a transport failure, which at a broadcast is an unknown outcome: every intent stays Built and is re-sent each pass, the alert speaks of a mempool race, and the operator looks in the wrong place for a wrong password."
+    },
+    {
+      "id": "spent-set-mark-writes-over-another-withdrawals-send",
+      "file": "utxo/selector.go",
+      "package": "./utxo",
+      "test": "TestMarkBroadcastRefusesAnotherWithdrawalsUnconfirmedEntry",
+      "find": "if e, exists := ss.entries[key]; exists && e.sentByAnother(broadcastTxID, intentID) {",
+      "replace": "if e, exists := ss.entries[key]; exists && e.sentByAnother(broadcastTxID, intentID) && false {",
+      "why": "An entry that records a send is permanent until the chain confirms it. Writing another withdrawal's send over it attributes the input to the transaction that cannot confirm, and the set then describes the wrong payment as in flight."
+    },
+    {
+      "id": "spent-set-forget-leaves-the-broadcast-entries",
+      "file": "utxo/selector.go",
+      "package": "./utxo",
+      "test": "TestForgetDropsOnlyTheWithdrawalsOwnEntries",
+      "find": "\t\tif e.IntentID == intentID {\n\t\t\tdelete(ss.entries, key)\n\t\t\tdropped++",
+      "replace": "\t\tif e.IntentID == intentID && e.reserved() {\n\t\t\tdelete(ss.entries, key)\n\t\t\tdropped++",
+      "why": "Forget is the one call that removes a broadcast entry, for an abandoned withdrawal. Dropping only the reservations leaves the abandoned inputs locked, which is what Abandon exists to end."
     }
   ]
 }

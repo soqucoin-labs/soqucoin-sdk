@@ -9,7 +9,7 @@ nothing else.
 |---|---|---|---|
 | `watcher` | node RPC credential, indexer address. No key | accepted requests, `snapshot.json` | → `Created` |
 | `signer` | the keystore. **No socket, no credential** | intent files | `Created` → `Built` |
-| `broadcaster` | node RPC credential. No key | intent files | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed` |
+| `broadcaster` | node RPC credential. No key | intent files | `Built` → `Broadcast` → `Confirmed`, `Built` → `Failed`, `Built` held |
 
 The processes never speak to each other. Each reads the files the others left
 and writes only the files it owns, so there is no protocol to get wrong and

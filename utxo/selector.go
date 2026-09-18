@@ -111,6 +111,16 @@ func (e SpentEntry) expired(now time.Time) bool {
 	return e.reserved() && now.After(e.ExpiresAt)
 }
 
+// sentByAnother reports whether e records an unconfirmed send that neither
+// intentID nor broadcastTxID owns. An empty intentID owns nothing, as in
+// Reserve.
+func (e SpentEntry) sentByAnother(broadcastTxID, intentID string) bool {
+	if e.reserved() || e.Confirmed || e.SpentInTx == broadcastTxID {
+		return false
+	}
+	return intentID == "" || e.IntentID != intentID
+}
+
 // spentSetFile is the JSON structure persisted to disk.
 type spentSetFile struct {
 	Version int          `json:"version"`
@@ -263,6 +273,32 @@ func (ss *SpentSet) Release(intentID string) error {
 	return nil
 }
 
+// Forget drops every entry intentID owns, reservations and broadcast entries
+// alike, and writes the file once. It is the one call that removes a
+// broadcast entry before the chain confirms it, and withdraw.Engine.Abandon
+// is its one caller: it runs after the node has been asked and does not know
+// the transaction and reports every input unspent. An empty id is refused;
+// it would drop every entry written without one.
+func (ss *SpentSet) Forget(intentID string) error {
+	if intentID == "" {
+		return errors.New("utxo: Forget needs an intent id")
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	dropped := 0
+	for key, e := range ss.entries {
+		if e.IntentID == intentID {
+			delete(ss.entries, key)
+			dropped++
+		}
+	}
+	if dropped == 0 {
+		return nil
+	}
+	ss.log.Warn("spent set: entries of an abandoned withdrawal dropped", "intent", intentID, "dropped", dropped)
+	return ss.persist()
+}
+
 // ReservedIntents returns the id of every withdrawal that holds a reservation
 // in the set, expired or not, each once, sorted. Broadcast entries are not
 // reservations and do not appear. withdraw.Engine.Recover uses it to release
@@ -296,10 +332,22 @@ func (ss *SpentSet) MarkBroadcastFor(inputs []types.UTXO, broadcastTxID, intentI
 	return ss.markBroadcast(inputs, broadcastTxID, intentID)
 }
 
+// markBroadcast is all-or-nothing: an input another withdrawal has recorded
+// as spent, in a transaction the chain has not confirmed, refuses the whole
+// call with ErrAlreadyReserved and nothing is written. Writing over it would
+// attribute the input to the transaction that cannot confirm. The caller's
+// own entries, entries of the same transaction, and confirmed entries are
+// replaced.
 func (ss *SpentSet) markBroadcast(inputs []types.UTXO, broadcastTxID, intentID string) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
+	for _, u := range inputs {
+		key := SpentKey{u.TxID, u.Vout}
+		if e, exists := ss.entries[key]; exists && e.sentByAnother(broadcastTxID, intentID) {
+			return fmt.Errorf("%w: %s:%d is spent in %s by withdrawal %q", ErrAlreadyReserved, u.TxID, u.Vout, e.SpentInTx, e.IntentID)
+		}
+	}
 	now := time.Now()
 	for _, u := range inputs {
 		key := SpentKey{u.TxID, u.Vout}

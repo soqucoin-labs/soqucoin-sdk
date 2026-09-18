@@ -246,11 +246,12 @@ func reconcile(ctx context.Context, store withdraw.Store, spent *utxo.SpentSet, 
 		return fmt.Errorf("list built withdrawals: %w", err)
 	}
 	for _, in := range built {
-		if in.NodeTxID != "" {
-			// The node accepted other bytes for this withdrawal. Those inputs
+		if in.NodeTxID != "" || in.Hold != "" {
+			// Held: the node accepted other bytes for this withdrawal, or
+			// rejected bytes an earlier attempt may have relayed. Those inputs
 			// are spent for good and must not sit on a reservation that
 			// expires, which is how Recover records the same case.
-			if err := recordSpend(spent, in, in.NodeTxID); err != nil {
+			if err := recordSpend(spent, in, heldTxID(in)); err != nil {
 				return fmt.Errorf("record the spend of held withdrawal %s: %w", in.ID, err)
 			}
 			continue
@@ -280,11 +281,7 @@ func reconcile(ctx context.Context, store withdraw.Store, spent *utxo.SpentSet, 
 			}
 			continue
 		}
-		txid := in.TxID
-		if in.NodeTxID != "" {
-			txid = in.NodeTxID // the node accepted other bytes; those are the spend
-		}
-		if err := recordSpend(spent, in, txid); err != nil {
+		if err := recordSpend(spent, in, heldTxID(in)); err != nil {
 			return fmt.Errorf("record the spend of withdrawal %s: %w", in.ID, err)
 		}
 	}
@@ -422,4 +419,13 @@ func inputsOf(in *withdraw.Intent) []types.UTXO {
 func fatal(msg string, err error) {
 	logger.Error(msg, "err", err)
 	os.Exit(1)
+}
+
+// heldTxID is the txid a withdrawal's inputs are spent under: the node's when
+// it accepted other bytes, the withdrawal's own otherwise.
+func heldTxID(in *withdraw.Intent) string {
+	if in.NodeTxID != "" {
+		return in.NodeTxID
+	}
+	return in.TxID
 }
