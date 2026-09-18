@@ -16,8 +16,10 @@
 // outputs alone, and re-checks every credited-but-not-final outpoint on each
 // scan so a reorg that removes a credited deposit is alarmed rather than
 // missed. A node that does not answer has not disagreed with the indexer: a
-// gettxout error that is not the context's ends the pass and is returned,
-// wherever in the pass the node was asked, and raises no alert.
+// gettxout that fails to complete ends the pass and is returned, wherever in
+// the pass the node was asked, and raises no alert. A node that answers a
+// gettxout with an error of its own (a malformed txid) has refused the
+// question it was asked, and that outpoint is alarmed and skipped.
 package deposit
 
 import (
@@ -128,7 +130,8 @@ type Monitor struct {
 
 	// Network supplies the chain's coinbase maturity: a mined-to deposit is
 	// credited only once consensus lets it be spent. The zero value is
-	// types.Mainnet. Every pass asks the node (Node.RequireChain) for this
+	// types.Mainnet, and so is any value with no ChainID, whatever its other
+	// fields. Every pass asks the node (Node.RequireChain) for this
 	// chain and refuses to credit anything while it serves another, so the
 	// maturity applied and the node consulted cannot drift apart; a Monitor
 	// left with no Network over a regtest node is refused for that reason.
@@ -264,6 +267,16 @@ func ended(ctx context.Context, err error) bool {
 	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// refused reports whether the node answered a lookup with an error of its own
+// (rpc.ErrPermanent: a malformed txid, a method it does not have) rather than
+// failing to answer. The node has then disagreed with the question, and the
+// outpoint it was asked about is alarmed and skipped; a lookup that did not
+// complete ends the pass instead. *rpc.Client wraps the node's code so that
+// errors.Is reads it through the wrapping.
+func refused(err error) bool {
+	return errors.Is(err, rpc.ErrPermanent)
+}
+
 func (m *Monitor) maxCacheAge() time.Duration {
 	if m.MaxCacheAge > 0 {
 		return m.MaxCacheAge
@@ -274,10 +287,14 @@ func (m *Monitor) maxCacheAge() time.Duration {
 // Scan performs one pass. It returns the deposits credited in this pass, or
 // ErrPaused (wrapped with the reason) when crediting was not safe. A node on
 // the wrong chain is returned as rpc.ErrWrongChain, a permanent error, not as
-// a pause. Any other error from the node is returned as it is, unalarmed, from
-// whichever call raised it: the deposits credited before it are credited and
-// returned with it, the rest wait for the next pass. A context that ends
-// mid-pass is returned the same way, never as a pause and never as an alert.
+// a pause; a node that cannot say whether it is synced is alarmed and paused.
+// Once the node is synced and on this chain, a call of the pass that fails to
+// complete is returned as it is, unalarmed, from whichever call raised it: the
+// deposits credited before it are credited and returned with it, the rest wait
+// for the next pass. A context that ends mid-pass is returned the same way,
+// never as a pause and never as an alert. A gettxout the node answers with an
+// error of its own is a disagreement about that outpoint: alarmed, skipped,
+// and the pass goes on.
 // A MaxCacheAge the cache's cadence cannot fit is ErrCacheAgeBelowPings, with
 // nothing asked of anyone.
 func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
@@ -395,6 +412,10 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 				if !pending[outpointKey(u.TxID, u.Vout)] {
 					out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 					if err != nil {
+						if refused(err) {
+							m.alert(AlertIndexerMismatch, "%s:%d for %s: the node refused the lookup: %v", u.TxID, u.Vout, addr, err)
+							continue
+						}
 						// The credit stands; the node did not answer, and the
 						// pass ends here as it does at every gettxout.
 						return credited, err
@@ -437,13 +458,19 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 
 // verifyWithNode asks the exchange's own node for the exact output and
 // requires agreement on existence, value, destination script, confirmation
-// depth and coinbase maturity. Any disagreement is alarmed and not credited.
-// A lookup that returns an error, the context's or the node's, is returned as
-// that error, unalarmed: the node has not disagreed, it has not answered, and
-// AlertIndexerMismatch names a disagreement.
+// depth and coinbase maturity. Any disagreement is alarmed and not credited,
+// and a lookup the node refuses is one: the indexer named an output the node
+// will not be asked about. A lookup that does not complete, ended by the
+// context or by the transport, is returned as that error, unalarmed: the node
+// has not disagreed, it has not answered, and AlertIndexerMismatch names a
+// disagreement.
 func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u types.UTXO, confs int64) (Deposit, bool, error) {
 	out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 	if err != nil {
+		if refused(err) {
+			m.alert(AlertIndexerMismatch, "%s:%d for %s: the node refused the lookup: %v", u.TxID, u.Vout, addr, err)
+			return Deposit{}, false, nil
+		}
 		return Deposit{}, false, err
 	}
 	switch {
@@ -485,6 +512,13 @@ func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 		keys[outpointKey(d.TxID, d.Vout)] = true
 		out, err := m.Node.GetTxOut(ctx, d.TxID, d.Vout, false)
 		if err != nil {
+			if refused(err) {
+				// The book named an outpoint the node will not be asked
+				// about; the book's problem, alarmed as one, and the pass
+				// goes on to the next.
+				m.alert(AlertLedgerError, "gettxout %s:%d refused by the node: %v", d.TxID, d.Vout, err)
+				continue
+			}
 			return nil, err
 		}
 		if out == nil {

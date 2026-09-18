@@ -244,7 +244,8 @@ type Engine struct {
 	Chain       Chain     // optional; Abandon refuses without it
 
 	// Network is the chain every destination must be an address on. The zero
-	// value is types.Mainnet, as for deposit.Monitor. Submit refuses a
+	// value is types.Mainnet, as for deposit.Monitor, and so is any value with
+	// no ChainID, whatever its other fields. Submit refuses a
 	// destination that is not a witness version 1 address on its prefix and
 	// records nothing (ErrInvalidIntent); Build applies the same check to the
 	// stored record before anything is selected and fails an intent that does

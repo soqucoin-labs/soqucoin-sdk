@@ -994,7 +994,8 @@ re-broadcasts, and re-broadcasting is the broadcaster's job.
 # Three terminals, one directory. Only -dir is shared between hosts.
 go run ./examples/exchange_split/watcher      -dir state -network stagenet -hot ssq1p... -electrumx 127.0.0.1:50001
 go run ./examples/exchange_split/signer       -dir state -network stagenet -state signer-state
-go run ./examples/exchange_split/broadcaster  -dir state -network stagenet -state broadcaster-state
+go run ./examples/exchange_split/broadcaster  -dir state -network stagenet -state broadcaster-state -confirmations 1
+# -confirmations 1 so the walk-through finishes in a minute; the default is types.MaxReorgDepth (288), Step 4's figure for withdrawal release
 ```
 
 ---

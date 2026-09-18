@@ -15,10 +15,11 @@
 // transaction goes out and a lost reply cannot become a second payment.
 //
 // While the store holds a held intent (the node accepted other bytes for it,
-// or rejected bytes an earlier attempt may have relayed) nothing is sent:
-// the condition is read from the store on every pass, so it survives a
-// restart and ends when an operator has moved the intent on through
-// withdraw.Engine.Abandon. Confirmations are still read meanwhile.
+// or rejected bytes an earlier attempt may have relayed) nothing is sent, by
+// Recover at startup or by the send pass: the condition is read from the
+// store before each, so it survives a restart and ends when an operator has
+// moved the intent on through withdraw.Engine.Abandon. Confirmations are
+// still read meanwhile.
 //
 // Usage:
 //
@@ -113,17 +114,9 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 	}
 
 	// Startup: re-mark what was sent, release what was reserved for nothing,
-	// re-send what was built. Every error is reported and none of them stops
-	// the loop; a held intent (ErrHeld) is one a person must resolve, and
-	// send refuses to send anything while the store holds one.
-	if err := engine.Recover(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return err
-		}
-		logger.Error("recover", "err", err)
-		if errors.Is(err, withdraw.ErrHeld) {
-			logger.Error("withdrawals halted: a held intent must be resolved by hand before anything is sent")
-		}
+	// re-send what was built, unless the store holds a held intent.
+	if err := recoverAtStartup(ctx, store, engine); err != nil {
+		return err
 	}
 
 	logger.Info("broadcaster started", "dir", string(dir), "state", state, "confirmations", confirmations)
@@ -136,6 +129,34 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 		case <-time.After(interval):
 		}
 	}
+}
+
+// recoverAtStartup runs the engine's Recover. Recover re-sends every Built
+// intent it can re-reserve, so while the store holds a held intent it runs
+// under a context that has already ended: its repair passes (re-marking sent
+// inputs, releasing orphan reservations, re-reserving Built intents) do not
+// read the context, and only the sending does, so nothing is sent and send
+// refuses the same way on every later pass. Every other error is reported and
+// does not stop the process; the process's own context ending does.
+func recoverAtStartup(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) error {
+	built, err := store.List(ctx, withdraw.StateBuilt)
+	if err != nil {
+		return fmt.Errorf("recover: the store could not be read: %w", err)
+	}
+	recoverCtx := ctx
+	if held := heldCount(built); held > 0 {
+		logger.Error("withdrawals halted: held intents must be resolved by hand before anything is sent", "held", held)
+		var stop context.CancelFunc
+		recoverCtx, stop = context.WithCancel(ctx)
+		stop()
+	}
+	if err := engine.Recover(recoverCtx); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		logger.Error("recover", "err", err)
+	}
+	return nil
 }
 
 // send broadcasts every Built intent. The engine decides what each outcome

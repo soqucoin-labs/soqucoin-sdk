@@ -52,15 +52,19 @@ func (c *fakeCache) GetUTXOs(a string) []types.UTXO  { return c.utxos[a] }
 func (c *fakeCache) LastRefresh() (time.Time, error) { return c.at, c.err }
 
 type fakeNode struct {
-	synced  bool
-	syncErr error  // returned by RequireSynced when set, in place of ErrNodeSyncing
-	chain   string // what getblockchaininfo would report
-	tip     int64
-	outs    map[string]*rpc.TxOut // "txid:vout"
-	calls   int
+	synced   bool
+	syncErr  error  // returned by RequireSynced when set, in place of ErrNodeSyncing
+	chainErr error  // returned by RequireChain when set: the call did not complete
+	chain    string // what getblockchaininfo would report
+	tip      int64
+	outs     map[string]*rpc.TxOut // "txid:vout"
+	calls    int
 }
 
 func (n *fakeNode) RequireChain(_ context.Context, want string) error {
+	if n.chainErr != nil {
+		return n.chainErr
+	}
 	if want != "" && n.chain != want {
 		return fmt.Errorf("%w: node reports %q, configured for %q", rpc.ErrWrongChain, n.chain, want)
 	}
@@ -127,6 +131,15 @@ func (c *fakeCachePerAddr) LastRefreshOf(a string) (time.Time, error) { return c
 type alerts struct{ kinds []AlertKind }
 
 func (a *alerts) fn(k AlertKind, _ string) { a.kinds = append(a.kinds, k) }
+func (a *alerts) count(k AlertKind) int {
+	n := 0
+	for _, x := range a.kinds {
+		if x == k {
+			n++
+		}
+	}
+	return n
+}
 func (a *alerts) has(k AlertKind) bool {
 	for _, x := range a.kinds {
 		if x == k {

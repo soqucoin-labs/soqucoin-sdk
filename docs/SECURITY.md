@@ -480,9 +480,10 @@ if err := address.Validate(types.Mainnet.HRP, userProvidedAddress); err != nil {
 ```
 
 `withdraw.Engine` applies this check itself, against its `Network`, at `Submit` and again at
-`Build`: a destination that is not an address on the engine's network is never recorded and never
-signed, whatever your own code did with it first. The prefix is not part of the script, so nothing
-after that point would refuse it.
+`Build`: a destination that is not an address on the engine's network is never recorded by
+`Submit` and never signed, whatever your own code did with it first, and a record another process
+or an older release wrote into the store with such a destination is failed at `Build`. The prefix
+is not part of the script, so nothing after that point would refuse it.
 
 If you accept addresses on more than one network, derive the network from the
 address instead of guessing:

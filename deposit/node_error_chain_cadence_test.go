@@ -3,6 +3,7 @@ package deposit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -163,5 +164,59 @@ func TestMaxCacheAgeMustHoldTwoPingsOfACacheThatReportsThem(t *testing.T) {
 	m.MaxCacheAge = time.Second
 	if _, err := m.Scan(context.Background()); err != nil {
 		t.Fatalf("cache without a cadence: %v", err)
+	}
+}
+
+// A node that answers a gettxout with an error of its own has refused the
+// question, which the indexer wrote: the outpoint is alarmed as a
+// disagreement and skipped, the pass goes on to the next candidate, and the
+// same refusal on a credited outpoint under recheck is the book's problem,
+// alarmed as one. Neither ends the pass, unlike a lookup that did not complete.
+func TestANodeThatRefusesALookupIsADisagreementNotAnOutage(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	malformed := fmt.Errorf("gettxout: %w", &rpc.Error{Code: -8, Message: "txid must be hexadecimal"})
+	cache.utxos[a] = []types.UTXO{
+		{TxID: txA, Vout: 0, Value: 100, Height: 900, Address: a},
+		{TxID: txB, Vout: 0, Value: 100, Height: 900, Address: a},
+	}
+	node.outs[key(txA, 0)] = txout(t, a, 100, 101, false)
+	node.outs[key(txB, 0)] = txout(t, a, 100, 101, false)
+	m.Node = &failingNode{fakeNode: node, failKey: key(txA, 0), failErr: malformed}
+
+	got, err := m.Scan(context.Background())
+	if err != nil || len(got) != 1 || got[0].TxID != txB || len(led.credited) != 1 {
+		t.Fatalf("scan with a refused lookup on txA: %v %+v, want txB credited and no error", err, got)
+	}
+	if al.count(AlertIndexerMismatch) != 1 || len(al.kinds) != 1 {
+		t.Fatalf("alerts %v, want one indexer_mismatch for the refused lookup", al.kinds)
+	}
+	// txB is credited and pending; the node now refuses its recheck and
+	// answers for txA, which is credited in the same pass.
+	m.Node = &failingNode{fakeNode: node, failKey: key(txB, 0), failErr: malformed}
+	got, err = m.Scan(context.Background())
+	if err != nil || len(got) != 1 || got[0].TxID != txA {
+		t.Fatalf("scan with a refused recheck: %v %+v, want no error and txA credited", err, got)
+	}
+	if al.count(AlertLedgerError) != 1 {
+		t.Fatalf("alerts %v, want one ledger_error for the refused recheck", al.kinds)
+	}
+	if led.final[key(txB, 0)] {
+		t.Fatal("marked final without the node's word")
+	}
+}
+
+// A RequireChain that does not complete is neither a wrong chain nor a pause:
+// the error is returned as it is, nothing is credited, and no alert is raised.
+func TestAChainCheckThatDoesNotCompleteEndsThePassWithTheError(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	node.chainErr = errors.New("node: connection refused")
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 100, Height: 900, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 100, 101, false)
+	got, err := m.Scan(context.Background())
+	if !errors.Is(err, node.chainErr) || errors.Is(err, ErrPaused) || errors.Is(err, rpc.ErrWrongChain) {
+		t.Fatalf("got %v, want the transport error as it is", err)
+	}
+	if len(got) != 0 || len(led.credited) != 0 || len(al.kinds) != 0 {
+		t.Fatalf("credited %+v, alerts %v; want nothing credited and no alert", got, al.kinds)
 	}
 }

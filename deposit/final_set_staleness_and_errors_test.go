@@ -46,14 +46,19 @@ func TestPruneKeepsTheEntriesOfAStaleAddress(t *testing.T) {
 	}
 }
 
-// failingNode answers gettxout with an error for one outpoint.
+// failingNode answers gettxout with an error for one outpoint: a transport
+// failure, or failErr when set.
 type failingNode struct {
 	*fakeNode
 	failKey string
+	failErr error
 }
 
 func (n *failingNode) GetTxOut(ctx context.Context, txid string, vout uint32, mem bool) (*rpc.TxOut, error) {
 	if key(txid, vout) == n.failKey {
+		if n.failErr != nil {
+			return nil, n.failErr
+		}
 		return nil, errors.New("node: connection refused")
 	}
 	return n.fakeNode.GetTxOut(ctx, txid, vout, mem)

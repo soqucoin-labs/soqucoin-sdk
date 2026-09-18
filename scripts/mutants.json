@@ -1149,8 +1149,8 @@
       "file": "deposit/monitor.go",
       "package": "./deposit",
       "test": "TestNodeErrorInsideTheCreditLoopEndsThePassWithTheError",
-      "find": "\tif err != nil {\n\t\treturn Deposit{}, false, err\n\t}\n\tswitch {",
-      "replace": "\tif err != nil {\n\t\tm.alert(AlertIndexerMismatch, \"%v\", err)\n\t\treturn Deposit{}, false, nil\n\t}\n\tswitch {",
+      "find": "\t\treturn Deposit{}, false, err\n\t}\n\tswitch {",
+      "replace": "\t\tm.alert(AlertIndexerMismatch, \"%s:%d for %s: node lookup failed: %v\", u.TxID, u.Vout, addr, err)\n\t\treturn Deposit{}, false, nil\n\t}\n\tswitch {",
       "why": "A node that did not answer has not disagreed with the indexer. Alarming the transport error as indexer_mismatch and ending the pass clean routes a node outage to the runbook for a lying indexer while Scan reports nothing wrong; the error is returned instead, as at every other gettxout."
     },
     {
@@ -1215,6 +1215,33 @@
       "find": "if errors.Is(err, withdraw.ErrHeld) || errors.Is(err, rpc.ErrTxIDMismatch) {",
       "replace": "if errors.Is(err, withdraw.ErrHeld) && errors.Is(err, rpc.ErrTxIDMismatch) {",
       "why": "A hold that arises inside a pass must end the pass, or the intent listed after it is sent before the store check of the next pass can refuse it."
+    },
+    {
+      "id": "deposit-refused-lookup-read-as-an-outage",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestANodeThatRefusesALookupIsADisagreementNotAnOutage",
+      "find": "\tif err != nil {\n\t\tif refused(err) {\n\t\t\tm.alert(AlertIndexerMismatch, \"%s:%d for %s: the node refused the lookup: %v\", u.TxID, u.Vout, addr, err)\n\t\t\treturn Deposit{}, false, nil\n\t\t}",
+      "replace": "\tif err != nil {\n\t\tif !refused(err) {\n\t\t\tm.alert(AlertIndexerMismatch, \"%s:%d for %s: the node refused the lookup: %v\", u.TxID, u.Vout, addr, err)\n\t\t\treturn Deposit{}, false, nil\n\t\t}",
+      "why": "A node that answers a lookup with an error of its own has refused a question the indexer wrote, and that outpoint is a disagreement to alarm and skip; read as an outage it ends every pass at that candidate and every address after it is never credited, with no alert."
+    },
+    {
+      "id": "deposit-chain-check-transport-error-swallowed",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestAChainCheckThatDoesNotCompleteEndsThePassWithTheError",
+      "find": "\tif err := m.Node.RequireChain(ctx, m.network().ChainID); err != nil {",
+      "replace": "\tif err := m.Node.RequireChain(ctx, m.network().ChainID); errors.Is(err, rpc.ErrWrongChain) {",
+      "why": "A chain check that did not complete has not said which chain the node serves; a pass that goes on credits with the chain unverified."
+    },
+    {
+      "id": "broadcaster-recover-sends-while-an-intent-is-held",
+      "file": "examples/exchange_split/broadcaster/main.go",
+      "package": "./examples/exchange_split/broadcaster",
+      "test": "TestRecoverAtStartupSendsNothingWhileAnIntentIsHeld",
+      "find": "if held := heldCount(built); held > 0 {",
+      "replace": "if held := heldCount(built); held < 0 {",
+      "why": "Recover re-sends every Built intent it can re-reserve, so the held check has to run before it; without it a restart sends past a held intent that the send pass would have refused."
     }
   ]
 }

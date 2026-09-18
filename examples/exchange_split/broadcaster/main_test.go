@@ -122,3 +122,38 @@ func TestATxIDMismatchEndsThePassAndTheNextOneSendsNothing(t *testing.T) {
 		t.Fatalf("sent %v on the next pass; want nothing while w-a is held", node.sent)
 	}
 }
+
+// Recover re-sends every Built intent it can re-reserve, so at startup the
+// held check has to come before it: with a held intent in the store, Recover
+// runs its repair passes and sends nothing, and once the hold is resolved the
+// next start sends what was built.
+func TestRecoverAtStartupSendsNothingWhileAnIntentIsHeld(t *testing.T) {
+	store, engine, node, log := setup(t)
+	built(t, store, "w-a", nil)
+	built(t, store, "w-b", func(in *withdraw.Intent) { in.NodeTxID = "node-tx-w-b" })
+
+	if err := recoverAtStartup(context.Background(), store, engine); err != nil {
+		t.Fatal(err)
+	}
+	if node.count() != 0 {
+		t.Fatalf("recover sent %v while w-b is held; want nothing sent", node.sent)
+	}
+	if !strings.Contains(log.String(), "held") {
+		t.Fatalf("the halt was not reported; log:\n%s", log.String())
+	}
+	a, _, _ := store.Get(context.Background(), "w-a")
+	if a.State != withdraw.StateBuilt || len(engine.Spent.ReservedIntents()) != 1 {
+		t.Fatalf("w-a is %s with reservations %v; want Built and re-reserved by the repair pass", a.State, engine.Spent.ReservedIntents())
+	}
+	held, _, _ := store.Get(context.Background(), "w-b")
+	held.State = withdraw.StateFailed
+	if err := store.Update(context.Background(), held, withdraw.StateBuilt); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverAtStartup(context.Background(), store, engine); err != nil {
+		t.Fatal(err)
+	}
+	if node.count() != 1 || node.sent[0] != "tx-w-a" {
+		t.Fatalf("recover sent %v after the hold was resolved; want tx-w-a alone", node.sent)
+	}
+}
