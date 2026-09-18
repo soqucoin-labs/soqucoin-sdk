@@ -206,8 +206,8 @@ func (c *queuedConfirmer) Confirmations(context.Context, string) (int64, error) 
 }
 
 // Two confirmation loops hold copies of one Broadcast intent. The first reads
-// the node at the threshold and saves Confirmed. The second read the node one
-// block earlier, or a node one block behind, and saves after. Confirmed is
+// the node at the threshold and saves Confirmed. The second loop read the node
+// one block earlier, or a node one block behind, and saves after. Confirmed is
 // terminal: the second must write nothing, so a ledger acting on the
 // Confirmed transition sees it once and the record never reads Broadcast
 // again after it read Confirmed.
@@ -369,5 +369,56 @@ func TestPermanentRejectionWhoseSaveFailsKeepsTheInputsReserved(t *testing.T) {
 		if spent.IsSpent(o.TxID, o.Vout) {
 			t.Fatalf("input %s:%d is still held after the Failed record landed", o.TxID, o.Vout)
 		}
+	}
+}
+
+// A save that fails after the network answered leaves the caller's copy ahead
+// of the store: Broadcast sent and could not record it, so the copy says
+// Broadcast while the store says Built. The caller retries with the object it
+// holds. The stored record decides, and the retry sends the same bytes; a
+// check on the copy's own state would have refused the retry for as long as
+// the caller held that object.
+func TestRetryWithACopyAheadOfTheStoreActsOnTheStoredRecord(t *testing.T) {
+	ctx := context.Background()
+	store := &updateFailOnce{MemStore: NewMemStore(), state: StateBroadcast}
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, store, utxo.NewSpentSet("", nil), net, coins())
+	if _, _, err := e.Submit(ctx, "w1", dst, 2_000_000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	in, _, _ := store.Get(ctx, "w1")
+	if err := e.Build(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Broadcast(ctx, in); err == nil || in.State != StateBroadcast {
+		t.Fatalf("first send: err=%v copy=%s; want the save error with the copy ahead of the store", err, in.State)
+	}
+	if stored, _, _ := store.Get(ctx, "w1"); stored.State != StateBuilt {
+		t.Fatalf("store after the failed save: %s, want Built", stored.State)
+	}
+	if err := e.Broadcast(ctx, in); err != nil {
+		t.Fatalf("retry with the copy the caller holds: %v, want the send retried from the stored record", err)
+	}
+	stored, _, _ := store.Get(ctx, "w1")
+	if stored.State != StateBroadcast || net.sentCount() != 2 || net.sent[0] != net.sent[1] {
+		t.Fatalf("after the retry: state=%s sent=%v; want Broadcast recorded and the same bytes twice", stored.State, net.sent)
+	}
+
+	// The same shape for a Failed save: the copy says Failed, the store says
+	// Created, and Build on the copy builds.
+	failing := &updateFailOnce{MemStore: NewMemStore(), state: StateFailed}
+	e2 := newEngine(t, failing, utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"}, coins())
+	if _, _, err := e2.Submit(ctx, "w2", dst, 100_000_000, 1000); err != nil { // more than the coins cover
+		t.Fatal(err)
+	}
+	w2, _, _ := failing.Get(ctx, "w2")
+	if err := e2.Build(ctx, w2); err == nil || w2.State != StateFailed {
+		t.Fatalf("first build: err=%v copy=%s; want the selector's failure and the save error", err, w2.State)
+	}
+	if err := e2.Build(ctx, w2); err == nil {
+		t.Fatal("retry of Build on the Failed copy returned no error; the selector still cannot cover the amount")
+	}
+	if stored, _, _ := failing.Get(ctx, "w2"); stored.State != StateFailed {
+		t.Fatalf("store after the retry: %s, want the Failed verdict recorded this time", stored.State)
 	}
 }

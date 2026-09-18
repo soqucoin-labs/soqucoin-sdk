@@ -401,20 +401,18 @@ func (e *Engine) Submit(ctx context.Context, id, address string, amount, feeRate
 // the intent. A signer error is the same, except that the reservation taken
 // before signing is released.
 func (e *Engine) Build(ctx context.Context, in *Intent) error {
-	if in.State != StateCreated {
-		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// The check above reads the caller's copy of the intent, which another
-	// worker can have advanced between the caller's read and this lock. The
-	// stored state is the one that decides. Without this re-read, two workers
-	// each holding a Created copy of one intent both pass the check, and the
-	// lock then serialises them into two builds: each selects different inputs
-	// because the other's are reserved, each signs, and each broadcasts. That
-	// pays the recipient twice from different inputs, which is the first of the
-	// two failure modes this package exists to prevent.
+	// The stored state is the one that decides, not the caller's copy: another
+	// worker can have advanced the intent between the caller's read and this
+	// lock, and a copy can also be ahead of the store, when a save failed
+	// after this method changed it. Without this re-read, two workers each
+	// holding a Created copy of one intent both build, and the lock then
+	// serialises them into two builds: each selects different inputs because
+	// the other's are reserved, each signs, and each broadcasts. That pays the
+	// recipient twice from different inputs, which is the first of the two
+	// failure modes this package exists to prevent.
 	stored, err := e.reread(ctx, in, StateCreated)
 	if err != nil {
 		return err
@@ -503,7 +501,9 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 // Broadcast, because another worker sent it first, receives ErrWrongState
 // and sends nothing; without that, the second sender's lost reply would renew
 // a reservation over inputs the first had marked spent and save Built over
-// the Broadcast the first had recorded.
+// the Broadcast the first had recorded. The caller's copy is only the key:
+// one that says Broadcast while the store says Built, because the save after
+// a send failed, is sent again from the stored record.
 //
 // Before the send the intent's inputs are re-reserved for another TTL, so a
 // Built intent retried at least once per ReservationTTL never loses them.
@@ -513,9 +513,6 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 // cause recorded, and the operator resolves it. This is the same rule
 // Recover applies, at the one place a send can start.
 func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
-	if in.State != StateBuilt {
-		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	stored, err := e.reread(ctx, in, StateBuilt)
@@ -762,9 +759,6 @@ func (e *Engine) releaseOrphanReservations(ctx context.Context) error {
 // confirmed it first, receives ErrWrongState and writes nothing: Confirmed is
 // terminal, and a ledger acting on that transition must see it once.
 func (e *Engine) UpdateConfirmations(ctx context.Context, in *Intent) error {
-	if in.State != StateBroadcast {
-		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
-	}
 	if e.Confirmer == nil {
 		return errors.New("withdraw: no Confirmer configured")
 	}
