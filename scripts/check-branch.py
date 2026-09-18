@@ -28,15 +28,29 @@ miss.
    exists there is no body, so a local run takes ALLOW_LARGE_DIFF=1 and prints
    what the body will have to carry. A marker with no reason behind it fails.
 
+3. Every function the branch adds or changes is named in the pull request
+   body (check-delta.py, which holds the rule and its reasons). Like the size
+   override this needs the body, so it runs in CI and in the read-back before
+   `gh pr ready`; a local run before the body exists prints the enumeration
+   the body will have to carry and does not fail on it.
+
 Exit status is 0 when every check passes, 1 otherwise.
 """
 
 import argparse
+import importlib.util
 import os
 import pathlib
 import re
 import subprocess
 import sys
+
+# Loading the sibling by path would leave a __pycache__ directory in scripts/.
+sys.dont_write_bytecode = True
+_spec = importlib.util.spec_from_file_location(
+    "check_delta", pathlib.Path(__file__).resolve().parent / "check-delta.py")
+delta = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(delta)
 
 DEFAULT_MAX_LINES = 600
 
@@ -210,8 +224,16 @@ def main() -> int:
         return 1
 
     problems = check_current(args.base) + check_size(args.base, args.max_lines, body)
+    if body is not None:
+        problems += delta.check_names(args.base, "HEAD", body)[0]
+    else:
+        names = delta.listing(args.base, "HEAD")
+        if names:
+            print("note: no body yet. The pull request body must name each of these, with the "
+                  "sibling of each in its site list:\n" + names + "\n")
     if not problems:
-        print(f"check-branch: OK (current with {args.base}, within the line budget)")
+        print(f"check-branch: OK (current with {args.base}, within the line budget"
+              + (", every changed function named in the body)" if body is not None else ")"))
         return 0
     print(f"check-branch: {len([p for p in problems if not p.startswith('  ')])} problem(s)\n")
     for line in problems:

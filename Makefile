@@ -43,6 +43,7 @@ mutants:
 # that the refusals it does not cover still hold.
 branch:
 	python3 scripts/check-branch-selftest.py
+	python3 scripts/check-delta-selftest.py
 	python3 scripts/check-branch.py
 
 # mutants rewrites a source file in place for the length of one test run, so
