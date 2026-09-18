@@ -19,8 +19,8 @@ it and are counted there. Files marked `Code generated` are skipped.
 
 How a name satisfies the check. The bare name (`commitRefresh`, `Host`) as a
 whole word anywhere in the body, in prose or in backticks. Where the repository
-declares that bare name more than once (`Call` on a `Client` in both `rpc` and
-`electrumx`, `String` on three types), the qualified form is required:
+declares that bare name more than once (`Call` on a `Client` in more than one
+directory, `String` on three types), the qualified form is required:
 `Type.Method` for a method, `<dir>.Func` for a function, with the directory
 holding the file rather than the Go package name, so a `main` package reads as
 its directory. Where even `Type.Method` is declared more than once, as
@@ -29,15 +29,18 @@ its directory. Where even `Type.Method` is declared more than once, as
 Parsing. A small scanner over the source skips comments, interpreted strings,
 raw strings and rune literals, so a brace or a `func` inside any of them is
 not a brace or a declaration. A declaration is `func` in column 0; its body
-begins at the first `{` outside parentheses and ends at the matching `}`, so a
-signature spanning several lines and a body holding any text are read as Go
-reads them. A declaration whose line ends outside parentheses before any `{`
-has no body. The doc comment is the run of `//` lines directly above.
+begins at the first `{` outside parentheses and brackets and ends at the
+matching `}`, so a signature spanning several lines, a brace inside a type
+parameter's constraint and a body holding any text are read as Go reads them.
+A declaration whose line ends outside parentheses before any `{` has no body.
+The doc comment is the run of `//` lines directly above.
 
 Reading the diff. The file list comes from `--name-status -z`, so a path with a
 space or a rename is exact, and only hunk headers (`@@`) are read from a
-zero-context diff, so no content line can pose as a file header and a reader's
-diff configuration cannot change what is read.
+zero-context diff, so no content line can pose as a file header. The diff
+algorithm, the hunk heuristic and the context are named on the command line,
+so the settings of the reader's git that could move a change between two
+functions do not.
 
 Usage:
   check-delta.py --list                        print the enumeration, exit 0
@@ -59,7 +62,11 @@ import subprocess
 import sys
 
 GIT = ["git", "-c", "core.quotePath=false"]
-DIFF = ["--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-M"]
+# The algorithm and the hunk-sliding heuristic are named so that a reader's
+# diff.algorithm or diff.indentHeuristic cannot move a change from one function
+# to another; a reordering of identical bodies is the case that shows it.
+DIFF = ["--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-M",
+        "--diff-algorithm=myers", "--indent-heuristic"]
 
 # A declaration line as gofmt prints it: `func Name(` or `func (r *Type) Name(`,
 # with an optional type parameter list on the receiver. Group 1 is the receiver
@@ -77,6 +84,11 @@ class Function:
     def __init__(self, directory, receiver, name, start, end):
         self.directory, self.receiver, self.name = directory, receiver, name
         self.start, self.end = start, end  # 1-based, inclusive, doc comment included
+
+    @property
+    def local(self) -> str:
+        """The name within one file: receiver and name, no directory."""
+        return f"{self.receiver}.{self.name}" if self.receiver else self.name
 
     @property
     def qualified(self) -> str:
@@ -131,12 +143,14 @@ def tokens(source: str) -> list[tuple[str, int]]:
             j = i + 1
             while j < n and source[j] not in (c, "\n"):
                 j += 2 if source[j] == "\\" else 1
-            i = j + 1
+            # A literal the line ends before closing is left at the newline,
+            # so the line count stays right for what follows.
+            i = j + 1 if j < n and source[j] == c else j
         elif column0 and source.startswith("func", i) and i + 4 < n and source[i + 4] in " \t(":
             out.append(("func", line))
             i += 4
         else:
-            if c in "{}()":
+            if c in "{}()[]":
                 out.append((c, line))
             i += 1
         column0 = False
@@ -168,9 +182,9 @@ def functions(source: str, directory: str) -> list[Function]:
         body = False
         while j < len(toks):
             kind, ln = toks[j]
-            if kind == "(":
+            if kind in "([":
                 paren += 1
-            elif kind == ")":
+            elif kind in ")]":
                 paren -= 1
             elif kind == "{" and paren == 0:
                 body = True
@@ -265,16 +279,19 @@ def enumerate_delta(base: str, head: str):
         old_lines, new_lines = hunks(base, head, *(p for p in (old_path, new_path) if p))
         new_funcs = functions(show(head, new_path), directory_of(new_path)) if new_path else []
         old_funcs = functions(show(merge_base, old_path), directory_of(old_path)) if old_path else []
-        new_by_name = {f.qualified: f for f in new_funcs}
-        old_by_name = {f.qualified: f for f in old_funcs}
+        # Keyed within the file pair by receiver and name, not by directory, so
+        # a file renamed across directories still pairs each function with
+        # itself and a deletion-only edit inside it is a change, not a removal.
+        new_by_name = {f.local: f for f in new_funcs}
+        old_by_name = {f.local: f for f in old_funcs}
         touched: dict[str, Function] = {}
         for f in new_funcs:
             if f.touches(new_lines):
-                touched[f.qualified] = f
+                touched[f.local] = f
         for f in old_funcs:
             if f.touches(old_lines):
-                if f.qualified in new_by_name:
-                    touched.setdefault(f.qualified, new_by_name[f.qualified])
+                if f.local in new_by_name:
+                    touched.setdefault(f.local, new_by_name[f.local])
                 else:
                     removed.append((old_path, f))
         for q, f in touched.items():
@@ -289,6 +306,8 @@ def declarations(head: str) -> dict[str, int]:
     # each output line is `<head>:<path>NUL<line text>`.
     r = subprocess.run([*GIT, "grep", "-z", "-E", "^func ", head, "--", "*.go", ":!*_test.go"],
                        capture_output=True, text=True)
+    if r.returncode not in (0, 1):  # 1 is no match; anything else is a failure to read
+        raise subprocess.CalledProcessError(r.returncode, "git grep", r.stdout, r.stderr)
     counts: dict[str, int] = {}
     for line in r.stdout.split("\n"):
         where, sep, text = line.partition("\0")
