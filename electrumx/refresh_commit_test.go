@@ -288,12 +288,15 @@ func TestAMalformedReplyFromAReplacedConnectionIsRecordedAsTheReplacement(t *tes
 	}
 
 	// A stale malformed reply that a later refresh has already superseded
-	// (ticket 1 after ticket 2 committed) records nothing and leaves no
-	// refresh pending, as commitRefresh drops a superseded reply.
+	// (ticket 1 after ticket 2 committed) records nothing, leaves no refresh
+	// pending and is not a failure of the pass, as commitRefresh drops a
+	// superseded reply without one.
 	c.mu.Lock()
 	c.changed = make(map[string]bool)
 	c.mu.Unlock()
-	_ = c.recordRefreshFailure(a, 1, 0, 1, parse)
+	if err := c.recordRefreshFailure(a, 1, 0, 1, parse); err != nil {
+		t.Fatalf("a superseded stale reply failed the pass with %v; the later refresh already stood in for it", err)
+	}
 	c.mu.Lock()
 	pending := c.changed[a]
 	c.mu.Unlock()

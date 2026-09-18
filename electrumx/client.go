@@ -726,18 +726,20 @@ func (c *Client) staleReplyLocked(addr string, gen uint64) error {
 }
 
 // recordRefreshFailure records a reply that could not be used and returns
-// the error recorded. A reply from a connection that has since been replaced
-// is recorded as the replacement, whatever it carried: the pass then ends
-// like any lost connection, and the address is not alarmed for a fault the
-// replacement explains.
+// the error recorded, or nil for a reply a later refresh has superseded. A
+// reply from a connection that has since been replaced is recorded as the
+// replacement, whatever it carried: the pass then ends like any lost
+// connection, and the address is not alarmed for a fault the replacement
+// explains.
 func (c *Client) recordRefreshFailure(addr string, gen, seqBefore, ticket uint64, err error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if last := c.refreshed[addr].commit; ticket < last {
-		// A later refresh of this address has already committed, as
+		// A later refresh of this address has already reported, as
 		// commitRefresh tests before its own stale check: this reply is
-		// superseded, records nothing and leaves nothing pending.
-		return err
+		// superseded, records nothing, leaves nothing pending and is not a
+		// failure of the pass, since the later refresh has stood in for it.
+		return nil // superseded: the later refresh is the address's result
 	}
 	if serr := c.staleReplyLocked(addr, gen); serr != nil {
 		c.recordStaleLocked(addr, gen, seqBefore, ticket, serr)
