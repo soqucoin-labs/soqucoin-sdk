@@ -18,16 +18,26 @@ A removed function is reported but not required, since its callers change with
 it and are counted there. Files marked `Code generated` are skipped.
 
 How a name satisfies the check. The bare name (`commitRefresh`, `Host`) as a
-whole word anywhere in the body, in prose or in backticks. When the repository
-declares that bare name more than once (`Close` on several types, `dial` in two
-packages), `Type.Method` for a method or `package.Func` for a function is
-required, since the bare word cannot tell them apart.
+whole word anywhere in the body, in prose or in backticks. Where the repository
+declares that bare name more than once (`Call` on a `Client` in both `rpc` and
+`electrumx`, `String` on three types), the qualified form is required:
+`Type.Method` for a method, `<dir>.Func` for a function, with the directory
+holding the file rather than the Go package name, so a `main` package reads as
+its directory. Where even `Type.Method` is declared more than once, as
+`Client.Call` is, `<dir>.Type.Method` is required.
 
-Parsing. The source is read as gofmt leaves it: a declaration starts at a
-`func` in column 0 and its body ends at the first `}` in column 0. A raw string
-holding a `}` at column 0 would end a function early; none of the library's
-non-test files carries one, and the effect is a function counted as two, which
-over-reports and never under-reports.
+Parsing. A small scanner over the source skips comments, interpreted strings,
+raw strings and rune literals, so a brace or a `func` inside any of them is
+not a brace or a declaration. A declaration is `func` in column 0; its body
+begins at the first `{` outside parentheses and ends at the matching `}`, so a
+signature spanning several lines and a body holding any text are read as Go
+reads them. A declaration whose line ends outside parentheses before any `{`
+has no body. The doc comment is the run of `//` lines directly above.
+
+Reading the diff. The file list comes from `--name-status -z`, so a path with a
+space or a rename is exact, and only hunk headers (`@@`) are read from a
+zero-context diff, so no content line can pose as a file header and a reader's
+diff configuration cannot change what is read.
 
 Usage:
   check-delta.py --list                        print the enumeration, exit 0
@@ -49,9 +59,9 @@ import subprocess
 import sys
 
 GIT = ["git", "-c", "core.quotePath=false"]
-DIFF = ["--no-ext-diff", "--no-textconv", "--ignore-submodules=none"]
+DIFF = ["--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-M"]
 
-# A declaration as gofmt prints it: `func Name(` or `func (r *Type) Name(`,
+# A declaration line as gofmt prints it: `func Name(` or `func (r *Type) Name(`,
 # with an optional type parameter list on the receiver. Group 1 is the receiver
 # type, group 2 the name.
 FUNC = re.compile(
@@ -62,15 +72,19 @@ HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 class Function:
-    __slots__ = ("package", "receiver", "name", "start", "end")
+    __slots__ = ("directory", "receiver", "name", "start", "end")
 
-    def __init__(self, package, receiver, name, start, end):
-        self.package, self.receiver, self.name = package, receiver, name
+    def __init__(self, directory, receiver, name, start, end):
+        self.directory, self.receiver, self.name = directory, receiver, name
         self.start, self.end = start, end  # 1-based, inclusive, doc comment included
 
     @property
     def qualified(self) -> str:
-        return f"{self.receiver}.{self.name}" if self.receiver else f"{self.package}.{self.name}"
+        return f"{self.receiver}.{self.name}" if self.receiver else f"{self.directory}.{self.name}"
+
+    @property
+    def full(self) -> str:
+        return f"{self.directory}.{self.qualified}" if self.receiver else self.qualified
 
     def touches(self, lines: set[int]) -> bool:
         return any(self.start <= n <= self.end for n in lines)
@@ -84,69 +98,154 @@ def is_non_test_go(path: str) -> bool:
     return path.endswith(".go") and not path.endswith("_test.go")
 
 
-def package_of(path: str) -> str:
-    parent = pathlib.PurePosixPath(path).parent.name
-    return parent or "main"
+def directory_of(path: str) -> str:
+    return pathlib.PurePosixPath(path).parent.name or "."
 
 
-def functions(source: str, package: str) -> list[Function]:
+def tokens(source: str) -> list[tuple[str, int]]:
+    """The tokens the declaration walk needs: `func` in column 0, the four
+    brackets, and line ends, each with its line number. Comments, interpreted
+    strings, raw strings and rune literals are consumed whole."""
+    out: list[tuple[str, int]] = []
+    i, n, line, column0 = 0, len(source), 1, True
+    while i < n:
+        c = source[i]
+        if c == "\n":
+            out.append(("nl", line))
+            line, i, column0 = line + 1, i + 1, True
+            continue
+        if source.startswith("//", i):
+            j = source.find("\n", i)
+            i = n if j < 0 else j
+        elif source.startswith("/*", i):
+            j = source.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            line += source.count("\n", i, j)
+            i = j
+        elif c == "`":
+            j = source.find("`", i + 1)
+            j = n if j < 0 else j + 1
+            line += source.count("\n", i, j)
+            i = j
+        elif c in "\"'":
+            j = i + 1
+            while j < n and source[j] not in (c, "\n"):
+                j += 2 if source[j] == "\\" else 1
+            i = j + 1
+        elif column0 and source.startswith("func", i) and i + 4 < n and source[i + 4] in " \t(":
+            out.append(("func", line))
+            i += 4
+        else:
+            if c in "{}()":
+                out.append((c, line))
+            i += 1
+        column0 = False
+    return out
+
+
+def functions(source: str, directory: str) -> list[Function]:
     """Top-level functions and methods with their line ranges.
 
     The range runs from the first line of the doc comment (contiguous `//`
-    lines directly above the declaration) to the closing `}` in column 0, or to
-    the declaration line itself for a one-line body or a bodyless declaration.
+    lines directly above the declaration) to the `}` that closes the body, or
+    to the line the declaration ends on when it has no body.
     """
     if GENERATED.search(source[:2000]):
         return []
     lines = source.split("\n")
+    toks = tokens(source)
     out: list[Function] = []
-    i = 0
-    while i < len(lines):
-        m = FUNC.match(lines[i])
-        if not m:
-            i += 1
+    k = 0
+    while k < len(toks):
+        if toks[k][0] != "func":
+            k += 1
             continue
-        start = i
-        while start > 0 and lines[start - 1].startswith("//"):
+        decl_line = toks[k][1]
+        m = FUNC.match(lines[decl_line - 1])
+        end = decl_line
+        paren = 0
+        j = k + 1
+        body = False
+        while j < len(toks):
+            kind, ln = toks[j]
+            if kind == "(":
+                paren += 1
+            elif kind == ")":
+                paren -= 1
+            elif kind == "{" and paren == 0:
+                body = True
+                break
+            elif kind in ("nl", "func") and paren == 0:
+                end = ln if kind == "nl" else ln - 1
+                break
+            j += 1
+        if body:
+            depth = 0
+            while j < len(toks):
+                kind, ln = toks[j]
+                if kind == "{":
+                    depth += 1
+                elif kind == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = ln
+                        # A `{` before the line ends is a body after a result
+                        # type written as a struct or interface literal.
+                        if j + 1 < len(toks) and toks[j + 1][0] == "{":
+                            j += 1
+                            continue
+                        break
+                j += 1
+            else:
+                end = len(lines)
+        start = decl_line
+        while start > 1 and lines[start - 2].startswith("//"):
             start -= 1
-        line = lines[i]
-        if "{" not in line or line.rstrip().endswith("}"):
-            end = i  # bodyless, or the whole body on the declaration line
-        else:
-            end = i + 1
-            while end < len(lines) and not lines[end].startswith("}"):
-                end += 1
-            end = min(end, len(lines) - 1)
-        out.append(Function(package, m.group(1), m.group(2), start + 1, end + 1))
-        i = end + 1
+        if m:
+            out.append(Function(directory, m.group(1), m.group(2), start, end))
+        k = j + 1
     return out
 
 
-def changed_lines(base: str, head: str) -> list[tuple[str | None, str | None, set[int], set[int]]]:
-    """[(old_path, new_path, old changed lines, new changed lines)] for non-test Go.
+def changed_files(base: str, head: str) -> list[tuple[str | None, str | None]]:
+    """[(old_path, new_path)] for the non-test Go files the branch changes; a
+    path is None on the side where the file does not exist."""
+    fields = git("diff", "--name-status", "-z", *DIFF, f"{base}...{head}", "--").split("\0")
+    out: list[tuple[str | None, str | None]] = []
+    i = 0
+    while i < len(fields) and fields[i]:
+        status = fields[i][0]
+        if status in "RC":
+            old, new = fields[i + 1], fields[i + 2]
+            i += 3
+        else:
+            old = new = fields[i + 1]
+            i += 2
+            if status == "A":
+                old = None
+            elif status == "D":
+                new = None
+        if is_non_test_go(new if new is not None else old):
+            out.append((old, new))
+    return out
 
-    From a zero-context diff, so every hunk is exactly the changed lines. A
-    path is None on the side where the file does not exist: old_path for a file
-    the branch adds, new_path for one it deletes.
-    """
-    text = git("diff", "-U0", "--no-color", *DIFF, f"{base}...{head}", "--")
-    out: list[tuple[str | None, str | None, set[int], set[int]]] = []
-    old_path = None
+
+def hunks(base: str, head: str, *paths: str) -> tuple[set[int], set[int]]:
+    """(old changed lines, new changed lines) for one file, from the hunk
+    headers of a zero-context diff; every hunk is exactly the changed lines."""
+    text = git("diff", "-U0", "--no-color", "--inter-hunk-context=0", *DIFF,
+               f"{base}...{head}", "--", *paths)
+    old_lines: set[int] = set()
+    new_lines: set[int] = set()
     for line in text.split("\n"):
-        if line.startswith("--- "):
-            old_path = None if line == "--- /dev/null" else line[6:]
-        elif line.startswith("+++ "):
-            new_path = None if line == "+++ /dev/null" else line[6:]
-            out.append((old_path, new_path, set(), set()))
-        elif line.startswith("@@") and out:
-            m = HUNK.match(line)
-            if not m:
-                continue
-            a, b = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
-            c, d = int(m.group(3)), int(m.group(4) if m.group(4) is not None else 1)
-            out[-1][2].update(range(a, a + b))
-            out[-1][3].update(range(c, c + d))
-    return [r for r in out if is_non_test_go(r[1] if r[1] is not None else r[0])]
+        m = HUNK.match(line)
+        if not m:
+            continue
+        a, b = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+        c, d = int(m.group(3)), int(m.group(4) if m.group(4) is not None else 1)
+        old_lines.update(range(a, a + b))
+        new_lines.update(range(c, c + d))
+    return old_lines, new_lines
 
 
 def show(rev: str, path: str) -> str:
@@ -162,9 +261,10 @@ def enumerate_delta(base: str, head: str):
     """
     merge_base = git("merge-base", base, head).strip()
     added, changed, removed = [], [], []
-    for old_path, new_path, old_lines, new_lines in changed_lines(base, head):
-        new_funcs = functions(show(head, new_path), package_of(new_path)) if new_path else []
-        old_funcs = functions(show(merge_base, old_path), package_of(old_path)) if old_path else []
+    for old_path, new_path in changed_files(base, head):
+        old_lines, new_lines = hunks(base, head, *(p for p in (old_path, new_path) if p))
+        new_funcs = functions(show(head, new_path), directory_of(new_path)) if new_path else []
+        old_funcs = functions(show(merge_base, old_path), directory_of(old_path)) if old_path else []
         new_by_name = {f.qualified: f for f in new_funcs}
         old_by_name = {f.qualified: f for f in old_funcs}
         touched: dict[str, Function] = {}
@@ -182,22 +282,36 @@ def enumerate_delta(base: str, head: str):
     return added, changed, removed
 
 
-def bare_counts(head: str) -> dict[str, int]:
-    """How many times each bare function name is declared in non-test Go at head."""
-    r = subprocess.run([*GIT, "grep", "-h", "-E", "^func ", head, "--", "*.go", ":!*_test.go"],
+def declarations(head: str) -> dict[str, int]:
+    """How many times each name form is declared in non-test Go at head: the
+    bare name, the qualified form and the full form all counted."""
+    # `-z` puts a NUL after the path, so a path holding a colon is still exact:
+    # each output line is `<head>:<path>NUL<line text>`.
+    r = subprocess.run([*GIT, "grep", "-z", "-E", "^func ", head, "--", "*.go", ":!*_test.go"],
                        capture_output=True, text=True)
     counts: dict[str, int] = {}
     for line in r.stdout.split("\n"):
-        m = FUNC.match(line)
-        if m:
-            counts[m.group(2)] = counts.get(m.group(2), 0) + 1
+        where, sep, text = line.partition("\0")
+        m = FUNC.match(text) if sep else None
+        if not m:
+            continue
+        path = where.partition(":")[2]
+        f = Function(directory_of(path), m.group(1), m.group(2), 0, 0)
+        for form in (f.name, f.qualified, f.full):
+            counts[form] = counts.get(form, 0) + 1
     return counts
 
 
 def required_forms(funcs: list[Function], counts: dict[str, int]) -> dict[Function, str]:
-    """The form the body must carry for each function: bare, or qualified when
-    the repository declares the bare name more than once."""
-    return {f: (f.name if counts.get(f.name, 0) <= 1 else f.qualified) for f in funcs}
+    """The form the body must carry for each function: the shortest form the
+    repository declares only once."""
+    out = {}
+    for f in funcs:
+        for form in (f.name, f.qualified, f.full):
+            if counts.get(form, 0) <= 1:
+                break
+        out[f] = form
+    return out
 
 
 def named_in(body: str, form: str) -> bool:
@@ -210,7 +324,7 @@ def check_names(base: str, head: str, body: str) -> tuple[list[str], int]:
     added, changed, _removed = enumerate_delta(base, head)
     funcs = [f for _, f in added + changed]
     paths = {f: p for p, f in added + changed}
-    forms = required_forms(funcs, bare_counts(head))
+    forms = required_forms(funcs, declarations(head))
     missing = sorted((f for f in funcs if not named_in(body, forms[f])),
                      key=lambda f: (paths[f], f.start))
     if not missing:
@@ -230,7 +344,7 @@ def check_names(base: str, head: str, body: str) -> tuple[list[str], int]:
 
 def listing(base: str, head: str) -> str:
     added, changed, removed = enumerate_delta(base, head)
-    forms = required_forms([f for _, f in added + changed], bare_counts(head))
+    forms = required_forms([f for _, f in added + changed], declarations(head))
     out = []
     for kind, items in (("added", added), ("changed", changed)):
         for p, f in items:

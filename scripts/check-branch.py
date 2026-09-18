@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Mechanical checks on a branch before its pull request opens.
 
-Neither check is about taste. Both answer in a second a question a reading can
-miss.
+None of these checks is about taste. Each answers in a second a question a
+reading can miss.
 
 1. The branch is current with main, decided by comparing the patch text of
    the two diffs rather than the ancestry or their line counts. The repository
