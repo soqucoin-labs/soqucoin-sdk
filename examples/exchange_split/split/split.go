@@ -94,21 +94,25 @@ func CheckID(id string) error {
 // processes can share it.
 //
 // withdraw.FileStore cannot be shared: it holds every intent in memory and
-// writes the whole file from that map on each Put, so a second process does
+// writes the whole file from that map on each write, so a second process does
 // not merge with the first, it overwrites it. An intent the signer saved as
 // Built would come back as Created the next time the watcher wrote, with its
 // signed transaction already in a mempool and its inputs free for the next
-// withdrawal to take. Here a Put replaces one file and reads none, and every
+// withdrawal to take. Here a write replaces one file and reads none, and every
 // read comes from the disk rather than from a cache, so no process holds a
 // view that another can invalidate.
 //
-// What it does not do is lock. Nothing here stops two processes writing the
-// same intent at the same time; what stops them is that each state has one
-// owner (the watcher creates, the signer builds, the broadcaster sends and
-// confirms) and each process lists only the states it owns. An exchange that
-// wants the guarantee rather than the convention puts the intents in a
-// database and takes a row lock, which is what withdraw.Store is an interface
-// for.
+// What it does not do is lock across processes. Create is atomic on the
+// filesystem: the record is linked into place under a name that must not
+// exist yet, so two processes creating one id cannot both succeed. Update
+// reads the record, compares its state and replaces the file under this
+// process's lock only, so two processes updating one id at the same moment
+// can still interleave; what stops them is that each state has one owner (the
+// watcher creates, the signer builds, the broadcaster sends and confirms) and
+// each process lists only the states it owns. An exchange that wants the
+// guarantee rather than the convention puts the intents in a database and
+// makes Update a conditional update on the state column, which is what
+// withdraw.Store is an interface for.
 type DirStore struct {
 	dir string
 	// mu orders the writes of this process. The file is the shared truth; this
@@ -150,6 +154,11 @@ func (s *DirStore) Get(_ context.Context, id string) (*withdraw.Intent, bool, er
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.get(id)
+}
+
+// get is Get under a lock the caller holds.
+func (s *DirStore) get(id string) (*withdraw.Intent, bool, error) {
 	// Read through io/fs rooted at the store: a name that tries to leave the
 	// directory is refused by the filesystem package as well as by CheckID.
 	data, err := fs.ReadFile(os.DirFS(s.dir), s.file(id))
@@ -176,8 +185,29 @@ func (s *DirStore) Get(_ context.Context, id string) (*withdraw.Intent, bool, er
 	return &in, true, nil
 }
 
-// Put implements withdraw.Store. The record is on disk, and its directory
-// entry synced, before it returns nil.
+// Create implements withdraw.Store. The record is written to a temporary file
+// and linked into place under the id's name; the link fails when that name
+// exists, whichever process made it, so exactly one Create of an id succeeds
+// and the other receives withdraw.ErrExists. The record is on disk, and its
+// directory entry synced, before it returns nil.
+func (s *DirStore) Create(_ context.Context, in *withdraw.Intent) error {
+	data, err := s.encode(in)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err = createFile(filepath.Join(s.dir, s.file(in.ID)), data, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("%w: %s", withdraw.ErrExists, in.ID)
+	}
+	return err
+}
+
+// Update implements withdraw.Store. The stored record is read and its state
+// compared with from under this process's lock, then the file is replaced.
+// The record is on disk, and its directory entry synced, before it returns
+// nil.
 //
 // Unlike withdraw.FileStore there is nothing to roll back, because this store
 // keeps no map. A write that failed after the rename leaves the file holding
@@ -185,17 +215,36 @@ func (s *DirStore) Get(_ context.Context, id string) (*withdraw.Intent, bool, er
 // the record is in the store and only its durability is unconfirmed. A Built
 // intent then keeps its inputs reserved, because the broadcaster reads the
 // same file and will send it.
-func (s *DirStore) Put(_ context.Context, in *withdraw.Intent) error {
-	if err := CheckID(in.ID); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(in, "", "  ")
+func (s *DirStore) Update(_ context.Context, in *withdraw.Intent, from withdraw.State) error {
+	data, err := s.encode(in)
 	if err != nil {
-		return fmt.Errorf("marshal intent %s: %w", in.ID, err)
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	stored, ok, err := s.get(in.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: %s is not in the store", withdraw.ErrStale, in.ID)
+	}
+	if stored.State != from {
+		return fmt.Errorf("%w: %s is %s, the write expected %s", withdraw.ErrStale, in.ID, stored.State, from)
+	}
 	return replaceFile(filepath.Join(s.dir, s.file(in.ID)), data, 0o600)
+}
+
+// encode checks the id and renders the record.
+func (s *DirStore) encode(in *withdraw.Intent) ([]byte, error) {
+	if err := CheckID(in.ID); err != nil {
+		return nil, err
+	}
+	data, err := json.MarshalIndent(in, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal intent %s: %w", in.ID, err)
+	}
+	return data, nil
 }
 
 // List implements withdraw.Store, in the order the engine expects: oldest
@@ -258,10 +307,45 @@ func (s *DirStore) List(_ context.Context, states ...withdraw.State) ([]*withdra
 // compilable when it is lifted out of the module, which is what an exchange
 // does with it.
 func replaceFile(path string, data []byte, perm os.FileMode) error {
+	tmp, err := writeTemp(path, data, perm)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s: %w", path, err)
+	}
+	return syncDir(path)
+}
+
+// createFile puts data at path as replaceFile does, except that a path that
+// already exists is refused with fs.ErrExist and left as it was. The
+// temporary file is linked into place rather than renamed: a link onto an
+// existing name fails, atomically, on every filesystem this example runs on,
+// which is what makes one Create of an id succeed and the rest fail.
+func createFile(path string, data []byte, perm os.FileMode) error {
+	tmp, err := writeTemp(path, data, perm)
+	if err != nil {
+		return err
+	}
+	linkErr := os.Link(tmp, path)
+	_ = os.Remove(tmp)
+	if linkErr != nil {
+		if errors.Is(linkErr, fs.ErrExist) {
+			return fmt.Errorf("create %s: %w", path, fs.ErrExist)
+		}
+		return fmt.Errorf("link %s: %w", path, linkErr)
+	}
+	return syncDir(path)
+}
+
+// writeTemp writes data to a new temporary file beside path, synced and
+// closed, and returns its name. The name starts with a dot, which List skips.
+func writeTemp(path string, data []byte, perm os.FileMode) (string, error) {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temp file for %s: %w", path, err)
+		return "", fmt.Errorf("create temp file for %s: %w", path, err)
 	}
 	tmp := f.Name()
 	fail := func(step string, err error) error {
@@ -270,20 +354,24 @@ func replaceFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("%s %s: %w", step, path, err)
 	}
 	if err := f.Chmod(perm); err != nil {
-		return fail("chmod", err)
+		return "", fail("chmod", err)
 	}
 	if _, err := f.Write(data); err != nil {
-		return fail("write", err)
+		return "", fail("write", err)
 	}
 	if err := f.Sync(); err != nil {
-		return fail("sync", err)
+		return "", fail("sync", err)
 	}
 	if err := f.Close(); err != nil {
-		return fail("close", err)
+		return "", fail("close", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fail("rename", err)
-	}
+	return tmp, nil
+}
+
+// syncDir syncs the directory entry of path, so the rename or link that put
+// the file there survives a power loss.
+func syncDir(path string) error {
+	dir := filepath.Dir(path)
 	if runtime.GOOS == "windows" {
 		// Syncing a directory handle fails there; the file sync above has run.
 		// The SDK's own replace step makes the same exception.

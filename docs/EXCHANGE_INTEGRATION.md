@@ -265,11 +265,11 @@ builds a second transaction. The harness proves it against the node: scenario 9 
 broadcast to the node through a proxy that never returns the reply, cancels, restarts, and pays once.
 
 The context governs what the engine asks of the network and how long it waits for a store read.
-It does not govern the writes that record what the network did: every `withdraw.Store.Put`
-after `Submit` is made under `context.WithoutCancel(ctx)`, because the record (a broadcast
+It does not govern the writes that record what the network did: every `withdraw.Store.Update`
+is made under `context.WithoutCancel(ctx)`, because the record (a broadcast
 accepted, a txid the node disagreed on, a lost reply's attempt) must land whether or not the
 caller is still waiting; so are the `Get` and `List` calls `Recover` makes to repair the spent
-set. `Submit`'s own write is bound to the caller's context, since nothing has happened yet and
+set. `Submit`'s `Create` is bound to the caller's context, since nothing has happened yet and
 an abandoned registration must not become a payment. `WithoutCancel` carries no deadline, so a
 database-backed `Store` bounds every method with its own timeout and does not rely on the
 context for that. `deposit.Ledger` follows the same rule: `IsCredited` and `Pending` receive
@@ -696,7 +696,8 @@ func main() {
 
 	// Durable intents: persisted before anything is broadcast. An exchange
 	// with a database implements withdraw.Store over it and keeps the same
-	// rule that Put is durable before it returns.
+	// rules: Create and Update are durable before they return, Create fails
+	// on an existing id, and Update writes only over the state it names.
 	store, err := withdraw.NewFileStore("/var/lib/exchange/withdrawals.json")
 	if err != nil {
 		log.Fatalf("open intents: %v", err)
@@ -858,7 +859,7 @@ outputs it read back from the node one at a time, stamped with the node's tip he
 it answered, and the signer refuses a snapshot older than a bound it is given. A withheld or stale
 snapshot means no withdrawal is built until the watcher publishes a current one.
 
-**`withdraw.FileStore` is for one process.** Every `Put` writes the whole file from that process's
+**`withdraw.FileStore` is for one process.** Every write puts the whole file from that process's
 own map, so a second process does not merge with the first, it overwrites it: an intent saved as
 `Built` comes back as `Created` while its signed transaction is already in a mempool, and its
 inputs are free for the next withdrawal to select. Share a store only through something that
@@ -867,19 +868,23 @@ one-file-per-intent store the example carries.
 
 **One state, one writer, and the store is the truth about spends.** Give each transition to exactly
 one process and have each process list only the states it owns. This is also what keeps one intent
-to one transaction: `Build` re-reads the stored intent under a lock that is held inside one
-process, so two goroutines of a worker pool cannot both build one id, but two processes sharing a
-store do not share that lock. Each would re-read, each would find `Created`, and each would build
-and broadcast from different inputs, which pays the recipient twice. A shared database behind
-`withdraw.Store` does not make that safe on its own; one writer of `Created` → `Built` does. The spent set is then per process,
-not shared: the signer holds the reservations because it is the only one that selects, and it
-reconciles them against the store before every selection. Every `Built` intent in the store is
-re-reserved, inputs of `Broadcast` intents are marked spent, entries the set already holds for a
-`Confirmed` intent are marked confirmed so they age out, and a reservation held for something
-`Created` or `Failed` is released. In one process
-`withdraw.Engine.Recover` does this once at startup. In a split the facts change while the signer
-runs, so the repair runs every pass; the signer cannot call `Recover` itself, because `Recover`
-also re-broadcasts, and re-broadcasting is the broadcaster's job.
+to one transaction: `Build`, `Broadcast` and `UpdateConfirmations` each re-read the stored intent
+under a lock that is held inside one process, so two goroutines of a worker pool cannot both build
+or both send one id, but two processes sharing a store do not share that lock. Each would re-read,
+each would find `Created`, and each would build and broadcast from different inputs, which pays the
+recipient twice. What a shared store does refuse is a write over a record another process has
+moved: `Update` names the state the writer read, and a database store makes it a conditional update
+on the state column, so the loser of that race is refused (`withdraw.ErrStale`) rather than putting
+the record back. It does not stop the two builds; one writer of `Created` → `Built` does. The spent
+set is then per process: the signer holds the reservations because it is the only one
+that selects, and it reconciles them against the store before every selection. Every `Built` intent
+in the store is re-reserved, inputs of `Broadcast` intents are marked spent, entries the set already
+holds for a `Confirmed` intent are marked confirmed so they age out, and a reservation held for
+something `Created` or `Failed` is released. In one process `withdraw.Engine.Recover` does this once
+at startup, and a `Built` intent whose inputs it cannot re-reserve is reported as
+`withdraw.ErrReservationLost` and not sent. In a split the facts change while the signer runs, so
+the repair runs every pass; the signer cannot call `Recover` itself, because `Recover` also
+re-broadcasts, and re-broadcasting is the broadcaster's job.
 
 ```bash
 # Three terminals, one directory. Only -dir is shared between hosts.

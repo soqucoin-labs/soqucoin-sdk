@@ -284,11 +284,18 @@ func (s ctxStore) Get(ctx context.Context, id string) (*Intent, bool, error) {
 	return s.MemStore.Get(ctx, id)
 }
 
-func (s ctxStore) Put(ctx context.Context, in *Intent) error {
+func (s ctxStore) Create(ctx context.Context, in *Intent) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.MemStore.Put(ctx, in)
+	return s.MemStore.Create(ctx, in)
+}
+
+func (s ctxStore) Update(ctx context.Context, in *Intent, from State) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.MemStore.Update(ctx, in, from)
 }
 
 func (s ctxStore) List(ctx context.Context, states ...State) ([]*Intent, error) {
@@ -476,11 +483,18 @@ func (s ctxBoundStore) Get(ctx context.Context, id string) (*Intent, bool, error
 	return s.Store.Get(ctx, id)
 }
 
-func (s ctxBoundStore) Put(ctx context.Context, in *Intent) error {
+func (s ctxBoundStore) Create(ctx context.Context, in *Intent) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("put %s: %w", in.ID, err)
+		return fmt.Errorf("create %s: %w", in.ID, err)
 	}
-	return s.Store.Put(ctx, in)
+	return s.Store.Create(ctx, in)
+}
+
+func (s ctxBoundStore) Update(ctx context.Context, in *Intent, from State) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("update %s: %w", in.ID, err)
+	}
+	return s.Store.Update(ctx, in, from)
 }
 
 func (s ctxBoundStore) List(ctx context.Context, states ...State) ([]*Intent, error) {

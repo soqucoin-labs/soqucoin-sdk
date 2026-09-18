@@ -40,7 +40,18 @@ func put(t *testing.T, s *split.DirStore, id string, state withdraw.State, txid 
 		FeeRate: types.RecommendedFeeRate, State: state, TxID: txid,
 		Inputs: inputs, CreatedAt: time.Now().UTC(),
 	}
-	if err := s.Put(context.Background(), in); err != nil {
+	// A record the store holds is moved from its stored state; a new one is
+	// created. The tests use this for both.
+	stored, ok, err := s.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		err = s.Update(context.Background(), in, stored.State)
+	} else {
+		err = s.Create(context.Background(), in)
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 }

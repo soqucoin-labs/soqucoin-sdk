@@ -45,7 +45,7 @@ func TestPutKeepsARecordThatLandedButIsNotKnownDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := &Intent{ID: "w1", State: StateCreated, CreatedAt: time.Now().UTC()}
-	if err := s.Put(context.Background(), created); err != nil {
+	if err := s.Create(context.Background(), created); err != nil {
 		t.Fatal(err)
 	}
 
@@ -53,7 +53,7 @@ func TestPutKeepsARecordThatLandedButIsNotKnownDurable(t *testing.T) {
 	built := *created
 	built.State, built.RawHex, built.TxID = StateBuilt, "00", "t"
 	built.Inputs = []Outpoint{{TxID: txA, Vout: 0, Value: 1000, Address: "ssq1phot"}}
-	err = s.Put(context.Background(), &built)
+	err = s.Update(context.Background(), &built, StateCreated)
 	if !errors.Is(err, atomicfile.ErrWrittenNotDurable) {
 		t.Fatalf("Put returned %v, want an error wrapping atomicfile.ErrWrittenNotDurable", err)
 	}
@@ -73,11 +73,11 @@ func TestPutKeepsARecordThatLandedButIsNotKnownDurable(t *testing.T) {
 		t.Fatalf("the file holds %+v; the write landed before the failure, so it must hold the Built record", fromFile)
 	}
 
-	// The defect this pins: the next successful Put writes the whole store
+	// The defect this pins: the next successful write puts the whole store
 	// from memory, so a rolled-back map reverts the Built intent on disk.
 	restore()
-	if err := s.Put(context.Background(), &Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err != nil {
-		t.Fatalf("the next Put, with the write step restored: %v", err)
+	if err := s.Create(context.Background(), &Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("the next write, with the write step restored: %v", err)
 	}
 	reloaded, err := NewFileStore(path)
 	if err != nil {
@@ -86,5 +86,54 @@ func TestPutKeepsARecordThatLandedButIsNotKnownDurable(t *testing.T) {
 	after, ok, _ := reloaded.Get(context.Background(), "w1")
 	if !ok || after.State != StateBuilt || after.TxID != "t" || len(after.Inputs) != 1 {
 		t.Fatalf("the later write left %+v on disk; the Built record and its inputs were overwritten by the older one", after)
+	}
+}
+
+// Every write names what it expects to find. Create refuses an id the store
+// holds, and Update refuses a record that is absent or in another state, so
+// a second Submit cannot write Created over a sent intent and a loop holding
+// a copy the store has moved past cannot move it back. Both stores, one test.
+func TestStoresWriteOnlyOverTheStateTheyWereTold(t *testing.T) {
+	fs, err := NewFileStore(filepath.Join(t.TempDir(), "intents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, s := range map[string]Store{"MemStore": NewMemStore(), "FileStore": fs} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			in := &Intent{ID: "w1", Amount: 1, State: StateCreated, CreatedAt: time.Now().UTC()}
+			if err := s.Create(ctx, in); err != nil {
+				t.Fatal(err)
+			}
+			again := *in
+			again.Amount = 7
+			if err := s.Create(ctx, &again); !errors.Is(err, ErrExists) {
+				t.Fatalf("a second Create of w1 returned %v, want ErrExists", err)
+			}
+			if got, _, _ := s.Get(ctx, "w1"); got.Amount != 1 {
+				t.Fatalf("the refused Create wrote its record: amount %d", got.Amount)
+			}
+
+			built := *in
+			built.State, built.RawHex = StateBuilt, "00"
+			if err := s.Update(ctx, &built, StateCreated); err != nil {
+				t.Fatal(err)
+			}
+			late := *in
+			late.LastError = "late"
+			if err := s.Update(ctx, &late, StateCreated); !errors.Is(err, ErrStale) {
+				t.Fatalf("an Update naming Created over a Built record returned %v, want ErrStale", err)
+			}
+			got, _, _ := s.Get(ctx, "w1")
+			if got.State != StateBuilt || got.LastError != "" {
+				t.Fatalf("the refused Update wrote its record: %+v", got)
+			}
+			if err := s.Update(ctx, &Intent{ID: "w2", State: StateBuilt}, StateCreated); !errors.Is(err, ErrStale) {
+				t.Fatalf("an Update of an absent id returned %v, want ErrStale", err)
+			}
+			if _, ok, _ := s.Get(ctx, "w2"); ok {
+				t.Fatal("an Update of an absent id created it")
+			}
+		})
 	}
 }

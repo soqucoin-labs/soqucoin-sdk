@@ -244,11 +244,11 @@ type failingStore struct {
 	failBuilt bool
 }
 
-func (f *failingStore) Put(_ context.Context, in *Intent) error {
+func (f *failingStore) Update(_ context.Context, in *Intent, from State) error {
 	if f.failBuilt && in.State == StateBuilt {
 		return errors.New("disk full")
 	}
-	return f.MemStore.Put(context.Background(), in)
+	return f.MemStore.Update(context.Background(), in, from)
 }
 
 func TestNothingIsBroadcastUnlessPersistedFirst(t *testing.T) {
@@ -306,10 +306,10 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	if err := s.Put(context.Background(), &Intent{ID: "b", State: StateBuilt, RawHex: "00", CreatedAt: now.Add(time.Second)}); err != nil {
+	if err := s.Create(context.Background(), &Intent{ID: "b", State: StateBuilt, RawHex: "00", CreatedAt: now.Add(time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Put(context.Background(), &Intent{ID: "a", State: StateBroadcast, CreatedAt: now}); err != nil {
+	if err := s.Create(context.Background(), &Intent{ID: "a", State: StateBroadcast, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := NewFileStore(path)
@@ -347,7 +347,8 @@ func breakStoreFile(t *testing.T, path string) (fix func()) {
 // When the write fails, the store keeps reporting the record it held before,
 // so Get and the caller that treated the error as "not saved" agree. A record
 // whose first save failed is not reported at all. Once the path is writable
-// the next Put writes the whole store, and a reload shows only what was saved.
+// the next write puts the whole store on disk, and a reload shows only what
+// was saved.
 func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "intents.json")
 	s, err := NewFileStore(path)
@@ -355,24 +356,24 @@ func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := &Intent{ID: "w1", State: StateCreated, CreatedAt: time.Now().UTC()}
-	if err := s.Put(context.Background(), created); err != nil {
+	if err := s.Create(context.Background(), created); err != nil {
 		t.Fatal(err)
 	}
 	fix := breakStoreFile(t, path)
 
 	built := *created
 	built.State, built.RawHex, built.TxID = StateBuilt, "00", "t"
-	if err := s.Put(context.Background(), &built); err == nil {
+	if err := s.Update(context.Background(), &built, StateCreated); err == nil {
 		t.Fatal("a write onto a directory succeeded")
 	}
 	got, ok, _ := s.Get(context.Background(), "w1")
 	if !ok || got.State != StateCreated || got.RawHex != "" {
-		t.Fatalf("after the failed Put, Get reports %+v; want the Created record", got)
+		t.Fatalf("after the failed write, Get reports %+v; want the Created record", got)
 	}
 	if list, _ := s.List(context.Background(), StateBuilt); len(list) != 0 {
 		t.Fatalf("List reports a Built intent whose save failed: %+v", list)
 	}
-	if err := s.Put(context.Background(), &Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err == nil {
+	if err := s.Create(context.Background(), &Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err == nil {
 		t.Fatal("a write onto a directory succeeded")
 	}
 	if _, ok, _ := s.Get(context.Background(), "w2"); ok {
@@ -380,7 +381,7 @@ func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
 	}
 
 	fix()
-	if err := s.Put(context.Background(), &built); err != nil {
+	if err := s.Update(context.Background(), &built, StateCreated); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := NewFileStore(path)
@@ -784,7 +785,9 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	}
 	failed, _, _ := store.Get(context.Background(), "failed")
 	failed.State = StateFailed
-	store.Put(context.Background(), failed)
+	if err := store.Update(context.Background(), failed, StateCreated); err != nil {
+		t.Fatal(err)
+	}
 	// ghost: an intent the store never saw (written by a process that lost its store).
 	if err := spent.Reserve([]types.UTXO{{TxID: txB, Vout: 7, Value: 1}}, "ghost", time.Hour); err != nil {
 		t.Fatal(err)
