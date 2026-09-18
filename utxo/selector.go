@@ -299,6 +299,27 @@ func (ss *SpentSet) Forget(intentID string) error {
 	return ss.persist()
 }
 
+// SentIntents returns the id of every withdrawal that owns an unconfirmed
+// broadcast entry, each once, sorted; entries written without an id do not
+// appear. withdraw.Engine.Recover uses it to drop the entries of an
+// abandoned withdrawal whose Forget did not land.
+func (ss *SpentSet) SentIntents() []string {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	seen := map[string]bool{}
+	for _, e := range ss.entries {
+		if !e.reserved() && !e.Confirmed && e.IntentID != "" {
+			seen[e.IntentID] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // ReservedIntents returns the id of every withdrawal that holds a reservation
 // in the set, expired or not, each once, sorted. Broadcast entries are not
 // reservations and do not appear. withdraw.Engine.Recover uses it to release

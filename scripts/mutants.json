@@ -429,8 +429,8 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestProcessOfAnAlreadyFailedIntentReportsTheFailure",
-      "find": "\tErrFailed = fmt.Errorf(\"withdraw: intent failed permanently and was not sent (%w)\", rpc.ErrPermanent)",
-      "replace": "\tErrFailed = errors.New(\"withdraw: intent failed permanently and was not sent\")",
+      "find": "\tErrFailed = fmt.Errorf(\"withdraw: intent failed permanently (%w)\", rpc.ErrPermanent)",
+      "replace": "\tErrFailed = errors.New(\"withdraw: intent failed permanently\")",
       "why": "One withdrawal that cannot succeed says nothing about the node or the indexer. resilience.CircuitBreaker recognises a per-request fault by rpc.ErrPermanent and counts anything else as systemic, so an ErrFailed that wraps nothing makes three retries of one bad payout open the breaker and stop every withdrawal for its cooldown. That is the outcome the breaker's own documentation says it exists to prevent."
     },
     {
@@ -618,7 +618,7 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestRejectionAfterALostReplyHoldsTheIntent",
-      "find": "case errors.Is(err, rpc.ErrPermanent) && in.MaybeRelayed:",
+      "find": "case errors.Is(err, rpc.ErrPermanent) && prior:",
       "replace": "case errors.Is(err, rpc.ErrPermanent) && false:",
       "why": "A rejection on the attempt after a lost reply must hold the intent. Failing it releases inputs the first transmission may still spend: peers keep a relayed transaction for the mempool expiry and can mine it after the node forgot it, and the exchange then pays the recipient again from other coins."
     },
@@ -627,9 +627,9 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestRejectionAfterALostReplyHoldsTheIntent",
-      "find": "\t\tin.MaybeRelayed = true\n",
-      "replace": "\t\tin.MaybeRelayed = false\n",
-      "why": "The record must carry that an attempt's outcome was unknown, because the hold rule on a later rejection reads it. Without the mark every later rejection fails the intent as if nothing had been sent."
+      "find": "\tin.MaybeRelayed, in.SentAt = true, e.now()\n",
+      "replace": "\tin.MaybeRelayed, in.SentAt = false, e.now()\n",
+      "why": "The mark that peers may hold the bytes is written before the send, so a save that fails after the send cannot lose it. Without it a rejection on the next attempt fails the intent and releases inputs the first transmission may still spend."
     },
     {
       "id": "withdraw-broadcast-sends-a-held-intent",
@@ -720,6 +720,51 @@
       "find": "\t\tif e.IntentID == intentID {\n\t\t\tdelete(ss.entries, key)\n\t\t\tdropped++",
       "replace": "\t\tif e.IntentID == intentID && e.reserved() {\n\t\t\tdelete(ss.entries, key)\n\t\t\tdropped++",
       "why": "Forget is the one call that removes a broadcast entry, for an abandoned withdrawal. Dropping only the reservations leaves the abandoned inputs locked, which is what Abandon exists to end."
+    },
+    {
+      "id": "withdraw-transient-answer-keeps-the-mark",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestTransientAnswerThenRejectionFailsTheIntent",
+      "find": "\t\tin.MaybeRelayed = prior\n",
+      "replace": "\t\tin.MaybeRelayed = true\n",
+      "why": "A transient error or refused credentials is the node answering without taking the bytes; the mark goes back to what earlier attempts left. Keeping it would hold every intent whose first attempt met a node in warmup, for a rejection that has nothing behind it on the network."
+    },
+    {
+      "id": "withdraw-recover-keeps-the-entries-of-a-failed-intent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRecoverDropsTheEntriesOfAnAbandonedIntentWhoseForgetFailed",
+      "find": "\t\tif !ok || in.State != StateFailed {\n\t\t\tcontinue\n\t\t}\n\t\te.log().Warn(\"recover: dropping",
+      "replace": "\t\tif !ok || in.State != StateFailed || true {\n\t\t\tcontinue\n\t\t}\n\t\te.log().Warn(\"recover: dropping",
+      "why": "An Abandon whose Forget did not land leaves a Failed record and the entries on disk, and nothing else ever frees those inputs: Recover releases reservations only and Abandon refuses a Failed record."
+    },
+    {
+      "id": "withdraw-abandon-sends-the-placeholder-to-the-node",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestAbandonNeverAsksTheNodeAboutThePlaceholderTxID",
+      "find": "\t\tif txid == \"\" || txid == NodeTxIDUnknown {",
+      "replace": "\t\tif txid == \"\" {",
+      "why": "The placeholder is not a txid. Sent to the node it is an invalid-parameter error on every call, which Abandon returns as it is, so a hold armed without the node's txid would have no exit through the engine."
+    },
+    {
+      "id": "withdraw-refused-rebroadcast-restarts-the-wait",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRefusedRebroadcastDoesNotRestartTheAbandonWait",
+      "find": "\t\t\tin.SentAt = sentAt // the node answered and did not take the bytes",
+      "replace": "\t\t\t_ = sentAt // the node answered and did not take the bytes",
+      "why": "A re-send the node refused reached no peer. Counting it as a send restarts the wait on every pass of a loop that rebroadcasts an unknown transaction, and Abandon is never reachable while the loop runs."
+    },
+    {
+      "id": "withdraw-abandon-measures-the-wait-from-the-last-write",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRefusedRebroadcastDoesNotRestartTheAbandonWait",
+      "find": "\tsentAt := in.SentAt\n\tif sentAt.IsZero() {",
+      "replace": "\tsentAt := in.UpdatedAt\n\tif sentAt.IsZero() {",
+      "why": "Every save moves UpdatedAt, a refused Rebroadcast included. The wait is about bytes reaching peers, so it is measured from the last send the node did not refuse."
     }
   ]
 }

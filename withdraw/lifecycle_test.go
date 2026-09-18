@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +20,12 @@ type fakeChain struct {
 	spent map[string]bool // "txid:vout"
 	err   error
 	calls int
+	asked []string
 }
 
 func (c *fakeChain) KnowsTransaction(_ context.Context, txid string) (bool, error) {
 	c.calls++
+	c.asked = append(c.asked, txid)
 	return c.known[txid], c.err
 }
 
@@ -185,15 +189,15 @@ func TestRebroadcastSendsTheSameBytesAndChangesNoState(t *testing.T) {
 	}
 }
 
-// backdate writes the stored record with UpdatedAt moved into the past, as a
-// record that has sat untouched for that long would read.
+// backdate writes the stored record with SentAt and UpdatedAt moved into the
+// past, as a record whose last send was that long ago would read.
 func backdate(t *testing.T, store Store, id string, by time.Duration) {
 	t.Helper()
 	in, _, err := store.Get(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	in.UpdatedAt = in.UpdatedAt.Add(-by)
+	in.SentAt, in.UpdatedAt = in.SentAt.Add(-by), in.UpdatedAt.Add(-by)
 	if err := store.Update(context.Background(), in, in.State); err != nil {
 		t.Fatal(err)
 	}
@@ -337,5 +341,186 @@ func TestZeroRequiredConfirmationsIsRefused(t *testing.T) {
 	}
 	if stored, _, _ := e.Store.Get(context.Background(), "w1"); stored.State != StateBroadcast || confirmer.calls != 0 {
 		t.Fatalf("%+v, confirmer called %d times: want Broadcast and no node call", stored, confirmer.calls)
+	}
+}
+
+// updateFailWhen fails every Update for which pick is true; the record is
+// left as it was.
+type updateFailWhen struct {
+	*MemStore
+	pick func(in *Intent) bool
+}
+
+var errDiskFull = errors.New("disk full")
+
+func (u *updateFailWhen) Update(ctx context.Context, in *Intent, from State) error {
+	if u.pick(in) {
+		return errDiskFull
+	}
+	return u.MemStore.Update(ctx, in, from)
+}
+
+// The mark that an attempt's outcome is unknown is written before the send.
+// A lost reply whose save after the send fails therefore still leaves the
+// store marked, and the rejection on the next attempt holds the intent.
+func TestLostReplyWhoseSaveFailsStillHoldsTheLaterRejection(t *testing.T) {
+	store := &updateFailWhen{MemStore: NewMemStore(), pick: func(in *Intent) bool {
+		return in.State == StateBuilt && strings.Contains(in.LastError, "outcome unknown")
+	}}
+	spent := utxo.NewSpentSet("", nil)
+	net := &fakeNet{mode: "lost"}
+	e := newEngine(t, store, spent, net, coins())
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, errDiskFull) || !errors.Is(err, rpc.ErrUnknownOutcome) {
+		t.Fatalf("lost reply with the save failing: %v", err)
+	}
+	stored, _, _ := store.Get(context.Background(), "w1")
+	if !stored.MaybeRelayed || stored.Attempts != 1 {
+		t.Fatalf("the store does not carry the attempt: %+v", stored)
+	}
+	net.setMode("reject")
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, ErrHeld) {
+		t.Fatalf("rejection after the unrecorded lost reply: %v, want ErrHeld", err)
+	}
+	stored, _, _ = store.Get(context.Background(), "w1")
+	if stored.State != StateBuilt || stored.Hold == "" || !spent.IsSpent(stored.Inputs[0].TxID, stored.Inputs[0].Vout) {
+		t.Fatalf("%+v: want held with the inputs spent", stored)
+	}
+}
+
+// No record, no send: the save before the send failing means the bytes do
+// not go out, so the store never shows fewer attempts than the network saw.
+func TestAttemptThatCannotBeRecordedIsNotSent(t *testing.T) {
+	store := &updateFailWhen{MemStore: NewMemStore(), pick: func(in *Intent) bool {
+		return in.State == StateBuilt && in.Attempts == 1 && in.LastError == ""
+	}}
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, store, utxo.NewSpentSet("", nil), net, coins())
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, errDiskFull) {
+		t.Fatalf("process: %v", err)
+	}
+	stored, _, _ := store.Get(context.Background(), "w1")
+	if net.sentCount() != 0 || stored.Attempts != 0 || stored.State != StateBuilt {
+		t.Fatalf("sent %d, stored %+v: an attempt the store refused was sent", net.sentCount(), stored)
+	}
+}
+
+// An answer that shows the node did not take the bytes (a transient error)
+// takes the mark back, so a rejection on the next attempt fails the intent
+// the way a first-attempt rejection does.
+func TestTransientAnswerThenRejectionFailsTheIntent(t *testing.T) {
+	spent := utxo.NewSpentSet("", nil)
+	net := &fakeNet{mode: "transient"}
+	e := newEngine(t, NewMemStore(), spent, net, coins())
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	if _, err := e.Process(context.Background(), "w1"); !errors.Is(err, rpc.ErrTransient) {
+		t.Fatalf("transient: %v", err)
+	}
+	if stored, _, _ := e.Store.Get(context.Background(), "w1"); stored.MaybeRelayed {
+		t.Fatalf("a transient answer left the mark: %+v", stored)
+	}
+	net.setMode("reject")
+	got, err := e.Process(context.Background(), "w1")
+	if !errors.Is(err, rpc.ErrPermanent) || got.State != StateFailed || spent.IsSpent(got.Inputs[0].TxID, got.Inputs[0].Vout) {
+		t.Fatalf("rejection after a transient answer: %v %+v, want Failed with the inputs released", err, got)
+	}
+}
+
+// Abandon saves Failed, then drops the entries. When the drop does not land
+// the file still holds them, and the next start drops them from the record.
+func TestRecoverDropsTheEntriesOfAnAbandonedIntentWhoseForgetFailed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spent.json")
+	spent, err := utxo.OpenSpentSet(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewMemStore()
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, store, spent, net, coins())
+	e.Chain = &fakeChain{known: map[string]bool{}, spent: map[string]bool{}}
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w1, err := e.Process(context.Background(), "w1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, store, "w1", DefaultAbandonAfter+time.Minute)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if err := e.Abandon(context.Background(), w1); !errors.Is(err, utxo.ErrPersist) {
+		t.Fatalf("abandon with the set unwritable: %v, want ErrPersist", err)
+	}
+	os.Chmod(dir, 0o700)
+	stored, _, _ := store.Get(context.Background(), "w1")
+	reopened, err := utxo.OpenSpentSet(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != StateFailed || !reopened.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatalf("%s, spent on disk %v: want Failed with the entries still on disk", stored.State, reopened.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout))
+	}
+	restarted := newEngine(t, store, reopened, net, coins())
+	if err := restarted.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reopened.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
+		t.Fatal("the entries of an abandoned intent survive Recover")
+	}
+}
+
+// A refused re-send did not reach any peer and does not restart the wait; one
+// the node took, or whose outcome is unknown, does.
+func TestRefusedRebroadcastDoesNotRestartTheAbandonWait(t *testing.T) {
+	net := &fakeNet{mode: "ok"}
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), net, coins())
+	e.Chain = &fakeChain{known: map[string]bool{}, spent: map[string]bool{}}
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	e.Submit(context.Background(), "w2", dst, 1_000_000, 1000)
+	w1, _ := e.Process(context.Background(), "w1")
+	w2, _ := e.Process(context.Background(), "w2")
+	backdate(t, e.Store, "w1", DefaultAbandonAfter+time.Minute)
+	backdate(t, e.Store, "w2", DefaultAbandonAfter+time.Minute)
+
+	net.setMode("reject")
+	if err := e.Rebroadcast(context.Background(), w1); err == nil {
+		t.Fatal("rejection not reported")
+	}
+	if err := e.Abandon(context.Background(), w1); err != nil {
+		t.Fatalf("abandon after a refused rebroadcast: %v, want the wait unchanged", err)
+	}
+
+	net.setMode("lost")
+	if err := e.Rebroadcast(context.Background(), w2); err == nil {
+		t.Fatal("lost reply not reported")
+	}
+	if err := e.Abandon(context.Background(), w2); !errors.Is(err, ErrNotAbandonable) {
+		t.Fatalf("abandon after a rebroadcast whose outcome is unknown: %v, want the wait restarted", err)
+	}
+}
+
+// A hold armed without the node's txid carries a placeholder; Abandon never
+// sends it to the node and decides on the intent's txid and the inputs.
+func TestAbandonNeverAsksTheNodeAboutThePlaceholderTxID(t *testing.T) {
+	net := &fakeNet{mode: "mismatch-blank"}
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), net, coins())
+	chain := &fakeChain{known: map[string]bool{}, spent: map[string]bool{}}
+	e.Chain = chain
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	e.Process(context.Background(), "w1")
+	w1, _, _ := e.Store.Get(context.Background(), "w1")
+	if w1.NodeTxID != NodeTxIDUnknown {
+		t.Fatalf("hold not armed with the placeholder: %+v", w1)
+	}
+	backdate(t, e.Store, "w1", DefaultAbandonAfter+time.Minute)
+	if err := e.Abandon(context.Background(), w1); err != nil {
+		t.Fatal(err)
+	}
+	for _, txid := range chain.asked {
+		if txid == NodeTxIDUnknown {
+			t.Fatalf("the placeholder was sent to the node: asked %v", chain.asked)
+		}
 	}
 }
