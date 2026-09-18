@@ -124,4 +124,5 @@ is built at all:
 2. `watcher/main.go`: the conditions under which a snapshot is withheld.
 3. `signer/main.go`: the reconcile pass, which stops the pass and builds nothing when two sent
    withdrawals claim one input, and why a signer cannot call `withdraw.Engine.Recover`.
-4. `broadcaster/main.go`: `Recover` at startup, then send and confirm.
+4. `broadcaster/main.go`: `Recover` at startup as a repair that sends nothing, then send, which
+   refuses while an intent is held, and confirm.

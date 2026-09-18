@@ -257,7 +257,7 @@ What a context that ends does to a withdrawal, state by state
 | In `Broadcast`, intent Built | Stays Built, reservation renewed, `rpc.ErrUnknownOutcome` carrying the context's error | The node may hold the transaction; only the same bytes may go out again |
 | In `UpdateConfirmations` or `Abandon` | Error returned, no state change | |
 | In `Rebroadcast`, intent Broadcast | Stays Broadcast, attempt recorded, `SentAt` moved | The node may hold the transaction again |
-| In `Recover` | The passes that repair the spent set run to the end whatever the context says; the re-send loop stops at the first Built intent and reports it | Every Built intent is sent by the next `Recover` |
+| In `Recover` | The passes that repair the spent set run to the end whatever the context says; every Built intent is re-reserved, none is sent, and each is reported as not sent with the context's error | Every Built intent is sent by the next `Recover` or `Broadcast` |
 
 `rpc.Client.Broadcast` treats a context ending during the send as a lost reply: the resolution
 lookup runs on the same, ended, context and reports nothing, and the outcome stays unknown. It is
@@ -646,8 +646,9 @@ cannot afford impossible by construction:
   rejection nor a retry: the payment is in the mempool. The inputs are marked spent under the
   node's txid, the intent stays Built with `NodeTxID` recorded, and `Broadcast` and `Recover`
   refuse to send it again (`withdraw.ErrHeld`); stop withdrawals and investigate before anything
-  is rebuilt. The split example's broadcaster does this: while its store holds a held intent it
-  sends nothing, and a hold that arises inside a pass ends the pass.
+  is rebuilt. The split example's broadcaster does this: its startup `Recover` runs under an
+  ended context and only repairs, its send pass is the one sender, and that pass sends nothing
+  while the store holds a held intent and ends at a hold that arises inside it.
 - **A destination on another network is refused where it enters.** The engine is bound to a
   network (`withdraw.Engine.Network`, mainnet when unset, as for `deposit.Monitor`): `Submit`
   refuses a destination that is not a witness version 1 address on its prefix with

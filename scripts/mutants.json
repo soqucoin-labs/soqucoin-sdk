@@ -1235,13 +1235,22 @@
       "why": "A chain check that did not complete has not said which chain the node serves; a pass that goes on credits with the chain unverified."
     },
     {
-      "id": "broadcaster-recover-sends-while-an-intent-is-held",
+      "id": "broadcaster-recover-runs-under-a-live-context",
       "file": "examples/exchange_split/broadcaster/main.go",
       "package": "./examples/exchange_split/broadcaster",
-      "test": "TestRecoverAtStartupSendsNothingWhileAnIntentIsHeld",
-      "find": "if held := heldCount(built); held > 0 {",
-      "replace": "if held := heldCount(built); held < 0 {",
-      "why": "Recover re-sends every Built intent it can re-reserve, so the held check has to run before it; without it a restart sends past a held intent that the send pass would have refused."
+      "test": "TestRecoverAtStartupRepairsAndSendsNothing",
+      "find": "\trepair, stop := context.WithCancel(ctx)\n\tstop()",
+      "replace": "\trepair, stop := context.WithCancel(ctx)\n\tdefer stop()",
+      "why": "Recover attempts every Built intent it can re-reserve whatever an earlier one returned, so a hold that arises inside it does not stop the ones after it; run under a live context at startup it sends past a hold the send pass would have refused."
+    },
+    {
+      "id": "deposit-refused-depth-lookup-read-as-an-outage",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestARefusedDepthLookupIsADisagreementAndThePassGoesOn",
+      "find": "\t\t\t\t\t\tif refused(err) {\n\t\t\t\t\t\t\tm.alert(AlertIndexerMismatch",
+      "replace": "\t\t\t\t\t\tif !refused(err) {\n\t\t\t\t\t\t\tm.alert(AlertIndexerMismatch",
+      "why": "The depth lookup is the second cache-driven gettxout site; a refusal there is the same disagreement as at verifyWithNode, and read as an outage it ends every pass at that outpoint."
     }
   ]
 }

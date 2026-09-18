@@ -215,7 +215,7 @@ const (
 	AlertCacheStale      AlertKind = "cache_stale"      // indexer has not refreshed; crediting paused, or skipped for the stale addresses
 	AlertIndexerMismatch AlertKind = "indexer_mismatch" // indexer and node disagree on an output; NOT credited
 	AlertDepositVanished AlertKind = "deposit_vanished" // a credited, non-final output is gone from the node
-	AlertLedgerError     AlertKind = "ledger_error"     // the exchange's own book returned an error
+	AlertLedgerError     AlertKind = "ledger_error"     // the exchange's own book returned an error, or holds a record the node refuses
 )
 
 var (
@@ -288,8 +288,8 @@ func (m *Monitor) maxCacheAge() time.Duration {
 // ErrPaused (wrapped with the reason) when crediting was not safe. A node on
 // the wrong chain is returned as rpc.ErrWrongChain, a permanent error, not as
 // a pause; a node that cannot say whether it is synced is alarmed and paused.
-// Once the node is synced and on this chain, a call of the pass that fails to
-// complete is returned as it is, unalarmed, from whichever call raised it: the
+// Once RequireSynced has passed, a call of the pass that fails to complete is
+// returned as it is, unalarmed, from whichever call raised it: the
 // deposits credited before it are credited and returned with it, the rest wait
 // for the next pass. A context that ends mid-pass is returned the same way,
 // never as a pause and never as an alert. A gettxout the node answers with an

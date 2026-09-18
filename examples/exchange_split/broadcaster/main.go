@@ -10,16 +10,19 @@
 //
 // Recover runs first, once, and it is this process's job rather than the
 // signer's: it re-marks the inputs of every intent the store holds as
-// Broadcast, releases reservations that belong to nothing built, and re-sends
-// the persisted bytes of every Built intent. It never rebuilds, so the same
-// transaction goes out and a lost reply cannot become a second payment.
+// Broadcast, releases reservations that belong to nothing built, and
+// re-reserves every Built intent. It runs under a context that has already
+// ended, so it sends nothing: Recover attempts every Built intent it can
+// re-reserve whatever the others returned, and the send pass, the one sender
+// here, applies the hold rule below. Nothing is ever rebuilt, so the same
+// bytes go out and a lost reply cannot become a second payment.
 //
 // While the store holds a held intent (the node accepted other bytes for it,
-// or rejected bytes an earlier attempt may have relayed) nothing is sent, by
-// Recover at startup or by the send pass: the condition is read from the
-// store before each, so it survives a restart and ends when an operator has
-// moved the intent on through withdraw.Engine.Abandon. Confirmations are
-// still read meanwhile.
+// or rejected bytes an earlier attempt may have relayed) nothing is sent: the
+// condition is read from the store before every send pass, so it survives a
+// restart and ends when an operator has moved the intent on through
+// withdraw.Engine.Abandon, and a hold that arises inside a pass ends the
+// pass. Confirmations are still read meanwhile.
 //
 // Usage:
 //
@@ -114,8 +117,8 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 	}
 
 	// Startup: re-mark what was sent, release what was reserved for nothing,
-	// re-send what was built, unless the store holds a held intent.
-	if err := recoverAtStartup(ctx, store, engine); err != nil {
+	// re-reserve what was built. The first send pass sends it.
+	if err := recoverAtStartup(ctx, engine); err != nil {
 		return err
 	}
 
@@ -131,32 +134,49 @@ func run(ctx context.Context, dir split.Dir, state string, network types.Network
 	}
 }
 
-// recoverAtStartup runs the engine's Recover. Recover re-sends every Built
-// intent it can re-reserve, so while the store holds a held intent it runs
-// under a context that has already ended: its repair passes (re-marking sent
-// inputs, releasing orphan reservations, re-reserving Built intents) do not
-// read the context, and only the sending does, so nothing is sent and send
-// refuses the same way on every later pass. Every other error is reported and
-// does not stop the process; the process's own context ending does.
-func recoverAtStartup(ctx context.Context, store *split.DirStore, engine *withdraw.Engine) error {
-	built, err := store.List(ctx, withdraw.StateBuilt)
-	if err != nil {
-		return fmt.Errorf("recover: the store could not be read: %w", err)
+// recoverAtStartup runs the engine's Recover as a repair and nothing more.
+// Recover attempts every Built intent it can re-reserve whatever an earlier
+// one returned, so a hold that arose inside it would not stop the ones after
+// it; run under a context that has already ended, its repair passes
+// (re-marking sent inputs, releasing orphan reservations, re-reserving Built
+// intents) still run, because they do not read the context, and the sending,
+// which does, sends nothing. The send pass then sends under the hold rule.
+// The entries Recover adds for the intents it did not send are dropped from
+// the report; every other error is reported and does not stop the process,
+// and the process's own context ending does.
+func recoverAtStartup(ctx context.Context, engine *withdraw.Engine) error {
+	repair, stop := context.WithCancel(ctx)
+	stop()
+	err := engine.Recover(repair)
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	recoverCtx := ctx
-	if held := heldCount(built); held > 0 {
-		logger.Error("withdrawals halted: held intents must be resolved by hand before anything is sent", "held", held)
-		var stop context.CancelFunc
-		recoverCtx, stop = context.WithCancel(ctx)
-		stop()
-	}
-	if err := engine.Recover(recoverCtx); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	if err := withoutNotSent(err); err != nil {
 		logger.Error("recover", "err", err)
 	}
 	return nil
+}
+
+// withoutNotSent drops from Recover's joined report the entries that say a
+// Built intent was not sent because the context had ended: under the repair
+// context that is every Built intent, and the send pass sends them. The
+// repair passes run under a context that cannot end, so no other entry
+// carries the context's error.
+func withoutNotSent(err error) error {
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		if err != nil && errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+	var kept []error
+	for _, e := range joined.Unwrap() {
+		if !errors.Is(e, context.Canceled) {
+			kept = append(kept, e)
+		}
+	}
+	return errors.Join(kept...)
 }
 
 // send broadcasts every Built intent. The engine decides what each outcome

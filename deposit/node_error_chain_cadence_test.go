@@ -220,3 +220,34 @@ func TestAChainCheckThatDoesNotCompleteEndsThePassWithTheError(t *testing.T) {
 		t.Fatalf("credited %+v, alerts %v; want nothing credited and no alert", got, al.kinds)
 	}
 }
+
+// The same refusal on the depth lookup of a credited outpoint the book leaves
+// out of Pending: alarmed as a disagreement, skipped, not final, and the pass
+// goes on to credit the next candidate.
+func TestARefusedDepthLookupIsADisagreementAndThePassGoesOn(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 1000, Height: node.tip - 40, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 1000, types.MaxReorgDepth+1, false)
+	for i := 0; i < 2; i++ { // credit, then final in the book by the recheck path
+		if _, err := m.Scan(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.finalMu.Lock()
+	m.final = nil // as a restart would
+	m.finalMu.Unlock()
+	cache.utxos[a] = append(cache.utxos[a], types.UTXO{TxID: txB, Vout: 0, Value: 100, Height: 900, Address: a})
+	node.outs[key(txB, 0)] = txout(t, a, 100, 101, false)
+	m.Node = &failingNode{fakeNode: node, failKey: key(txA, 0), failErr: fmt.Errorf("gettxout: %w", &rpc.Error{Code: -8, Message: "txid must be hexadecimal"})}
+
+	got, err := m.Scan(context.Background())
+	if err != nil || len(got) != 1 || got[0].TxID != txB || len(led.credited) != 2 {
+		t.Fatalf("scan with a refused depth lookup: %v %+v, want txB credited and no error", err, got)
+	}
+	if al.count(AlertIndexerMismatch) != 1 || len(al.kinds) != 1 {
+		t.Fatalf("alerts %v, want one indexer_mismatch", al.kinds)
+	}
+	if m.finalCount() != 0 {
+		t.Fatal("an outpoint entered the final set without the node's word")
+	}
+}
