@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
+	"strings"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -155,12 +157,14 @@ var (
 //   - a member named twice keeps the last, so a copy prepended before the real
 //     one is authenticated away while a reader taking the first sees it.
 func strictDecode(data []byte) (Keystore, error) {
-	if err := checkNoDuplicateMembers(json.NewDecoder(bytes.NewReader(data))); err != nil {
+	if err := checkMembers(json.NewDecoder(bytes.NewReader(data)), reflect.TypeOf(Keystore{})); err != nil {
 		return Keystore{}, err
 	}
+	// No DisallowUnknownFields here: checkMembers has already refused every
+	// name that is not a tag, by exact spelling, which is stricter than the
+	// decoder's folded match; a second, weaker guard would show nowhere.
 	var ks Keystore
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&ks); err != nil {
 		return Keystore{}, err
 	}
@@ -171,11 +175,17 @@ func strictDecode(data []byte) (Keystore, error) {
 	return ks, nil
 }
 
-// checkNoDuplicateMembers walks one JSON value and refuses an object that names
-// the same member twice, at any depth: the public key entries and the KDF
-// parameters are objects too. Recursion is bounded by the decoder's own
-// nesting limit.
-func checkNoDuplicateMembers(dec *json.Decoder) error {
+// checkMembers walks one JSON value beside the Go type the decoder will fill
+// and refuses, at any depth, a member whose name is not exactly one of that
+// type's JSON tags, and a member named twice. encoding/json matches a name to
+// a field case-insensitively with the last value winning, and its own
+// unknown-field check folds the same way, so a file naming "PubKeys" would
+// decode into PubKeys while a reader that compares bytes saw a member this
+// build never wrote; requiring the tag's own spelling closes that, the
+// unknown member and the plain duplicate together. The public key entries and
+// the KDF parameters are objects too and are walked with their own types.
+// Recursion is bounded by the decoder's nesting limit.
+func checkMembers(dec *json.Decoder, typ reflect.Type) error {
 	tok, err := dec.Token()
 	if err != nil {
 		return fmt.Errorf("parse keystore: %w", err)
@@ -184,8 +194,12 @@ func checkNoDuplicateMembers(dec *json.Decoder) error {
 	if !ok {
 		return nil // a scalar, nothing to check
 	}
+	for typ != nil && typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
 	switch delim {
 	case '{':
+		names := memberNames(typ)
 		seen := make(map[string]bool)
 		for dec.More() {
 			nameTok, err := dec.Token()
@@ -196,17 +210,25 @@ func checkNoDuplicateMembers(dec *json.Decoder) error {
 			if !ok {
 				return fmt.Errorf("%w: member name is not a string", ErrKeystoreHeader)
 			}
+			field, known := names[name]
+			if !known {
+				return fmt.Errorf("%w: the member %q is not a name this build writes", ErrKeystoreHeader, name)
+			}
 			if seen[name] {
 				return fmt.Errorf("%w: the member %q is named more than once", ErrKeystoreHeader, name)
 			}
 			seen[name] = true
-			if err := checkNoDuplicateMembers(dec); err != nil {
+			if err := checkMembers(dec, field); err != nil {
 				return err
 			}
 		}
 	case '[':
+		var elem reflect.Type
+		if typ != nil && (typ.Kind() == reflect.Slice || typ.Kind() == reflect.Array) {
+			elem = typ.Elem()
+		}
 		for dec.More() {
-			if err := checkNoDuplicateMembers(dec); err != nil {
+			if err := checkMembers(dec, elem); err != nil {
 				return err
 			}
 		}
@@ -215,6 +237,29 @@ func checkNoDuplicateMembers(dec *json.Decoder) error {
 		return fmt.Errorf("parse keystore: %w", err)
 	}
 	return nil
+}
+
+// memberNames maps the JSON name of every field a struct type decodes to the
+// field's type: the tag, or the Go name for an exported field without one.
+// Anything that is not a struct has no members, so an object where the type
+// says otherwise has no acceptable name.
+func memberNames(typ reflect.Type) map[string]reflect.Type {
+	names := make(map[string]reflect.Type)
+	if typ == nil || typ.Kind() != reflect.Struct {
+		return names
+	}
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		tag, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		switch {
+		case tag == "-", !f.IsExported():
+			continue
+		case tag == "":
+			tag = f.Name
+		}
+		names[tag] = f.Type
+	}
+	return names
 }
 
 // checkPubKeyList compares the file's unencrypted public key list against the
@@ -374,6 +419,13 @@ func (m *Manager) deriveKey(ks *Keystore) ([]byte, error) {
 	}
 	switch ks.KDF {
 	case KDFArgon2id:
+		// The sibling of NewManagerWithKey's size check, applied where the
+		// secret is read rather than where it was handed over, because
+		// NewManager returns no error. Empty is a missing secret, not a weak
+		// one; strength stays with the operator (docs/SECURITY.md).
+		if len(m.passwd) == 0 {
+			return nil, ErrPassphraseEmpty
+		}
 		if err := ks.KDFParams.check(); err != nil {
 			return nil, err
 		}

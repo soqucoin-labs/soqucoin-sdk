@@ -390,8 +390,9 @@ hot-wallet store: randomly generated keys in a file encrypted with AES-256-GCM u
 Argon2id-derived key, loaded and rewritten as one document, sized for a hot wallet's few addresses
 rather than one per user. Back that file up; a generated key has no seed. Neither `FromSeed` nor the
 generator returns a key the node treats as invalid (a public key whose first byte is `0xFF`), and
-`Load` refuses a record whose address does not belong to its key. Key handling in detail:
-[Security Guide](SECURITY.md).
+`Load` refuses a record whose address does not belong to its key or whose private key does not sign
+for its public key, and a passphrase manager refuses an empty passphrase wherever it would be used:
+`Load`, `LoadOrCreate` and `Save`. Key handling in detail: [Security Guide](SECURITY.md).
 
 ---
 
@@ -729,8 +730,9 @@ func main() {
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	// Keys. The manager refuses records the node could not spend from and
-	// records whose address does not belong to their key.
+	// Keys. The manager refuses records the node could not spend from,
+	// records whose address does not belong to their key, records whose
+	// private key does not sign for their public key, and an empty passphrase.
 	keystore := keys.NewManager("/var/lib/exchange/keys.enc", os.Getenv("SOQ_KEYSTORE_PASSPHRASE"))
 	if err := keystore.Load(); err != nil {
 		log.Fatalf("load keystore: %v", err)
