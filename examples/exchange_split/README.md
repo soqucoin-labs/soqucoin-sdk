@@ -53,13 +53,17 @@ gone. Nothing here enforces that, because the convention is what the file layout
 implementation of `withdraw.Store` over a database enforces it with a row lock.
 
 `withdraw.FileStore` is not used here and cannot be: it holds every intent in
-memory and rewrites the whole file from that map on each `Put`, so a second
+memory and rewrites the whole file from that map on each write, so a second
 process overwrites the first rather than merging with it. An intent saved as
 `Built` comes back as `Created` with its signed transaction already in a
 mempool. `split.DirStore` keeps one record per file and reads from disk every
-time. What keeps two processes off one record is that each state has exactly
-one owner, as in the table above; an exchange that wants a lock rather than a
-convention implements `withdraw.Store` over its database.
+time. Its `Create` links the record into place under a name that must not
+exist, so two processes cannot both register one id, which needs a filesystem
+with hard links under the intents directory; its `Update` compares the stored
+state under this process's lock only. What keeps two processes off
+one record beyond that is that each state has exactly one owner, as in the
+table above; an exchange that wants a lock rather than a convention implements
+`withdraw.Store` over its database with a conditional update on the state.
 
 ## Running it on stagenet
 

@@ -244,11 +244,11 @@ type failingStore struct {
 	failBuilt bool
 }
 
-func (f *failingStore) Put(_ context.Context, in *Intent) error {
+func (f *failingStore) Update(_ context.Context, in *Intent, from State) error {
 	if f.failBuilt && in.State == StateBuilt {
 		return errors.New("disk full")
 	}
-	return f.MemStore.Put(context.Background(), in)
+	return f.MemStore.Update(context.Background(), in, from)
 }
 
 func TestNothingIsBroadcastUnlessPersistedFirst(t *testing.T) {
@@ -306,10 +306,10 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	if err := s.Put(context.Background(), &Intent{ID: "b", State: StateBuilt, RawHex: "00", CreatedAt: now.Add(time.Second)}); err != nil {
+	if err := s.Create(context.Background(), &Intent{ID: "b", State: StateBuilt, RawHex: "00", CreatedAt: now.Add(time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Put(context.Background(), &Intent{ID: "a", State: StateBroadcast, CreatedAt: now}); err != nil {
+	if err := s.Create(context.Background(), &Intent{ID: "a", State: StateBroadcast, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := NewFileStore(path)
@@ -347,7 +347,8 @@ func breakStoreFile(t *testing.T, path string) (fix func()) {
 // When the write fails, the store keeps reporting the record it held before,
 // so Get and the caller that treated the error as "not saved" agree. A record
 // whose first save failed is not reported at all. Once the path is writable
-// the next Put writes the whole store, and a reload shows only what was saved.
+// the next write puts the whole store on disk, and a reload shows only what
+// was saved.
 func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "intents.json")
 	s, err := NewFileStore(path)
@@ -355,24 +356,24 @@ func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := &Intent{ID: "w1", State: StateCreated, CreatedAt: time.Now().UTC()}
-	if err := s.Put(context.Background(), created); err != nil {
+	if err := s.Create(context.Background(), created); err != nil {
 		t.Fatal(err)
 	}
 	fix := breakStoreFile(t, path)
 
 	built := *created
 	built.State, built.RawHex, built.TxID = StateBuilt, "00", "t"
-	if err := s.Put(context.Background(), &built); err == nil {
+	if err := s.Update(context.Background(), &built, StateCreated); err == nil {
 		t.Fatal("a write onto a directory succeeded")
 	}
 	got, ok, _ := s.Get(context.Background(), "w1")
 	if !ok || got.State != StateCreated || got.RawHex != "" {
-		t.Fatalf("after the failed Put, Get reports %+v; want the Created record", got)
+		t.Fatalf("after the failed write, Get reports %+v; want the Created record", got)
 	}
 	if list, _ := s.List(context.Background(), StateBuilt); len(list) != 0 {
 		t.Fatalf("List reports a Built intent whose save failed: %+v", list)
 	}
-	if err := s.Put(context.Background(), &Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err == nil {
+	if err := s.Create(context.Background(), &Intent{ID: "w2", State: StateCreated, CreatedAt: time.Now().UTC()}); err == nil {
 		t.Fatal("a write onto a directory succeeded")
 	}
 	if _, ok, _ := s.Get(context.Background(), "w2"); ok {
@@ -380,7 +381,7 @@ func TestFileStorePutKeepsThePreviousRecordWhenTheWriteFails(t *testing.T) {
 	}
 
 	fix()
-	if err := s.Put(context.Background(), &built); err != nil {
+	if err := s.Update(context.Background(), &built, StateCreated); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := NewFileStore(path)
@@ -496,8 +497,8 @@ func TestUnsettledBroadcastRenewsTheReservation(t *testing.T) {
 }
 
 // If the reservation did expire and another withdrawal took the input before
-// the retry, the retry must not release or fail the first intent (its bytes
-// may be in the mempool) and must say what happened.
+// the retry, the retry sends nothing, must not release or fail the first
+// intent (its bytes may be in the mempool) and must say what happened.
 func TestRetryAfterLostReservationReportsAndHolds(t *testing.T) {
 	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "lost"}
@@ -513,14 +514,17 @@ func TestRetryAfterLostReservationReportsAndHolds(t *testing.T) {
 	if err != nil || w2.Inputs[0].TxID != w1.Inputs[0].TxID {
 		t.Fatalf("w2 should have taken the lapsed input: %v %+v", err, w2)
 	}
-	net.setMode("lost")
+	sentBefore := net.sentCount()
 	err = e.Broadcast(context.Background(), w1)
-	if !errors.Is(err, ErrReservationLost) || !errors.Is(err, rpc.ErrUnknownOutcome) {
-		t.Fatalf("retry after the input was taken: %v, want ErrReservationLost wrapping the broadcast error", err)
+	if !errors.Is(err, ErrReservationLost) {
+		t.Fatalf("retry after the input was taken: %v, want ErrReservationLost", err)
+	}
+	if net.sentCount() != sentBefore {
+		t.Fatal("the retry sent bytes over an input another withdrawal holds")
 	}
 	w1, _, _ = e.Store.Get(context.Background(), "w1")
-	if w1.State != StateBuilt || w1.RawHex == "" {
-		t.Fatalf("w1 %+v, want still Built with its bytes", w1)
+	if w1.State != StateBuilt || w1.RawHex == "" || w1.LastError == "" {
+		t.Fatalf("w1 %+v, want still Built with its bytes and the cause recorded", w1)
 	}
 	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
 		t.Fatal("w2's broadcast entry was released by w1's retry")
@@ -627,6 +631,21 @@ func TestBuildWithUnwritableSpentSetSendsNothing(t *testing.T) {
 	}
 }
 
+// breakSetInSend replaces the spent set's file with a directory while the
+// send is in flight, so the next persist fails at the rename.
+type breakSetInSend struct {
+	inner Broadcaster
+	path  string
+}
+
+func (b breakSetInSend) Broadcast(ctx context.Context, rawHex, txid string) (string, error) {
+	_ = os.Remove(b.path)
+	if err := os.MkdirAll(filepath.Join(b.path, "x"), 0o700); err != nil {
+		return "", err
+	}
+	return b.inner.Broadcast(ctx, rawHex, txid)
+}
+
 // The disk fails between a successful broadcast and the spent-set write. The
 // intent is still recorded as Broadcast (the payment is out), the error is
 // returned so the operator hears about it, this process refuses the inputs,
@@ -641,7 +660,11 @@ func TestBroadcastWithUnwritableSpentSetReportsAndRecoverRemarks(t *testing.T) {
 	if err := e.Build(context.Background(), w1); err != nil {
 		t.Fatal(err)
 	}
-	e.Spent = failingSpentSet(t) // the disk goes away after the build
+	// The disk goes away inside the send, after the reservation was renewed
+	// and before the spend is recorded: the Broadcaster breaks the set's path.
+	setPath := filepath.Join(t.TempDir(), "spent.json")
+	e.Spent = utxo.NewSpentSet(setPath, nil)
+	e.Broadcaster = breakSetInSend{inner: net, path: setPath}
 	err := e.Broadcast(context.Background(), w1)
 	if !errors.Is(err, utxo.ErrPersist) {
 		t.Fatalf("broadcast: %v, want ErrPersist reported", err)
@@ -784,7 +807,9 @@ func TestRecoverReleasesReservationsOfIntentsWithNothingBuilt(t *testing.T) {
 	}
 	failed, _, _ := store.Get(context.Background(), "failed")
 	failed.State = StateFailed
-	store.Put(context.Background(), failed)
+	if err := store.Update(context.Background(), failed, StateCreated); err != nil {
+		t.Fatal(err)
+	}
 	// ghost: an intent the store never saw (written by a process that lost its store).
 	if err := spent.Reserve([]types.UTXO{{TxID: txB, Vout: 7, Value: 1}}, "ghost", time.Hour); err != nil {
 		t.Fatal(err)

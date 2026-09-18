@@ -15,13 +15,14 @@ import (
 )
 
 // writeFile is the durable replace step, a variable so a test can fail it
-// after the content has landed at the path. That is the one failure Put keeps
-// its record on, and the one no test can provoke from outside.
+// after the content has landed at the path. That is the one failure a write
+// keeps its record on, and the one no test can provoke from outside.
 var writeFile = atomicfile.WriteFile
 
-// ErrWrittenNotDurable reports a Put whose record reached the store but whose
-// durability is unconfirmed: the content is at the path and a reader of the
-// store will find it, and only a power loss before the filesystem flushes its
+// ErrWrittenNotDurable reports a Create or Update whose record reached the
+// store but whose durability is unconfirmed: the content is at the path and a
+// reader of the store will find it, and only a power loss before the
+// filesystem flushes its
 // directory entry would lose it.
 //
 // A Store that can tell the two apart should return it, wrapped, instead of a
@@ -57,12 +58,40 @@ func (m *MemStore) Get(_ context.Context, id string) (*Intent, bool, error) {
 	return &cp, true, nil
 }
 
-// Put implements Store.
-func (m *MemStore) Put(_ context.Context, in *Intent) error {
+// Create implements Store.
+func (m *MemStore) Create(_ context.Context, in *Intent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, had := m.intents[in.ID]; had {
+		return fmt.Errorf("%w: %s", ErrExists, in.ID)
+	}
 	cp := *in
 	m.intents[in.ID] = &cp
+	return nil
+}
+
+// Update implements Store.
+func (m *MemStore) Update(_ context.Context, in *Intent, from State) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := expectState(m.intents, in.ID, from); err != nil {
+		return err
+	}
+	cp := *in
+	m.intents[in.ID] = &cp
+	return nil
+}
+
+// expectState is the check behind Update in MemStore and FileStore: the
+// record must be present and in the state the write names.
+func expectState(intents map[string]*Intent, id string, from State) error {
+	prev, had := intents[id]
+	if !had {
+		return fmt.Errorf("%w: %s is not in the store", ErrStale, id)
+	}
+	if prev.State != from {
+		return fmt.Errorf("%w: %s is %s, the write expected %s", ErrStale, id, prev.State, from)
+	}
 	return nil
 }
 
@@ -73,7 +102,7 @@ func (m *MemStore) List(_ context.Context, states ...State) ([]*Intent, error) {
 	return filterSorted(m.intents, states), nil
 }
 
-// FileStore keeps every intent in one JSON file, rewritten on each Put: a
+// FileStore keeps every intent in one JSON file, rewritten on each write: a
 // temporary file in the same directory is written, synced and renamed into
 // place, then the directory is synced so the rename survives a power loss.
 // Suitable for a single process with modest volume; an exchange with a
@@ -81,7 +110,7 @@ func (m *MemStore) List(_ context.Context, states ...State) ([]*Intent, error) {
 // before broadcast" rule. The file stores ignore the context; a database
 // store bounds its queries with it.
 //
-// One process, not two. Every Put writes the whole file from this process's
+// One process, not two. Every write puts the whole file from this process's
 // map, so a second process on the same path does not merge with it: it
 // overwrites whatever the first one wrote with its own view, and an intent
 // saved as Built by one process reappears as Created to the other while its
@@ -134,22 +163,43 @@ func (fs *FileStore) Get(_ context.Context, id string) (*Intent, bool, error) {
 	return &cp, true, nil
 }
 
-// Put implements Store. It returns only after the new file is on disk and
-// renamed into place, and the directory entry is synced. When the write
-// fails the store keeps reporting the record it held before, so a caller that
-// treats the error as "not saved" and Get agree; the next successful Put
-// writes the whole store from memory again.
+// Create implements Store. It writes as Update does, once the id is known to
+// be absent.
+func (fs *FileStore) Create(_ context.Context, in *Intent) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if _, had := fs.intents[in.ID]; had {
+		return fmt.Errorf("%w: %s", ErrExists, in.ID)
+	}
+	return fs.put(in)
+}
+
+// Update implements Store. It writes as Create does, once the stored record
+// is known to be in state from.
+func (fs *FileStore) Update(_ context.Context, in *Intent, from State) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if err := expectState(fs.intents, in.ID, from); err != nil {
+		return err
+	}
+	return fs.put(in)
+}
+
+// put replaces the record in memory and writes the whole store. It returns
+// only after the new file is on disk and renamed into place, and the
+// directory entry is synced. When the write fails the store keeps reporting
+// the record it held before, so a caller that treats the error as "not saved"
+// and Get agree; the next successful write puts the whole store from memory
+// on disk again.
 //
 // The one write failure that is not rolled back is the one that happened after
 // the rename (atomicfile.ErrWrittenNotDurable): the file holds the new record
 // already. Rolling memory back there would make Get contradict the file, and
-// because the next Put writes the whole store from memory, it would put the
+// because the next write puts the whole store from memory, it would put the
 // older record back over the newer one on disk. For a Built intent that is a
 // signed transaction whose inputs the store has forgotten. The error is still
 // returned, because durability is unconfirmed; only the rollback is skipped.
-func (fs *FileStore) Put(_ context.Context, in *Intent) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+func (fs *FileStore) put(in *Intent) error {
 	prev, had := fs.intents[in.ID]
 	cp := *in
 	fs.intents[in.ID] = &cp

@@ -43,8 +43,8 @@ func TestTheStoreRefusesAnIDThatIsNotAFileNameInIt(t *testing.T) {
 		"", "..", ".", "../escape", "a/b", "/abs", ".hidden", "with space",
 		"w1\n", "w\x00", "évidence",
 	} {
-		if err := s.Put(context.Background(), intent(id, withdraw.StateCreated)); !errors.Is(err, ErrBadID) {
-			t.Errorf("Put(%q) returned %v, want ErrBadID", id, err)
+		if err := s.Create(context.Background(), intent(id, withdraw.StateCreated)); !errors.Is(err, ErrBadID) {
+			t.Errorf("Create(%q) returned %v, want ErrBadID", id, err)
 		}
 		if _, _, err := s.Get(context.Background(), id); !errors.Is(err, ErrBadID) {
 			t.Errorf("Get(%q) returned %v, want ErrBadID", id, err)
@@ -63,10 +63,10 @@ func TestTheStoreRefusesAnIDThatIsNotAFileNameInIt(t *testing.T) {
 	for i := range long {
 		long[i] = 'a'
 	}
-	if err := s.Put(context.Background(), intent(string(long), withdraw.StateCreated)); err != nil {
+	if err := s.Create(context.Background(), intent(string(long), withdraw.StateCreated)); err != nil {
 		t.Errorf("a 64-character id was refused: %v", err)
 	}
-	if err := s.Put(context.Background(), intent(string(long)+"a", withdraw.StateCreated)); !errors.Is(err, ErrBadID) {
+	if err := s.Create(context.Background(), intent(string(long)+"a", withdraw.StateCreated)); !errors.Is(err, ErrBadID) {
 		t.Errorf("a 65-character id was accepted: %v", err)
 	}
 }
@@ -87,10 +87,10 @@ func TestTwoStoresOnOneDirectoryDoNotOverwriteEachOther(t *testing.T) {
 
 	built := intent("w1", withdraw.StateBuilt)
 	built.RawHex, built.TxID = "00", "t1"
-	if err := a.Put(context.Background(), built); err != nil {
+	if err := a.Create(context.Background(), built); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Put(context.Background(), intent("w2", withdraw.StateCreated)); err != nil {
+	if err := b.Create(context.Background(), intent("w2", withdraw.StateCreated)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -127,10 +127,10 @@ func TestTheSDKFileStoreLosesARecordWhenTwoProcessesShareIt(t *testing.T) {
 	}
 	built := intent("w1", withdraw.StateBuilt)
 	built.RawHex, built.TxID = "00", "t1"
-	if err := a.Put(context.Background(), built); err != nil {
+	if err := a.Create(context.Background(), built); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Put(context.Background(), intent("w2", withdraw.StateCreated)); err != nil {
+	if err := b.Create(context.Background(), intent("w2", withdraw.StateCreated)); err != nil {
 		t.Fatal(err)
 	}
 	reloaded, err := withdraw.NewFileStore(path)
@@ -338,7 +338,7 @@ func TestListIsOldestFirstThenByID(t *testing.T) {
 		t.Helper()
 		in := intent(id, withdraw.StateBuilt)
 		in.CreatedAt = at
-		if err := s.Put(context.Background(), in); err != nil {
+		if err := s.Create(context.Background(), in); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -370,7 +370,7 @@ func TestListIsOldestFirstThenByID(t *testing.T) {
 }
 
 // A file name and the record inside it can agree and both still be unusable.
-// Get and Put refuse such an id, so List admitting it would hand the engine a
+// Get, Create and Update refuse such an id, so List admitting it would hand the engine a
 // withdrawal this store can neither read back nor save on its next transition.
 func TestListRefusesARecordWhoseIDIsNotUsableAtAll(t *testing.T) {
 	s, dir := openStore(t)
@@ -384,5 +384,57 @@ func TestListRefusesARecordWhoseIDIsNotUsableAtAll(t *testing.T) {
 	}
 	if _, err := s.List(context.Background()); !errors.Is(err, ErrBadID) {
 		t.Fatalf("List returned %v, want ErrBadID", err)
+	}
+}
+
+// Create is what keeps two processes from both registering one id: the second
+// link onto the name fails on the filesystem, whichever process made the
+// first. Update names the state it read, so a process writing over a record
+// another has moved is refused rather than moving it back.
+func TestCreateRefusesAnExistingRecordAndUpdateRefusesAnotherState(t *testing.T) {
+	_, dir := openStore(t)
+	a, err := OpenDirStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := OpenDirStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := a.Create(ctx, intent("w1", withdraw.StateCreated)); err != nil {
+		t.Fatal(err)
+	}
+	again := intent("w1", withdraw.StateCreated)
+	again.Amount = 7
+	if err := b.Create(ctx, again); !errors.Is(err, withdraw.ErrExists) {
+		t.Fatalf("the second process's Create of w1 returned %v, want ErrExists", err)
+	}
+	if got, _, _ := a.Get(ctx, "w1"); got.Amount != 1000 {
+		t.Fatalf("the refused Create replaced the record: amount %d", got.Amount)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("the refused Create left %d entries in the store, want the one record", len(entries))
+	}
+
+	built := intent("w1", withdraw.StateBuilt)
+	built.RawHex, built.TxID = "00", "t1"
+	if err := b.Update(ctx, built, withdraw.StateCreated); err != nil {
+		t.Fatal(err)
+	}
+	late := intent("w1", withdraw.StateCreated)
+	late.LastError = "late"
+	if err := a.Update(ctx, late, withdraw.StateCreated); !errors.Is(err, withdraw.ErrStale) {
+		t.Fatalf("an Update naming Created over the Built record returned %v, want ErrStale", err)
+	}
+	got, _, _ := a.Get(ctx, "w1")
+	if got.State != withdraw.StateBuilt || got.TxID != "t1" {
+		t.Fatalf("the refused Update replaced the record: %+v", got)
+	}
+	if err := a.Update(ctx, intent("w2", withdraw.StateBuilt), withdraw.StateCreated); !errors.Is(err, withdraw.ErrStale) {
+		t.Fatalf("an Update of an absent id returned %v, want ErrStale", err)
+	}
+	if _, ok, _ := a.Get(ctx, "w2"); ok {
+		t.Fatal("an Update of an absent id created it")
 	}
 }

@@ -115,7 +115,10 @@ type CircuitBreaker struct {
 //
 // withdraw.ErrHeld and withdraw.ErrReservationLost are deliberately absent:
 // each means an operator must resolve a transaction before anything else is
-// sent, so each counts and the breaker is the thing that stops the run.
+// sent, so each counts and the breaker is the thing that stops the run. So
+// is withdraw.ErrStale: the engine re-reads under its lock before every
+// write, so a store refusing a write as stale means a second process is
+// moving the same records, which is a deployment fault and not a request.
 var perRequestSentinels = []error{
 	context.Canceled,
 	rpc.ErrPermanent,

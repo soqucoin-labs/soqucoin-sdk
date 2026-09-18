@@ -301,3 +301,51 @@ func TestReservedIntentsListsReservationsOnly(t *testing.T) {
 		t.Fatalf("after w2 broadcast: %v, want [w1]", got)
 	}
 }
+
+// A withdrawal's retry after a lost reply renews what it holds. When an
+// earlier attempt succeeded and its record did not land, what it holds is the
+// permanent entry of its own send. That entry is accepted, not refused as
+// another withdrawal's, and it is left as it is: turned into a reservation it
+// would expire, and the inputs of a transaction in a mempool would come back
+// into selection.
+func TestReserveLeavesTheCallersOwnBroadcastEntryPermanent(t *testing.T) {
+	ss := NewSpentSet("", nil)
+	if err := ss.Reserve(rUTXOs(), "w1", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.MarkBroadcastFor(rUTXOs(), "txid-sent", "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.Reserve(rUTXOs(), "w1", time.Millisecond); err != nil {
+		t.Fatalf("a withdrawal's own sent inputs were refused to it: %v", err)
+	}
+	ss.mu.Lock()
+	e := ss.entries[SpentKey{rTxA, 0}]
+	ss.mu.Unlock()
+	if e.reserved() || !e.ExpiresAt.IsZero() || e.SpentInTx != "txid-sent" {
+		t.Fatalf("the record of the send became %+v; want it left as the permanent entry", e)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if !ss.IsSpent(rTxA, 0) || !ss.IsSpent(rTxB, 1) {
+		t.Fatal("an input of a sent transaction expired out of the set")
+	}
+	if err := ss.Reserve(rUTXOs()[:1], "w2", time.Hour); !errors.Is(err, ErrAlreadyReserved) {
+		t.Fatalf("another withdrawal took a sent input: %v", err)
+	}
+}
+
+// MarkBroadcast records a spend with no withdrawal id. A Reserve that names no
+// withdrawal either must not read those entries as its own: the input is
+// spent, and the caller must be refused it.
+func TestReserveWithNoIntentNeverMatchesAnEntryWithNone(t *testing.T) {
+	ss := NewSpentSet("", nil)
+	if err := ss.MarkBroadcast(rUTXOs()[:1], "txid-sent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.Reserve(rUTXOs(), "", time.Hour); !errors.Is(err, ErrAlreadyReserved) {
+		t.Fatalf("Reserve over a spent input, with no intent id: %v, want ErrAlreadyReserved", err)
+	}
+	if ss.IsSpent(rTxB, 1) {
+		t.Fatal("a refused reservation reserved the free input")
+	}
+}

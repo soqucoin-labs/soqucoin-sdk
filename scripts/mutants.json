@@ -393,8 +393,8 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestConcurrentProcessOfOneIntentBuildsOneTransaction",
-      "find": "\tif stored.State != StateCreated {\n\t\treturn fmt.Errorf(\"%w: %s is %s\", ErrWrongState, in.ID, stored.State)\n\t}",
-      "replace": "\tif false {\n\t\treturn fmt.Errorf(\"%w: %s is %s\", ErrWrongState, in.ID, stored.State)\n\t}",
+      "find": "\tstored, err := e.reread(ctx, in, StateCreated)",
+      "replace": "\tstored, err := in, error(nil)",
       "why": "Build's first state check reads the caller's copy of the intent, which another worker can have advanced between its read and this lock. Without the stored state deciding, two workers each holding a Created copy of one intent both build, each reserving different inputs because the other's are taken, and each broadcasts. The recipient is paid twice from different inputs, which is the first of the two failure modes the package exists to prevent."
     },
     {
@@ -432,15 +432,6 @@
       "find": "\tErrFailed = fmt.Errorf(\"withdraw: intent failed permanently and was not sent (%w)\", rpc.ErrPermanent)",
       "replace": "\tErrFailed = errors.New(\"withdraw: intent failed permanently and was not sent\")",
       "why": "One withdrawal that cannot succeed says nothing about the node or the indexer. resilience.CircuitBreaker recognises a per-request fault by rpc.ErrPermanent and counts anything else as systemic, so an ErrFailed that wraps nothing makes three retries of one bad payout open the breaker and stop every withdrawal for its cooldown. That is the outcome the breaker's own documentation says it exists to prevent."
-    },
-    {
-      "id": "withdraw-process-follows-a-lost-build-race-into-broadcast",
-      "file": "withdraw/engine.go",
-      "package": "./withdraw",
-      "test": "TestConcurrentProcessOfOneIntentBuildsOneTransaction",
-      "find": "\t\t\t// later call reads the intent fresh and sends it.\n\t\t\treturn in, err",
-      "replace": "\t\t\t// later call reads the intent fresh and sends it.\n\t\t\tif errors.Is(err, ErrWrongState) {\n\t\t\t\tin, _, _ = e.Store.Get(ctx, id)\n\t\t\t} else {\n\t\t\t\treturn in, err\n\t\t\t}",
-      "why": "The worker that loses the build race must stop on the state error rather than follow the intent into Broadcast. Two workers in Broadcast at once hold separate copies and Broadcast takes no lock: the second re-reserves inputs the first marked permanently spent, raises ErrReservationLost naming a withdrawal that does not exist, and saves Built over the Broadcast state the first recorded, so the payout is not marked confirmed until a later pass re-sends it."
     },
     {
       "id": "breaker-counts-a-lost-build-race-as-systemic",
@@ -513,6 +504,114 @@
       "find": "\tfee := tx.EstimateFee(feeRate)\n\ttx.Outputs = nil\n\tif err := checkFee(fee, feeRate); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Validate USDSOQ balance",
       "replace": "\tfee := tx.EstimateFee(feeRate)\n\ttx.Outputs = nil\n\n\t// Validate USDSOQ balance",
       "why": "checkFee is what refuses a rate above MaxFeeRateShorsPerVB and a fee above MaxFeeShors. Without it a fee-rate typo is paid, and docs/SECURITY.md tells the reader the builders cap both."
+    },
+    {
+      "id": "memstore-create-accepts-an-existing-id",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestDuplicateSubmitInFlightNeverPaysTwice",
+      "find": "\tif _, had := m.intents[in.ID]; had {",
+      "replace": "\tif false {",
+      "why": "Submit's registration is one Create, and the store's refusal of an id it holds is the only thing between a client retry under an idempotency key and a second record for the same withdrawal. Without it the retry's write lands as Created over the record a worker has driven to Built or Broadcast, and the next Process builds a second transaction from other inputs and pays the recipient twice."
+    },
+    {
+      "id": "stores-update-ignores-the-state-it-was-told",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestStoresWriteOnlyOverTheStateTheyWereTold",
+      "find": "\tif prev.State != from {",
+      "replace": "\tif false {",
+      "why": "Update writes only over the state the caller read. Without the check a writer holding a copy the store has moved past puts the record back: Created over Built, Broadcast over Confirmed. The engine re-reads under its lock inside one process, so this check is what refuses a second process, or a caller of the store itself, that skipped the re-read."
+    },
+    {
+      "id": "withdraw-broadcast-trusts-the-callers-intent-state",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSecondSenderOfABuiltIntentStopsOnTheStoredState",
+      "find": "\tstored, err := e.reread(ctx, in, StateBuilt)",
+      "replace": "\tstored, err := in, error(nil)",
+      "why": "Broadcast's first check reads the caller's copy, which another worker can have sent between the caller's read and the lock. Without the stored record deciding, the second worker sends the same bytes, its lost reply renews a reservation over inputs the first marked spent, and its save of Built over the first's Broadcast is refused by the store as stale, so the payout is reported as an error and the breaker is fed for a transaction that went out once."
+    },
+    {
+      "id": "withdraw-confirmations-trust-the-callers-intent-state",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestStaleConfirmationUpdateDoesNotRegressAConfirmedRecord",
+      "find": "\tstored, err := e.reread(ctx, in, StateBroadcast)",
+      "replace": "\tstored, err := in, error(nil)",
+      "why": "UpdateConfirmations acts on the stored record. Without the re-read a loop holding a copy from one block earlier writes Broadcast over a record another loop has confirmed; the store refuses the write as stale and the loop reports an error for an intent that is complete, and a ledger acting on the Confirmed transition cannot rely on seeing it once."
+    },
+    {
+      "id": "withdraw-fail-releases-the-inputs-before-the-verdict-lands",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestPermanentRejectionWhoseSaveFailsKeepsTheInputsReserved",
+      "find": "\tif err := e.save(ctx, in, from); err != nil {\n\t\treturn errors.Join(cause, err)\n\t}\n\te.release(in)",
+      "replace": "\te.release(in)\n\tif err := e.save(ctx, in, from); err != nil {\n\t\treturn errors.Join(cause, err)\n\t}",
+      "why": "A permanent rejection releases the intent's inputs and records it Failed. Released first, a failed save leaves the store holding a Built intent with signed bytes whose inputs the next withdrawal can select; Recover then re-reserves them against that withdrawal and reports a conflict. Saved first, a failed save leaves the intent as it was, inputs held, and the next attempt reaches the same verdict."
+    },
+    {
+      "id": "spent-set-reserve-refuses-the-callers-own-sent-entry",
+      "file": "utxo/selector.go",
+      "package": "./withdraw",
+      "test": "TestRetryAfterOwnBroadcastSaveFailedIsNotAReservationLoss",
+      "find": "\t\t\tif intentID != \"\" && e.IntentID == intentID {",
+      "replace": "\t\t\tif intentID != \"\" && e.IntentID == intentID && e.reserved() {",
+      "why": "A retry after a lost reply renews the reservation of a Built intent. When an earlier attempt succeeded and its record did not land, the set holds the intent's own inputs as sent, and refusing them names a conflicting withdrawal that does not exist: the engine reports ErrReservationLost, which the guide says halts every payout, for a transaction that went out once."
+    },
+    {
+      "id": "spent-set-reserve-replaces-the-callers-own-sent-entry",
+      "file": "utxo/selector.go",
+      "package": "./utxo",
+      "test": "TestReserveLeavesTheCallersOwnBroadcastEntryPermanent",
+      "find": "\t\t\tif intentID != \"\" && e.IntentID == intentID && !e.reserved() {\n\t\t\t\tcontinue",
+      "replace": "\t\t\tif false {\n\t\t\t\tcontinue",
+      "why": "An entry that records a send is permanent until the chain confirms it. Accepting the intent's own sent entry and then writing a reservation over it gives the inputs of a transaction in a mempool an expiry, after which the next withdrawal selects them and double-spends its own payment."
+    },
+    {
+      "id": "withdraw-reread-is-bound-to-the-callers-context",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBroadcastUnderAnEndedContextStillHoldsTheIntent",
+      "find": "\tstored, ok, err := e.Store.Get(context.WithoutCancel(ctx), in.ID)",
+      "replace": "\tstored, ok, err := e.Store.Get(ctx, in.ID)",
+      "why": "The re-read decides what the engine may do and is not a network call. Bound to the caller's context, a store that honours the context answers an ended one with an error, and Broadcast returns before it renews the reservation or records the attempt; a worker pool whose per-task deadlines expire while tasks wait then never renews, the reservation lapses at its TTL, and the inputs of a signed transaction are selected by the next withdrawal. The same context ending a moment later, inside the send, is a lost reply that does both."
+    },
+    {
+      "id": "withdraw-broadcast-sends-inputs-it-does-not-hold",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRecoverDoesNotSendABuiltIntentItCouldNotReReserve",
+      "find": "\tif rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {\n\t\treturn e.holdBuilt(ctx, in, notReserved(rerr))\n\t}",
+      "replace": "\tif rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {\n\t\t_ = rerr\n\t}",
+      "why": "Broadcast is the one place a send starts, and the shipped broadcaster lists every Built intent each pass and sends each. A Built intent whose inputs another withdrawal holds is two signed transactions over one input; refusing it only in Recover leaves the next pass to send it, and the second send also overwrites the first transaction's record of the shared input in the spent set."
+    },
+    {
+      "id": "spent-set-reserve-with-no-intent-owns-unowned-entries",
+      "file": "utxo/selector.go",
+      "package": "./utxo",
+      "test": "TestReserveWithNoIntentNeverMatchesAnEntryWithNone",
+      "find": "\t\t\tif intentID != \"\" && e.IntentID == intentID {",
+      "replace": "\t\t\tif e.IntentID == intentID {",
+      "why": "MarkBroadcast writes entries with no withdrawal id, and the pool payout and consolidation examples use it. A Reserve that names no withdrawal would match those entries as its own, skip every write, and answer nil: the caller is told the inputs are reserved for it while the set records them as spent in a transaction that is out."
+    },
+    {
+      "id": "filestore-create-accepts-an-existing-id",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestStoresWriteOnlyOverTheStateTheyWereTold",
+      "find": "\tif _, had := fs.intents[in.ID]; had {",
+      "replace": "\tif false {",
+      "why": "Create is the registration write, and its refusal of an id the store holds is what keeps a second Submit of one id from writing Created over the record a worker has driven to Built or Broadcast. The in-memory store has the same check pinned separately; this is the file-backed one an exchange without a database runs."
+    },
+    {
+      "id": "split-store-update-ignores-the-state-it-was-told",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestCreateRefusesAnExistingRecordAndUpdateRefusesAnotherState",
+      "find": "\tif stored.State != from {",
+      "replace": "\tif false {",
+      "why": "Update writes only over the state the caller read. In the shared directory the three processes hold no common lock, so this comparison is the only thing that refuses a process writing over a record another process has moved, and without it a late write puts a sent intent back to Built or a built one back to Created."
     }
   ]
 }
