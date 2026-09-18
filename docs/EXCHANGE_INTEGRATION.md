@@ -410,8 +410,10 @@ tracked address (`blockchain.scripthash.subscribe`, `electrumx/subscribe.go`); w
 reports an address's history changed, the client makes one `blockchain.scripthash.listunspent` for
 that address and merges the reply into the cache. A notification writes nothing to the cache by
 itself: only a `listunspent` reply does, and credit still needs your node's `gettxout`, so what a
-faulty or lying indexer can do with a notification is what it could do with a poll reply. Two
-timers back the subscriptions. The reconcile interval given to `electrumx.NewClient` is a full
+faulty or lying indexer can do with a notification is what it could do with a poll reply. The
+reply is validated as a whole before it is merged (`electrumx/client.go`, `parseUnspent`): a
+malformed one is refused, the cache keeps its set, and the address records the error so the
+Monitor skips and alarms it. Two timers back the subscriptions. The reconcile interval given to `electrumx.NewClient` is a full
 `listunspent` pass over every address whatever the statuses say: the safety net for a notification
 the server never sent, so a dropped notification delays a deposit by at most that interval plus
 your scan period. `PingInterval` (60 seconds by default) is a `server.ping` that keeps the server
@@ -432,7 +434,17 @@ Monitor pauses only when every address is stale. The costs, each cited to the co
 - Reconnect: one `subscribe` per address (`pass`), plus one `listunspent` per address whose status
   changed while the client was away; an unchanged address whose record is clean costs the
   subscribe call alone (`subscribe`, the status comparison). A connection that dies after every
-  handshake is redialled on a backoff from one second to a minute (`run`, `after`), not in a loop.
+  handshake is redialled on a backoff from one second to a minute (`subscribe.go`, `run`; the
+  schedule is `refreshpolicy.go`).
+- Failure: a call whose reply does not arrive within the 30-second call deadline ends the pass at
+  that call (`conn.go`, `endsPass`); the retry's pass asks a pending address first, against a
+  stalled server that call times out too, and the second timeout rebuilds the connection
+  (`refreshpolicy.go`, `onResult`), so a server that has stopped answering costs two deadlines
+  plus the backoff in force whatever the address count. An address the server refuses is asked
+  again on the same backoff ladder, on every pass another event runs and on the ladder's timer,
+  and holds nothing else: a notification for another address is refreshed at once (`onEvent`;
+  the refusal sets no `paced`). The ladder resets only on a clean pass, so while any address is
+  refused it sits at its one-minute ceiling and that is the backoff a later timeout waits out.
 - Reconcile: one `listunspent` per address (`subscribe.go`, `pass` with `full` set, through
   `client.go`, `refresh`); the interval must exceed the pass.
 - The client's own cost per address, over loopback against a server that answers at once, is
@@ -529,8 +541,10 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 	// The indexer. Over anything but a private network, use TLS: the server
-	// sees every address you track. The network is inferred from the
-	// addresses; mixed or undecodable addresses are refused.
+	// sees every address you track, and plaintext to a host that is not
+	// loopback is refused unless AllowPlaintext says the path is private. The
+	// network is inferred from the addresses; mixed or undecodable addresses
+	// are refused.
 	elx := electrumx.NewClient("electrumx.example.com:50002", 10*time.Minute, logger) // the reconcile interval
 	elx.UseTLS()
 	if err := elx.TrackAddresses(depositAddresses); err != nil {
@@ -1045,7 +1059,7 @@ Every package carries unit tests. The figures below are one run of `go test -cov
 commit this document ships with, library packages only: the `examples/` programs and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Nine of the ten reproduce exactly. The `electrumx`
-figure moves between about 88.4 and 89.2 across runs, because several of its tests drive
+figure moves between about 89.6 and 90.3 across runs, because several of its tests drive
 the reader goroutine, the ping loop and the refresher at once, and which branches run
 depends on how those are scheduled.
 
@@ -1053,9 +1067,9 @@ depends on how those are scheduled.
 |---------|:--------:|-----------------|
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
 | `utxo` | **90.9%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
-| `rpc` | **85.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
+| `rpc` | **85.2%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **88.4%** | Id-matched replies, notification routing, merge, refresh failures, per-address freshness, network inference, genesis check, TLS |
+| `electrumx` | **89.6%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
 | `tx` | **91.6%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **89.6%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **84.3%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |

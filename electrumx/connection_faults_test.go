@@ -109,3 +109,40 @@ func TestAFailedWriteReportsALostConnection(t *testing.T) {
 		t.Errorf("a write cut off by the caller's context reported %v, want the context error", err)
 	}
 }
+
+// One address the indexer refuses paces nothing. After two refusals the
+// policy's retry is two seconds away; a notification for a healthy address
+// arriving in that wait is refreshed at once. Before this the wait dropped
+// every kick, and one refused address kept the policy at the 60 s ceiling for
+// the life of the process, so every other address's deposit waited up to a
+// minute for the timer. The policy is model-tested in
+// refreshpolicy_model_test.go (kick liveness); this is the same statement
+// against a real refresher and a real server.
+func TestARefusedAddressDoesNotDelayAPushForAnotherAddress(t *testing.T) {
+	stub := newPushStub(t)
+	bad, good := craftAddr(t, 0x66), craftAddr(t, 0x77)
+	shBad, shGood := scripthashOf(t, bad), scripthashOf(t, good)
+	stub.set(shGood, "g1", `[]`)
+	stub.mu.Lock()
+	stub.failList[shBad] = true
+	stub.mu.Unlock()
+	c, _ := startClient(t, stub, bad, good)
+
+	// Passes at 0 and at +1 s refuse the bad address; the next retry is then
+	// two seconds away.
+	waitFor(t, "two refusals", func() bool { return stub.count("blockchain.scripthash.listunspent", shBad) >= 2 })
+	before := stub.count("blockchain.scripthash.listunspent", shGood)
+
+	stub.notify(shGood, "g2", oneUTXO)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for stub.count("blockchain.scripthash.listunspent", shGood) == before {
+		if time.Now().After(deadline) {
+			t.Fatalf("the push for the healthy address waited for the refused address's retry timer")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitFor(t, "the deposit to land", func() bool { return len(c.GetUTXOs(good)) == 1 })
+	if n := stub.count("blockchain.scripthash.subscribe", shGood); n != 1 {
+		t.Fatalf("the healthy address was subscribed %d times: the refused address rebuilt the connection", n)
+	}
+}

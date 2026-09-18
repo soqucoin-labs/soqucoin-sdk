@@ -9,6 +9,10 @@
 //   - PF-018b: Serialised writes, one reader, replies paired with calls by id
 //   - Defense 12: Merge-based UTXO refresh that preserves the AssetType stamp
 //   - Panic recovery: the refresher goroutine auto-restarts after crashes
+//   - Reply validation: a malformed listunspent reply is refused as a whole
+//     and the cache keeps its set (parseUnspent)
+//   - Plaintext only to a loopback host unless AllowPlaintext says the path
+//     is private (dial)
 //
 // Usage:
 //
@@ -47,13 +51,17 @@ package electrumx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,7 +85,8 @@ type Client struct {
 	// semaphore rather than a mutex so that a caller waiting for it leaves
 	// the queue when its own context ends. gen counts connections; a reader
 	// goroutine and every pending call belong to one generation. liveGen
-	// mirrors gen for readers that hold mu, not connSem.
+	// mirrors gen for readers that hold mu, not connSem; it is written under
+	// both (setLiveGen), so under mu it cannot move.
 	conn     net.Conn
 	reader   *bufio.Reader
 	gen      uint64
@@ -107,8 +116,10 @@ type Client struct {
 
 	addresses         []string
 	reconcileInterval time.Duration
+	callDeadline      time.Duration // defaultCallDeadline; a test shortens it
 	stopCh            chan struct{}
 	stopOnce          sync.Once
+	startOnce         sync.Once     // Start launches the refresher and the ping loop once
 	kickCh            chan struct{} // wakes the refresher; one slot
 	log               *slog.Logger
 
@@ -153,6 +164,17 @@ type Client struct {
 	// tls.Config verifies the server certificate against the system roots,
 	// which is what you want; see UseTLS.
 	TLSConfig *tls.Config
+
+	// AllowPlaintext permits a plaintext connection to a host that is not
+	// loopback. Until it is set, Connect returns ErrPlaintextRemote with
+	// nothing dialled for such a host while TLSConfig is nil. Loopback is the
+	// name "localhost" or an IP literal in 127.0.0.0/8 or ::1, read from the
+	// host as written; nothing is resolved, so a Docker service name or a LAN
+	// address is not loopback even when it reaches this machine. Setting it
+	// states that the path to the server is private: a tunnel that ends
+	// elsewhere, or a network segment nothing else can read. It does not
+	// change what TLSConfig does when set.
+	AllowPlaintext bool
 }
 
 // UseTLS enables TLS with certificate verification against the system roots.
@@ -223,6 +245,11 @@ var (
 	// set after the connection, so the first verification of a chain can fall
 	// on an ordinary call rather than on Connect.
 	ErrGenesisMismatch = errors.New("electrumx: server is indexing a different chain")
+	// ErrPlaintextRemote is returned by Connect, with nothing dialled, for a
+	// host that is not loopback while TLSConfig is nil and AllowPlaintext is
+	// not set. The server sees every tracked address, and a plaintext path
+	// lets whoever is on it alter every set this client reports.
+	ErrPlaintextRemote = errors.New("electrumx: host is not loopback and TLSConfig is nil; call UseTLS, set TLSConfig, or set AllowPlaintext for a path that is private")
 )
 
 // NewClient creates a new ElectrumX client.
@@ -250,6 +277,7 @@ func NewClient(host string, reconcileInterval time.Duration, logger *slog.Logger
 		pending:           make(map[int64]pendingCall),
 		host:              host,
 		reconcileInterval: reconcileInterval,
+		callDeadline:      defaultCallDeadline,
 		stopCh:            make(chan struct{}),
 		kickCh:            make(chan struct{}, 1),
 		connSem:           make(chan struct{}, 1),
@@ -388,10 +416,13 @@ func (c *Client) SetHRP(hrp string) error {
 // is recorded for LastRefresh, which callers must consult before treating an
 // empty UTXO set as "no deposits", and per address for LastRefreshOf.
 //
-// When ctx ends mid-pass, or the connection is lost, the pass stops there:
-// the addresses reached keep their new records, the rest keep their old ones,
-// and the error names one address, the one whose call was cut short or,
-// between calls, the first not attempted.
+// When ctx ends mid-pass, the connection is lost, or a reply does not arrive
+// within the call deadline, the pass stops there: the addresses reached keep
+// their new records, the rest keep their old ones, and the error names one
+// address, the one whose call was cut short or, between calls, the first not
+// attempted. A server that has stopped answering therefore costs one call
+// deadline, whatever the address count; an address the server refuses costs
+// nothing to the others.
 func (c *Client) RefreshAll(ctx context.Context) error {
 	c.mu.RLock()
 	addrs := append([]string(nil), c.addresses...)
@@ -419,8 +450,10 @@ func (c *Client) refresh(ctx context.Context, addrs []string, full bool) ([]stri
 			failed = append(failed, addr)
 			// A context that ended during this address's call is already
 			// named through its error; so is a lost connection, which every
-			// later call would report the same way. The pass stops here.
-			if ctx.Err() != nil || errIsConnection(err) {
+			// later call would report the same way, and so is a reply that
+			// never came, after which the connection is in doubt. The pass
+			// stops here.
+			if ctx.Err() != nil || endsPass(err) {
 				failed = append(failed, addrs[i+1:]...)
 				break
 			}
@@ -505,13 +538,21 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 		return fmt.Errorf("listunspent: %w", err)
 	}
 
-	var freshUTXOs []types.UTXO
-	if err := json.Unmarshal(result, &freshUTXOs); err != nil {
-		c.recordRefresh(addr, gen, seqBefore, ticket, fmt.Errorf("parse utxos: %w", err))
-		return fmt.Errorf("parse utxos: %w", err)
+	freshUTXOs, err := parseUnspent(result)
+	if err != nil {
+		// The whole reply is refused and the cache keeps its previous set:
+		// a server that sends one malformed entry is not a server whose
+		// other entries are trusted. The error is on the address's record,
+		// so deposit.Monitor skips and alarms it; a malformed reply from a
+		// connection that has since been replaced is recorded as the
+		// replacement instead.
+		return c.recordRefreshFailure(addr, gen, seqBefore, ticket, fmt.Errorf("parse utxos: %w", err))
 	}
 
-	count, committed := c.commitRefresh(addr, gen, seqBefore, ticket, freshUTXOs)
+	count, committed, err := c.commitRefresh(addr, gen, seqBefore, ticket, freshUTXOs)
+	if err != nil {
+		return err
+	}
 	if committed && c.OnRefresh != nil {
 		// Outside the lock: a slow OnRefresh must not hold the reader, which
 		// takes mu to note a change, and with it every reply on the
@@ -522,12 +563,84 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 	return nil
 }
 
+// parseUnspent is the one reader of a listunspent result. It refuses a null
+// result, a result that is not a list, and any list with an entry whose
+// tx_hash is not 64 hexadecimal digits, whose value is negative or above the
+// node's per-output ceiling, whose height is negative, or whose outpoint
+// appears twice, and a list whose values do not fit in an int64. The ceiling
+// is consensus on one output (MAX_MONEY, src/amount.h) and is not a bound on
+// an address: the head supply is above two ceilings, so an address's set may
+// sum past it and is refused only when the sum would overflow, a bound the
+// supply is decades from. The caller refuses the whole reply on any of these
+// and keeps the previous set. Transaction ids are lower-cased, the form the
+// node prints and the cache compares.
+//
+// The height is not compared with the connection's last tip: the server
+// processes a batch of blocks between two header notifications while it
+// catches up, and the tip here is zero until the first header, so an honest
+// reply could be refused.
+func parseUnspent(raw json.RawMessage) ([]types.UTXO, error) {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return nil, errors.New("result is null, not a list")
+	}
+	var fresh []types.UTXO
+	if err := json.Unmarshal(raw, &fresh); err != nil {
+		return nil, err
+	}
+	type outpoint struct {
+		txid string
+		vout uint32
+	}
+	seen := make(map[outpoint]bool, len(fresh))
+	var total int64
+	for i := range fresh {
+		u := &fresh[i]
+		if len(u.TxID) != 64 {
+			return nil, fmt.Errorf("entry %d: tx_hash %q is not 64 hexadecimal digits", i, u.TxID)
+		}
+		if _, err := hex.DecodeString(u.TxID); err != nil {
+			return nil, fmt.Errorf("entry %d: tx_hash %q is not 64 hexadecimal digits", i, u.TxID)
+		}
+		u.TxID = strings.ToLower(u.TxID)
+		if u.Value < 0 || u.Value > types.MaxMoney {
+			return nil, fmt.Errorf("entry %d: value %d is outside 0 to %d", i, u.Value, types.MaxMoney)
+		}
+		if u.Height < 0 {
+			return nil, fmt.Errorf("entry %d: height %d is negative", i, u.Height)
+		}
+		// total is at least 0 here, so the subtraction cannot overflow, and
+		// a sum that would is refused before it does. The supply is decades
+		// from this bound; the per-output ceiling above is what keeps a
+		// handful of hostile entries from reaching it.
+		if u.Value > math.MaxInt64-total {
+			return nil, fmt.Errorf("entry %d: the values do not fit in an int64", i)
+		}
+		total += u.Value
+		key := outpoint{u.TxID, u.Vout}
+		if seen[key] {
+			return nil, fmt.Errorf("entry %d: outpoint %s:%d appears twice", i, u.TxID, u.Vout)
+		}
+		seen[key] = true
+	}
+	return fresh, nil
+}
+
 // commitRefresh merges one listunspent reply into the cache under mu and
 // reports the size of the merged set and whether it was committed. A merge
 // rather than a replacement, so the AssetType stamp survives the pass.
 // Outputs the reply no longer lists are dropped as spent, and outputs it
 // lists for the first time are added.
-func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool) {
+//
+// Nothing is committed from a connection a newer connection has replaced, as
+// commitSubscribe commits nothing from one: the reply was true when the
+// server wrote it and the record would date it after whatever the live
+// connection has already written for the address. That case
+// (staleReplyLocked) is returned as an error wrapping ErrNotConnected and
+// recorded on the address, so the pass ends; the address's record carries the
+// error, so the next pass on the live connection subscribes it and refreshes
+// it whatever status the subscribe reply carries. A reply from a connection
+// that was lost with nothing live since is committed: see staleReplyLocked.
+func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, freshUTXOs []types.UTXO) (int, bool, error) {
 	type utxoKey struct {
 		TxID string
 		Vout uint32
@@ -579,22 +692,87 @@ func (c *Client) commitRefresh(addr string, gen, seqBefore, ticket uint64, fresh
 		// TrackAddresses dropped the address while this listunspent was in
 		// flight; committing now would put an untracked address's outputs
 		// back into the cache the balance and the selector read.
-		return 0, false
+		return 0, false, nil
 	}
 	if ticket < c.refreshed[addr].commit {
 		// A refresh that started later has already committed; this reply is
 		// older than what the cache holds.
-		return 0, false
+		return 0, false, nil
+	}
+	if err := c.staleReplyLocked(addr, gen); err != nil {
+		c.recordStaleLocked(addr, gen, seqBefore, ticket, err)
+		return 0, false, err
 	}
 	c.utxos[addr] = merged
 	c.recordRefreshLocked(addr, gen, seqBefore, ticket, nil)
-	return len(merged), true
+	return len(merged), true, nil
 }
 
 func (c *Client) recordRefresh(addr string, gen, seqBefore, ticket uint64, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.recordRefreshLocked(addr, gen, seqBefore, ticket, err)
+}
+
+// staleReplyLocked reports a reply from a connection that a newer connection
+// has replaced as an error wrapping ErrNotConnected, and nil otherwise. Caller
+// holds mu, under which liveGen cannot move (setLiveGen), so the answer holds
+// for as long as the caller keeps the lock. The two sites that handle a
+// reply's content call it: commitRefresh before it writes the cache, and
+// recordRefreshFailure for a reply that could not be parsed.
+//
+// Replaced is the case that matters: the newer connection's own subscribe
+// reply may already have committed for the address, and a set from before it
+// would then be dated after it. A reply delivered from a connection that was
+// lost with nothing live since (await drains a reply queued before the loss)
+// is the address's own answer and no other connection has written the
+// address, so it is committed like any other; refusing it cost one
+// listunspent after the reconnect and put a lost-connection error on an
+// address the server had answered.
+func (c *Client) staleReplyLocked(addr string, gen uint64) error {
+	if live := c.liveGen.Load(); live != 0 && gen != live {
+		return fmt.Errorf("%w: the connection was replaced before the listunspent reply for %s was handled", ErrNotConnected, addr)
+	}
+	return nil
+}
+
+// recordRefreshFailure records a reply that could not be used and returns
+// the error recorded, or nil for a reply a later refresh has superseded. A
+// reply from a connection that has since been replaced is recorded as the
+// replacement, whatever it carried: the pass then ends like any lost
+// connection, and the address is not alarmed for a fault the replacement
+// explains.
+func (c *Client) recordRefreshFailure(addr string, gen, seqBefore, ticket uint64, err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if last := c.refreshed[addr].commit; ticket < last {
+		// A later refresh of this address has already reported, as
+		// commitRefresh tests before its own stale check: this reply is
+		// superseded, records nothing, leaves nothing pending and is not a
+		// failure of the pass, since the later refresh has stood in for it.
+		return nil // superseded: the later refresh is the address's result
+	}
+	if serr := c.staleReplyLocked(addr, gen); serr != nil {
+		c.recordStaleLocked(addr, gen, seqBefore, ticket, serr)
+		return serr
+	}
+	c.recordRefreshLocked(addr, gen, seqBefore, ticket, err)
+	return err
+}
+
+// recordStaleLocked records a reply from a replaced connection: the error on
+// the record, and the address marked changed with the refresher woken. The
+// mark is for the one caller the pass does not cover, RefreshAll from outside
+// the refresher: if the live connection's subscribe reply for the address has
+// already committed clean, nothing else would refresh it before the reconcile
+// and the error would keep the Monitor away from it until then. Caller holds
+// mu.
+func (c *Client) recordStaleLocked(addr string, gen, seqBefore, ticket uint64, err error) {
+	c.recordRefreshLocked(addr, gen, seqBefore, ticket, err)
+	if c.trackedSet[addr] {
+		c.changed[addr] = true // the stale reply leaves a refresh pending
+		c.kick()
+	}
 }
 
 // recordRefreshLocked records one listunspent attempt. Caller holds mu. A

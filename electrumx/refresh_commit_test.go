@@ -2,6 +2,7 @@ package electrumx
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -151,5 +152,174 @@ func TestASubscribeReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
 	}
 	if st != "the live connection's status" {
 		t.Errorf("the status recorded is %q", st)
+	}
+}
+
+// A listunspent reply from a connection that a newer connection has replaced
+// commits nothing, as a subscribe reply from one commits nothing: the set was
+// true when the server wrote it and the record would date it after whatever
+// the live connection has written for the address. The stale reply is
+// recorded as a lost connection so the pass ends, and the error on the record
+// makes the next pass on the live connection refresh the address whatever
+// status its subscribe reply carries. A reply from a connection that was lost
+// with nothing live since is a different case and commits: no other connection
+// has written the address, and await delivers a reply queued before the loss
+// so that it is not thrown away.
+func TestAListunspentReplyFromAReplacedConnectionCommitsNothing(t *testing.T) {
+	a := craftAddr(t, 0x11)
+	c := NewClient("127.0.0.1:1", time.Hour, nil)
+	setHRP(t, c, types.Stagenet.HRP)
+	if err := c.TrackAddresses([]string{a}); err != nil {
+		t.Fatal(err)
+	}
+	c.liveGen.Store(2)
+	fresh := []types.UTXO{{TxID: txA, Vout: 0, Value: 100, Height: 10}}
+
+	n, committed, err := c.commitRefresh(a, 1, 0, 1, fresh)
+	if committed || n != 0 {
+		t.Fatalf("a reply from generation 1 committed %d outputs while generation 2 is live", n)
+	}
+	if !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("a stale reply reported %v, want an error wrapping ErrNotConnected so the pass ends", err)
+	}
+	if got := c.GetUTXOs(a); len(got) != 0 {
+		t.Fatalf("a reply from a replaced connection reached the cache: %+v", got)
+	}
+	at, rerr := c.LastRefreshOf(a)
+	if rerr == nil || !at.IsZero() {
+		t.Fatalf("after a stale reply the record reads at=%v err=%v, want the zero time and the error", at, rerr)
+	}
+	c.mu.Lock()
+	pending := c.changed[a]
+	c.mu.Unlock()
+	if !pending {
+		t.Fatal("a stale reply left no refresh pending, so an address whose live subscribe had already committed clean would carry the error until the reconcile")
+	}
+
+	n, committed, err = c.commitRefresh(a, 2, 0, 2, fresh)
+	if err != nil || !committed || n != 1 {
+		t.Fatalf("the live connection's reply: n=%d committed=%v err=%v", n, committed, err)
+	}
+	if got := c.GetUTXOs(a); len(got) != 1 {
+		t.Fatalf("the live connection's reply did not reach the cache: %+v", got)
+	}
+	at, rerr = c.LastRefreshOf(a)
+	if rerr != nil || at.IsZero() {
+		t.Fatalf("after the live reply the record reads at=%v err=%v", at, rerr)
+	}
+
+	// The connection is lost and nothing is live: a reply from generation 2
+	// delivered now is the address's own answer and commits.
+	c.liveGen.Store(0)
+	later := []types.UTXO{{TxID: txA, Vout: 0, Value: 100, Height: 10}, {TxID: txA, Vout: 1, Value: 7, Height: 11}}
+	n, committed, err = c.commitRefresh(a, 2, 0, 3, later)
+	if err != nil || !committed || n != 2 {
+		t.Fatalf("a reply delivered after the connection was lost, with nothing live: n=%d committed=%v err=%v; the server answered and no other connection has written the address", n, committed, err)
+	}
+	if got := c.GetUTXOs(a); len(got) != 2 {
+		t.Fatalf("the delivered reply did not reach the cache: %+v", got)
+	}
+	if _, rerr := c.LastRefreshOf(a); rerr != nil {
+		t.Fatalf("a delivered reply put %v on the record", rerr)
+	}
+}
+
+// The live generation is written under the cache lock as well as the
+// connection semaphore, so a check of it under the lock cannot be overtaken by
+// a replacement before the write that follows. Here the lock is held while a
+// Connect and then a Stop try to move it: neither completes until the lock is
+// released. Without this a reply from the old connection could pass the
+// stale check and commit after Connect had moved the generation.
+func TestTheLiveGenerationDoesNotMoveWhileTheCacheLockIsHeld(t *testing.T) {
+	stub := newStub(t, nil)
+	c := NewClient(stub.addr(), time.Hour, nil)
+
+	c.mu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- c.Connect(context.Background()) }()
+	select {
+	case err := <-done:
+		c.mu.Unlock()
+		t.Fatalf("Connect completed while the cache lock was held (err=%v): the generation moved outside the lock", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if g := c.liveGen.Load(); g != 0 {
+		c.mu.Unlock()
+		t.Fatalf("the live generation moved to %d while the cache lock was held", g)
+	}
+	c.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("Connect after the lock was released: %v", err)
+	}
+	if g := c.liveGen.Load(); g != 1 {
+		t.Fatalf("live generation after Connect: %d, want 1", g)
+	}
+
+	c.mu.Lock()
+	stopped := make(chan struct{})
+	go func() { c.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		c.mu.Unlock()
+		t.Fatal("Stop completed while the cache lock was held: the generation moved outside the lock")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if g := c.liveGen.Load(); g != 1 {
+		c.mu.Unlock()
+		t.Fatalf("the live generation moved to %d during Stop while the cache lock was held", g)
+	}
+	c.mu.Unlock()
+	<-stopped
+	if g := c.liveGen.Load(); g != 0 {
+		t.Fatalf("live generation after Stop: %d, want 0", g)
+	}
+}
+
+// A reply that could not be parsed, from a connection that has since been
+// replaced, is recorded as the replacement and not as a fault of the address:
+// the pass ends as it does for any lost connection, and the Monitor is not
+// alarmed for a parse error the replacement explains. From the live
+// connection the parse error itself is recorded.
+func TestAMalformedReplyFromAReplacedConnectionIsRecordedAsTheReplacement(t *testing.T) {
+	a := craftAddr(t, 0x11)
+	c := NewClient("127.0.0.1:1", time.Hour, nil)
+	setHRP(t, c, types.Stagenet.HRP)
+	if err := c.TrackAddresses([]string{a}); err != nil {
+		t.Fatal(err)
+	}
+	c.liveGen.Store(2)
+	parse := errors.New("parse utxos: entry 0: value -5 is negative")
+
+	err := c.recordRefreshFailure(a, 1, 0, 1, parse)
+	if !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("a malformed reply from generation 1 while 2 is live was recorded as %v, want ErrNotConnected", err)
+	}
+	if _, rerr := c.LastRefreshOf(a); !errors.Is(rerr, ErrNotConnected) {
+		t.Fatalf("the record reads %v, want ErrNotConnected", rerr)
+	}
+
+	err = c.recordRefreshFailure(a, 2, 0, 2, parse)
+	if !errors.Is(err, parse) {
+		t.Fatalf("a malformed reply from the live connection was recorded as %v, want the parse error", err)
+	}
+	if _, rerr := c.LastRefreshOf(a); !errors.Is(rerr, parse) {
+		t.Fatalf("the record reads %v, want the parse error", rerr)
+	}
+
+	// A stale malformed reply that a later refresh has already superseded
+	// (ticket 1 after ticket 2 committed) records nothing, leaves no refresh
+	// pending and is not a failure of the pass, as commitRefresh drops a
+	// superseded reply without one.
+	c.mu.Lock()
+	c.changed = make(map[string]bool)
+	c.mu.Unlock()
+	if err := c.recordRefreshFailure(a, 1, 0, 1, parse); err != nil {
+		t.Fatalf("a superseded stale reply failed the pass with %v; the later refresh already stood in for it", err)
+	}
+	c.mu.Lock()
+	pending := c.changed[a]
+	c.mu.Unlock()
+	if pending {
+		t.Fatal("a superseded stale reply left a refresh pending, which costs a listunspent the later refresh already made")
 	}
 }

@@ -299,10 +299,11 @@ func TestFailedRefreshAfterANotificationIsRetried(t *testing.T) {
 
 // One address the indexer refuses on every pass must not starve the
 // reconcile. The full pass is the only safety net against a notification the
-// server never sent, so a tick that lands during a backoff is deferred and
-// made up by the pass after it, not dropped. The policy that decides this is
-// model-tested in refreshpolicy_model_test.go; the same statement is made here
-// against a real refresher and a real server.
+// server never sent. A refusal paces nothing, so a tick that lands while the
+// refused address waits for its retry runs full at once; a tick that lands in
+// a connection backoff is deferred and made up by the pass after it. Both are
+// model-tested in refreshpolicy_model_test.go; the first is made here against
+// a real refresher and a real server.
 func TestARefusedAddressDoesNotStarveTheReconcile(t *testing.T) {
 	stub := newPushStub(t)
 	a1, a2 := craftAddr(t, 0x11), craftAddr(t, 0x22)
@@ -315,14 +316,46 @@ func TestARefusedAddressDoesNotStarveTheReconcile(t *testing.T) {
 	waitFor(t, "the first pass", func() bool {
 		return stub.count("blockchain.scripthash.listunspent", sh2) >= 1
 	})
-	// Reconcile ticks land every 150 ms throughout the one-second backoff and
-	// are deferred; the retry's pass must therefore be full and refresh the
-	// healthy address again. Without the deferral the count stays at the one
-	// refresh of the opening pass, for the life of the process.
-	waitFor(t, "the deferred reconcile to be made up", func() bool {
+	// Reconcile ticks land every 150 ms while the refused address waits for
+	// its retry and each runs a full pass, so the healthy address is refreshed
+	// again. When the wait paced the ticks the count stayed at the one refresh
+	// of the opening pass until the retry made the deferred tick up.
+	waitFor(t, "the reconcile to run during the refused address's wait", func() bool {
 		return stub.count("blockchain.scripthash.listunspent", sh1) >= 2
 	})
 	if n := stub.count("blockchain.scripthash.subscribe", sh1); n != 1 {
 		t.Fatalf("the healthy address was subscribed %d times: the refused address rebuilt the connection", n)
+	}
+}
+
+// Start runs one refresher and one ping loop however often it is called. A
+// second call once ran a second of each against the one cache, so every
+// address was subscribed and refreshed twice on every pass.
+func TestStartTwiceRunsOneRefresher(t *testing.T) {
+	stub := newPushStub(t)
+	a1 := craftAddr(t, 0x13)
+	sh1 := scripthashOf(t, a1)
+	stub.set(sh1, "s0", `[]`)
+	c := NewClient(stub.addr(), time.Hour, nil)
+	setHRP(t, c, types.Stagenet.HRP)
+	c.PingInterval = time.Hour
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Stop)
+	if err := c.TrackAddresses([]string{a1}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c.Start(ctx)
+	c.Start(ctx)
+	waitFor(t, "the opening pass", func() bool { return stub.count("blockchain.scripthash.listunspent", sh1) >= 1 })
+	time.Sleep(300 * time.Millisecond)
+	if n := stub.count("blockchain.scripthash.subscribe", sh1); n != 1 {
+		t.Fatalf("the address was subscribed %d times after Start twice, want 1", n)
+	}
+	if n := stub.count("blockchain.scripthash.listunspent", sh1); n != 1 {
+		t.Fatalf("the address was refreshed %d times after Start twice, want 1", n)
 	}
 }

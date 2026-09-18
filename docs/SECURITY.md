@@ -351,8 +351,13 @@ plaintext connection discloses your entire deposit set to anyone in between, and
 lets them alter the balances and UTXOs you act on. Coin selection acts on that
 data, so this is an integrity problem and not only a privacy one.
 
-The client speaks plaintext by default, because the common deployment is a server
-on localhost. Enable TLS for anything else:
+The client speaks plaintext to a loopback host, because the common deployment is a
+server on localhost, and to no other host until you say the path is private. `Connect`
+returns `electrumx.ErrPlaintextRemote`, with nothing dialled, for a host that is not
+`localhost` or a loopback IP literal while `TLSConfig` is nil and `AllowPlaintext` is not
+set. Loopback is read from the host as written and nothing is resolved, so a Docker
+service name or a LAN address is a remote host to the client, as it is to the RPC client
+below. Enable TLS for anything that is not loopback:
 
 ```go
 client := electrumx.NewClient("electrum.example.org:50002", 15*time.Second, logger)
@@ -374,19 +379,38 @@ if err := client.Connect(ctx); err != nil {
 }
 ```
 
-`TLSConfig` applies to reconnects as well. This matters: the client reconnects
-automatically when the connection is lost, when two calls in a row time out
-waiting for a reply, and after a panic in the refresher goroutine, so a
-downgrade there would be silent and could last for days. There is a test that
-pins it.
+`TLSConfig` applies to reconnects as well, and so does the plaintext refusal, since
+both go through the one dial. This matters: the client reconnects automatically when
+the connection is lost, when two calls in a row time out waiting for a reply, and after
+a panic in the refresher goroutine, so a downgrade there would be silent and could last
+for days. There is a test that pins it. A call that times out ends the pass it belongs
+to, so the second timeout follows on the retry whatever the address count, and a server
+that has stopped answering while holding the socket open is replaced after two call
+deadlines plus the backoff in force, which is one second after a clean pass and at most
+a minute.
 
 Do not set `InsecureSkipVerify`. An unverified TLS connection is worse than a
 plaintext one, because it looks secure while an on-path attacker can still
 substitute their own certificate.
 
-Where TLS is not available, run ElectrumX on localhost or reach it over a tunnel
-you control. That is a legitimate configuration and is why plaintext remains the
-default.
+Where TLS is not available, run ElectrumX on localhost or reach it over a tunnel that
+ends on this machine, so the host stays loopback and needs no setting. A private network
+segment is what `AllowPlaintext` is for; setting it states that nothing else can read
+that segment.
+
+```go
+client := electrumx.NewClient("electrumx.internal:50001", 15*time.Second, logger)
+client.AllowPlaintext = true // the host is not loopback and the segment is private
+```
+
+Every `listunspent` reply is validated as a whole before it reaches the cache
+(`electrumx/client.go`, `parseUnspent`): a transaction id that is not 64 hexadecimal
+digits, a negative value, a value above the node's per-output ceiling (`types.MaxMoney`,
+consensus on one output and not a bound on an address), a negative height, an outpoint
+listed twice, a sum that would not fit in an int64, or a result that is not a list is
+refused. The cache keeps its previous set and the address records the error, so
+`deposit.Monitor` skips and alarms it. The balance across addresses is the indexer's view,
+and credit reads your node.
 
 ### soqucoind RPC
 

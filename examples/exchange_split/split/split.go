@@ -27,10 +27,10 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/internal/loopback"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	"github.com/soqucoin-labs/soqucoin-sdk/withdraw"
 )
@@ -635,9 +635,5 @@ func LoopbackHost(hostport string) bool {
 	if err != nil {
 		host = hostport
 	}
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return loopback.Host(host)
 }

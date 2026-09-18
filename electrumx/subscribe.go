@@ -177,8 +177,9 @@ func (c *Client) touch(gen uint64, now time.Time) {
 // pass is one wake of the refresher: subscribe every tracked address not yet
 // subscribed on the live connection, then refresh the addresses with a change
 // pending, or every address when full (the reconcile, which also records
-// LastRefresh). A lost connection or an ended context stops the pass where
-// it is; the next pass picks up what is left.
+// LastRefresh). A lost connection, a reply that does not arrive within the
+// call deadline, or an ended context stops the pass where it is; the next pass
+// picks up what is left.
 func (c *Client) pass(ctx context.Context, full bool) (made bool, err error) {
 	if c.liveGen.Load() == 0 {
 		return false, ErrNotConnected // nothing to subscribe on; the refresher reconnects
@@ -198,7 +199,7 @@ func (c *Client) pass(ctx context.Context, full bool) (made bool, err error) {
 		made = true
 		if err := c.subscribe(ctx, addr); err != nil {
 			errs = append(errs, err)
-			if errIsConnection(err) || ctx.Err() != nil {
+			if endsPass(err) || ctx.Err() != nil {
 				return made, errors.Join(errs...)
 			}
 		}
@@ -247,25 +248,43 @@ func (c *Client) pingInterval() time.Duration {
 // Start launches the refresher: it subscribes every tracked address, refreshes
 // an address when the server reports it changed, makes a full pass on the
 // reconcile interval, and reconnects when the connection is lost (at once) or
-// two calls in a row time out waiting for a reply. An application error from
-// the server, such as one address it refuses, never rebuilds the connection.
-// Every failed pass is followed by a retry after a backoff that doubles from
-// one second to a minute and resets on the first clean pass, so a connection
-// that dies after every handshake is dialled a few times a minute, not
-// thousands. A reconcile tick that falls in a backoff is deferred, not
-// dropped, and the pass after the backoff runs full: an address the indexer
-// refuses on every pass delays the reconcile, it does not end it. The ping runs on its own goroutine on PingInterval, beside any
-// pass in progress, so a long reconcile does not age the addresses it has
-// not reached. Both goroutines end when ctx ends or Stop is called; every
-// call they make runs under ctx.
+// two calls in a row time out waiting for a reply. A call that times out ends
+// the pass it belongs to, so a server that has stopped answering while
+// holding the socket open costs one call deadline per pass, whatever the
+// address count, and is replaced after the second. Every failed pass is
+// followed by a retry after a backoff that doubles from one second to a
+// minute and resets on the first clean pass. After a lost connection or a
+// timeout that backoff paces everything: a wake during it waits for the
+// retry, a reconcile tick during it is deferred and the retry's pass runs
+// full, so a connection that dies after every handshake is dialled a few
+// times a minute. An application error from the server, such as one address
+// it refuses, rebuilds nothing and paces nothing: the refused address is
+// asked again on the same ladder, and a notification for another address is
+// refreshed at once. The ping runs on its own goroutine on PingInterval,
+// beside any pass in progress, so a long reconcile does not age the addresses
+// it has not reached. Both goroutines end when ctx ends or Stop is called;
+// every call they make runs under ctx.
+//
+// Start runs them once. A second call logs a warning and starts nothing, so a
+// caller that wires the client twice does not run two refreshers against one
+// cache. The one call is the first, whatever its context: a Start with a
+// context that has already ended, or after Stop, is that call, and the client
+// cannot be started again.
 //
 // Production lesson: the goroutine includes panic recovery and auto-reconnect.
 // Without this, a bufio panic kills the entire process. With recovery, the
 // goroutine logs the panic, reconnects, and resumes.
 func (c *Client) Start(ctx context.Context) {
-	pingErr := make(chan error, 1)
-	go c.pingLoop(ctx, pingErr)
-	go c.run(ctx, pingErr)
+	started := false
+	c.startOnce.Do(func() {
+		started = true
+		pingErr := make(chan error, 1)
+		go c.pingLoop(ctx, pingErr)
+		go c.run(ctx, pingErr)
+	})
+	if !started {
+		c.log.Warn("Start called again; the refresher is already running", "host", c.host)
+	}
 }
 
 // pingLoop pings on PingInterval and hands each failure to the refresher,

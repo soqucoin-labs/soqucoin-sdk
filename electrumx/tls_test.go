@@ -6,11 +6,14 @@
 // balances the caller acts on. Transport security here is an integrity property
 // and not only a privacy one.
 //
-// Three things are worth pinning, because each fails silently: TLS is really
+// Four things are worth pinning, because each fails silently: TLS is really
 // negotiated rather than configured and ignored, certificate verification is
-// really on by default, and a reconnect cannot drop back to plaintext. That last
-// one matters most, since the client reconnects automatically after two failed
-// polls and after a panic in the polling goroutine.
+// really on by default, a reconnect cannot drop back to plaintext, and
+// plaintext to a host that is not loopback is refused before anything is
+// dialled unless the operator has said the path is private. The reconnect one
+// matters most, since the client reconnects on its own after a lost
+// connection, after two reply timeouts in a row and after a panic in the
+// refresher.
 
 package electrumx
 
@@ -19,6 +22,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -176,5 +180,50 @@ func TestTLSToPlaintextServerFails(t *testing.T) {
 	if err := c.Connect(context.Background()); err == nil {
 		c.Stop()
 		t.Fatal("TLS client connected to a plaintext server")
+	}
+}
+
+// Plaintext to a host that is not loopback is refused with nothing dialled.
+// The context here would end a dial in 100 ms, so a client that dialled
+// reports the deadline rather than the refusal. AllowPlaintext lifts the
+// refusal, and so does a TLSConfig, since the refusal is about plaintext.
+func TestPlaintextToAHostThatIsNotLoopbackIsRefusedBeforeTheDial(t *testing.T) {
+	c := NewClient("10.255.255.1:50001", time.Second, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := c.Connect(ctx); !errors.Is(err, ErrPlaintextRemote) {
+		t.Fatalf("Connect to a remote host in plaintext: %v, want ErrPlaintextRemote", err)
+	}
+
+	c.AllowPlaintext = true
+	if err := c.Connect(ctx); err == nil || errors.Is(err, ErrPlaintextRemote) {
+		t.Fatalf("Connect with AllowPlaintext: %v, want a dial error", err)
+	}
+
+	c.AllowPlaintext = false
+	c.UseTLS()
+	if err := c.Connect(ctx); err == nil || errors.Is(err, ErrPlaintextRemote) {
+		t.Fatalf("Connect with TLS: %v, want a dial error", err)
+	}
+}
+
+// Loopback is read from the host as written by the one rule the rpc client
+// applies: the name localhost or a loopback IP literal, with the port split
+// off and brackets removed. Nothing listens on port 1, so every spelling that
+// passes the refusal reports a dial error instead.
+func TestLoopbackSpellingsTakePlaintextAndOtherHostsDoNot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	for _, host := range []string{"localhost:1", "127.0.0.1:1", "127.5.6.7:1", "[::1]:1"} {
+		err := NewClient(host, time.Second, nil).Connect(ctx)
+		if err == nil || errors.Is(err, ErrPlaintextRemote) {
+			t.Errorf("Connect(%q) in plaintext: %v, want a dial error", host, err)
+		}
+	}
+	for _, host := range []string{"127.1:1", "localhost.:1", "host.docker.internal:1", "example.invalid:1", "10.0.0.5"} {
+		err := NewClient(host, time.Second, nil).Connect(ctx)
+		if !errors.Is(err, ErrPlaintextRemote) {
+			t.Errorf("Connect(%q) in plaintext: %v, want ErrPlaintextRemote", host, err)
+		}
 	}
 }
