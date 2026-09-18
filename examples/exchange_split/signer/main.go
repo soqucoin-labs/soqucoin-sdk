@@ -421,8 +421,7 @@ func fatal(msg string, err error) {
 	os.Exit(1)
 }
 
-// heldTxID is the txid a withdrawal's inputs are spent under: the node's when
-// it accepted other bytes, the withdrawal's own otherwise.
+// heldTxID is the txid a withdrawal's inputs are spent under.
 func heldTxID(in *withdraw.Intent) string {
 	if in.NodeTxID != "" {
 		return in.NodeTxID

@@ -631,3 +631,19 @@ func TestRecoverKeepsTheEntriesOfAFailedIntentThatWasNotAbandoned(t *testing.T) 
 		t.Fatal("recover dropped the entries of a send the node took")
 	}
 }
+
+// A Broadcaster that passes the node's "already in chain" through reports a
+// success: the node has these bytes mined. rpc.Client folds it itself; the
+// engine reads it the same way from any other Broadcaster.
+func TestAlreadyInChainIsSuccessForBroadcastAndRebroadcast(t *testing.T) {
+	net := &fakeNet{mode: "inchain"}
+	e := newEngine(t, NewMemStore(), utxo.NewSpentSet("", nil), net, coins())
+	e.Submit(context.Background(), "w1", dst, 1_000_000, 1000)
+	w1, err := e.Process(context.Background(), "w1")
+	if err != nil || w1.State != StateBroadcast {
+		t.Fatalf("broadcast answered already in chain: %v %+v, want Broadcast", err, w1)
+	}
+	if err := e.Rebroadcast(context.Background(), w1); err != nil || w1.LastError != "" {
+		t.Fatalf("rebroadcast answered already in chain: %v, LastError %q, want success", err, w1.LastError)
+	}
+}

@@ -128,12 +128,10 @@ type Intent struct {
 	// it. Zero on records from before this field existed, which read UpdatedAt.
 	SentAt time.Time `json:"sent_at,omitempty"`
 	// AbandonedAt is set by Abandon. Recover drops the spent entries only of
-	// a Failed intent that carries it; any other Failed intent that owns
-	// entries is a store and spent set that disagree, and they are kept.
+	// a Failed intent that carries it; any other Failed owner's are kept.
 	AbandonedAt time.Time `json:"abandoned_at,omitempty"`
 	// Hold names why a Built intent is held (HoldRejectedAfterUnknown); empty
-	// when it is not. NodeTxID set is a hold in its own right, so records
-	// written before this field existed keep their meaning.
+	// when it is not. NodeTxID set is a hold in its own right.
 	Hold          string     `json:"hold,omitempty"`
 	RawHex        string     `json:"raw_hex,omitempty"`
 	Inputs        []Outpoint `json:"inputs,omitempty"`
@@ -183,8 +181,9 @@ type Store interface {
 }
 
 // Broadcaster sends a signed transaction and reports the outcome using the
-// rpc error kinds. *rpc.Client satisfies it. A context that ends during the
-// send, or a connection lost after the request was written, must be reported
+// rpc error kinds; rpc.ErrAlreadyInChain is read as success. *rpc.Client
+// satisfies it. A context that ends during the send, or a connection lost
+// after the request was written, must be reported
 // as rpc.ErrUnknownOutcome or as the context's error, never as
 // rpc.ErrPermanent or rpc.ErrTransient: the bytes may be in a mempool, and
 // the engine reads ErrTransient as the node answering without taking them.
@@ -281,16 +280,14 @@ var (
 	// reused for a different payment, which is a caller bug worth stopping.
 	ErrConflict = errors.New("withdraw: intent id already used for a different withdrawal")
 	// ErrHeld is returned by Broadcast, and reported by Recover, for a Built
-	// intent the engine will not send again and will not fail: one the node
-	// accepted under a different txid (NodeTxID set), or one the node rejected
-	// after an attempt whose outcome is unknown (Hold set). Its inputs are
-	// marked spent for good; Abandon is the way out. It never wraps the
-	// rejection, which is rpc.ErrPermanent and would read to the breaker as a
-	// fault of one request; a held intent is a run that must stop.
+	// intent the engine will not send again and will not fail: the node
+	// accepted it under a different txid (NodeTxID), or rejected it after an
+	// attempt whose outcome is unknown (Hold). Abandon is the way out. It never
+	// wraps the rejection: rpc.ErrPermanent reads to the breaker as one bad
+	// request, and a held intent is a run that must stop.
 	ErrHeld = errors.New("withdraw: intent is held; resolve by hand")
-	// ErrNotAbandonable is returned by Abandon when one of its checks did not
-	// pass: the wait since the last send is not over, the node knows the
-	// transaction, or an input is spent. Nothing changes.
+	// ErrNotAbandonable is returned by Abandon when a check did not pass: the
+	// wait is not over, the node knows the transaction, or an input is spent.
 	ErrNotAbandonable = errors.New("withdraw: the checks for abandoning the intent did not pass")
 	// ErrReservationLost is returned by Broadcast and by Recover for a Built
 	// intent whose inputs could not be re-reserved because another withdrawal
@@ -345,9 +342,8 @@ var beforeBuild = func() {}
 // DefaultReservationTTL applies when Engine.ReservationTTL is zero.
 const DefaultReservationTTL = 4 * time.Hour
 
-// DefaultAbandonAfter applies when Engine.AbandonAfter is zero. It is the
-// node's DEFAULT_MEMPOOL_EXPIRY: how long a peer keeps an unmined
-// transaction it relayed.
+// DefaultAbandonAfter applies when Engine.AbandonAfter is zero: the node's
+// DEFAULT_MEMPOOL_EXPIRY, how long a peer keeps an unmined transaction.
 const DefaultAbandonAfter = 24 * time.Hour
 
 // HoldRejectedAfterUnknown is Intent.Hold for a Built intent the node rejected
@@ -355,8 +351,7 @@ const DefaultAbandonAfter = 24 * time.Hour
 const HoldRejectedAfterUnknown = "rejected after an attempt whose outcome is unknown"
 
 // NodeTxIDUnknown is Intent.NodeTxID when a Broadcaster reported
-// rpc.ErrTxIDMismatch without the node's txid. It is not a txid and is never
-// sent to the node; Abandon decides on TxID and the inputs alone.
+// rpc.ErrTxIDMismatch without the node's txid; it is never sent to the node.
 const NodeTxIDUnknown = "unknown"
 
 func (e *Engine) now() time.Time { return time.Now().UTC() }
@@ -621,7 +616,7 @@ func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	}
 	got, err := e.Broadcaster.Broadcast(ctx, in.RawHex, in.TxID)
 	switch {
-	case err == nil:
+	case err == nil || errors.Is(err, rpc.ErrAlreadyInChain):
 		in.State = StateBroadcast
 		in.LastError = ""
 		perr := e.Spent.MarkBroadcastFor(e.inputs(in), in.TxID, in.ID)
@@ -788,8 +783,8 @@ func (e *Engine) Recover(ctx context.Context) error {
 		}
 	}
 	// An abandoned intent whose Forget did not land still owns broadcast
-	// entries, and nothing else would ever free those inputs. Any other
-	// Failed intent that owns them is a store that missed a send; kept.
+	// entries; any other Failed intent that owns them is a store that missed
+	// a send, and those are kept.
 	for _, id := range e.Spent.SentIntents() {
 		in, ok, err := e.Store.Get(repair, id)
 		if err != nil {
@@ -956,6 +951,9 @@ func (e *Engine) Rebroadcast(ctx context.Context, in *Intent) error {
 		return fmt.Errorf("record re-send %d of %s, nothing sent: %w", in.Attempts, in.ID, err)
 	}
 	_, err = e.Broadcaster.Broadcast(ctx, in.RawHex, in.TxID)
+	if errors.Is(err, rpc.ErrAlreadyInChain) {
+		err = nil // the node has these bytes mined
+	}
 	in.LastError = ""
 	if err != nil {
 		err = fmt.Errorf("rebroadcast %s: %w", in.ID, err)

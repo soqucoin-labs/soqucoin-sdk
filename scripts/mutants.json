@@ -810,6 +810,24 @@
       "find": "\t\tfor key, e := range dropped {\n\t\t\tss.entries[key] = e\n\t\t}\n\t\treturn err",
       "replace": "\t\tfor key, e := range dropped {\n\t\t\t_ = key\n\t\t\t_ = e\n\t\t}\n\t\treturn err",
       "why": "A drop that is not on disk must not take effect in memory: the process would select inputs the file still records as spent, and a restart would put the entries back under a record that says Failed."
+    },
+    {
+      "id": "withdraw-broadcast-reads-already-in-chain-as-unknown",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestAlreadyInChainIsSuccessForBroadcastAndRebroadcast",
+      "find": "\tcase err == nil || errors.Is(err, rpc.ErrAlreadyInChain):",
+      "replace": "\tcase err == nil:",
+      "why": "A node that already has the bytes mined has taken the payment. Read as an unknown outcome the intent stays Built and is re-sent every pass for a transaction that has confirmed."
+    },
+    {
+      "id": "withdraw-rebroadcast-reads-already-in-chain-as-a-refusal",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestAlreadyInChainIsSuccessForBroadcastAndRebroadcast",
+      "find": "\tif errors.Is(err, rpc.ErrAlreadyInChain) {\n\t\terr = nil",
+      "replace": "\tif false {\n\t\terr = nil",
+      "why": "A re-send after the transaction mined is answered already in chain, which is the node saying it has the bytes. Read as a refusal it is recorded and returned as a failure on every pass and sends an operator to a payment that has confirmed."
     }
   ]
 }
