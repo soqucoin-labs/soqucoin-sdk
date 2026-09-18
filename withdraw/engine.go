@@ -201,10 +201,9 @@ type Confirmer interface {
 }
 
 // Chain answers Abandon's two questions from the node: whether it knows a
-// transaction, and whether an outpoint is unspent. A "no" to either is acted
-// on, so an implementation refuses to answer while the node is behind, as
-// RPCChain does. It is called with the engine's lock held and must not call
-// back into the Engine.
+// transaction, and whether an outpoint is unspent. A "no" is acted on, so an
+// implementation refuses to answer while the node is behind, as RPCChain does.
+// It is called with the engine's lock held and must not call back into the Engine.
 type Chain interface {
 	KnowsTransaction(ctx context.Context, txid string) (bool, error)
 	Unspent(ctx context.Context, txid string, vout uint32) (bool, error)
@@ -783,8 +782,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 		}
 	}
 	// An abandoned intent whose Forget did not land still owns broadcast
-	// entries; any other Failed intent that owns them is a store that missed
-	// a send, and those are kept.
+	// entries; any other Failed owner's are a store that missed a send, kept.
 	for _, id := range e.Spent.SentIntents() {
 		in, ok, err := e.Store.Get(repair, id)
 		if err != nil {
@@ -1118,8 +1116,8 @@ func (c RPCConfirmer) Confirmations(ctx context.Context, txid string) (int64, er
 // since a "no" from a node behind its headers would let Abandon free the
 // inputs of a transaction the network has. KnowsTransaction is
 // getrawtransaction, then gettxout on output 0; Unspent is gettxout with the
-// mempool included. Without -txindex a mined transaction whose outputs are
-// all spent is unknown to the first; the inputs check refuses the abandon.
+// mempool included. Without -txindex a spent-out mined transaction is unknown
+// to the first; the inputs check refuses the abandon.
 type RPCChain struct{ Client *rpc.Client }
 
 // KnowsTransaction implements Chain.
