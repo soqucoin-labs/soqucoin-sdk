@@ -462,12 +462,12 @@ func (ss *SpentSet) Size() int {
 	return len(ss.entries)
 }
 
-// persist writes the spent set to disk atomically.
 // writeFile is atomicfile.WriteFile, a variable so a test can make the write
 // fail after the rename and see what Reserve does with a reservation that is
 // in the file and not known to be durable.
 var writeFile = atomicfile.WriteFile
 
+// persist writes the spent set to disk atomically.
 func (ss *SpentSet) persist() error {
 	if ss.filePath == "" {
 		return nil
