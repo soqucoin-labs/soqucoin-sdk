@@ -286,4 +286,18 @@ func TestAMalformedReplyFromAReplacedConnectionIsRecordedAsTheReplacement(t *tes
 	if _, rerr := c.LastRefreshOf(a); !errors.Is(rerr, parse) {
 		t.Fatalf("the record reads %v, want the parse error", rerr)
 	}
+
+	// A stale malformed reply that a later refresh has already superseded
+	// (ticket 1 after ticket 2 committed) records nothing and leaves no
+	// refresh pending, as commitRefresh drops a superseded reply.
+	c.mu.Lock()
+	c.changed = make(map[string]bool)
+	c.mu.Unlock()
+	_ = c.recordRefreshFailure(a, 1, 0, 1, parse)
+	c.mu.Lock()
+	pending := c.changed[a]
+	c.mu.Unlock()
+	if pending {
+		t.Fatal("a superseded stale reply left a refresh pending, which costs a listunspent the later refresh already made")
+	}
 }
