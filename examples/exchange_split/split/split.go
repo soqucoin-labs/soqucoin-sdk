@@ -190,6 +190,13 @@ func (s *DirStore) get(id string) (*withdraw.Intent, bool, error) {
 // exists, whichever process made it, so exactly one Create of an id succeeds
 // and the other receives withdraw.ErrExists. The record is on disk, and its
 // directory entry synced, before it returns nil.
+//
+// The intents directory therefore has to be on a filesystem that supports
+// hard links. A share that does not fails every Create with the link error
+// at the first withdrawal, which is loud and immediate; the alternative, an
+// exclusive create written in place, would leave a half-written record
+// visible to every reader after a crash. A crash between the link and the
+// removal of the temporary file leaves that file behind; List skips it.
 func (s *DirStore) Create(_ context.Context, in *withdraw.Intent) error {
 	data, err := s.encode(in)
 	if err != nil {
@@ -276,9 +283,10 @@ func (s *DirStore) List(_ context.Context, states ...withdraw.State) ([]*withdra
 		}
 		if err := CheckID(in.ID); err != nil {
 			// The name and the record can agree and both still be unusable,
-			// as "bad id.json" holding the id "bad id" does. Get and Put
-			// refuse that id, so the engine would receive a withdrawal this
-			// store can neither read back nor persist on its next transition.
+			// as "bad id.json" holding the id "bad id" does. Get, Create and
+			// Update refuse that id, so the engine would receive a withdrawal
+			// this store can neither read back nor persist on its next
+			// transition.
 			return nil, fmt.Errorf("intent file %s: %w", name, err)
 		}
 		if name != s.file(in.ID) {
@@ -321,8 +329,8 @@ func replaceFile(path string, data []byte, perm os.FileMode) error {
 // createFile puts data at path as replaceFile does, except that a path that
 // already exists is refused with fs.ErrExist and left as it was. The
 // temporary file is linked into place rather than renamed: a link onto an
-// existing name fails, atomically, on every filesystem this example runs on,
-// which is what makes one Create of an id succeed and the rest fail.
+// existing name fails atomically where hard links are supported, which is
+// what makes one Create of an id succeed and the rest fail.
 func createFile(path string, data []byte, perm os.FileMode) error {
 	tmp, err := writeTemp(path, data, perm)
 	if err != nil {

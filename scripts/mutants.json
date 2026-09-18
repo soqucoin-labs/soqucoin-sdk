@@ -542,15 +542,6 @@
       "why": "UpdateConfirmations acts on the stored record. Without the re-read a loop holding a copy from one block earlier writes Broadcast over a record another loop has confirmed; the store refuses the write as stale and the loop reports an error for an intent that is complete, and a ledger acting on the Confirmed transition cannot rely on seeing it once."
     },
     {
-      "id": "withdraw-recover-sends-a-built-intent-it-could-not-re-reserve",
-      "file": "withdraw/engine.go",
-      "package": "./withdraw",
-      "test": "TestRecoverDoesNotSendABuiltIntentItCouldNotReReserve",
-      "find": "\t\t\tnote(fmt.Errorf(\"recover %s: not sent: %w\", in.ID, notReserved(err)))\n\t\t\tcontinue",
-      "replace": "\t\t\tnote(fmt.Errorf(\"recover %s: not sent: %w\", in.ID, notReserved(err)))",
-      "why": "Recover re-reserves a Built intent's inputs before it sends the bytes, and the guide promises exactly that. When the reservation is refused, another withdrawal holds an input and two signed transactions stand over it. Sending the second anyway relies on the node to reject it, fails the withdrawal a user asked for, and reports nothing the operator can act on; ErrReservationLost exists for this case and was bypassed here."
-    },
-    {
       "id": "withdraw-fail-releases-the-inputs-before-the-verdict-lands",
       "file": "withdraw/engine.go",
       "package": "./withdraw",
@@ -564,8 +555,8 @@
       "file": "utxo/selector.go",
       "package": "./withdraw",
       "test": "TestRetryAfterOwnBroadcastSaveFailedIsNotAReservationLoss",
-      "find": "\t\t\tif e.IntentID == intentID {",
-      "replace": "\t\t\tif e.IntentID == intentID && e.reserved() {",
+      "find": "\t\t\tif intentID != \"\" && e.IntentID == intentID {",
+      "replace": "\t\t\tif intentID != \"\" && e.IntentID == intentID && e.reserved() {",
       "why": "A retry after a lost reply renews the reservation of a Built intent. When an earlier attempt succeeded and its record did not land, the set holds the intent's own inputs as sent, and refusing them names a conflicting withdrawal that does not exist: the engine reports ErrReservationLost, which the guide says halts every payout, for a transaction that went out once."
     },
     {
@@ -573,9 +564,54 @@
       "file": "utxo/selector.go",
       "package": "./utxo",
       "test": "TestReserveLeavesTheCallersOwnBroadcastEntryPermanent",
-      "find": "\t\t\tif e.IntentID == intentID && !e.reserved() {\n\t\t\t\tcontinue",
+      "find": "\t\t\tif intentID != \"\" && e.IntentID == intentID && !e.reserved() {\n\t\t\t\tcontinue",
       "replace": "\t\t\tif false {\n\t\t\t\tcontinue",
       "why": "An entry that records a send is permanent until the chain confirms it. Accepting the intent's own sent entry and then writing a reservation over it gives the inputs of a transaction in a mempool an expiry, after which the next withdrawal selects them and double-spends its own payment."
+    },
+    {
+      "id": "withdraw-reread-is-bound-to-the-callers-context",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBroadcastUnderAnEndedContextStillHoldsTheIntent",
+      "find": "\tstored, ok, err := e.Store.Get(context.WithoutCancel(ctx), in.ID)",
+      "replace": "\tstored, ok, err := e.Store.Get(ctx, in.ID)",
+      "why": "The re-read decides what the engine may do and is not a network call. Bound to the caller's context, a store that honours the context answers an ended one with an error, and Broadcast returns before it renews the reservation or records the attempt; a worker pool whose per-task deadlines expire while tasks wait then never renews, the reservation lapses at its TTL, and the inputs of a signed transaction are selected by the next withdrawal. The same context ending a moment later, inside the send, is a lost reply that does both."
+    },
+    {
+      "id": "withdraw-broadcast-sends-inputs-it-does-not-hold",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestRecoverDoesNotSendABuiltIntentItCouldNotReReserve",
+      "find": "\tif rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {\n\t\treturn e.holdBuilt(ctx, in, notReserved(rerr))\n\t}",
+      "replace": "\tif rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {\n\t\t_ = rerr\n\t}",
+      "why": "Broadcast is the one place a send starts, and the shipped broadcaster lists every Built intent each pass and sends each. A Built intent whose inputs another withdrawal holds is two signed transactions over one input; refusing it only in Recover leaves the next pass to send it, and the second send also overwrites the first transaction's record of the shared input in the spent set."
+    },
+    {
+      "id": "spent-set-reserve-with-no-intent-owns-unowned-entries",
+      "file": "utxo/selector.go",
+      "package": "./utxo",
+      "test": "TestReserveWithNoIntentNeverMatchesAnEntryWithNone",
+      "find": "\t\t\tif intentID != \"\" && e.IntentID == intentID {",
+      "replace": "\t\t\tif e.IntentID == intentID {",
+      "why": "MarkBroadcast writes entries with no withdrawal id, and the pool payout and consolidation examples use it. A Reserve that names no withdrawal would match those entries as its own, skip every write, and answer nil: the caller is told the inputs are reserved for it while the set records them as spent in a transaction that is out."
+    },
+    {
+      "id": "filestore-create-accepts-an-existing-id",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestStoresWriteOnlyOverTheStateTheyWereTold",
+      "find": "\tif _, had := fs.intents[in.ID]; had {",
+      "replace": "\tif false {",
+      "why": "Create is the registration write, and its refusal of an id the store holds is what keeps a second Submit of one id from writing Created over the record a worker has driven to Built or Broadcast. The in-memory store has the same check pinned separately; this is the file-backed one an exchange without a database runs."
+    },
+    {
+      "id": "split-store-update-ignores-the-state-it-was-told",
+      "file": "examples/exchange_split/split/split.go",
+      "package": "./examples/exchange_split/split",
+      "test": "TestCreateRefusesAnExistingRecordAndUpdateRefusesAnotherState",
+      "find": "\tif stored.State != from {",
+      "replace": "\tif false {",
+      "why": "Update writes only over the state the caller read. In the shared directory the three processes hold no common lock, so this comparison is the only thing that refuses a process writing over a record another process has moved, and without it a late write puts a sent intent back to Built or a built one back to Created."
     }
   ]
 }

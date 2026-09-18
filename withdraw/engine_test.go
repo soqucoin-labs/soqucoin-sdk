@@ -497,8 +497,8 @@ func TestUnsettledBroadcastRenewsTheReservation(t *testing.T) {
 }
 
 // If the reservation did expire and another withdrawal took the input before
-// the retry, the retry must not release or fail the first intent (its bytes
-// may be in the mempool) and must say what happened.
+// the retry, the retry sends nothing, must not release or fail the first
+// intent (its bytes may be in the mempool) and must say what happened.
 func TestRetryAfterLostReservationReportsAndHolds(t *testing.T) {
 	spent := utxo.NewSpentSet("", nil)
 	net := &fakeNet{mode: "lost"}
@@ -514,14 +514,17 @@ func TestRetryAfterLostReservationReportsAndHolds(t *testing.T) {
 	if err != nil || w2.Inputs[0].TxID != w1.Inputs[0].TxID {
 		t.Fatalf("w2 should have taken the lapsed input: %v %+v", err, w2)
 	}
-	net.setMode("lost")
+	sentBefore := net.sentCount()
 	err = e.Broadcast(context.Background(), w1)
-	if !errors.Is(err, ErrReservationLost) || !errors.Is(err, rpc.ErrUnknownOutcome) {
-		t.Fatalf("retry after the input was taken: %v, want ErrReservationLost wrapping the broadcast error", err)
+	if !errors.Is(err, ErrReservationLost) {
+		t.Fatalf("retry after the input was taken: %v, want ErrReservationLost", err)
+	}
+	if net.sentCount() != sentBefore {
+		t.Fatal("the retry sent bytes over an input another withdrawal holds")
 	}
 	w1, _, _ = e.Store.Get(context.Background(), "w1")
-	if w1.State != StateBuilt || w1.RawHex == "" {
-		t.Fatalf("w1 %+v, want still Built with its bytes", w1)
+	if w1.State != StateBuilt || w1.RawHex == "" || w1.LastError == "" {
+		t.Fatalf("w1 %+v, want still Built with its bytes and the cause recorded", w1)
 	}
 	if !spent.IsSpent(w1.Inputs[0].TxID, w1.Inputs[0].Vout) {
 		t.Fatal("w2's broadcast entry was released by w1's retry")
@@ -628,6 +631,21 @@ func TestBuildWithUnwritableSpentSetSendsNothing(t *testing.T) {
 	}
 }
 
+// breakSetInSend replaces the spent set's file with a directory while the
+// send is in flight, so the next persist fails at the rename.
+type breakSetInSend struct {
+	inner Broadcaster
+	path  string
+}
+
+func (b breakSetInSend) Broadcast(ctx context.Context, rawHex, txid string) (string, error) {
+	_ = os.Remove(b.path)
+	if err := os.MkdirAll(filepath.Join(b.path, "x"), 0o700); err != nil {
+		return "", err
+	}
+	return b.inner.Broadcast(ctx, rawHex, txid)
+}
+
 // The disk fails between a successful broadcast and the spent-set write. The
 // intent is still recorded as Broadcast (the payment is out), the error is
 // returned so the operator hears about it, this process refuses the inputs,
@@ -642,7 +660,11 @@ func TestBroadcastWithUnwritableSpentSetReportsAndRecoverRemarks(t *testing.T) {
 	if err := e.Build(context.Background(), w1); err != nil {
 		t.Fatal(err)
 	}
-	e.Spent = failingSpentSet(t) // the disk goes away after the build
+	// The disk goes away inside the send, after the reservation was renewed
+	// and before the spend is recorded: the Broadcaster breaks the set's path.
+	setPath := filepath.Join(t.TempDir(), "spent.json")
+	e.Spent = utxo.NewSpentSet(setPath, nil)
+	e.Broadcaster = breakSetInSend{inner: net, path: setPath}
 	err := e.Broadcast(context.Background(), w1)
 	if !errors.Is(err, utxo.ErrPersist) {
 		t.Fatalf("broadcast: %v, want ErrPersist reported", err)

@@ -37,10 +37,11 @@
 //
 // The context governs what the engine asks of the network and how long it
 // waits for the store to answer a read. It does not govern the writes that
-// record what the network did: those Store.Put calls, and the Get and List
+// record what the network did: those Store.Update calls, the re-read each
+// transition makes of the record it is about to act on, and the Get and List
 // calls Recover makes to repair the spent set, are made under
 // context.WithoutCancel(ctx), because the record must land, and the repair
-// must run, whether or not the caller is still waiting. Submit's write is
+// must run, whether or not the caller is still waiting. Submit's Create is
 // the one exception: it records nothing the network has done and is bound
 // to the caller's context. A Store bounds every call with a timeout of its
 // own; the engine's contexts carry no deadline on these paths.
@@ -125,19 +126,25 @@ type Intent struct {
 // every write conditional on what the writer read, so no caller can move a
 // record backwards: a second Submit cannot write Created over a Built intent,
 // and a confirmation loop holding a stale copy cannot write Broadcast over
-// Confirmed. A database store implements Create as an insert that fails on
-// the primary key and Update as an update whose where clause names the state.
+// Confirmed. A database store implements Create as an insert that reports a
+// conflict on the primary key without aborting the caller's transaction (in
+// PostgreSQL, ON CONFLICT DO NOTHING and a row count), and Update as an
+// update whose where clause names the state. The engine also calls Update
+// with from equal to the record's own state, to record an attempt that
+// settled nothing, so the where clause must not demand that the state change.
 //
 // Which context each call receives: Create, and the Get and List calls of
 // Submit, Process and the re-send pass of Recover, receive the caller's
-// context. Every Update, and the Get and List calls of Recover's repair
-// passes, receive one that does not end when the caller's does
-// (context.WithoutCancel, which also carries no deadline): the engine makes
-// them to record what the network has already done, or to repair the spent
-// set from the record, and a record cut short by the caller is a Built
-// intent the store thinks is Created, or a held intent it thinks is
-// sendable. A database-backed store bounds every method with its own
-// timeout and does not rely on the context for that.
+// context. Every Update, the Get each of Build, Broadcast and
+// UpdateConfirmations makes under the engine's lock to re-read the record it
+// acts on, and the Get and List calls of Recover's repair passes, receive one
+// that does not end when the caller's does (context.WithoutCancel, which also
+// carries no deadline): the engine makes them to record what the network has
+// already done, to decide what it may do, or to repair the spent set from the
+// record, and a record cut short by the caller is a Built intent the store
+// thinks is Created, or a held intent it thinks is sendable. A database-backed
+// store bounds every method with its own timeout and does not rely on the
+// context for that.
 type Store interface {
 	Get(ctx context.Context, id string) (*Intent, bool, error)
 	Create(ctx context.Context, intent *Intent) error
@@ -148,13 +155,15 @@ type Store interface {
 // Broadcaster sends a signed transaction and reports the outcome using the
 // rpc error kinds. *rpc.Client satisfies it. A context that ends during the
 // send must be reported as rpc.ErrUnknownOutcome or as the context's error,
-// never as rpc.ErrPermanent: the bytes may be in a mempool.
+// never as rpc.ErrPermanent: the bytes may be in a mempool. It is called with
+// the engine's lock held and must not call back into the Engine.
 type Broadcaster interface {
 	Broadcast(ctx context.Context, rawHex, txid string) (string, error)
 }
 
 // Confirmer reports how many confirmations a transaction has (0 for mempool).
-// It is optional; without it intents stay in StateBroadcast.
+// It is optional; without it intents stay in StateBroadcast. It is called
+// with the engine's lock held and must not call back into the Engine.
 type Confirmer interface {
 	Confirmations(ctx context.Context, txid string) (int64, error)
 }
@@ -162,7 +171,8 @@ type Confirmer interface {
 // Selector chooses inputs for an amount at a fee rate. It must honour the
 // engine's SpentSet (utxo.CoinSelector does) so reserved inputs are skipped.
 // An error that is rpc.ErrTransient, or the context's own error, leaves the
-// intent Created for a later Build; any other error fails it.
+// intent Created for a later Build; any other error fails it. It is called
+// with the engine's lock held and must not call back into the Engine.
 type Selector func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error)
 
 // BuildSigner turns selected inputs into a signed transaction. tx.BuildAndSign
@@ -171,10 +181,17 @@ type Selector func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, er
 // transaction the node would refuse fails Build and never reaches Broadcast.
 // A signer that reaches another process honours the context; when it returns
 // the context's error nothing signed has reached the engine, the reservation
-// is released and the intent stays Created.
+// is released and the intent stays Created. It is called with the engine's
+// lock held and must not call back into the Engine.
 type BuildSigner func(ctx context.Context, inputs []types.UTXO, toAddress string, amount, feeRate int64) (rawHex, txid string, err error)
 
 // Engine drives intents through the state machine.
+//
+// One lock covers every transition after Submit, and it is held across the
+// selector, the signer, the Broadcaster and the Confirmer. Builds, sends and
+// confirmation lookups are therefore serialised within one process, and a
+// node call that does not return holds every transition for as long as its
+// context allows, so give the injected clients a deadline.
 type Engine struct {
 	Store       Store
 	Spent       *utxo.SpentSet
@@ -228,12 +245,12 @@ var (
 	// intent would silently become a Broadcast intent under a txid the node
 	// does not know. An operator resolves it by hand.
 	ErrHeld = errors.New("withdraw: intent is held after a txid mismatch; resolve by hand")
-	// ErrReservationLost is returned when a Built intent's inputs could not be
-	// re-reserved because another withdrawal took them after the reservation
-	// expired: by Broadcast, wrapped around the broadcast error, after an
-	// attempt that did not settle the intent; and by Recover for a Built
-	// intent it therefore did not send. Both transactions cannot confirm; the
-	// operator resolves which one the network took.
+	// ErrReservationLost is returned by Broadcast and by Recover for a Built
+	// intent whose inputs could not be re-reserved because another withdrawal
+	// took them after the reservation expired. Nothing is sent for it: the
+	// intent stays Built with its bytes, which an earlier attempt may have
+	// relayed, and both transactions cannot confirm. The operator resolves
+	// which one the network took.
 	ErrReservationLost = errors.New("withdraw: inputs of a built intent were taken by another withdrawal")
 	// ErrExists is returned by Store.Create for an id the store already
 	// holds. Submit reads the existing record and answers with it.
@@ -311,8 +328,15 @@ func (e *Engine) save(ctx context.Context, in *Intent, from State) error {
 // store does not hold. Every transition after Submit calls it under e.mu
 // before acting, because the caller's copy can be behind the store: another
 // worker may have advanced the intent between the caller's read and the lock.
+//
+// The read is not bound to the caller's context. It decides what the engine
+// may do, not what it asks of the network, and a store that honours the
+// context would otherwise turn an ended context into a transition that never
+// happened: a Broadcast that renews no reservation and records no attempt,
+// where the same context ending a moment later, inside the send, is a lost
+// reply that does both.
 func (e *Engine) reread(ctx context.Context, in *Intent, want State) (*Intent, error) {
-	stored, ok, err := e.Store.Get(ctx, in.ID)
+	stored, ok, err := e.Store.Get(context.WithoutCancel(ctx), in.ID)
 	if err != nil {
 		return nil, fmt.Errorf("re-read %s: %w", in.ID, err)
 	}
@@ -480,6 +504,14 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 // and sends nothing; without that, the second sender's lost reply would renew
 // a reservation over inputs the first had marked spent and save Built over
 // the Broadcast the first had recorded.
+//
+// Before the send the intent's inputs are re-reserved for another TTL, so a
+// Built intent retried at least once per ReservationTTL never loses them.
+// When that fails, because another withdrawal holds an input after the
+// reservation expired (ErrReservationLost) or the spent set cannot be
+// written, nothing is sent: the intent stays Built with its bytes and the
+// cause recorded, and the operator resolves it. This is the same rule
+// Recover applies, at the one place a send can start.
 func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	if in.State != StateBuilt {
 		return fmt.Errorf("%w: %s is %s", ErrWrongState, in.ID, in.State)
@@ -493,6 +525,9 @@ func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	*in = *stored
 	if in.NodeTxID != "" {
 		return fmt.Errorf("%w: %s computed %s, node accepted %s", ErrHeld, in.ID, in.TxID, in.NodeTxID)
+	}
+	if rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {
+		return e.holdBuilt(ctx, in, notReserved(rerr))
 	}
 	in.Attempts++
 	got, err := e.Broadcaster.Broadcast(ctx, in.RawHex, in.TxID)
@@ -548,19 +583,12 @@ func (e *Engine) deferBuild(ctx context.Context, in *Intent, cause error) error 
 	return cause
 }
 
-// holdBuilt keeps a Built intent Built after a broadcast attempt that did not
-// settle it: the reservation is renewed for another TTL so the inputs cannot
-// be selected by a later withdrawal while this one is unresolved, the cause
-// is recorded, and the cause is returned. The renewal accepts entries this
-// intent already holds of either kind, so an earlier send of its own whose
-// save failed is not read as another withdrawal taking the inputs.
+// holdBuilt keeps a Built intent Built after a Broadcast call that did not
+// settle it, whether the send happened or was refused: the cause is recorded
+// and returned. Nothing is released and the intent is not failed, because
+// its bytes may be in a mempool. The reservation was renewed before the
+// send, by Broadcast, and stays as it is.
 func (e *Engine) holdBuilt(ctx context.Context, in *Intent, cause error) error {
-	if rerr := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); rerr != nil {
-		// The reservation had expired and another withdrawal took an input.
-		// Do not release anything and do not fail this intent: its bytes may
-		// be in the mempool. Report both facts.
-		cause = fmt.Errorf("%w: %v: %w", ErrReservationLost, rerr, cause)
-	}
 	in.LastError = cause.Error()
 	if saveErr := e.save(ctx, in, StateBuilt); saveErr != nil {
 		return errors.Join(cause, saveErr)
@@ -581,10 +609,10 @@ func (e *Engine) Process(ctx context.Context, id string) (*Intent, error) {
 	if in.State == StateCreated {
 		beforeBuild()
 		if err := e.Build(ctx, in); err != nil {
-			// ErrWrongState here means another worker holds this intent and
-			// advanced it between the read above and Build's lock. It is
-			// returned rather than followed: that worker is sending it, and a
-			// later call reads the intent fresh.
+			// ErrWrongState here means another worker moved this intent
+			// between the read above and Build's lock, to Built, Broadcast or
+			// Failed. It is returned rather than followed: that worker holds
+			// the intent, and a later call reads it fresh.
 			return in, err
 		}
 	}
@@ -667,10 +695,9 @@ func (e *Engine) Recover(ctx context.Context) error {
 		}
 		if err := e.Spent.Reserve(e.inputs(in), in.ID, e.reservationTTL()); err != nil {
 			// The inputs are held by another withdrawal, or the set could
-			// not be written. Either way this intent is not sent: two signed
-			// transactions over one input is the case ErrReservationLost
-			// exists for, and a reservation the set would forget on restart
-			// is no reservation. The bytes stay; the operator decides.
+			// not be written. Broadcast would refuse this intent for the same
+			// reason; refusing it here keeps the re-reservation of every
+			// Built intent ahead of any send and reports the cause once.
 			e.log().Warn("recover: built intent not sent, inputs not re-reserved", "intent", in.ID, "err", err)
 			note(fmt.Errorf("recover %s: not sent: %w", in.ID, notReserved(err)))
 			continue
@@ -792,9 +819,9 @@ func (e *Engine) fail(ctx context.Context, in *Intent, cause error, keepTx bool,
 	return cause
 }
 
-// notReserved wraps a Reserve failure for a Built intent Recover did not
-// send: another withdrawal holding an input is ErrReservationLost, and a set
-// that could not be written is reported as the write error it is.
+// notReserved wraps a Reserve failure for a Built intent that is therefore
+// not sent: another withdrawal holding an input is ErrReservationLost, and a
+// set that could not be written is reported as the write error it is.
 func notReserved(err error) error {
 	if errors.Is(err, utxo.ErrAlreadyReserved) {
 		return fmt.Errorf("%w: %w", ErrReservationLost, err)

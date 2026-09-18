@@ -333,3 +333,19 @@ func TestReserveLeavesTheCallersOwnBroadcastEntryPermanent(t *testing.T) {
 		t.Fatalf("another withdrawal took a sent input: %v", err)
 	}
 }
+
+// MarkBroadcast records a spend with no withdrawal id. A Reserve that names no
+// withdrawal either must not read those entries as its own: the input is
+// spent, and the caller must be refused it.
+func TestReserveWithNoIntentNeverMatchesAnEntryWithNone(t *testing.T) {
+	ss := NewSpentSet("", nil)
+	if err := ss.MarkBroadcast(rUTXOs()[:1], "txid-sent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.Reserve(rUTXOs(), "", time.Hour); !errors.Is(err, ErrAlreadyReserved) {
+		t.Fatalf("Reserve over a spent input, with no intent id: %v, want ErrAlreadyReserved", err)
+	}
+	if ss.IsSpent(rTxB, 1) {
+		t.Fatal("a refused reservation reserved the free input")
+	}
+}

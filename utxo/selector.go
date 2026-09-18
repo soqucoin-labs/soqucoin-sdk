@@ -184,6 +184,9 @@ func OpenSpentSet(filePath string, logger *slog.Logger) (*SpentSet, error) {
 // case is a retry after a send whose reply was lost and whose earlier attempt
 // had succeeded without the record of it landing; reading it as another
 // withdrawal taking the inputs would name a conflict that does not exist.
+// An empty intentID owns nothing: entries MarkBroadcast wrote without an
+// intent carry an empty id too, and a caller reserving without one must
+// still be refused those inputs.
 func (ss *SpentSet) Reserve(inputs []types.UTXO, intentID string, ttl time.Duration) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -192,7 +195,7 @@ func (ss *SpentSet) Reserve(inputs []types.UTXO, intentID string, ttl time.Durat
 	for _, u := range inputs {
 		key := SpentKey{u.TxID, u.Vout}
 		if e, exists := ss.entries[key]; exists && !e.expired(now) {
-			if e.IntentID == intentID {
+			if intentID != "" && e.IntentID == intentID {
 				continue // this withdrawal's own entry: renewed below, or kept if it records a send
 			}
 			return fmt.Errorf("%w: %s:%d (%s)", ErrAlreadyReserved, u.TxID, u.Vout, e.SpentInTx)
@@ -205,7 +208,7 @@ func (ss *SpentSet) Reserve(inputs []types.UTXO, intentID string, ttl time.Durat
 			continue // the same outpoint twice: keep the state from before the first write
 		}
 		if e, exists := ss.entries[key]; exists {
-			if e.IntentID == intentID && !e.reserved() {
+			if intentID != "" && e.IntentID == intentID && !e.reserved() {
 				continue // this withdrawal's own record of a send: permanent, never replaced by a reservation
 			}
 			e := e

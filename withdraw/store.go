@@ -15,12 +15,12 @@ import (
 )
 
 // writeFile is the durable replace step, a variable so a test can fail it
-// after the content has landed at the path. That is the one failure Put keeps
-// its record on, and the one no test can provoke from outside.
+// after the content has landed at the path. That is the one failure a write
+// keeps its record on, and the one no test can provoke from outside.
 var writeFile = atomicfile.WriteFile
 
-// ErrWrittenNotDurable reports a Put whose record reached the store but whose
-// durability is unconfirmed: the content is at the path and a reader of the
+// ErrWrittenNotDurable reports a Create or Update whose record reached the
+// store but whose durability is unconfirmed: the content is at the path and a reader of the
 // store will find it, and only a power loss before the filesystem flushes its
 // directory entry would lose it.
 //
@@ -81,7 +81,7 @@ func (m *MemStore) Update(_ context.Context, in *Intent, from State) error {
 	return nil
 }
 
-// expectState is the check behind Update in both file-backed stores: the
+// expectState is the check behind Update in MemStore and FileStore: the
 // record must be present and in the state the write names.
 func expectState(intents map[string]*Intent, id string, from State) error {
 	prev, had := intents[id]

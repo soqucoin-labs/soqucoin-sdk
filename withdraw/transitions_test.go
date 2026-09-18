@@ -272,6 +272,59 @@ func TestRecoverDoesNotSendABuiltIntentItCouldNotReReserve(t *testing.T) {
 	if o.State != StateBroadcast || y.State != StateBuilt {
 		t.Fatalf("older is %s and younger is %s; want Broadcast and Built", o.State, y.State)
 	}
+
+	// The broadcaster's next pass lists every Built intent and sends each,
+	// whatever Recover reported a moment earlier. The refusal has to live
+	// where the send starts, or the second transaction goes out one pass
+	// later.
+	err = e.Broadcast(ctx, y)
+	if !errors.Is(err, ErrReservationLost) {
+		t.Fatalf("broadcast of the intent whose inputs another holds: %v, want ErrReservationLost", err)
+	}
+	if net.sentCount() != 1 {
+		t.Fatalf("sent %v; the second transaction over the shared input went out", net.sent)
+	}
+	y, _, _ = store.Get(ctx, "younger")
+	if y.State != StateBuilt || y.RawHex == "" {
+		t.Fatalf("younger is %+v; want Built with its bytes", y)
+	}
+}
+
+// A worker's context has already ended when it calls Broadcast, as a saturated
+// pool's per-task deadline does. Against a store that honours the context, the
+// re-read of the record must not turn that into a call that never happened:
+// the send still runs on the caller's context and is a lost reply, the attempt
+// is recorded and the reservation renewed, as the package doc promises for a
+// context ending anywhere inside Broadcast.
+func TestBroadcastUnderAnEndedContextStillHoldsTheIntent(t *testing.T) {
+	store := ctxStore{NewMemStore()}
+	spent := utxo.NewSpentSet("", nil)
+	net := &fakeNet{mode: "lost"}
+	e := newEngine(t, store, spent, net, coins())
+	e.ReservationTTL = 40 * time.Millisecond
+	if _, _, err := e.Submit(context.Background(), "w1", dst, 2_000_000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	in, _, _ := store.Get(context.Background(), "w1")
+	if err := e.Build(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond) // inside the TTL; the renewal below carries it past
+
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := e.Broadcast(ended, in)
+	if !errors.Is(err, rpc.ErrUnknownOutcome) {
+		t.Fatalf("broadcast under an ended context: %v, want the lost reply reported", err)
+	}
+	stored, _, _ := store.Get(context.Background(), "w1")
+	if stored.State != StateBuilt || stored.Attempts != 1 {
+		t.Fatalf("stored record is %s after %d attempts; want Built after the one attempt", stored.State, stored.Attempts)
+	}
+	time.Sleep(20 * time.Millisecond) // past the original TTL, inside the renewed one
+	if !spent.IsSpent(in.Inputs[0].TxID, in.Inputs[0].Vout) {
+		t.Fatal("the reservation was not renewed: the input of a signed transaction is free")
+	}
 }
 
 // The node rejects the transaction for good, and the save of the Failed
