@@ -1,9 +1,9 @@
 # Transaction Verification Record
 
 This document lets you verify the signing path independently rather than take our
-word for it. It records three transactions **built, signed, serialized, broadcast and
-confirmed entirely by the public SDK**, the second and third through its withdrawal
-engine, with identifiers you can decode against a Soqucoin node yourself, and the
+word for it. It records four transactions **built, signed, serialized, broadcast and
+confirmed entirely by the public SDK**, the second, third and fourth through its
+withdrawal engine, with identifiers you can decode against a Soqucoin node yourself, and the
 procedure to reproduce them.
 
 Nothing here requires access to our infrastructure. Every identifier below is
@@ -91,6 +91,38 @@ This particular run reached the node over the public builders gateway (`gettxout
 `getrawtransaction` and a client-signed broadcast over HTTPS) because the machine that produced it
 had no route to an RPC port; the engine, the selector, the keystore and the signing path were the
 SDK's own. With node RPC of your own, the example reproduces it directly.
+
+## The confirmed withdrawal from the v0.5 tree
+
+Stagenet, built and signed by the v0.5 tree and driven through `withdraw.Engine` by
+[`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal) as committed, against a stagenet
+node with `txindex=1` over RPC: the intent was persisted before anything reached the network, the
+input was reserved in the spent set at build time, the transaction was broadcast once through
+`rpc.Client.Broadcast`, and `withdraw.RPCConfirmer` moved the intent to confirmed on the node's
+word.
+
+| | |
+|---|---|
+| **Transaction id** | `ebe41fd8ac7feaafbf2e99bbc9522fdecddb527227fa6a9e7db99c4a7377c9ef` |
+| **Block** | `2541c140fc0b43b44b21a57c402d34ccaa6174193136467ba0a02320dd322d7d` (height 89,196, 2026-09-19T06:17:08Z) |
+| Funding transaction | `428c090ada2b8c3db1089f5ea847dda0a3328ccbe3428aa8e1f51cecc9f9f58d`, output 0 |
+| Inputs / outputs | 1 in, 2 out (payment plus change) |
+| Size / vsize | 3,880 bytes / 1,073 vB |
+| Witness stack | `[2421, 1313]` bytes |
+| Payment / change | 2,400,000,000 / 98,926,000 shors |
+| Fee | 1,074,000 shors, 1,001 shors/vB against the 1,000 asked for |
+| Network | stagenet |
+| SDK version | `v0.5.0`; no Go source changed between this run and the tag |
+
+```bash
+soqucoin-cli getrawtransaction \
+  ebe41fd8ac7feaafbf2e99bbc9522fdecddb527227fa6a9e7db99c4a7377c9ef 1
+```
+
+The transaction id the SDK computed before the broadcast is the id the node assigned, and the
+node's decode of the confirmed transaction gives the sizes and witness lengths above. This record
+differs from the v0.4 one in transport only: the example reached the node's RPC port directly, so
+the confirmer and the broadcaster are the SDK's `rpc.Client`, as they will be in your deployment.
 
 ---
 
@@ -213,7 +245,7 @@ Stated precisely, so you can see exactly what has and has not been demonstrated.
 
 - **These are single-signature SOQ payments of one and three inputs.** They do not
   exercise USDSOQ asset transactions or the authority paths.
-- **Both were performed on stagenet.** Mainnet construction is covered by unit tests
+- **All four were performed on stagenet.** Mainnet construction is covered by unit tests
   across all three networks, by address vectors produced by the node's own
   encoder, and by a sighash and witness vector produced by the node's own
   signing path (below), but no mainnet transaction has been broadcast: the
