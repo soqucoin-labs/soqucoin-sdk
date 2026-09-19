@@ -1045,21 +1045,22 @@ budget and hold larger amounts to 288, rather than lowering the threshold unifor
 ## Verification: a real confirmed transaction
 
 Rather than asking you to trust that the signing path works, there is a
-[verification record](VERIFICATION.md) for three stagenet transactions **built, signed,
+[verification record](VERIFICATION.md) for four stagenet transactions **built, signed,
 serialized, broadcast and confirmed entirely by this SDK**:
 
-| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` | v0.4, `withdraw.Engine` |
-|---|---|---|---|
-| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` | `b0c659f7d63fd1346c6d4d95e15cbe465e7464213391654f694a08fa62f8422c` |
-| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` | `c1c1c95fae85e1fbcc1cf2c7e586f61a3fbc558e083a370583f22e56b74c0a44` |
-| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
+| | Single input, `tx.BuildAndSign` | Three inputs, `withdraw.Engine` | v0.4, `withdraw.Engine` | v0.5, `withdraw.Engine` |
+|---|---|---|---|---|
+| Transaction id | `99fd147aaa4d575ee8f6266acfda4b09a5b0dc730d964294efded2cf3cd2eae7` | `13568c1a34416618fc5d160385643304230062bb6c53023522ec9e7f08fb67be` | `b0c659f7d63fd1346c6d4d95e15cbe465e7464213391654f694a08fa62f8422c` | `ebe41fd8ac7feaafbf2e99bbc9522fdecddb527227fa6a9e7db99c4a7377c9ef` |
+| Block | `ad12368c1e083a6f0efe8da7cc65b52613b05d3301f0e609ba4660fdcffcf380` | `823edee8e491e706b16f38923cfc30767516fadca9d3247d7dd72a1ed13d5e42` | `c1c1c95fae85e1fbcc1cf2c7e586f61a3fbc558e083a370583f22e56b74c0a44` | `2541c140fc0b43b44b21a57c402d34ccaa6174193136467ba0a02320dd322d7d` |
+| Witness stack per input | `[2421, 1313]` bytes | `[2421, 1313]` bytes | `[2421, 1313]` bytes | `[2421, 1313]` bytes |
 
-The transaction id the SDK computed matches the one the node assigned in all three
+The transaction id the SDK computed matches the one the node assigned in all four
 cases, which independently confirms that serialization agrees with consensus byte
-for byte. The second and third were produced through the engine: intent persisted,
+for byte. The second, third and fourth were produced through the engine: intent persisted,
 inputs reserved, broadcast and confirmed. The second is
 [`examples/stagenet_withdrawal`](../examples/stagenet_withdrawal); the third is the same path on
-the v0.4 tree, where every call takes a context and the amounts are `int64` shors throughout.
+the v0.4 tree, where every call takes a context and the amounts are `int64` shors throughout;
+the fourth is the committed example on the v0.5 tree against a stagenet node over RPC.
 
 That document also gives the exact witness format consensus requires, a table
 mapping `testmempoolaccept` rejections to their causes, and the steps to reproduce
@@ -1074,29 +1075,29 @@ Every package carries unit tests. The figures below are one run of `go test -cov
 commit this document ships with, library packages only: the `examples/` programs and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Nine of the ten reproduce exactly. The `electrumx`
-figure moves between about 89.6 and 90.3 across runs, because several of its tests drive
+figure moved between 89.7 and 90.4 across fourteen runs on this commit, because several of its tests drive
 the reader goroutine, the ping loop and the refresher at once, and which branches run
 depends on how those are scheduled.
 
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
 | `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
-| `utxo` | **90.9%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
-| `rpc` | **85.2%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
-| `deposit` | **90.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **89.6%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
+| `utxo` | **91.1%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
+| `rpc` | **85.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
+| `deposit` | **93.9%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
+| `electrumx` | **90.1%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
 | `tx` | **91.6%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
-| `keys` | **89.6%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
-| `withdraw` | **84.3%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
+| `keys` | **89.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
+| `withdraw` | **87.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `types` | **85.7%** | Amount parsing and formatting exact at every value the node prints, network records, asset constants |
-| `resilience` | **81.9%** | Circuit breaker transitions, classification and the halt, reconciler against the node with the spent set, the webhook body |
+| `resilience` | **81.6%** | Circuit breaker transitions, classification and the halt, reconciler against the node with the spent set, the webhook body |
 
 Also passes under the race detector (`go test -race`), which matters for `electrumx` because its
 UTXO cache is shared between the reader goroutine, the refresher and caller threads.
 
 **Where the coverage is thin, and why.** These numbers are reported rather than rounded up:
 
-- **`resilience` (81.9%)**: the breaker and the reconciler are covered against fakes and the
+- **`resilience` (81.6%)**: the breaker and the reconciler are covered against fakes and the
   alerter's post against a local server; the reconciler's timers are exercised at short intervals.
 - **`electrumx`**: the protocol path is driven by a scripted fake server, including the
   notification-in-front-of-reply case, pushed changes, a reconnect and a dropped notification
