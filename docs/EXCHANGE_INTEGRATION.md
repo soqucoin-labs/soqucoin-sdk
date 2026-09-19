@@ -1075,7 +1075,7 @@ Every package carries unit tests. The figures below are one run of `go test -cov
 commit this document ships with, library packages only: the `examples/` programs and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Nine of the ten reproduce exactly. The `electrumx`
-figure moves between about 89.6 and 90.3 across runs, because several of its tests drive
+figure moved between 89.7 and 90.4 across fourteen runs on this commit, because several of its tests drive
 the reader goroutine, the ping loop and the refresher at once, and which branches run
 depends on how those are scheduled.
 
@@ -1097,7 +1097,7 @@ UTXO cache is shared between the reader goroutine, the refresher and caller thre
 
 **Where the coverage is thin, and why.** These numbers are reported rather than rounded up:
 
-- **`resilience` (81.9%)**: the breaker and the reconciler are covered against fakes and the
+- **`resilience` (81.6%)**: the breaker and the reconciler are covered against fakes and the
   alerter's post against a local server; the reconciler's timers are exercised at short intervals.
 - **`electrumx`**: the protocol path is driven by a scripted fake server, including the
   notification-in-front-of-reply case, pushed changes, a reconnect and a dropped notification
