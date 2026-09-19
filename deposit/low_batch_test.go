@@ -262,12 +262,16 @@ func TestAddressesAwaitingTheFirstReplyAreQuietForOneWindow(t *testing.T) {
 	if al.count(AlertCacheStale) != 0 {
 		t.Fatalf("alarmed while awaiting the first reply: %v", al.kinds)
 	}
-	clock = start.Add(m.maxCacheAge() + time.Second)
-	if _, err := m.Scan(context.Background()); !errors.Is(err, ErrPaused) {
-		t.Fatalf("past the window with no reply: %v, want ErrPaused", err)
-	}
-	if al.count(AlertCacheStale) != 1 {
-		t.Fatalf("past the window: %v", al.kinds)
+	// Past the window the address is stale on every pass, with no fresh
+	// window granted in between.
+	for i := 1; i <= 3; i++ {
+		clock = start.Add(m.maxCacheAge() + time.Duration(i)*time.Second)
+		if _, err := m.Scan(context.Background()); !errors.Is(err, ErrPaused) {
+			t.Fatalf("past the window with no reply, pass %d: %v, want ErrPaused", i, err)
+		}
+		if al.count(AlertCacheStale) != i {
+			t.Fatalf("past the window, pass %d: %v", i, al.kinds)
+		}
 	}
 	per.ats[a] = clock
 	got, err := m.Scan(context.Background())

@@ -187,8 +187,9 @@ type Monitor struct {
 	// under scanMu, records when a pass first found an address awaiting the
 	// indexer's first reply, so the address is quiet for one MaxCacheAge from
 	// then rather than alarmed from the first pass; an entry is removed once
-	// the address has been answered or has failed, so the map holds the
-	// addresses awaiting a reply and no others.
+	// the address has been answered or has failed, and kept while its
+	// window has expired unanswered, so the map holds the addresses awaiting
+	// or overdue a reply and no others.
 	scanMu      sync.Mutex
 	firstListed map[string]time.Time
 }
@@ -422,7 +423,13 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			if at.IsZero() && err == nil && m.awaiting(addr) {
 				continue // the indexer has not answered for it yet; its deposits wait, quietly
 			}
-			delete(m.firstListed, addr) // answered, or failed: the record has done its work
+			if !at.IsZero() || err != nil {
+				// Answered, or failed: the record has done its work. A zero
+				// time with no error past the window keeps it, so the address
+				// stays stale rather than earning a fresh window every other
+				// pass.
+				delete(m.firstListed, addr)
+			}
 			if at.IsZero() || m.clock().Sub(at) > m.maxCacheAge() {
 				if staleErr == nil {
 					staleErr = err

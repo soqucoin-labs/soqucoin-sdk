@@ -53,6 +53,13 @@ var ErrNoCandidates = errors.New("utxo: no confirmed UTXOs available for consoli
 // can proceed with a reduced payment.
 var ErrInputLimitReached = errors.New("input limit reached")
 
+// MaxUTXOVerifyRetries has no reader in this module: the retry it described
+// was never built, and deposit.Monitor asks the node once per output per
+// pass. It stays exported for a caller that read it, with its value.
+//
+// Deprecated: nothing in the SDK reads or applies it.
+const MaxUTXOVerifyRetries = 8
+
 // SpentKey uniquely identifies a UTXO for the persistent spent set.
 type SpentKey struct {
 	TxID string
