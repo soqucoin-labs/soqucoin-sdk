@@ -73,6 +73,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -266,7 +267,11 @@ type Engine struct {
 	// shorter than this. A Built intent's bytes may already be in a mempool,
 	// so an expired reservation is a double-spend window, not a cleanup; the
 	// default is long because Recover, not the clock, frees the reservations
-	// of intents that have nothing built.
+	// of intents that have nothing built. Expiry is read from the wall clock,
+	// so a forward step of the clock ages every reservation by the size of
+	// the step; run Recover after a clock correction, as after a restart. The
+	// spent set keeps an expired reservation on disk until Recover or Prune
+	// decides it, so Recover sees what the step did.
 	ReservationTTL time.Duration
 	// AbandonAfter is how long after the last send (Intent.SentAt) Abandon
 	// will consider an intent (default DefaultAbandonAfter, 24 hours, the
@@ -466,8 +471,11 @@ func (e *Engine) reread(ctx context.Context, in *Intent, want ...State) (*Intent
 
 // Submit registers a withdrawal. Calling it again with the same id returns
 // the existing intent (created=false); with the same id and different
-// parameters it returns ErrConflict. A destination that is not an address on
-// Network is ErrInvalidIntent, and nothing is recorded for it.
+// parameters it returns ErrConflict. The destination is compared as an
+// address: bech32m spells one address all-lower or all-upper, and the other
+// spelling of the recorded destination is the same parameters, recorded as
+// first written. A destination that is not an address on Network is
+// ErrInvalidIntent, and nothing is recorded for it.
 //
 // The registration is one Store.Create, which the store refuses for an id it
 // holds, so a second Submit of one id can never write over the first one's
@@ -501,7 +509,7 @@ func (e *Engine) Submit(ctx context.Context, id, address string, amount, feeRate
 	if !ok {
 		return nil, false, fmt.Errorf("%w: %s: the store refused to create it and does not hold it", ErrInvalidIntent, id)
 	}
-	if existing.Address != address || existing.Amount != amount || existing.FeeRate != feeRate {
+	if !strings.EqualFold(existing.Address, address) || existing.Amount != amount || existing.FeeRate != feeRate {
 		return existing, false, fmt.Errorf("%w: %s", ErrConflict, id)
 	}
 	return existing, false, nil

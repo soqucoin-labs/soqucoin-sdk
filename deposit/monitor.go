@@ -49,7 +49,11 @@ type Cache interface {
 // it. When the Cache has it, Scan judges staleness address by address: the
 // addresses the indexer has not answered for within MaxCacheAge are skipped
 // and alarmed, the others are credited, and Scan pauses only when every
-// address is stale. Without it one failed address in a pass makes the whole
+// address is stale. An address the indexer has never answered for (the zero
+// time and no error) is awaiting its first reply for one MaxCacheAge from the
+// pass that first found it so, skipped and not alarmed; after that it is
+// stale like any other. A zero time with an error is a refresh that failed,
+// which is stale at once. Without the interface one failed address in a pass makes the whole
 // pass stale and nothing is credited until a pass succeeds for all of them.
 type AddressFreshness interface {
 	LastRefreshOf(addr string) (time.Time, error)
@@ -105,7 +109,10 @@ type Ledger interface {
 	MarkFinal(ctx context.Context, txid string, vout uint32) error
 }
 
-// Deposit is a credited output.
+// Deposit is a credited output. Height and Confirmations are the node's word
+// at the pass that credited it: the tip the pass read less the depth the node
+// reported, plus one. The indexer's height decides only whether an output is
+// asked about.
 type Deposit struct {
 	TxID          string
 	Vout          uint32
@@ -173,6 +180,18 @@ type Monitor struct {
 	// process. A restart empties the set.
 	finalMu sync.Mutex
 	final   map[string]string
+
+	// scanMu makes Scan one pass at a time. Two passes over one outpoint both
+	// asked IsCredited before either called Credit, and the book was offered
+	// the outpoint twice; a second caller now waits. firstListed, read only
+	// under scanMu, records when a pass first found an address awaiting the
+	// indexer's first reply, so the address is quiet for one MaxCacheAge from
+	// then rather than alarmed from the first pass; an entry is removed once
+	// the address has been answered or has failed, and kept while its
+	// window has expired unanswered, so the map holds the addresses awaiting
+	// or overdue a reply and no others.
+	scanMu      sync.Mutex
+	firstListed map[string]time.Time
 }
 
 func outpointKey(txid string, vout uint32) string { return fmt.Sprintf("%s:%d", txid, vout) }
@@ -210,12 +229,13 @@ func (m *Monitor) pruneFinal(scanned map[string]bool, seen map[string]bool) {
 type AlertKind string
 
 const (
-	AlertNodeSyncing     AlertKind = "node_syncing"     // crediting paused; node not caught up
-	AlertNodeWrongChain  AlertKind = "node_wrong_chain" // node serves another chain than Network; crediting refused until the deployment is fixed
-	AlertCacheStale      AlertKind = "cache_stale"      // indexer has not refreshed; crediting paused, or skipped for the stale addresses
-	AlertIndexerMismatch AlertKind = "indexer_mismatch" // indexer and node disagree on an output; NOT credited
-	AlertDepositVanished AlertKind = "deposit_vanished" // a credited, non-final output is gone from the node
-	AlertLedgerError     AlertKind = "ledger_error"     // the exchange's own book returned an error, or holds a record the node refuses
+	AlertNodeSyncing      AlertKind = "node_syncing"      // crediting paused; node not caught up
+	AlertNodeWrongChain   AlertKind = "node_wrong_chain"  // node serves another chain than Network; crediting refused until the deployment is fixed
+	AlertCacheStale       AlertKind = "cache_stale"       // indexer has not refreshed; crediting paused, or skipped for the stale addresses
+	AlertIndexerMismatch  AlertKind = "indexer_mismatch"  // indexer and node disagree on an output; NOT credited
+	AlertDepositVanished  AlertKind = "deposit_vanished"  // a credited, non-final output is gone from the node
+	AlertDepositRegressed AlertKind = "deposit_regressed" // a credited, non-final output is shallower than the policy required; the credit stands
+	AlertLedgerError      AlertKind = "ledger_error"      // the exchange's own book returned an error, or holds a record the node refuses
 )
 
 var (
@@ -277,6 +297,35 @@ func refused(err error) bool {
 	return errors.Is(err, rpc.ErrPermanent)
 }
 
+// regressed is true when the node reports a credited output shallower than
+// the policy now requires for its value: a reorganisation re-included it
+// lower down, or the policy was raised since the credit. It is read at both
+// sites that ask the node about a credited output, recheckPending and the
+// credited branch of Scan; the credit stands and the ledger decides, as for
+// an output that vanished. The Scan site sees the regression only while the
+// indexer still reports the depth the credit was given at; an indexer that
+// has followed the reorganisation reports the lower height, the pre-filter
+// on Required skips the output before IsCredited is asked, and only
+// recheckPending, for an output the ledger lists as pending, alarms it.
+func (m *Monitor) regressed(out *rpc.TxOut, value int64) bool {
+	return out != nil && out.Confirmations < m.Required(value)
+}
+
+// awaiting is true while an address the indexer has never answered for, with
+// no reply and no error, is inside one MaxCacheAge of the pass that first
+// found it so. Called under scanMu.
+func (m *Monitor) awaiting(addr string) bool {
+	if m.firstListed == nil {
+		m.firstListed = map[string]time.Time{}
+	}
+	first, ok := m.firstListed[addr]
+	if !ok {
+		first = m.clock()
+		m.firstListed[addr] = first
+	}
+	return m.clock().Sub(first) <= m.maxCacheAge()
+}
+
 func (m *Monitor) maxCacheAge() time.Duration {
 	if m.MaxCacheAge > 0 {
 		return m.MaxCacheAge
@@ -296,8 +345,11 @@ func (m *Monitor) maxCacheAge() time.Duration {
 // error of its own is a disagreement about that outpoint: alarmed, skipped,
 // and the pass goes on.
 // A MaxCacheAge the cache's cadence cannot fit is ErrCacheAgeBelowPings, with
-// nothing asked of anyone.
+// nothing asked of anyone. Scan runs one pass at a time: a second caller
+// waits for the first to return, so one outpoint reaches Credit once.
 func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
 	// 0. The window must hold two freshness intervals of a cache that reports
 	//    them, or every quiet address reads stale between two advances.
 	if cadence, ok := m.Cache.(FreshnessCadence); ok {
@@ -368,6 +420,16 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	for _, addr := range addrs {
 		if perAddress != nil {
 			at, err := perAddress.LastRefreshOf(addr)
+			if at.IsZero() && err == nil && m.awaiting(addr) {
+				continue // the indexer has not answered for it yet; its deposits wait, quietly
+			}
+			if !at.IsZero() || err != nil {
+				// Answered, or failed: the record has done its work. A zero
+				// time with no error past the window keeps it, so the address
+				// stays stale rather than earning a fresh window every other
+				// pass.
+				delete(m.firstListed, addr)
+			}
 			if at.IsZero() || m.clock().Sub(at) > m.maxCacheAge() {
 				if staleErr == nil {
 					staleErr = err
@@ -386,8 +448,11 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 		scanned[addr] = true
 		for _, u := range m.Cache.GetUTXOs(addr) {
 			seen[outpointKey(u.TxID, u.Vout)] = true
-			if u.Height <= 0 || u.AssetType != types.AssetTypeSOQ {
-				continue // unconfirmed (or a lying indexer's negative height), or not SOQ
+			if u.Height <= 0 {
+				// Unconfirmed, or a lying indexer's negative height. The asset
+				// is not read here: the indexer stamps none, and the node's
+				// script in verifyWithNode is the asset gate.
+				continue
 			}
 			confs := tip - u.Height + 1
 			if confs < m.Required(u.Value) {
@@ -420,13 +485,17 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 						// pass ends here as it does at every gettxout.
 						return credited, err
 					}
+					if m.regressed(out, u.Value) {
+						m.alert(AlertDepositRegressed, "credited deposit %s:%d (%d shors to %s) is at depth %d, required %d: a reorganisation re-included it lower down, or the policy was raised since it was credited; the credit stands, verify it", u.TxID, u.Vout, u.Value, addr, out.Confirmations, m.Required(u.Value))
+						continue
+					}
 					if out != nil && out.Confirmations > types.MaxReorgDepth {
 						m.markFinal(u.TxID, u.Vout, addr)
 					}
 				}
 				continue
 			}
-			d, ok, err := m.verifyWithNode(ctx, addr, wantHex, u, confs)
+			d, ok, err := m.verifyWithNode(ctx, addr, wantHex, u, confs, tip)
 			if err != nil {
 				return credited, err
 			}
@@ -463,8 +532,9 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 // will not be asked about. A lookup that does not complete, ended by the
 // context or by the transport, is returned as that error, unalarmed: the node
 // has not disagreed, it has not answered, and AlertIndexerMismatch names a
-// disagreement.
-func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u types.UTXO, confs int64) (Deposit, bool, error) {
+// disagreement. confs is the indexer's depth, quoted in the mismatch alert;
+// tip is the node's, and with the node's depth it gives the Deposit's Height.
+func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u types.UTXO, confs, tip int64) (Deposit, bool, error) {
 	out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 	if err != nil {
 		if refused(err) {
@@ -486,7 +556,7 @@ func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u ty
 		// Real, but not spendable yet; credit when mature. Not an alarm.
 	default:
 		return Deposit{
-			TxID: u.TxID, Vout: u.Vout, Address: addr, Value: u.Value, Height: u.Height,
+			TxID: u.TxID, Vout: u.Vout, Address: addr, Value: u.Value, Height: tip - out.Confirmations + 1,
 			Confirmations: out.Confirmations, CreditedAt: m.clock(),
 		}, true, nil
 	}
@@ -526,6 +596,10 @@ func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 			// deposits will hit this; a spend of a real deposit is fine. The
 			// ledger decides: it knows whether it spent the output itself.
 			m.alert(AlertDepositVanished, "credited deposit %s:%d (%d shors to %s) is no longer in the node's UTXO set; verify it was spent by you and not reorganised away", d.TxID, d.Vout, d.Value, d.Address)
+			continue
+		}
+		if m.regressed(out, d.Value) {
+			m.alert(AlertDepositRegressed, "credited deposit %s:%d (%d shors to %s) is at depth %d, required %d: a reorganisation re-included it lower down, or the policy was raised since it was credited; the credit stands, verify it", d.TxID, d.Vout, d.Value, d.Address, out.Confirmations, m.Required(d.Value))
 			continue
 		}
 		if out.Confirmations > types.MaxReorgDepth {

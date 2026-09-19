@@ -53,10 +53,11 @@ var ErrNoCandidates = errors.New("utxo: no confirmed UTXOs available for consoli
 // can proceed with a reduced payment.
 var ErrInputLimitReached = errors.New("input limit reached")
 
-// MaxUTXOVerifyRetries is the number of times Defense 11 will retry
-// gettxout verification before giving up on a UTXO. Each retry waits
-// 2 seconds. This handles the race where a block is mined between
-// ElectrumX refresh and gettxout call.
+// MaxUTXOVerifyRetries has no reader in this module: the retry it described
+// was never built, and deposit.Monitor asks the node once per output per
+// pass. It stays exported for a caller that read it, with its value.
+//
+// Deprecated: nothing in the SDK reads or applies it.
 const MaxUTXOVerifyRetries = 8
 
 // SpentKey uniquely identifies a UTXO for the persistent spent set.
@@ -468,6 +469,11 @@ func (ss *SpentSet) Size() int {
 	return len(ss.entries)
 }
 
+// writeFile is atomicfile.WriteFile, a variable so a test can make the write
+// fail after the rename and see what Reserve does with a reservation that is
+// in the file and not known to be durable.
+var writeFile = atomicfile.WriteFile
+
 // persist writes the spent set to disk atomically.
 func (ss *SpentSet) persist() error {
 	if ss.filePath == "" {
@@ -493,7 +499,7 @@ func (ss *SpentSet) persist() error {
 	// Written, synced and renamed into place, then the directory synced: a
 	// spend marked just before a power loss is on disk when persist returns,
 	// so a restart cannot re-select an input of a transaction already sent.
-	if err := atomicfile.WriteFile(ss.filePath, buf, 0600); err != nil {
+	if err := writeFile(ss.filePath, buf, 0600); err != nil {
 		return fmt.Errorf("%w: %w", ErrPersist, err)
 	}
 	return nil
@@ -501,11 +507,17 @@ func (ss *SpentSet) persist() error {
 
 // load reads the spent set from disk on startup.
 //
-// Confirmed entries older than 2 hours and expired reservations are
-// discarded. Unconfirmed broadcast entries are kept whatever their age: an
-// earlier version dropped them after 2 hours, so a restart after a slow
-// confirmation re-exposed the inputs of a transaction that was still in the
-// mempool, and the next withdrawal double-spent them.
+// Confirmed entries older than 2 hours are discarded. Unconfirmed broadcast
+// entries are kept whatever their age: an earlier version dropped them after
+// 2 hours, so a restart after a slow confirmation re-exposed the inputs of a
+// transaction that was still in the mempool, and the next withdrawal
+// double-spent them. Reservations are kept whether or not they have expired:
+// withdraw.Engine.Recover decides what each one was, renewing a Built
+// intent's and releasing an orphan's, and an earlier version dropped the
+// expired ones here, so after a forward step of the clock Recover found
+// nothing to decide and nothing was logged. Reserve treats an expired entry
+// as free and Prune drops it on the periodic path, so keeping it changes
+// neither the backstop nor the file's growth.
 func (ss *SpentSet) load() error {
 	// Ensure directory exists
 	dir := filepath.Dir(ss.filePath)
@@ -530,19 +542,23 @@ func (ss *SpentSet) load() error {
 	now := time.Now()
 	cutoff := now.Add(-2 * time.Hour)
 	loaded := 0
+	dropped := 0
 	expired := 0
 
 	for _, entry := range file.Entries {
-		if (entry.Confirmed && entry.SpentAt.Before(cutoff)) || entry.expired(now) {
-			expired++
+		if entry.Confirmed && entry.SpentAt.Before(cutoff) {
+			dropped++
 			continue
+		}
+		if entry.expired(now) {
+			expired++ // kept for Recover
 		}
 		key := SpentKey{entry.TxID, entry.Vout}
 		ss.entries[key] = entry
 		loaded++
 	}
 
-	ss.log.Info("spent set loaded", "path", ss.filePath, "entries", len(file.Entries), "expired", expired, "active", loaded)
+	ss.log.Info("spent set loaded", "path", ss.filePath, "entries", len(file.Entries), "dropped_confirmed", dropped, "expired_reservations_kept", expired, "active", loaded)
 	return nil
 }
 

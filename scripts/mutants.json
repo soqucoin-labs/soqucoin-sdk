@@ -1251,6 +1251,78 @@
       "find": "\t\t\t\t\t\tif refused(err) {\n\t\t\t\t\t\t\tm.alert(AlertIndexerMismatch",
       "replace": "\t\t\t\t\t\tif !refused(err) {\n\t\t\t\t\t\t\tm.alert(AlertIndexerMismatch",
       "why": "The depth lookup is the second cache-driven gettxout site; a refusal there is the same disagreement as at verifyWithNode, and read as an outage it ends every pass at that outpoint."
+    },
+    {
+      "id": "deposit-depth-regression-of-a-pending-deposit-is-silent",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestDepthRegressionOfAPendingDepositIsAlarmed",
+      "find": "\t\tif m.regressed(out, d.Value) {",
+      "replace": "\t\tif false {",
+      "why": "recheckPending is one of the two sites that ask the node about a credited output; a node that reports it shallower than the policy required is a reorganisation the operator must see, and without the alert the credit stands unremarked."
+    },
+    {
+      "id": "deposit-depth-regression-of-a-swept-deposit-is-silent",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestDepthRegressionOfASweptDepositIsAlarmed",
+      "find": "\t\t\t\t\tif m.regressed(out, u.Value) {",
+      "replace": "\t\t\t\t\tif false {",
+      "why": "The credited branch of Scan is the other site that asks the node about a credited output, for one the ledger left out of Pending; the same regression must alarm there."
+    },
+    {
+      "id": "deposit-two-scans-run-at-once",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestConcurrentScansRunOneAtATimeAndCreditOnce",
+      "find": "\tdefer m.scanMu.Unlock()",
+      "replace": "\tm.scanMu.Unlock()",
+      "why": "Two passes over one outpoint both ask IsCredited before either calls Credit, and the book is offered the outpoint twice; Scan holds the lock for the whole pass."
+    },
+    {
+      "id": "deposit-height-is-the-indexers-word",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestDepositHeightIsTheNodes",
+      "find": "Height: tip - out.Confirmations + 1,",
+      "replace": "Height: u.Height,",
+      "why": "The indexer's height is unverified; the Deposit records the node's, derived from the tip the pass read and the depth the node reported."
+    },
+    {
+      "id": "deposit-awaiting-first-reply-is-alarmed",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestAddressesAwaitingTheFirstReplyAreQuietForOneWindow",
+      "find": "\treturn m.clock().Sub(first) <= m.maxCacheAge()",
+      "replace": "\treturn false",
+      "why": "An address the indexer has never answered for is awaiting its first reply for one window, not stale; alarmed from the first pass, startup raises cache_stale on every pass until the indexer answers."
+    },
+    {
+      "id": "rpc-null-result-quoted-as-an-empty-txid",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestNullResultIsAMismatchThatNamesTheMissingTxID",
+      "find": "\"broadcast: %w: node returned no txid (a null result) for a transaction the caller computed as %s\"",
+      "replace": "\"broadcast: %w: node returned txid  for a transaction the caller computed as %s\"",
+      "why": "A null result is not a txid; the hold is right and the message has to say what the node returned rather than quote an empty txid as the one it accepted."
+    },
+    {
+      "id": "utxo-load-drops-expired-reservations",
+      "file": "utxo/selector.go",
+      "package": "./utxo",
+      "test": "TestLoadKeepsAnExpiredReservationForRecover",
+      "find": "\t\t\texpired++ // kept for Recover",
+      "replace": "\t\t\texpired++\n\t\t\tcontinue",
+      "why": "An expired reservation dropped at load is one Recover never sees: after a forward clock step every Built intent's reservation vanished before Recover could renew or release it, and nothing was logged."
+    },
+    {
+      "id": "withdraw-conflict-compares-the-destination-byte-for-byte",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitAcceptsTheOtherCaseSpellingOfOneDestination",
+      "find": "!strings.EqualFold(existing.Address, address)",
+      "replace": "strings.Compare(existing.Address, address) != 0",
+      "why": "bech32m spells one address all-lower or all-upper and checkDestination decodes either, so the other spelling of the recorded destination under one id is the same withdrawal, not a conflict."
     }
   ]
 }

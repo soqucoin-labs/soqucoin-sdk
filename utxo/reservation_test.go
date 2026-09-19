@@ -93,7 +93,8 @@ func TestUnconfirmedBroadcastSurvivesReloadRegardlessOfAge(t *testing.T) {
 	if !ss2.IsSpent(rTxA, 0) || !ss2.IsSpent(rTxB, 1) {
 		t.Fatal("two-day-old unconfirmed broadcast entries were dropped on reload")
 	}
-	// Confirmed entries older than two hours are dropped; expired reservations too.
+	// Confirmed entries older than two hours are dropped. An expired reservation
+	// is kept for Recover, and IsSpent reads it as free.
 	ss2.ConfirmSpent(rTxA, 0)
 	ss2.Reserve([]types.UTXO{{TxID: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Vout: 0}}, "w9", time.Millisecond)
 	ss2.mu.Lock()
@@ -111,7 +112,7 @@ func TestUnconfirmedBroadcastSurvivesReloadRegardlessOfAge(t *testing.T) {
 		t.Error("unconfirmed entry dropped")
 	}
 	if ss3.IsSpent("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", 0) {
-		t.Error("expired reservation kept")
+		t.Error("an expired reservation reads as spent")
 	}
 }
 
