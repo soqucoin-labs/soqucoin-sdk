@@ -109,7 +109,9 @@ Upstream `LICENCE` is unchanged.
 Tags name the revisions our own instances run. `soqucoin-1.19.0-2` (18 October 2026) carries the
 fix for the reorg undo path: a checkout from before it stops at the first mainnet reorg, height
 7,434, and recovers on restart at the tag with no reindex. A running instance moves to a newer tag
-with a fetch of the tags, a checkout of the tag and a restart.
+with a fetch of the tags, a checkout of the tag, a reinstall of the package into the environment its
+service runs from (`pip install .` from the checkout: a non-editable install keeps its own copy of the
+code, so a checkout alone changes nothing for the service) and a restart.
 
 **So the question we need answered:** do you run your own indexer for UTXO-model coins, or would
 you expect to connect to one we operate? That answer changes both the integration effort and where
