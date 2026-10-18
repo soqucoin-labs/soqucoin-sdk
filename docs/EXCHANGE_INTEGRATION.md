@@ -74,24 +74,24 @@ and we would rather you choose than discover it later:
 
 **We recommend Option A, and the software is published:**
 
-> **https://github.com/soqucoin-labs/electrumx**, branch `soqucoin`
+> **https://github.com/soqucoin-labs/electrumx**, branch `soqucoin`, tag **`soqucoin-1.19.0-2`** (18 October 2026)
 
 Upstream ElectrumX ships no Soqucoin coin definition, so that fork is what you need. It is based on
 a pinned upstream commit rather than tracking `master`, so the entire Soqucoin delta is reviewable
 in one command:
 
 ```bash
-git diff 24865dc..soqucoin -- src/
+git diff 24865dc..soqucoin-1.19.0-2 -- src/
 ```
 
-Roughly 242 lines across five files: the coin definitions (AuxPoW-aware headers), the AuxPoW
+Roughly 250 lines across five files: the coin definitions (AuxPoW-aware headers), the AuxPoW
 transaction deserializer, asset and visibility derivation from the witness version, UTXO records
 carrying that metadata, and one protocol extension (`get_multi_balance`) for per-asset balances.
 
 You can confirm a clean checkout works before committing any effort to it:
 
 ```bash
-git clone -b soqucoin https://github.com/soqucoin-labs/electrumx && cd electrumx
+git clone -b soqucoin-1.19.0-2 https://github.com/soqucoin-labs/electrumx && cd electrumx
 pip install .
 cd /tmp && python -c "
 from electrumx.lib.coins import Coin
@@ -105,6 +105,11 @@ in that repository documents the configuration. The mainnet coin class carries t
 (`0d828600…86a8`, 2026-09-02); a checkout from before that fix refuses to sync mainnet, and the SDK's
 ElectrumX client refuses a server whose reported genesis is not the chain its addresses belong to.
 Upstream `LICENCE` is unchanged.
+
+Tags name the revisions our own instances run. `soqucoin-1.19.0-2` (18 October 2026) carries the
+fix for the reorg undo path: a checkout from before it stops at the first mainnet reorg, height
+7,434, and recovers on restart at the tag with no reindex. A running instance moves to a newer tag
+with a fetch of the tags, a checkout of the tag and a restart.
 
 **So the question we need answered:** do you run your own indexer for UTXO-model coins, or would
 you expect to connect to one we operate? That answer changes both the integration effort and where
