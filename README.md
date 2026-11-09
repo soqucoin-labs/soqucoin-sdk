@@ -1,6 +1,6 @@
 # soqucoin-sdk
 
-**Go SDK for Soqucoin: integrate SOQ in hours, not weeks.**
+**Go SDK for Soqucoin: deposits, withdrawals and key custody for SOQ.**
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/soqucoin-labs/soqucoin-sdk.svg)](https://pkg.go.dev/github.com/soqucoin-labs/soqucoin-sdk)
 [![CI](https://github.com/soqucoin-labs/soqucoin-sdk/actions/workflows/test.yml/badge.svg)](https://github.com/soqucoin-labs/soqucoin-sdk/actions/workflows/test.yml)
@@ -10,7 +10,7 @@
 
 ## What is Soqucoin?
 
-Soqucoin (SOQ) is the first NIST FIPS 204 (ML-DSA / Dilithium) post-quantum cryptocurrency. Every on-chain signature uses ML-DSA-44, with no classical elliptic-curve fallback. This SDK gives you everything you need to build wallets, exchanges, mining pools, and services on top of SOQ.
+Soqucoin (SOQ) is a post-quantum cryptocurrency built on NIST FIPS 204 (ML-DSA / Dilithium). Every on-chain signature uses ML-DSA-44, with no classical elliptic-curve fallback. This SDK gives you everything you need to build wallets, exchanges, mining pools, and services on top of SOQ.
 
 ## Install
 
