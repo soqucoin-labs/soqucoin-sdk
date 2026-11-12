@@ -93,8 +93,9 @@ func loadVectors(t *testing.T) vectorSet {
 // only, so the vectors fix the order of two neighbouring checks in three
 // places: the alphabet before the checksum, the checksum before the prefix,
 // the padding before the program length. A decoder that exchanges any other
-// two neighbours returns the same class for every vector. The cases of
-// TestWitnessV6DecoderOrderOfChecks hold those neighbours.
+// two neighbours returns the same class for every vector. Of those eight
+// pairs TestWitnessV6DecoderOrderOfChecks holds six, and its comment says why
+// the last two stay open.
 var reasonClass = map[string]error{
 	"empty":             ErrInvalidLength,
 	"whitespace":        ErrInvalidChar,

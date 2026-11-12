@@ -2,7 +2,8 @@
 // Distributed under the MIT software license, see LICENSE.
 //
 // DecodeWitnessV6 on strings the vectors shared with the node do not hold:
-// bytes above 126, and strings that fail two checks at once.
+// bytes above 126, bytes at the edges of the ranges the byte and case checks
+// test, and strings that fail two checks at once.
 
 package address
 
