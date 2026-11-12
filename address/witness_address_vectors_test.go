@@ -349,7 +349,11 @@ func TestVersion1PathAgainstTheVectors(t *testing.T) {
 // Whatever DecodeWitnessV6 accepts is the one string EncodeWitnessV6 writes
 // for that program, in lower or in upper case, and is refused by the payment
 // address decoder.
-func FuzzDecodeWitnessV6(f *testing.F) {
+//
+// The name does not begin with FuzzDecode: the Makefile's fuzz target selects
+// the payment address target with that pattern, and go test refuses a pattern
+// that matches two fuzz targets.
+func FuzzWitnessV6Decode(f *testing.F) {
 	raw, err := os.ReadFile(vectorsFile)
 	if err != nil {
 		f.Fatalf("read the vectors: %v", err)
