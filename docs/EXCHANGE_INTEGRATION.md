@@ -1083,8 +1083,8 @@ Every package carries unit tests. The figures below are one run of `go test -cov
 commit this document ships with, library packages only: the `examples/` programs and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Nine of the ten reproduce exactly. The `electrumx`
-figure moved between 89.7 and 90.3 across fourteen runs on this commit. Several of its tests drive
-the reader goroutine, the ping loop and the refresher at once. Which branches run
+figure moved between 89.7 and 90.4 across fourteen runs on this commit, because several of its tests drive
+the reader goroutine, the ping loop and the refresher at once, and which branches run
 depends on how those are scheduled.
 
 | Package | Coverage | What is covered |
