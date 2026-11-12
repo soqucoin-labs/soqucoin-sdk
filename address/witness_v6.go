@@ -36,8 +36,10 @@ const witnessV6 = 6
 // checksum verifies under this constant is refused.
 const bech32Const = 1
 
-// ErrInvalidPadding is returned for a data part that does not hold a whole
-// number of bytes: non-zero padding bits, or a spare group.
+// ErrInvalidPadding is returned by DecodeWitnessV6 for a data part that does
+// not hold a whole number of bytes: non-zero padding bits, or a spare group.
+// Decode and Validate refuse the same fault with an error that wraps none of
+// this package's errors.
 var ErrInvalidPadding = errors.New("bech32m: invalid padding")
 
 // isNetworkPrefix reports whether hrp is the prefix of one of this SDK's
@@ -74,7 +76,7 @@ func EncodeWitnessV6(hrp string, program []byte) (string, error) {
 // package's errors:
 //
 //	the empty string                                   ErrInvalidLength
-//	a byte outside the printable ASCII range           ErrInvalidChar
+//	a byte below 33 or above 126, a space included     ErrInvalidChar
 //	mixed case                                         ErrInvalidChar
 //	more than MaxAddressLength characters              ErrInvalidLength
 //	no separator, or nothing before it                 ErrInvalidHRP
@@ -85,6 +87,10 @@ func EncodeWitnessV6(hrp string, program []byte) (string, error) {
 //	no witness version, or a version other than 6      ErrUnsupportedWitnessVersion
 //	non-zero padding bits or a spare group             ErrInvalidPadding
 //	a program that is not 32 bytes                     ErrInvalidLength
+//
+// The version check also refuses a well-formed version 1 payment address:
+// from this function ErrUnsupportedWitnessVersion means a version other than
+// 6, where Decode returns it for a version that is no payment address.
 //
 // A prefix argument that is not one of this SDK's networks' is refused with
 // ErrInvalidHRP before the string is read. The program is nil on every
@@ -128,6 +134,8 @@ func DecodeWitnessV6(hrp, addr string) ([]byte, error) {
 
 	data := make([]int, len(addr)-pos-1)
 	for i := range data {
+		// The byte check above leaves bytes 33 to 126 only, so c is inside
+		// the 128 entries of charsetRev. The lookup has no check of its own.
 		c := addr[pos+1+i]
 		if charsetRev[c] == -1 {
 			return nil, fmt.Errorf("%w: %q is outside the bech32 alphabet", ErrInvalidChar, c)
