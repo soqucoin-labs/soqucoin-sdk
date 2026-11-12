@@ -511,6 +511,18 @@ address and reject a transaction whose inputs mix networks. That check exists
 because the script derived from an address is what BIP143 commits to as the
 `scriptCode`, so a wrong network is a signing fault and not merely a decoding one.
 
+### Script-output addresses
+
+A witness version 6 address starts with `sq1x` or `ssq1x`. It names a script output. Its 32 bytes are the SHA-256 of a witnessScript.
+
+`Validate`, `Decode` and `ScriptFor` refuse this form. `withdraw.Engine` refuses it at `Submit` and at `Build`. A withdrawal can't pay one.
+
+`address.EncodeWitnessV6` writes the form and `address.DecodeWitnessV6` reads it. `tx.ScriptWitnessV6` builds the output script from the 32 bytes.
+
+An address doesn't show which script it commits to. Derive the witnessScript yourself. Compare its SHA-256 with the decoded bytes.
+
+`tx.ScriptWitnessV6` builds the same script in every chain state. A chain runs a version 6 script only from its activation height. Check that your node enforces witness version 6 at the next block before you fund one.
+
 ### Amounts
 
 **All amounts in this SDK are `int64` shors.** There is no `Amount` type. 1 SOQ is
