@@ -88,9 +88,13 @@ func loadVectors(t *testing.T) vectorSet {
 }
 
 // reasonClass maps each refusal reason of the vectors to the error
-// DecodeWitnessV6 returns for it. The reasons are the first check a string
-// fails, in the order the file's description lists them, so a decoder that
-// applies its checks in another order returns another class for some vector.
+// DecodeWitnessV6 returns for it. A reason is the first check a string fails,
+// in the order the file's description lists them. Most vectors fail one check
+// only, so the vectors fix the order of two neighbouring checks in three
+// places: the alphabet before the checksum, the checksum before the prefix,
+// the padding before the program length. A decoder that exchanges any other
+// two neighbours returns the same class for every vector. The cases of
+// TestWitnessV6DecoderOrderOfChecks hold those neighbours.
 var reasonClass = map[string]error{
 	"empty":             ErrInvalidLength,
 	"whitespace":        ErrInvalidChar,

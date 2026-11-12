@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Soqucoin Labs Inc.
 // Distributed under the MIT software license, see LICENSE.
 //
-// DecodeWitnessV6 on strings the vectors shared with the node do not hold.
+// DecodeWitnessV6 on strings the vectors shared with the node do not hold:
+// bytes above 126, and strings that fail two checks at once.
 
 package address
 
@@ -9,6 +10,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 // A byte above 126 is refused by the byte check, before anything reads the
@@ -32,6 +35,132 @@ func TestWitnessV6DecoderRefusesBytesAbove126(t *testing.T) {
 						v.Address, b, at, program, err)
 				}
 			}
+		}
+	}
+}
+
+// checksummed writes a prefix, the separator, the groups of five bits and the
+// bech32m checksum over them. The string passes the checksum whatever the
+// prefix and the groups are.
+func checksummed(hrp string, groups []int) string {
+	var sb strings.Builder
+	sb.WriteString(hrp)
+	sb.WriteByte('1')
+	for _, g := range groups {
+		sb.WriteByte(charset[g])
+	}
+	for _, g := range createChecksum(hrp, groups) {
+		sb.WriteByte(charset[g])
+	}
+	return sb.String()
+}
+
+// groupsOf is the data part of an address before its checksum: the witness
+// version, then the program in groups of five bits, zero padded.
+func groupsOf(t *testing.T, version int, program []byte) []int {
+	t.Helper()
+	in := make([]int, len(program))
+	for i, b := range program {
+		in[i] = int(b)
+	}
+	conv, err := convertBits(in, 8, 5, true)
+	if err != nil {
+		t.Fatalf("groups of %x: %v", program, err)
+	}
+	groups := []int{version}
+	for _, g := range conv {
+		groups = append(groups, int(g))
+	}
+	return groups
+}
+
+// orderCase is a string whose refusal depends on the order of the checks of
+// DecodeWitnessV6. reason names the check that refuses it, in the words of the
+// shared vectors.
+type orderCase struct {
+	name    string
+	prefix  string
+	address string
+	reason  string
+}
+
+func orderCases(t *testing.T) []orderCase {
+	t.Helper()
+	program := progOf(0x5a)
+	other := map[string]string{types.Mainnet.HRP: types.Stagenet.HRP, types.Stagenet.HRP: types.Mainnet.HRP}
+
+	var cases []orderCase
+	for _, hrp := range []string{types.Mainnet.HRP, types.Stagenet.HRP} {
+		valid, err := EncodeWitnessV6(hrp, program)
+		if err != nil {
+			t.Fatalf("EncodeWitnessV6(%q): %v", hrp, err)
+		}
+		sep := len(hrp)
+		long := valid + strings.Repeat("q", MaxAddressLength+1-len(valid))
+
+		version1, err := Encode(other[hrp], 1, program)
+		if err != nil {
+			t.Fatalf("Encode(%q, 1): %v", other[hrp], err)
+		}
+		padded := groupsOf(t, 1, program)
+		padded[len(padded)-1] |= 1
+
+		cases = append(cases,
+			// A refused byte and mixed case come before the length limit.
+			orderCase{"a space in a string of more than 90 characters", hrp, long + " ", "whitespace"},
+			orderCase{"mixed case in a string of more than 90 characters", hrp, strings.ToUpper(long[:1]) + long[1:], "mixed_case"},
+
+			// The length limit comes before the separator, and 90 characters are
+			// within it.
+			orderCase{"more than 90 characters and no separator", hrp, strings.Repeat("q", MaxAddressLength+1), "length_over_90"},
+			orderCase{"more than 90 characters and nothing before the separator", hrp, "1" + strings.Repeat("q", MaxAddressLength), "length_over_90"},
+			orderCase{"90 characters and no separator", hrp, strings.Repeat("q", MaxAddressLength), "separator_missing"},
+
+			// An empty prefix comes before the six characters of the checksum.
+			orderCase{"nothing before the separator and five characters after it", hrp, "1qqqqq", "prefix_empty"},
+
+			// The six characters of the checksum come before the alphabet.
+			orderCase{"five characters after the separator, one outside the alphabet", hrp, hrp + "1bqqqq", "checksum_short"},
+
+			// The prefix comes before the witness version.
+			orderCase{"a version 1 address of the other prefix", hrp, version1, "prefix"},
+			orderCase{"no witness version under the other prefix", hrp, checksummed(other[hrp], nil), "prefix"},
+
+			// The witness version comes before the padding.
+			orderCase{"version 1 with a non-zero padding bit", hrp, checksummed(hrp, padded), "version"},
+
+			// The separator is the last "1" of the string.
+			orderCase{"a 1 among the last six characters", hrp, valid[:len(valid)-3] + "1" + valid[len(valid)-2:], "checksum_short"},
+			orderCase{"a 1 in the data part before the last six characters", hrp, valid[:sep+10] + "1" + valid[sep+11:], "checksum"},
+			orderCase{"a 1 inside the prefix, under the checksum of that prefix", hrp, checksummed(hrp[:1]+"1"+hrp[1:], groupsOf(t, 6, program)), "prefix"},
+		)
+	}
+	return cases
+}
+
+// The order of the checks, where the shared vectors leave it open. Each case
+// but one fails two checks, and DecodeWitnessV6 reports the one that comes
+// first in the order it documents; the other case is a string of exactly 90
+// characters, which the length limit lets through. The reason of a case is
+// what classify() of the node's generator (gen_witness_address_vectors.py,
+// beside the vectors in the node's tree) returns for the same string.
+//
+// With the vectors, these cases hold every pair of neighbouring checks that
+// one string can fail with two different errors, and the rule that the
+// separator is the last "1". Two neighbouring pairs stay open. The empty
+// string has no byte to refuse, so no string fails the first two checks
+// together. A refused byte and mixed case both return ErrInvalidChar, so the
+// error does not tell which of the two was checked first.
+func TestWitnessV6DecoderOrderOfChecks(t *testing.T) {
+	for _, c := range orderCases(t) {
+		want, known := reasonClass[c.reason]
+		if !known {
+			t.Fatalf("%s: reason %q has no error class", c.name, c.reason)
+		}
+		program, err := DecodeWitnessV6(c.prefix, c.address)
+		if program != nil || !errors.Is(err, want) {
+			t.Errorf("%s, %q under %q: DecodeWitnessV6 = %x, %v; want the error of %q, %q",
+				c.name, c.address, c.prefix, program, err, c.reason, want)
 		}
 	}
 }
