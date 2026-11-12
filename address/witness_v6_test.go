@@ -39,6 +39,62 @@ func TestWitnessV6DecoderRefusesBytesAbove126(t *testing.T) {
 	}
 }
 
+// The byte check and the two letter ranges of the case check, at their edges.
+//
+// '!' (33) and '~' (126) are the lowest and the highest byte the byte check
+// lets through. '@', '[', '`' and '{' are the neighbours of 'A', 'Z', 'a' and
+// 'z' and are not letters. Written over the first byte of the prefix, each
+// leaves a string that passes the byte and case checks and fails the checksum.
+//
+// 'a', 'z', 'A' and 'Z' are letters: a string whose only upper-case letter is
+// one of them, or whose only lower-case letter is, is mixed case and refused.
+func TestWitnessV6DecoderByteAndCaseEdges(t *testing.T) {
+	letters := map[string]int{"a": 0, "z": 0}
+	for _, v := range loadVectors(t).Valid {
+		if v.Version != 6 {
+			continue
+		}
+		lower, upper := v.Address, strings.ToUpper(v.Address)
+
+		for _, c := range []struct {
+			in string
+			b  byte
+		}{
+			{lower, '!'}, {lower, '~'}, {lower, '@'}, {lower, '['},
+			{upper, '`'}, {upper, '{'},
+		} {
+			written := []byte(c.in)
+			written[0] = c.b
+			program, err := DecodeWitnessV6(v.Prefix, string(written))
+			if program != nil || !errors.Is(err, reasonClass["checksum"]) {
+				t.Errorf("%q with %q as its first byte: DecodeWitnessV6 = %x, %v; want ErrInvalidChecksum",
+					c.in, c.b, program, err)
+			}
+		}
+
+		for letter := range letters {
+			if !strings.Contains(lower, letter) {
+				continue
+			}
+			letters[letter]++
+			for _, written := range []string{
+				strings.ReplaceAll(lower, letter, strings.ToUpper(letter)),
+				strings.ReplaceAll(upper, strings.ToUpper(letter), letter),
+			} {
+				program, err := DecodeWitnessV6(v.Prefix, written)
+				if program != nil || !errors.Is(err, reasonClass["mixed_case"]) {
+					t.Errorf("%q: DecodeWitnessV6 = %x, %v; want ErrInvalidChar", written, program, err)
+				}
+			}
+		}
+	}
+	for letter, n := range letters {
+		if n == 0 {
+			t.Errorf("no valid version 6 vector holds the letter %q", letter)
+		}
+	}
+}
+
 // checksummed writes a prefix, the separator, the groups of five bits and the
 // bech32m checksum over them. The string passes the checksum whatever the
 // prefix and the groups are.
