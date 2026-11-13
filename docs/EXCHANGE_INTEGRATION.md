@@ -1089,12 +1089,12 @@ depends on how those are scheduled.
 
 | Package | Coverage | What is covered |
 |---------|:--------:|-----------------|
-| `address` | **92.4%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
+| `address` | **98.5%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
 | `utxo` | **91.1%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `rpc` | **85.3%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **93.9%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
 | `electrumx` | **90.1%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
-| `tx` | **91.6%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
+| `tx` | **91.7%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `keys` | **89.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **87.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `types` | **85.7%** | Amount parsing and formatting exact at every value the node prints, network records, asset constants |

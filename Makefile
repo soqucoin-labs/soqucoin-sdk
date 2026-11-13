@@ -12,6 +12,7 @@ race:
 fuzz:
 	go test ./address -run '^$$' -fuzz FuzzDecode -fuzztime 30s
 	go test ./address -run '^$$' -fuzz FuzzEncode -fuzztime 30s
+	go test ./address -run '^$$' -fuzz FuzzWitnessV6Decode -fuzztime 30s
 	go test ./tx -run '^$$' -fuzz FuzzWeightMatchesSerialization -fuzztime 30s
 	go test ./tx -run '^$$' -fuzz FuzzBuildSendNeverPanicsAndNeverOverpays -fuzztime 30s
 

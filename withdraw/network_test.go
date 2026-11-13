@@ -93,6 +93,63 @@ func TestBuildFailsAStoredIntentWhoseDestinationIsOnAnotherNetwork(t *testing.T)
 	}
 }
 
+// A witness version 6 address names a script output and is no payment
+// destination. The string address.EncodeWitnessV6 writes is refused where a
+// destination enters and again where it would be signed, on each network, in
+// lower and in upper case: Submit records nothing, and Build fails a stored
+// Created record that holds one before anything is selected, so the selector
+// and the signer are never called and nothing is reserved. The selector is
+// counted because Build releases a failed intent's reservation before it
+// returns, and the spent set read afterwards is empty either way.
+func TestEngineRefusesAWitnessV6Destination(t *testing.T) {
+	ctx := context.Background()
+	for _, n := range []types.Network{types.Mainnet, types.Stagenet, types.Regtest} {
+		written, err := address.EncodeWitnessV6(n.HRP, make([]byte, address.WitnessProgramSize))
+		if err != nil {
+			t.Fatalf("%s: EncodeWitnessV6: %v", n.Name, err)
+		}
+		for _, to := range []string{written, strings.ToUpper(written)} {
+			store := NewMemStore()
+			spent := utxo.NewSpentSet("", nil)
+			net := &fakeNet{mode: "ok"}
+			e := newEngine(t, store, spent, net, coins())
+			e.Network = n
+			selects := 0
+			realSelect := e.Select
+			e.Select = func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
+				selects++
+				return realSelect(ctx, amount, feeRate)
+			}
+
+			in, created, err := e.Submit(ctx, "w-submitted", to, 1_000_000, 1000)
+			if !errors.Is(err, ErrInvalidIntent) || created || in != nil {
+				t.Fatalf("%s, submit %s: err %v created %v intent %v; want ErrInvalidIntent and nothing created",
+					n.Name, to, err, created, in)
+			}
+			if _, ok, _ := store.Get(ctx, "w-submitted"); ok {
+				t.Fatalf("%s, submit %s: a record was created for a refused destination", n.Name, to)
+			}
+
+			stored := &Intent{ID: "w-stored", Address: to, Amount: 1_000_000, FeeRate: 1000, State: StateCreated}
+			if err := store.Create(ctx, stored); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.Build(ctx, stored); !errors.Is(err, ErrInvalidIntent) {
+				t.Fatalf("%s, build %s: %v, want ErrInvalidIntent", n.Name, to, err)
+			}
+			got, _, _ := store.Get(ctx, "w-stored")
+			if got.State != StateFailed || !strings.Contains(got.LastError, to) {
+				t.Fatalf("%s, build %s: stored %s with LastError %q; want Failed naming the destination",
+					n.Name, to, got.State, got.LastError)
+			}
+			if selects != 0 || len(spent.ReservedIntents()) != 0 || net.builds != 0 {
+				t.Fatalf("%s, build %s: selector calls %d, reserved %v, builds %d; want the selector and the signer never called and nothing reserved",
+					n.Name, to, selects, spent.ReservedIntents(), net.builds)
+			}
+		}
+	}
+}
+
 func mustEncode(t *testing.T, hrp string, witVer byte, n int) string {
 	t.Helper()
 	a, err := address.Encode(hrp, witVer, make([]byte, n))
