@@ -97,7 +97,10 @@ func TestBuildFailsAStoredIntentWhoseDestinationIsOnAnotherNetwork(t *testing.T)
 // destination. The string address.EncodeWitnessV6 writes is refused where a
 // destination enters and again where it would be signed, on each network, in
 // lower and in upper case: Submit records nothing, and Build fails a stored
-// Created record that holds one, reserves nothing and never calls the signer.
+// Created record that holds one before anything is selected, so the selector
+// and the signer are never called and nothing is reserved. The selector is
+// counted because Build releases a failed intent's reservation before it
+// returns, and the spent set read afterwards is empty either way.
 func TestEngineRefusesAWitnessV6Destination(t *testing.T) {
 	ctx := context.Background()
 	for _, n := range []types.Network{types.Mainnet, types.Stagenet, types.Regtest} {
@@ -111,6 +114,12 @@ func TestEngineRefusesAWitnessV6Destination(t *testing.T) {
 			net := &fakeNet{mode: "ok"}
 			e := newEngine(t, store, spent, net, coins())
 			e.Network = n
+			selects := 0
+			realSelect := e.Select
+			e.Select = func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
+				selects++
+				return realSelect(ctx, amount, feeRate)
+			}
 
 			in, created, err := e.Submit(ctx, "w-submitted", to, 1_000_000, 1000)
 			if !errors.Is(err, ErrInvalidIntent) || created || in != nil {
@@ -133,9 +142,9 @@ func TestEngineRefusesAWitnessV6Destination(t *testing.T) {
 				t.Fatalf("%s, build %s: stored %s with LastError %q; want Failed naming the destination",
 					n.Name, to, got.State, got.LastError)
 			}
-			if len(spent.ReservedIntents()) != 0 || net.builds != 0 {
-				t.Fatalf("%s, build %s: reserved %v, builds %d; want nothing reserved and the signer never called",
-					n.Name, to, spent.ReservedIntents(), net.builds)
+			if selects != 0 || len(spent.ReservedIntents()) != 0 || net.builds != 0 {
+				t.Fatalf("%s, build %s: selector calls %d, reserved %v, builds %d; want the selector and the signer never called and nothing reserved",
+					n.Name, to, selects, spent.ReservedIntents(), net.builds)
 			}
 		}
 	}

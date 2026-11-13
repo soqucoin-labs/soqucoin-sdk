@@ -146,6 +146,15 @@ func orderCases(t *testing.T) []orderCase {
 	program := progOf(0x5a)
 	other := map[string]string{types.Mainnet.HRP: types.Stagenet.HRP, types.Stagenet.HRP: types.Mainnet.HRP}
 
+	// For each prefix, a string the shared vectors refuse for its bech32
+	// checksum. Any of them serves, and the first in the file is taken.
+	bech32Vector := map[string]string{}
+	for _, v := range loadVectors(t).Invalid {
+		if _, taken := bech32Vector[v.Prefix]; !taken && v.Version == 6 && v.Reason == "checksum_bech32" {
+			bech32Vector[v.Prefix] = v.Address
+		}
+	}
+
 	var cases []orderCase
 	for _, hrp := range []string{types.Mainnet.HRP, types.Stagenet.HRP} {
 		valid, err := EncodeWitnessV6(hrp, program)
@@ -154,6 +163,10 @@ func orderCases(t *testing.T) []orderCase {
 		}
 		sep := len(hrp)
 		long := valid + strings.Repeat("q", MaxAddressLength+1-len(valid))
+		bech32, held := bech32Vector[other[hrp]]
+		if !held {
+			t.Fatalf("the vectors hold no version 6 string with a bech32 checksum under %q", other[hrp])
+		}
 
 		version1, err := Encode(other[hrp], 1, program)
 		if err != nil {
@@ -173,11 +186,20 @@ func orderCases(t *testing.T) []orderCase {
 			orderCase{"more than 90 characters and nothing before the separator", hrp, "1" + strings.Repeat("q", MaxAddressLength), "length_over_90"},
 			orderCase{"90 characters and no separator", hrp, strings.Repeat("q", MaxAddressLength), "separator_missing"},
 
+			// No separator comes before the six characters of the checksum and
+			// before the alphabet.
+			orderCase{"no separator and five characters", hrp, "qqqqq", "separator_missing"},
+			orderCase{"no separator and seven characters, one outside the alphabet", hrp, "bqqqqqq", "separator_missing"},
+
 			// An empty prefix comes before the six characters of the checksum.
 			orderCase{"nothing before the separator and five characters after it", hrp, "1qqqqq", "prefix_empty"},
 
 			// The six characters of the checksum come before the alphabet.
 			orderCase{"five characters after the separator, one outside the alphabet", hrp, hrp + "1bqqqq", "checksum_short"},
+
+			// A bech32 checksum comes before the prefix. The vectors hold the
+			// string under its own prefix only.
+			orderCase{"a bech32 checksum under the other prefix", hrp, bech32, "checksum_bech32"},
 
 			// The prefix comes before the witness version.
 			orderCase{"a version 1 address of the other prefix", hrp, version1, "prefix"},
