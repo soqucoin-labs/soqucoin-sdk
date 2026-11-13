@@ -131,9 +131,11 @@ func groupsOf(t *testing.T, version int, program []byte) []int {
 	return groups
 }
 
-// orderCase is a string whose refusal depends on the order of the checks of
-// DecodeWitnessV6. reason names the check that refuses it, in the words of the
-// shared vectors.
+// orderCase is a string DecodeWitnessV6 refuses. reason names the check that
+// refuses it, in the words of the shared vectors. Which check that is depends
+// on the order of the checks for every case but two under each prefix: the
+// string of exactly 90 characters, and the string under the checksum of a
+// prefix with a "1" inside it, fail one check each.
 type orderCase struct {
 	name    string
 	prefix  string
@@ -217,12 +219,15 @@ func orderCases(t *testing.T) []orderCase {
 	return cases
 }
 
-// The order of the checks, where the shared vectors leave it open. Each case
-// but one fails two checks, and DecodeWitnessV6 reports the one that comes
-// first in the order it documents; the other case is a string of exactly 90
-// characters, which the length limit lets through. The reason of a case is
-// what classify() of the node's generator (gen_witness_address_vectors.py,
-// beside the vectors in the node's tree) returns for the same string.
+// The order of the checks, where the shared vectors leave it open. Under each
+// prefix every case but two fails two or more checks, and DecodeWitnessV6
+// reports the one that comes first in the order it documents. The other two
+// fail one check each: the string of exactly 90 characters, which the length
+// limit lets through and the separator check refuses, and the string under
+// the checksum of a prefix with a "1" inside it, which passes every check but
+// the prefix comparison. The reason of a case is what classify() of the
+// node's generator (gen_witness_address_vectors.py, beside the vectors in the
+// node's tree) returns for the same string.
 //
 // With the vectors, these cases hold every pair of neighbouring checks that
 // one string can fail with two different errors, and the rule that the
