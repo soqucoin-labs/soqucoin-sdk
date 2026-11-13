@@ -25,9 +25,11 @@ var ErrWitnessProgramSize = errors.New("tx: witness program must be 32 bytes")
 // The function is the same in every chain state, and the node is not: it
 // enforces a version 6 script from the activation height of the deployment.
 // In a block below that height consensus does not check the script the
-// program commits to. A caller that funds an output of this form first
-// confirms with its node that witness version 6 is enforced for the next
-// block.
+// program commits to. The node's relay rule reads the tip once, and a
+// transaction it accepted can confirm below the height when the tip moves
+// back. A caller funds an output of this form only after the block at the
+// activation height has nMaxReorgDepth confirmations, the node's
+// reorganisation depth limit.
 //
 // No function of this SDK that takes an address returns this script. The
 // payment address path (address.ScriptFor) stays witness version 1 only.

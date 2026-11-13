@@ -521,7 +521,7 @@ A witness version 6 address starts with `sq1x` or `ssq1x`. It names a script out
 
 An address doesn't show which script it commits to. Derive the witnessScript yourself. Compare its SHA-256 with the decoded bytes.
 
-`tx.ScriptWitnessV6` builds the same script in every chain state. A chain runs a version 6 script only from its activation height. Below that height, consensus does not check the script the address commits to. Check that your node enforces witness version 6 at the next block before you fund one.
+`tx.ScriptWitnessV6` builds the same script in every chain state. A chain runs a version 6 script only from its activation height. Below that height, consensus does not check the script the address commits to. Fund a version 6 output only after the block at the activation height has `nMaxReorgDepth` confirmations. `nMaxReorgDepth` is the node's reorganisation depth limit. The node's relay rule reads the tip once. The mempool does not apply the relay rule again when the tip moves back. An accepted transaction can then confirm in a block below the activation height.
 
 ### Amounts
 
