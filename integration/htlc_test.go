@@ -296,6 +296,23 @@ func (b *swapBench) minedAt(name string, tr *tx.Transaction) int64 {
 	return b.n.height()
 }
 
+// paysTo requires the node's first output of a mined transaction to carry the
+// payment script of addr.
+func (b *swapBench) paysTo(name string, tr *tx.Transaction, addr string) {
+	b.t.Helper()
+	want, err := address.ScriptFor(addr)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	out, err := b.n.rpc.GetTxOut(context.Background(), tr.TxID(), 0, false)
+	if err != nil || out == nil {
+		b.t.Fatalf("%s: no unspent first output: %+v, %v", name, out, err)
+	}
+	if out.ScriptPubKey.Hex != hex.EncodeToString(want) {
+		b.t.Errorf("%s: the node holds output script %s, want %x, the script of %s", name, out.ScriptPubKey.Hex, want, addr)
+	}
+}
+
 func (b *swapBench) mineTo(height int64) {
 	b.t.Helper()
 	if at := b.n.height(); at < height {
@@ -513,11 +530,12 @@ func TestSwapContractClaimAndRefundMeetInTheMempool(t *testing.T) {
 	b.mineTo(int64(lock))
 
 	// The refund arrives first, then a claim at three times its fee rate.
+	// The claim pays the wallet key, which is not the key that signs it.
 	refund, err := htlc.BuildRefund(p, first, b.payer, htlcFeeRate, b.keys, b.payer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, err := htlc.BuildClaim(p, first, secret, b.payee, 3*htlcFeeRate, b.keys, b.payee)
+	claim, err := htlc.BuildClaim(p, first, secret, b.hot, 3*htlcFeeRate, b.keys, b.payee)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,6 +545,7 @@ func TestSwapContractClaimAndRefundMeetInTheMempool(t *testing.T) {
 		t.Error("the refund is still in the mempool beside the claim that replaced it")
 	}
 	b.minedAt("the claim that replaced the refund", claim)
+	b.paysTo("the claim that replaced the refund", claim, b.hot)
 
 	// The claim arrives first, then a refund at three times its fee rate.
 	claim, err = htlc.BuildClaim(p, second, secret, b.payee, htlcFeeRate, b.keys, b.payee)

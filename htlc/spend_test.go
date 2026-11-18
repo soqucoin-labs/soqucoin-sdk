@@ -6,6 +6,7 @@ package htlc
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -166,6 +167,9 @@ func TestClaimHasTheRuledShape(t *testing.T) {
 	}
 	if !bytes.Equal(in.ScriptPubKey, out) || in.Value != testFundedValue || in.Vout != 1 {
 		t.Errorf("input does not name the funded output")
+	}
+	if in.Address != w.payee.addr {
+		t.Errorf("the input's address is %q, want the signer's", in.Address)
 	}
 	item := in.WitnessData
 	if len(item) != 6 {
@@ -530,6 +534,9 @@ func TestVerifySpendRefusesEachChange(t *testing.T) {
 		{"a one-byte trailer", func(tr *tx.Transaction) {
 			tr.Inputs[0].WitnessData[len(tr.Inputs[0].WitnessData)-1] = []byte{0x00}
 		}, ErrSpendForm},
+		{"an empty trailer", func(tr *tx.Transaction) {
+			tr.Inputs[0].WitnessData[len(tr.Inputs[0].WitnessData)-1] = []byte{}
+		}, ErrSpendForm},
 		{"a stranger's key and trailer", func(tr *tx.Transaction) {
 			wd := tr.Inputs[0].WitnessData
 			wd[1], wd[len(wd)-1] = w.stranger.pub, append([]byte{0x00}, w.stranger.pub...)
@@ -592,8 +599,14 @@ func TestVerifySpendRefusesEachChange(t *testing.T) {
 	run := func(kind string, good *tx.Transaction, name string, change func(*tx.Transaction), want error) {
 		tr := clone(good)
 		change(tr)
-		if err := VerifySpend(tr, w.p, testFundedValue); !errors.Is(err, want) {
+		err := VerifySpend(tr, w.p, testFundedValue)
+		if !errors.Is(err, want) {
 			t.Errorf("%s, %s: got %v, want %v", kind, name, err, want)
+		}
+		// The node takes several other hash types, so the refusal of one is
+		// also a refusal of the form.
+		if want == tx.ErrHashType && !errors.Is(err, ErrSpendForm) {
+			t.Errorf("%s, %s: %v is not ErrSpendForm", kind, name, err)
 		}
 	}
 	claim, refund := w.claim(t), w.refund(t)
@@ -703,5 +716,116 @@ func TestVerifySpendRefusesTheInvalidKeyMarker(t *testing.T) {
 	err := VerifySpend(tr, p, testFundedValue)
 	if !errors.Is(err, ErrSpendForm) || !errors.Is(err, keys.ErrInvalidPublicKey) {
 		t.Errorf("got %v, want ErrSpendForm wrapping keys.ErrInvalidPublicKey", err)
+	}
+}
+
+// The output pays the destination named and the fee is taken at the rate
+// asked: a third party's address, which is not the signer's, and two rates
+// that are not the recommended one.
+func TestSpendsPayTheDestinationAtTheRateAsked(t *testing.T) {
+	w := newWorld(t)
+	stranger := tx.ScriptP2WPKH(w.stranger.kh[:])
+
+	claim, err := BuildClaim(w.p, w.funded, w.preimage, w.stranger.addr, 3*testFeeRate, w.m, w.payee.addr)
+	if err != nil {
+		t.Fatalf("BuildClaim: %v", err)
+	}
+	refund, err := BuildRefund(w.p, w.funded, w.stranger.addr, 7, w.m, w.payer.addr)
+	if err != nil {
+		t.Fatalf("BuildRefund: %v", err)
+	}
+	for _, c := range []struct {
+		name string
+		tr   *tx.Transaction
+		rate int64
+	}{{"claim", claim, 3 * testFeeRate}, {"refund", refund, 7}} {
+		if len(c.tr.Outputs) != 1 || !bytes.Equal(c.tr.Outputs[0].ScriptPubKey, stranger) {
+			t.Errorf("%s: the output does not pay the destination named", c.name)
+		}
+		want := (c.tr.VSize() + tx.FeeMarginVBytes) * c.rate
+		if fee := testFundedValue - c.tr.Outputs[0].Value; fee != want {
+			t.Errorf("%s at %d shors/vB: fee %d, want %d", c.name, c.rate, fee, want)
+		}
+		if err := VerifySpend(c.tr, w.p, testFundedValue); err != nil {
+			t.Errorf("%s: VerifySpend: %v", c.name, err)
+		}
+	}
+}
+
+// A key that begins 0xff is the node's invalid-key marker, and the node
+// refuses every spend under it. A builder whose signer returns such a key
+// refuses before the signer is asked, whatever the contract commits to.
+func TestBuildersRefuseTheInvalidKeyMarkerBeforeTheSignerIsAsked(t *testing.T) {
+	w := newWorld(t)
+	invalid := append([]byte{0xff}, w.payee.pub[1:]...)
+	p := w.p
+	p.PayeeKeyHash = sha256.Sum256(invalid)
+	p.PayerKeyHash = p.PayeeKeyHash
+
+	s := &counting{inner: faulty{inner: w.m, otherKey: invalid}}
+	tr, err := BuildClaim(p, w.funded, w.preimage, w.payee.addr, testFeeRate, s, w.payee.addr)
+	if !errors.Is(err, keys.ErrInvalidPublicKey) || tr != nil || s.signs != 0 {
+		t.Errorf("claim: got %v (transaction returned: %v), %d signatures; want keys.ErrInvalidPublicKey and none", err, tr != nil, s.signs)
+	}
+	tr, err = BuildRefund(p, w.funded, w.payer.addr, testFeeRate, s, w.payer.addr)
+	if !errors.Is(err, keys.ErrInvalidPublicKey) || tr != nil || s.signs != 0 {
+		t.Errorf("refund: got %v (transaction returned: %v), %d signatures; want keys.ErrInvalidPublicKey and none", err, tr != nil, s.signs)
+	}
+}
+
+// sharing is a signer that hands out one slice of its own for the key.
+type sharing struct {
+	inner tx.Signer
+	key   []byte
+}
+
+func (s sharing) Sign(a string, d []byte) ([]byte, error) { return s.inner.Sign(a, d) }
+func (s sharing) PublicKeyFor(string) ([]byte, error)     { return s.key, nil }
+
+// The key item of a returned transaction is the transaction's own bytes: a
+// change to the signer's slice does not change the transaction, and a change
+// to the key item does not change the signer's key.
+func TestSpendHoldsItsOwnCopyOfTheKey(t *testing.T) {
+	w := newWorld(t)
+	own := append([]byte(nil), w.payee.pub...)
+	tr, err := BuildClaim(w.p, w.funded, w.preimage, w.payee.addr, testFeeRate, sharing{inner: w.m, key: own}, w.payee.addr)
+	if err != nil {
+		t.Fatalf("BuildClaim: %v", err)
+	}
+	own[5] ^= 1
+	if !bytes.Equal(tr.Inputs[0].WitnessData[1], w.payee.pub) {
+		t.Error("the key item changed with the signer's slice")
+	}
+	if err := VerifySpend(tr, w.p, testFundedValue); err != nil {
+		t.Errorf("after the signer's slice changed: %v", err)
+	}
+	own[5] ^= 1
+	tr.Inputs[0].WitnessData[1][7] ^= 1
+	if !bytes.Equal(own, w.payee.pub) {
+		t.Error("the signer's slice changed with the key item")
+	}
+}
+
+// A refusal names a length or a field and never prints a witness item. Two
+// hand-assembled shapes carry the secret where the selector is read: six
+// items with the secret as items 3 and 4, and the refund's five with the
+// secret as item 3.
+func TestVerifySpendErrorsDoNotPrintTheSecret(t *testing.T) {
+	w := newWorld(t)
+	secret := hex.EncodeToString(w.preimage[:])
+
+	six := clone(w.claim(t))
+	six.Inputs[0].WitnessData[3] = append([]byte(nil), w.preimage[:]...)
+	five := clone(w.refund(t))
+	five.Inputs[0].WitnessData[2] = append([]byte(nil), w.preimage[:]...)
+	for name, tr := range map[string]*tx.Transaction{"six items": six, "five items": five} {
+		err := VerifySpend(tr, w.p, testFundedValue)
+		if !errors.Is(err, ErrSpendForm) {
+			t.Errorf("%s: got %v, want ErrSpendForm", name, err)
+			continue
+		}
+		if strings.Contains(strings.ToLower(err.Error()), secret) {
+			t.Errorf("%s: the error holds the secret: %v", name, err)
+		}
 	}
 }

@@ -11,15 +11,16 @@ import (
 	"testing"
 )
 
-// independentDigest is a second writing of the BIP 143 SIGHASH_ALL digest,
-// assembled field by field from the transaction's public fields with no call
-// into the builder's serializers, so the test below compares two
-// implementations and not one with itself. The script code is written as a
-// one-byte length and its bytes, which holds for every script code under 253
-// bytes; the test uses none longer.
-func independentDigest(t *testing.T, tr *Transaction, index int, scriptCode []byte) []byte {
+// independentDigest is a second writing of the BIP 143 digest in its
+// SIGHASH_ALL form, assembled field by field from the transaction's public
+// fields with no call into the builder's serializers, so the tests below
+// compare two implementations and not one with itself. The script code's
+// length is one byte under 253 bytes and 0xfd with two little-endian bytes
+// from 253 to 65,535; the tests use none longer. hashType is the last field
+// of the preimage.
+func independentDigest(t *testing.T, tr *Transaction, index int, scriptCode []byte, hashType uint32) []byte {
 	t.Helper()
-	if len(scriptCode) >= 0xfd {
+	if len(scriptCode) > 0xffff {
 		t.Fatalf("independentDigest: script code of %d bytes needs a longer length prefix", len(scriptCode))
 	}
 	dsha := func(b []byte) []byte {
@@ -51,13 +52,17 @@ func independentDigest(t *testing.T, tr *Transaction, index int, scriptCode []by
 	pre = append(pre, dsha(sequences)...)
 	pre = append(pre, in.TxID[:]...)
 	pre = append(pre, le32(in.Vout)...)
-	pre = append(pre, byte(len(scriptCode)))
+	if len(scriptCode) < 0xfd {
+		pre = append(pre, byte(len(scriptCode)))
+	} else {
+		pre = append(pre, 0xfd, byte(len(scriptCode)), byte(len(scriptCode)>>8))
+	}
 	pre = append(pre, scriptCode...)
 	pre = append(pre, le64(uint64(in.Value))...)
 	pre = append(pre, le32(in.Sequence)...)
 	pre = append(pre, dsha(outputs)...)
 	pre = append(pre, le32(tr.LockTime)...)
-	pre = append(pre, le32(SigHashAll)...)
+	pre = append(pre, le32(hashType)...)
 	return dsha(pre)
 }
 
@@ -88,6 +93,8 @@ func TestScriptCodeDigestOverTheOutputScriptIsTheNodeDigest(t *testing.T) {
 // The script code the caller names is the one committed to: a witnessScript
 // of 116 to 119 bytes (the lengths of the swap contract) gives the digest of
 // the independent writing, and no two script codes below give one digest.
+// 252 and 253 bytes are the two sides of the length prefix's change from one
+// byte to three, and 300 is a length whose low byte alone is another length.
 func TestScriptCodeDigestCommitsToTheNamedScriptCode(t *testing.T) {
 	v := loadNodeVector(t)
 	tr := buildNodeVector(t, v)
@@ -101,6 +108,8 @@ func TestScriptCodeDigestCommitsToTheNamedScriptCode(t *testing.T) {
 		bytes.Repeat([]byte{0x63}, 119),
 		append(bytes.Repeat([]byte{0x63}, 116), 0x68),
 		bytes.Repeat([]byte{0x63}, 252),
+		bytes.Repeat([]byte{0x63}, 253),
+		bytes.Repeat([]byte{0x63}, 300),
 	}
 	seen := map[string]int{}
 	for n, code := range codes {
@@ -109,7 +118,7 @@ func TestScriptCodeDigestCommitsToTheNamedScriptCode(t *testing.T) {
 			if err != nil {
 				t.Fatalf("script code %d, input %d: %v", n, i, err)
 			}
-			if want := independentDigest(t, tr, i, code); !bytes.Equal(got, want) {
+			if want := independentDigest(t, tr, i, code, SigHashAll); !bytes.Equal(got, want) {
 				t.Errorf("script code %d (%d bytes), input %d: digest %x, independent writing %x",
 					n, len(code), i, got, want)
 			}
@@ -119,6 +128,39 @@ func TestScriptCodeDigestCommitsToTheNamedScriptCode(t *testing.T) {
 				}
 				seen[string(got)] = n
 			}
+		}
+	}
+}
+
+// The hash type the caller names is the last field of the preimage: the
+// digest at 0x00 and at 0x04 is the independent writing's for that value and
+// is not the digest at SIGHASH_ALL. The preimage keeps the SIGHASH_ALL form
+// at every value, which is the node's form for these two.
+func TestScriptCodeDigestCommitsToTheHashType(t *testing.T) {
+	v := loadNodeVector(t)
+	tr := buildNodeVector(t, v)
+	code := bytes.Repeat([]byte{0x63}, 117)
+	all, err := tr.ComputeSigHashWithScriptCode(0, code, SigHashAll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hashType := range []uint32{0x00, 0x04} {
+		got, err := tr.ComputeSigHashWithScriptCode(0, code, hashType)
+		if err != nil {
+			t.Fatalf("hash type %#02x: %v", hashType, err)
+		}
+		if want := independentDigest(t, tr, 0, code, hashType); !bytes.Equal(got, want) {
+			t.Errorf("hash type %#02x: digest %x, independent writing %x", hashType, got, want)
+		}
+		if bytes.Equal(got, all) {
+			t.Errorf("hash type %#02x gives the digest of SIGHASH_ALL", hashType)
+		}
+		viaInput, err := tr.ComputeSigHash(0, hashType)
+		if err != nil {
+			t.Fatalf("hash type %#02x: %v", hashType, err)
+		}
+		if want := independentDigest(t, tr, 0, tr.Inputs[0].ScriptPubKey, hashType); !bytes.Equal(viaInput, want) {
+			t.Errorf("hash type %#02x: ComputeSigHash %x, independent writing %x", hashType, viaInput, want)
 		}
 	}
 }

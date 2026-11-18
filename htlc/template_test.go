@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
+	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 )
 
@@ -144,8 +145,10 @@ func splice(script []byte, from, to int, with ...byte) []byte {
 }
 
 // Each script is a contract another builder could write, or the template with
-// one thing changed. An output for any of them is either unspendable under
-// witness version 6 or spendable under other terms than the swap's.
+// one thing changed. Each is another script with another output, which this
+// package does not build and does not spend. Some of them a node spends on
+// the swap's own terms: the lock height as OP_5, OP_NOTIF for OP_IF and the
+// two branches exchanged.
 func TestParseScriptRefusesWhatIsNotTheTemplate(t *testing.T) {
 	v, _ := hex.DecodeString(nodeVectorHex)
 	low := nodeVectorParams()
@@ -301,5 +304,16 @@ func TestKeyHashTakesTheRawKeyOnly(t *testing.T) {
 	}
 	if _, err := KeyHash(nil); !errors.Is(err, ErrKeySize) {
 		t.Errorf("a nil key gave %v", err)
+	}
+	// The node reads a first byte of 0xff as its invalid-key marker and
+	// refuses every spend under such a key (src/pubkey.h, CPubKey::GetLen).
+	marker := bytes.Repeat([]byte{0x07}, 1312)
+	marker[0] = 0xff
+	if h, err := KeyHash(marker); !errors.Is(err, keys.ErrInvalidPublicKey) || h != ([32]byte{}) {
+		t.Errorf("a key that begins 0xff gave %x, %v; want keys.ErrInvalidPublicKey", h, err)
+	}
+	marker[0] = 0xfe
+	if _, err := KeyHash(marker); err != nil {
+		t.Errorf("a key that begins 0xfe: %v", err)
 	}
 }
