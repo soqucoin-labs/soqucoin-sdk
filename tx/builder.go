@@ -273,7 +273,29 @@ func (tx *Transaction) EstimateFee(feeRate int64) int64 {
 
 // ComputeSigHash computes the BIP143 sighash for a specific input.
 // This is the message digest that gets signed with Dilithium.
+//
+// The script code is the input's own scriptPubKey, which is what the node
+// commits to for a single-key witness version 1 spend. A spend whose script
+// code is another script signs through ComputeSigHashWithScriptCode.
 func (tx *Transaction) ComputeSigHash(inputIndex int, hashType uint32) ([]byte, error) {
+	if inputIndex < 0 || inputIndex >= len(tx.Inputs) {
+		return nil, fmt.Errorf("input index %d out of range [0, %d)", inputIndex, len(tx.Inputs))
+	}
+	return tx.ComputeSigHashWithScriptCode(inputIndex, tx.Inputs[inputIndex].ScriptPubKey, hashType)
+}
+
+// ComputeSigHashWithScriptCode computes the BIP143 sighash for a specific
+// input over the script code the caller names. It is the one implementation
+// of the digest in this SDK; ComputeSigHash calls it with the input's
+// scriptPubKey.
+//
+// The node takes the script code from the kind of output being spent
+// (src/script/interpreter.cpp): the scriptPubKey for a single-key version 1
+// spend, the witnessScript for a witness version 6 spend. A digest over the
+// wrong one is a signature the node refuses. The script code is written as
+// its length and its bytes and is not otherwise read. As in ComputeSigHash,
+// the preimage is the SIGHASH_ALL form whatever hashType is given.
+func (tx *Transaction) ComputeSigHashWithScriptCode(inputIndex int, scriptCode []byte, hashType uint32) ([]byte, error) {
 	if inputIndex < 0 || inputIndex >= len(tx.Inputs) {
 		return nil, fmt.Errorf("input index %d out of range [0, %d)", inputIndex, len(tx.Inputs))
 	}
@@ -292,10 +314,9 @@ func (tx *Transaction) ComputeSigHash(inputIndex int, hashType uint32) ([]byte, 
 	outpoint.Write(input.TxID[:])
 	binary.Write(&outpoint, binary.LittleEndian, input.Vout)
 
-	// 4. scriptCode = the previous output's scriptPubKey
-	// For P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
-	// For Soqucoin P2WPKH-Dilithium (witness v0/v1): the scriptPubKey itself
-	scriptCode := input.ScriptPubKey
+	// 4. scriptCode = the script the caller named: the previous output's
+	// scriptPubKey for Soqucoin P2WPKH-Dilithium (witness v0/v1), the
+	// witnessScript for witness version 6
 
 	// 5. value = input amount (8 bytes LE)
 	// 6. nSequence = this input's sequence (4 bytes LE)
