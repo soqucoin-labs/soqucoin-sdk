@@ -237,11 +237,13 @@ func (tx *Transaction) AddOutput(value int64, scriptPubKey []byte) {
 
 // EstimateWeight returns the transaction weight in weight units, measured on
 // the serialized form: 3 x the non-witness serialization plus the full
-// serialization (BIP 141). Inputs not yet signed are counted with the exact
-// witness this SDK emits (2421-byte signature||hashtype, 1313-byte 0x00||pk),
-// so the value is the node's own weight for the signed transaction, not an
-// approximation. Because every witness item has a fixed size, the estimate
-// before signing equals the measurement after.
+// serialization (BIP 141). An input that carries a witness is measured as it
+// stands. An input with none is counted with the two-item witness of a
+// payment spend (2421-byte signature||hashtype, 1313-byte 0x00||pk), so for a
+// payment the value is the node's own weight for the signed transaction, not
+// an approximation: every item has a fixed size, and the estimate before
+// signing equals the measurement after. A spend with another witness, such as
+// package htlc's, sets a witness of the final item sizes before it measures.
 func (tx *Transaction) EstimateWeight() int {
 	base := len(tx.serializeNoWitness())
 	witness := 2 // marker + flag
@@ -273,7 +275,29 @@ func (tx *Transaction) EstimateFee(feeRate int64) int64 {
 
 // ComputeSigHash computes the BIP143 sighash for a specific input.
 // This is the message digest that gets signed with Dilithium.
+//
+// The script code is the input's own scriptPubKey, which is what the node
+// commits to for a single-key witness version 1 spend. A spend whose script
+// code is another script signs through ComputeSigHashWithScriptCode.
 func (tx *Transaction) ComputeSigHash(inputIndex int, hashType uint32) ([]byte, error) {
+	if inputIndex < 0 || inputIndex >= len(tx.Inputs) {
+		return nil, fmt.Errorf("input index %d out of range [0, %d)", inputIndex, len(tx.Inputs))
+	}
+	return tx.ComputeSigHashWithScriptCode(inputIndex, tx.Inputs[inputIndex].ScriptPubKey, hashType)
+}
+
+// ComputeSigHashWithScriptCode computes the BIP143 sighash for a specific
+// input over the script code the caller names. It is the one implementation
+// of the digest in this SDK; ComputeSigHash calls it with the input's
+// scriptPubKey.
+//
+// The node takes the script code from the kind of output being spent
+// (src/script/interpreter.cpp): the scriptPubKey for a single-key version 1
+// spend, the witnessScript for a witness version 6 spend. A digest over the
+// wrong one is a signature the node refuses. The script code is written as
+// its length and its bytes and is not otherwise read. As in ComputeSigHash,
+// the preimage is the SIGHASH_ALL form whatever hashType is given.
+func (tx *Transaction) ComputeSigHashWithScriptCode(inputIndex int, scriptCode []byte, hashType uint32) ([]byte, error) {
 	if inputIndex < 0 || inputIndex >= len(tx.Inputs) {
 		return nil, fmt.Errorf("input index %d out of range [0, %d)", inputIndex, len(tx.Inputs))
 	}
@@ -292,10 +316,9 @@ func (tx *Transaction) ComputeSigHash(inputIndex int, hashType uint32) ([]byte, 
 	outpoint.Write(input.TxID[:])
 	binary.Write(&outpoint, binary.LittleEndian, input.Vout)
 
-	// 4. scriptCode = the previous output's scriptPubKey
-	// For P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
-	// For Soqucoin P2WPKH-Dilithium (witness v0/v1): the scriptPubKey itself
-	scriptCode := input.ScriptPubKey
+	// 4. scriptCode = the script the caller named: the previous output's
+	// scriptPubKey for Soqucoin P2WPKH-Dilithium (witness v0/v1), the
+	// witnessScript for witness version 6
 
 	// 5. value = input amount (8 bytes LE)
 	// 6. nSequence = this input's sequence (4 bytes LE)
