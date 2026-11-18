@@ -214,7 +214,7 @@ func TestParseScriptOnEverySingleByteChangeOfTheVector(t *testing.T) {
 				if !errors.Is(err, ErrNotTemplate) {
 					t.Fatalf("offset %d, byte %#02x: error %v does not wrap ErrNotTemplate", i, b, err)
 				}
-				if parameter(i) && !(i >= 77 && i < 79) {
+				if parameter(i) && (i < 77 || i >= 79) {
 					t.Errorf("offset %d, byte %#02x: a change inside a 32-byte parameter is refused: %v", i, b, err)
 				}
 				continue
