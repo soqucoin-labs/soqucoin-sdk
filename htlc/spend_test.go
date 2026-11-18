@@ -505,6 +505,12 @@ func TestVerifySpendRefusesEachChange(t *testing.T) {
 		{"the key with a leading zero", item(1, func(k []byte) []byte { return append([]byte{0x00}, k...) }), ErrSpendForm},
 		{"a signature item one byte short", item(0, func(s []byte) []byte { return s[1:] }), ErrSpendForm},
 		{"a signature item with no hash type", item(0, func(s []byte) []byte { return s[:len(s)-1] }), ErrSpendForm},
+		{"a signature item one byte longer", item(0, func(s []byte) []byte { return append(s, 0x01) }), ErrSpendForm},
+		{"the key with a leading zero, and a trailer made for it", func(tr *tx.Transaction) {
+			wd := tr.Inputs[0].WitnessData
+			wd[1] = append([]byte{0x00}, wd[1]...)
+			wd[len(wd)-1] = append([]byte{0x00}, wd[1]...)
+		}, ErrSpendForm},
 		{"hash type 0x00", hashType(0x00), tx.ErrHashType},
 		{"hash type NONE", hashType(0x02), tx.ErrHashType},
 		{"hash type SINGLE", hashType(0x03), tx.ErrHashType},

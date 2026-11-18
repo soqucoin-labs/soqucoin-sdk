@@ -182,9 +182,6 @@ func buildSpend(p Params, script []byte, funded types.UTXO, preimage *[32]byte, 
 	if err != nil {
 		return nil, fmt.Errorf("sign: %w", err)
 	}
-	if len(signature) != types.SignatureSize {
-		return nil, fmt.Errorf("%w: signature is %d bytes, want %d", ErrSpendForm, len(signature), types.SignatureSize)
-	}
 	signatureItem := make([]byte, 0, signatureItemSize)
 	signatureItem = append(signatureItem, signature...)
 	signatureItem = append(signatureItem, tx.SigHashAll)

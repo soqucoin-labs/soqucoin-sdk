@@ -210,7 +210,7 @@ func ParseScript(script []byte) (Params, error) {
 		return Params{}, fmt.Errorf("%w: %d bytes", ErrNotTemplate, len(script))
 	}
 	n := int(script[lockPushOffset])
-	if n < 1 || len(script) != scriptFixedBytes+n {
+	if len(script) != scriptFixedBytes+n {
 		return Params{}, fmt.Errorf("%w: lock height push of %d bytes in a script of %d", ErrNotTemplate, n, len(script))
 	}
 	var p Params
