@@ -809,10 +809,12 @@ func TestSpendHoldsItsOwnCopyOfTheKey(t *testing.T) {
 // A refusal names a length or a field and never prints a witness item. Two
 // hand-assembled shapes carry the secret where the selector is read: six
 // items with the secret as items 3 and 4, and the refund's five with the
-// secret as item 3.
+// secret as item 3. The whole text of the refusal is compared, so the item
+// is in it in no encoding.
 func TestVerifySpendErrorsDoNotPrintTheSecret(t *testing.T) {
 	w := newWorld(t)
 	secret := hex.EncodeToString(w.preimage[:])
+	want := ErrSpendForm.Error() + ": selector of 32 bytes"
 
 	six := clone(w.claim(t))
 	six.Inputs[0].WitnessData[3] = append([]byte(nil), w.preimage[:]...)
@@ -826,6 +828,9 @@ func TestVerifySpendErrorsDoNotPrintTheSecret(t *testing.T) {
 		}
 		if strings.Contains(strings.ToLower(err.Error()), secret) {
 			t.Errorf("%s: the error holds the secret: %v", name, err)
+		}
+		if err.Error() != want {
+			t.Errorf("%s: the refusal reads %q, want %q", name, err, want)
 		}
 	}
 }

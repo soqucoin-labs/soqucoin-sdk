@@ -255,9 +255,10 @@ func ParseScript(script []byte) (Params, error) {
 // A key whose first byte is 0xff is refused with keys.ErrInvalidPublicKey, as
 // keys.AddressFor refuses it: the node reads that byte as its invalid-key
 // marker (src/pubkey.h) and refuses every spend under the key, so a branch
-// that commits to its hash can never be spent. A party derives its own key
-// hash through this function. The other party's key hash arrives as 32 bytes
-// and cannot be checked this way.
+// that commits to its hash can never be spent. The check holds only for a
+// key hash derived here: keys.PubKeyHash and a plain SHA-256 give the same 32
+// bytes with no refusal, and the other party's key hash arrives as 32 bytes
+// that cannot be checked.
 func KeyHash(publicKey []byte) ([32]byte, error) {
 	if len(publicKey) != types.PublicKeySize {
 		return [32]byte{}, fmt.Errorf("%w: got %d", ErrKeySize, len(publicKey))

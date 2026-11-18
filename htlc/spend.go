@@ -63,7 +63,8 @@ const (
 // A claim shows the secret to every node it reaches, so nothing is signed and
 // nothing is returned unless the claim is one the script accepts. Refused
 // before the signer is asked: a preimage that does not hash to p.Hash
-// (ErrPreimage); a signer whose key does not hash to p.PayeeKeyHash
+// (ErrPreimage); a signer whose key begins 0xff, which the node refuses in
+// every spend (keys.ErrInvalidPublicKey), or does not hash to p.PayeeKeyHash
 // (ErrWrongKey); a destination that is not a payment address of the signer's
 // network (ErrDestination); a fee rate or a fee outside the limits of package
 // tx; a value that leaves less than the relay floor. The signed transaction
