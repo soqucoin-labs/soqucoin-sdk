@@ -1340,7 +1340,7 @@
       "test": "TestLockHeightPushAtTheBoundaryHeights",
       "find": "\tif n[len(n)-1]&0x80 != 0 {",
       "replace": "\tif false {",
-      "why": "A script number whose last byte has the top bit set is negative. Without the added zero byte a lock height such as 128 or 40,000 is written as a negative number: the claim still passes and every refund fails, so the payer's coins can only leave through the claim."
+      "why": "A script number whose last byte has the top bit set is negative. Without the added zero byte the node reads another number. When only the top bit is set (128, 32,768, 8,388,608) it reads zero: relay refuses the refund as a non-minimal number and a block takes it at any height. Otherwise, as at 40,000, it reads a negative number and every refund fails, so the payer's coins can only leave through the claim."
     },
     {
       "id": "htlc-parse-accepts-a-script-it-did-not-rebuild",
@@ -1394,7 +1394,7 @@
       "test": "TestClaimHasTheRuledShape",
       "find": "\tt.Inputs[0].WitnessData = witness(make([]byte, signatureItemSize), publicKey, preimage, script)\n\tfee := t.EstimateFee(feeRate)",
       "replace": "\tfee := t.EstimateFee(feeRate)",
-      "why": "An input with no witness is sized as a two-item payment witness, about 1,470 bytes smaller than a claim's. A fee measured that way is under the relay floor for the transaction that is sent, so the claim is signed and does not relay."
+      "why": "An input with no witness is sized as a two-item payment witness, about 1,470 bytes smaller than a claim's. A fee measured that way is about a quarter under the rate asked for, and under the relay floor when the rate asked is near it."
     },
     {
       "id": "htlc-verify-digest-over-the-output-script",
@@ -1413,6 +1413,87 @@
       "find": "\tif hashType != tx.SigHashAll {",
       "replace": "\tif false {",
       "why": "The script does not hold the signer to SIGHASH_ALL, and a type that leaves the outputs out of the signature lets anyone redirect the spend. The verifier names the hash type as the fault instead of reporting a signature that does not verify."
+    },
+    {
+      "id": "htlc-key-hash-takes-the-invalid-key-marker",
+      "file": "htlc/template.go",
+      "package": "./htlc",
+      "test": "TestBuildersRefuseTheInvalidKeyMarkerBeforeTheSignerIsAsked",
+      "find": "\tif publicKey[0] == 0xff {",
+      "replace": "\tif false {",
+      "why": "The node reads a first byte of 0xff as its invalid-key marker and refuses every spend under such a key. A contract that commits to the hash of one has a branch nobody can spend, and a builder that takes the key asks the signer for a signature the node refuses."
+    },
+    {
+      "id": "htlc-spend-pays-the-signer-whatever-destination-is-named",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestSpendsPayTheDestinationAtTheRateAsked",
+      "find": "\tpayScript, err := destinationScript(payToAddress, signerAddress)",
+      "replace": "\tpayScript, err := destinationScript(signerAddress, signerAddress)",
+      "why": "The destination and the signer's address are two arguments, and a caller may name a destination that is not the signing key's address. A builder that pays the signer's address sends the contract's value to a key the caller did not name."
+    },
+    {
+      "id": "htlc-fee-taken-at-one-rate-whatever-rate-is-asked",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestSpendsPayTheDestinationAtTheRateAsked",
+      "find": "\tfee := t.EstimateFee(feeRate)",
+      "replace": "\tfee := t.EstimateFee(types.RecommendedFeeRate)",
+      "why": "The fee is the signed size and the margin at the rate the caller asks. At a fixed rate a caller who asks for more to outbid a refund pays no more, and one who asks for less pays more than it agreed to."
+    },
+    {
+      "id": "htlc-verify-reads-the-first-byte-of-an-empty-trailer",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestVerifySpendRefusesEachChange",
+      "find": "\tif len(trailer) != 1+len(publicKey) || trailer[0] != trailerPrefix || !bytes.Equal(trailer[1:], publicKey) {",
+      "replace": "\tif trailer[0] != trailerPrefix || !bytes.Equal(trailer[1:], publicKey) {",
+      "why": "VerifySpend reads transactions that other parties wrote. The length is compared before the first byte is read, so a transaction whose last witness item is empty is refused and does not stop the process that verifies it."
+    },
+    {
+      "id": "htlc-key-item-is-the-signers-slice",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestSpendHoldsItsOwnCopyOfTheKey",
+      "find": "\tpublicKey = bytes.Clone(publicKey)\n",
+      "replace": "",
+      "why": "tx.Signer does not say who owns the slice PublicKeyFor returns. A transaction that keeps the signer's slice as its key item changes when the signer's buffer does, and a caller that edits the key item edits the signer's key."
+    },
+    {
+      "id": "htlc-verify-prints-the-selector-item",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestVerifySpendErrorsDoNotPrintTheSecret",
+      "find": "\t\treturn fmt.Errorf(\"%w: selector of %d bytes\", ErrSpendForm, len(gotSelector))",
+      "replace": "\t\treturn fmt.Errorf(\"%w: selector %x\", ErrSpendForm, gotSelector)",
+      "why": "In a transaction assembled by hand or received from another party the item at the selector's position can be the secret, and it can be of any length. An error that prints the item puts the secret in a log before the claim is sent."
+    },
+    {
+      "id": "htlc-hash-type-refusal-is-not-a-form-refusal",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestVerifySpendRefusesEachChange",
+      "find": "\t\treturn fmt.Errorf(\"%w: hashtype %#02x: %w\", ErrSpendForm, hashType, tx.ErrHashType)",
+      "replace": "\t\treturn fmt.Errorf(\"hashtype %#02x: %w\", hashType, tx.ErrHashType)",
+      "why": "The node takes other hash types on this script, so a spend signed with one is a form the node accepts and this package does not write. A caller that asks errors.Is for ErrSpendForm to tell such forms from a spend the script refuses gets that answer for a hash type too."
+    },
+    {
+      "id": "tx-sighash-script-code-length-in-one-byte",
+      "file": "tx/builder.go",
+      "package": "./tx",
+      "test": "TestScriptCodeDigestCommitsToTheNamedScriptCode",
+      "find": "\twriteVarInt(&preimage, uint64(len(scriptCode)))",
+      "replace": "\tpreimage.WriteByte(byte(len(scriptCode)))",
+      "why": "The digest function is exported for any script code, and the node takes witness version 6 scripts longer than 252 bytes. From 253 bytes the length is three bytes; written as one, every signature over a longer script is one the node refuses."
+    },
+    {
+      "id": "tx-sighash-ignores-the-hash-type",
+      "file": "tx/builder.go",
+      "package": "./tx",
+      "test": "TestScriptCodeDigestCommitsToTheHashType",
+      "find": "\tbinary.Write(&preimage, binary.LittleEndian, hashType)",
+      "replace": "\tbinary.Write(&preimage, binary.LittleEndian, uint32(SigHashAll))",
+      "why": "The hash type is the last field of the preimage. A digest that writes SIGHASH_ALL whatever the caller names gives one digest for two hash types, so a signature made for one verifies under the other."
     }
   ]
 }

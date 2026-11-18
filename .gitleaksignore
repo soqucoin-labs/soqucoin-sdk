@@ -2,7 +2,7 @@
 #
 # htlc/testdata/regtest_spends.json as first committed named two fields
 # "payee_key_hash" and "payer_key_hash". Their values are SHA-256 digests of
-# ML-DSA-44 public keys that a regtest node has seen in mined transactions.
+# ML-DSA-44 public keys, and each digest is in a script a regtest node mined.
 # The scanner's generic rule matched the word "key" in the field names. The
 # fields have other names since, and these four lines cover that one commit.
 83a983867fa20ce2d8e7ac77cab05dd3e7315538:htlc/testdata/regtest_spends.json:generic-api-key:7
