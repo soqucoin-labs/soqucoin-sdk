@@ -28,8 +28,12 @@
 package htlc
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 
+	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
@@ -91,38 +95,153 @@ const (
 	lockPushOffset   = 76
 )
 
-// The declarations below are placed ahead of their bodies so that the tests
-// of the package compile and fail on their assertions.
-
-var errNotBuilt = errors.New("htlc: not built yet")
-
+// Params are the four values a contract is made of. Both parties derive the
+// same script from the same four, so each can compare the funded output with
+// bytes it computed itself.
 type Params struct {
-	Hash         [32]byte
+	// Hash is the SHA-256 of the 32-byte secret.
+	Hash [32]byte
+	// PayeeKeyHash is the SHA-256 of the raw public key that claims.
 	PayeeKeyHash [32]byte
+	// PayerKeyHash is the SHA-256 of the raw public key that refunds.
 	PayerKeyHash [32]byte
-	LockHeight   Height
+	// LockHeight is the height from which the refund is valid: a refund is
+	// accepted by a node whose tip is at this height and can be in the next
+	// block.
+	LockHeight Height
 }
 
-func (p Params) Validate() error                { return errNotBuilt }
-func (p Params) Script() ([]byte, error)        { return nil, errNotBuilt }
-func (p Params) OutputScript() ([]byte, error)  { return nil, errNotBuilt }
-func (p Params) Address(string) (string, error) { return "", errNotBuilt }
-func ParseScript([]byte) (Params, error)        { return Params{}, errNotBuilt }
-func KeyHash([]byte) ([32]byte, error)          { return [32]byte{}, errNotBuilt }
-
-var (
-	ErrPreimage    = errors.New("htlc: preimage does not hash to the contract's hash")
-	ErrWrongKey    = errors.New("htlc: public key does not hash to the key hash of this branch")
-	ErrDestination = errors.New("htlc: destination is not a payment address on the signer's network")
-	ErrSpendForm   = errors.New("htlc: not a claim or a refund of this contract in the form this package writes")
-)
-
-func BuildClaim(Params, types.UTXO, [32]byte, string, int64, tx.Signer, string) (*tx.Transaction, error) {
-	return nil, errNotBuilt
+// Validate refuses a lock height of 0 or above MaxLockHeight with
+// ErrLockHeight. Whether a height is far enough ahead of the tip is a rule of
+// the swap and is not checked here.
+func (p Params) Validate() error {
+	if p.LockHeight < 1 || p.LockHeight > MaxLockHeight {
+		return fmt.Errorf("%w: got %d", ErrLockHeight, p.LockHeight)
+	}
+	return nil
 }
 
-func BuildRefund(Params, types.UTXO, string, int64, tx.Signer, string) (*tx.Transaction, error) {
-	return nil, errNotBuilt
+// lockHeightNumber writes a height as the node's script number: little-endian,
+// no leading zero bytes, and one more zero byte when the top bit of the last
+// byte is set, because that bit is the sign. 128 is 80 00. Without the added
+// byte the number is negative: the claim still passes and every refund fails.
+// The caller has validated the height, so it is at least 1.
+func lockHeightNumber(h Height) []byte {
+	var n []byte
+	for v := uint32(h); v > 0; v >>= 8 {
+		n = append(n, byte(v))
+	}
+	if n[len(n)-1]&0x80 != 0 {
+		n = append(n, 0x00)
+	}
+	return n
 }
 
-func VerifySpend(*tx.Transaction, Params, int64) error { return errNotBuilt }
+// Script returns the witnessScript of the contract. The lock height is
+// written as a data push of its script number at every value, 1 to 16
+// included, as the node's own builder writes it; a script that uses OP_1 to
+// OP_16 there is another script with another output.
+func (p Params) Script() ([]byte, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	n := lockHeightNumber(p.LockHeight)
+	s := make([]byte, 0, scriptFixedBytes+len(n))
+	s = append(s, opIf, opSize, 0x01, 0x20, opEqualVerify, opSHA256, push32)
+	s = append(s, p.Hash[:]...)
+	s = append(s, opEqualVerify, push32)
+	s = append(s, p.PayeeKeyHash[:]...)
+	s = append(s, opCheckDilithiumKeyHash, op1, opElse, byte(len(n)))
+	s = append(s, n...)
+	s = append(s, opCheckLockTimeVerify, opDrop, push32)
+	s = append(s, p.PayerKeyHash[:]...)
+	s = append(s, opCheckDilithiumKeyHash, op1, opEndIf)
+	return s, nil
+}
+
+// program is the witness program of the contract: one SHA-256 of the script.
+func (p Params) program() ([]byte, error) {
+	script, err := p.Script()
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(script)
+	return sum[:], nil
+}
+
+// OutputScript returns the 34-byte output script of the contract: OP_6 and
+// the SHA-256 of the witnessScript. These bytes, and no address string, are
+// what a party compares with the output it was shown.
+//
+// The function does not know the chain's state. Below the activation height
+// of witness version 6 consensus does not check the script the output commits
+// to, so an output of this form is funded only after that height is buried;
+// see tx.ScriptWitnessV6.
+func (p Params) OutputScript() ([]byte, error) {
+	program, err := p.program()
+	if err != nil {
+		return nil, err
+	}
+	return tx.ScriptWitnessV6(program)
+}
+
+// Address returns the display form of the output under the prefix of one of
+// the SDK's networks. It is for showing and for comparing: an address of
+// another script passes every checksum, so the script is always derived from
+// the parameters and never from an address. The rule of OutputScript on the
+// chain's state applies.
+func (p Params) Address(hrp string) (string, error) {
+	program, err := p.program()
+	if err != nil {
+		return "", err
+	}
+	return address.EncodeWitnessV6(hrp, program)
+}
+
+// ParseScript reads the four parameters from a witnessScript and returns them
+// only if the script is the template for exactly those parameters: it builds
+// the script again from what it read and compares the two byte for byte.
+// Every other script is refused with ErrNotTemplate, among them a contract
+// with another hash function, another signature opcode, a relative lock, a
+// key in place of a key hash, no length check on the secret, a lock height
+// written in another form or as a time, and one with a byte more or less.
+func ParseScript(script []byte) (Params, error) {
+	if len(script) < minScriptBytes || len(script) > maxScriptBytes {
+		return Params{}, fmt.Errorf("%w: %d bytes", ErrNotTemplate, len(script))
+	}
+	n := int(script[lockPushOffset])
+	if n < 1 || len(script) != scriptFixedBytes+n {
+		return Params{}, fmt.Errorf("%w: lock height push of %d bytes in a script of %d", ErrNotTemplate, n, len(script))
+	}
+	var p Params
+	copy(p.Hash[:], script[7:39])
+	copy(p.PayeeKeyHash[:], script[41:73])
+	number := script[lockPushOffset+1 : lockPushOffset+1+n]
+	var height uint32
+	for i := n - 1; i >= 0; i-- {
+		height = height<<8 | uint32(number[i])
+	}
+	p.LockHeight = Height(height)
+	payer := lockPushOffset + 1 + n + 3
+	copy(p.PayerKeyHash[:], script[payer:payer+32])
+
+	want, err := p.Script()
+	if err != nil {
+		return Params{}, fmt.Errorf("%w: %w", ErrNotTemplate, err)
+	}
+	if !bytes.Equal(want, script) {
+		return Params{}, ErrNotTemplate
+	}
+	return p, nil
+}
+
+// KeyHash returns the SHA-256 of a raw 1,312-byte ML-DSA-44 public key, the
+// value the template commits to for each party. It is also the witness
+// program of that key's payment address. A key of any other length, the
+// 1,313-byte form with a leading zero included, is refused with ErrKeySize.
+func KeyHash(publicKey []byte) ([32]byte, error) {
+	if len(publicKey) != types.PublicKeySize {
+		return [32]byte{}, fmt.Errorf("%w: got %d", ErrKeySize, len(publicKey))
+	}
+	return sha256.Sum256(publicKey), nil
+}
