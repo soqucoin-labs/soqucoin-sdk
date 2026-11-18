@@ -4,8 +4,8 @@
     {
       "kind": "claim",
       "hash": "fb25e3e92322c750d1dab3eb227e725a93402f969c0d04483ed7d53986dd9940",
-      "payee_key_hash": "df9e58de203a7318961fc4ce9e6c3cc1d09401f2cf43cbed65d604eecbae1b8b",
-      "payer_key_hash": "f38e83ff4339af74f1a06e19389b863ba32b6bba382d8f3c2bf324e0b8896f41",
+      "payee_hash": "df9e58de203a7318961fc4ce9e6c3cc1d09401f2cf43cbed65d604eecbae1b8b",
+      "payer_hash": "f38e83ff4339af74f1a06e19389b863ba32b6bba382d8f3c2bf324e0b8896f41",
       "lock_height": 110,
       "funded_txid": "fc24abdbb98db1285eb6bd90f3881969870c900d5f45007b06cce29067d5f6ee",
       "funded_vout": 0,
@@ -27,8 +27,8 @@
     {
       "kind": "refund",
       "hash": "ac2d907285f50c2c6f0452644189773f874ca04c6f4e55ada12ce3b77aa93edc",
-      "payee_key_hash": "e61516a1a837480120df4656ecb1e5337f3253187b0c78e0a375b35be09655ec",
-      "payer_key_hash": "921bade3b64aec406ad00f9b3bcc3b801c43cdc6cb1ed1ed11a89713e2459726",
+      "payee_hash": "e61516a1a837480120df4656ecb1e5337f3253187b0c78e0a375b35be09655ec",
+      "payer_hash": "921bade3b64aec406ad00f9b3bcc3b801c43cdc6cb1ed1ed11a89713e2459726",
       "lock_height": 130,
       "funded_txid": "b5fa789090f295fd674218b54ff0ef15c8c02a4b0b1a9d2edc87722455400ca0",
       "funded_vout": 0,

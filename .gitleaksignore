@@ -1,0 +1,11 @@
+# Findings of the secret scan that are not secrets, by fingerprint.
+#
+# htlc/testdata/regtest_spends.json as first committed named two fields
+# "payee_key_hash" and "payer_key_hash". Their values are SHA-256 digests of
+# ML-DSA-44 public keys that a regtest node has seen in mined transactions.
+# The scanner's generic rule matched the word "key" in the field names. The
+# fields have other names since, and these four lines cover that one commit.
+83a983867fa20ce2d8e7ac77cab05dd3e7315538:htlc/testdata/regtest_spends.json:generic-api-key:7
+83a983867fa20ce2d8e7ac77cab05dd3e7315538:htlc/testdata/regtest_spends.json:generic-api-key:8
+83a983867fa20ce2d8e7ac77cab05dd3e7315538:htlc/testdata/regtest_spends.json:generic-api-key:30
+83a983867fa20ce2d8e7ac77cab05dd3e7315538:htlc/testdata/regtest_spends.json:generic-api-key:31

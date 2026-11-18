@@ -31,8 +31,8 @@ import (
 type minedSpend struct {
 	Kind       string   `json:"kind"`
 	Hash       string   `json:"hash"`
-	PayeeHash  string   `json:"payee_key_hash"`
-	PayerHash  string   `json:"payer_key_hash"`
+	PayeeHash  string   `json:"payee_hash"`
+	PayerHash  string   `json:"payer_hash"`
 	LockHeight uint32   `json:"lock_height"`
 	FundedTxID string   `json:"funded_txid"`
 	FundedVout uint32   `json:"funded_vout"`
