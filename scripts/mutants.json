@@ -1323,6 +1323,96 @@
       "find": "!strings.EqualFold(existing.Address, address)",
       "replace": "strings.Compare(existing.Address, address) != 0",
       "why": "bech32m spells one address all-lower or all-upper and checkDestination decodes either, so the other spelling of the recorded destination under one id is the same withdrawal, not a conflict."
+    },
+    {
+      "id": "tx-sighash-script-code-is-the-input-script",
+      "file": "tx/builder.go",
+      "package": "./tx",
+      "test": "TestSighashMatchesNodeVector",
+      "find": "\treturn tx.ComputeSigHashWithScriptCode(inputIndex, tx.Inputs[inputIndex].ScriptPubKey, hashType)",
+      "replace": "\treturn tx.ComputeSigHashWithScriptCode(inputIndex, nil, hashType)",
+      "why": "Every version 1 spend signs through ComputeSigHash, and the node commits to the input's scriptPubKey as the script code there. With another script code every withdrawal carries a signature the node refuses."
+    },
+    {
+      "id": "htlc-lock-height-loses-the-sign-byte",
+      "file": "htlc/template.go",
+      "package": "./htlc",
+      "test": "TestLockHeightPushAtTheBoundaryHeights",
+      "find": "\tif n[len(n)-1]&0x80 != 0 {",
+      "replace": "\tif false {",
+      "why": "A script number whose last byte has the top bit set is negative. Without the added zero byte a lock height such as 128 or 40,000 is written as a negative number: the claim still passes and every refund fails, so the payer's coins can only leave through the claim."
+    },
+    {
+      "id": "htlc-parse-accepts-a-script-it-did-not-rebuild",
+      "file": "htlc/template.go",
+      "package": "./htlc",
+      "test": "TestParseScriptRefusesWhatIsNotTheTemplate",
+      "find": "\tif !bytes.Equal(want, script) {",
+      "replace": "\tif !bytes.Equal(want, script) && len(script) == 0 {",
+      "why": "ParseScript reads four values at fixed offsets and says nothing about the bytes between them. The comparison with the script built again is the whole of what refuses another hash function, another signature opcode, a relative lock or a missing length check."
+    },
+    {
+      "id": "htlc-refund-sequence-does-not-signal-replacement",
+      "file": "htlc/template.go",
+      "package": "./htlc",
+      "test": "TestRefundHasTheRuledShape",
+      "find": "\tRefundSequence uint32 = 0xfffffffd",
+      "replace": "\tRefundSequence uint32 = 0xfffffffe",
+      "why": "After the lock height the claim and the refund are both valid. A refund at 0xfffffffe cannot be replaced, so a refund that reaches a mempool first keeps out a later claim that has already shown the secret."
+    },
+    {
+      "id": "htlc-claim-signed-before-the-preimage-is-checked",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestBuildersRefuseBeforeTheSignerIsAsked",
+      "find": "\tif sha256.Sum256(preimage[:]) != p.Hash {\n\t\treturn nil, ErrPreimage\n\t}\n\treturn buildSpend(",
+      "replace": "\treturn buildSpend(",
+      "why": "A claim is refused before a signature exists for it. A signed claim with a wrong preimage is a transaction that can leave the process by another path, and the builder's contract is that nothing is signed for a spend the script refuses."
+    },
+    {
+      "id": "htlc-spend-signed-before-the-key-is-checked",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestBuildersRefuseBeforeTheSignerIsAsked",
+      "find": "\tif got != keyHash {",
+      "replace": "\tif got != keyHash && len(publicKey) == 0 {",
+      "why": "A claim under a key the branch does not name fails at the node after it has shown the secret. The key is compared with the branch's key hash before the signer is asked."
+    },
+    {
+      "id": "htlc-destination-on-another-network",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestBuildersRefuseBeforeTheSignerIsAsked",
+      "find": "\tif payHRP != signerHRP {",
+      "replace": "\tif false {",
+      "why": "A payment script is the same bytes on every network, so a claim paid to an address of another network confirms and pays a key that may not exist on this one. The prefix of the destination is held to the signer's."
+    },
+    {
+      "id": "htlc-fee-measured-without-the-witness",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestClaimHasTheRuledShape",
+      "find": "\tt.Inputs[0].WitnessData = witness(make([]byte, signatureItemSize), publicKey, preimage, script)\n\tfee := t.EstimateFee(feeRate)",
+      "replace": "\tfee := t.EstimateFee(feeRate)",
+      "why": "An input with no witness is sized as a two-item payment witness, about 1,470 bytes smaller than a claim's. A fee measured that way is under the relay floor for the transaction that is sent, so the claim is signed and does not relay."
+    },
+    {
+      "id": "htlc-verify-digest-over-the-output-script",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestSpendsANodeMinedAreTheBytesWrittenHereAndVerify",
+      "find": "\tdigest, err := t.ComputeSigHashWithScriptCode(0, script, uint32(hashType))",
+      "replace": "\tdigest, err := t.ComputeSigHashWithScriptCode(0, outputScript, uint32(hashType))",
+      "why": "The node signs a witness version 6 spend over the witnessScript. A verifier that recomputes the digest over the output script agrees with a builder making the same mistake and refuses every spend a node accepts; the spends a node mined are what tell the two apart."
+    },
+    {
+      "id": "htlc-verify-reads-no-hash-type",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestVerifySpendRefusesEachChange",
+      "find": "\tif hashType != tx.SigHashAll {",
+      "replace": "\tif false {",
+      "why": "The script does not hold the signer to SIGHASH_ALL, and a type that leaves the outputs out of the signature lets anyone redirect the spend. The verifier names the hash type as the fault instead of reporting a signature that does not verify."
     }
   ]
 }
