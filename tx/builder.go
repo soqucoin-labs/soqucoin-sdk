@@ -237,11 +237,13 @@ func (tx *Transaction) AddOutput(value int64, scriptPubKey []byte) {
 
 // EstimateWeight returns the transaction weight in weight units, measured on
 // the serialized form: 3 x the non-witness serialization plus the full
-// serialization (BIP 141). Inputs not yet signed are counted with the exact
-// witness this SDK emits (2421-byte signature||hashtype, 1313-byte 0x00||pk),
-// so the value is the node's own weight for the signed transaction, not an
-// approximation. Because every witness item has a fixed size, the estimate
-// before signing equals the measurement after.
+// serialization (BIP 141). An input that carries a witness is measured as it
+// stands. An input with none is counted with the two-item witness of a
+// payment spend (2421-byte signature||hashtype, 1313-byte 0x00||pk), so for a
+// payment the value is the node's own weight for the signed transaction, not
+// an approximation: every item has a fixed size, and the estimate before
+// signing equals the measurement after. A spend with another witness, such as
+// package htlc's, sets a witness of the final item sizes before it measures.
 func (tx *Transaction) EstimateWeight() int {
 	base := len(tx.serializeNoWitness())
 	witness := 2 // marker + flag

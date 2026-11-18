@@ -21,10 +21,12 @@
 // funded the output and takes it back from the lock height on. A key hash is
 // the SHA-256 of a raw 1,312-byte ML-DSA-44 public key.
 //
-// Every function here is a function of its arguments. None reads a node, a
-// clock or a file, so none knows whether the chain enforces witness version 6
-// yet, whether an output exists, or how far the tip is from the lock height.
-// A caller checks those against a node before it funds, claims or refunds.
+// No function here reads a node, a clock or a file, so none knows whether the
+// chain enforces witness version 6 yet, whether an output exists, or how far
+// the tip is from the lock height. A caller checks those against a node
+// before it funds, claims or refunds. The two builders read the fee limits of
+// package tx (MaxFeeRateShorsPerVB, MaxFeeShors) and ask the signer, whose
+// signatures may differ from call to call.
 package htlc
 
 import (
@@ -34,6 +36,7 @@ import (
 	"fmt"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
+	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
@@ -52,7 +55,9 @@ const MaxLockHeight Height = 499_999_999
 // which switches a transaction's lock time off and fails the refund's lock
 // time check. The claim's value does not signal replacement and the refund's
 // does (src/policy/rbf.cpp), so a node's mempool does not replace a claim it
-// holds and can replace a refund with a claim that pays more.
+// holds and can replace a refund with a claim that pays more. The payee
+// cannot replace its own claim either: a claim's fee is not raised by sending
+// the claim again at a higher rate.
 const (
 	ClaimSequence  uint32 = 0xfffffffe
 	RefundSequence uint32 = 0xfffffffd
@@ -124,8 +129,12 @@ func (p Params) Validate() error {
 // lockHeightNumber writes a height as the node's script number: little-endian,
 // no leading zero bytes, and one more zero byte when the top bit of the last
 // byte is set, because that bit is the sign. 128 is 80 00. Without the added
-// byte the number is negative: the claim still passes and every refund fails.
-// The caller has validated the height, so it is at least 1.
+// byte the node reads another number (src/script/script.h, CScriptNum). When
+// only the top bit is set (128, 32,768, 8,388,608) it reads zero: relay
+// refuses the refund as a non-minimal number and a block takes it at any
+// height. Otherwise it reads a negative number and every refund fails. The
+// claim passes in both cases. The caller has validated the height, so it is
+// at least 1.
 func lockHeightNumber(h Height) []byte {
 	var n []byte
 	for v := uint32(h); v > 0; v >>= 8 {
@@ -173,10 +182,13 @@ func (p Params) program() ([]byte, error) {
 // the SHA-256 of the witnessScript. These bytes, and no address string, are
 // what a party compares with the output it was shown.
 //
-// The function does not know the chain's state. Below the activation height
-// of witness version 6 consensus does not check the script the output commits
-// to, so an output of this form is funded only after that height is buried;
-// see tx.ScriptWitnessV6.
+// The function does not know the chain's state. The node enforces the
+// contract through three deployments: the witness version 6 script path, the
+// key hash opcode and the control flow opcodes (src/validation.cpp,
+// ConnectBlock). Below the height at which the last of them is active
+// consensus does not check all of the script the output commits to, so an
+// output of this form is funded only after that height is buried; see
+// tx.ScriptWitnessV6.
 func (p Params) OutputScript() ([]byte, error) {
 	program, err := p.program()
 	if err != nil {
@@ -239,9 +251,19 @@ func ParseScript(script []byte) (Params, error) {
 // value the template commits to for each party. It is also the witness
 // program of that key's payment address. A key of any other length, the
 // 1,313-byte form with a leading zero included, is refused with ErrKeySize.
+//
+// A key whose first byte is 0xff is refused with keys.ErrInvalidPublicKey, as
+// keys.AddressFor refuses it: the node reads that byte as its invalid-key
+// marker (src/pubkey.h) and refuses every spend under the key, so a branch
+// that commits to its hash can never be spent. A party derives its own key
+// hash through this function. The other party's key hash arrives as 32 bytes
+// and cannot be checked this way.
 func KeyHash(publicKey []byte) ([32]byte, error) {
 	if len(publicKey) != types.PublicKeySize {
 		return [32]byte{}, fmt.Errorf("%w: got %d", ErrKeySize, len(publicKey))
+	}
+	if publicKey[0] == 0xff {
+		return [32]byte{}, keys.ErrInvalidPublicKey
 	}
 	return sha256.Sum256(publicKey), nil
 }

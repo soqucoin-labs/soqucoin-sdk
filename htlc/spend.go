@@ -117,6 +117,8 @@ func buildSpend(p Params, script []byte, funded types.UTXO, preimage *[32]byte, 
 	if err != nil {
 		return nil, fmt.Errorf("public key for %s: %w", signerAddress, err)
 	}
+	// The transaction holds its own copy: the signer may keep the slice.
+	publicKey = bytes.Clone(publicKey)
 	got, err := KeyHash(publicKey)
 	if err != nil {
 		return nil, err
@@ -248,9 +250,16 @@ func destinationScript(payToAddress, signerAddress string) ([]byte, error) {
 //
 // It is stricter than the node, which also accepts the key with a leading
 // zero, any true or false selector in a block, a refund with a later lock
-// time or another non-final sequence, and any trailer that starts with 0x00.
-// What passes here passes the script; what the node accepts in another form
-// is refused here with ErrSpendForm.
+// time or another non-final sequence, a claim with another sequence or
+// another lock time it holds final, any trailer that starts with 0x00, other
+// hash types (the anyprevout ones excepted), transaction version 1 and a
+// transaction with further inputs. What passes here passes the script; what
+// the node accepts in another form is refused here with ErrSpendForm, and a
+// hash type that is not SIGHASH_ALL with tx.ErrHashType as well.
+//
+// The key item and the trailer are outside the signature. Anyone who holds a
+// spend this package built can rewrite them into a form the node accepts, and
+// the transaction id stays the same while the size changes.
 //
 // The outputs, the fee and the state of the chain are not checked: whether
 // the output exists and is unspent, whether witness version 6 is enforced,
@@ -318,7 +327,7 @@ func VerifySpend(t *tx.Transaction, p Params, value int64) error {
 			ErrSpendForm, t.LockTime, in.Sequence, p.LockHeight, RefundSequence)
 	}
 	if !bytes.Equal(gotSelector, selector) {
-		return fmt.Errorf("%w: selector %x", ErrSpendForm, gotSelector)
+		return fmt.Errorf("%w: selector of %d bytes", ErrSpendForm, len(gotSelector))
 	}
 	if !bytes.Equal(gotScript, script) {
 		return fmt.Errorf("%w: the witnessScript item is not the contract's script", ErrSpendForm)
@@ -328,7 +337,7 @@ func VerifySpend(t *tx.Transaction, p Params, value int64) error {
 	}
 	hashType := signatureItem[types.SignatureSize]
 	if hashType != tx.SigHashAll {
-		return fmt.Errorf("hashtype %#02x: %w", hashType, tx.ErrHashType)
+		return fmt.Errorf("%w: hashtype %#02x: %w", ErrSpendForm, hashType, tx.ErrHashType)
 	}
 	if sha256.Sum256(publicKey) != keyHash {
 		return ErrWrongKey
