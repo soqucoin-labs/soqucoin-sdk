@@ -143,6 +143,7 @@ var perRequestSentinels = []error{
 	soqaddr.ErrInvalidChecksum, soqaddr.ErrInvalidLength, soqaddr.ErrInvalidHRP,
 	soqaddr.ErrInvalidChar, soqaddr.ErrUnsupportedWitnessVersion, soqaddr.ErrInvalidVersion,
 	tx.ErrInvalidAmount, tx.ErrBelowDust, tx.ErrFeeTooHigh, tx.ErrInsufficientFunds, tx.ErrInputOverflow,
+	tx.ErrNoOutputs, tx.ErrTooHeavy, tx.ErrEmptyScript,
 	withdraw.ErrWrongState, withdraw.ErrInvalidIntent, withdraw.ErrConflict,
 }
 

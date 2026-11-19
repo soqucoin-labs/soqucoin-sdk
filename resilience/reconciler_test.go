@@ -193,6 +193,9 @@ func TestRecordResultIgnoresPerRequestErrors(t *testing.T) {
 		fmt.Errorf("decode: %w", address.ErrInvalidChecksum),
 		fmt.Errorf("build: %w", tx.ErrBelowDust),
 		fmt.Errorf("build: %w", tx.ErrInsufficientFunds),
+		fmt.Errorf("build: %w", tx.ErrNoOutputs),
+		fmt.Errorf("build: %w", tx.ErrTooHeavy),
+		fmt.Errorf("build: %w", tx.ErrEmptyScript),
 		fmt.Errorf("broadcast: %w", &rpc.Error{Code: rpc.CodeVerifyRejected, Message: "rejected"}),
 	}
 	for i := 0; i < 3; i++ {
@@ -203,7 +206,7 @@ func TestRecordResultIgnoresPerRequestErrors(t *testing.T) {
 		}
 	}
 	if err := cb.Allow(); err != nil {
-		t.Fatalf("twelve bad requests halted the system: %v", err)
+		t.Fatalf("bad requests halted the system: %v", err)
 	}
 	systemic := []error{
 		fmt.Errorf("node: %w", rpc.ErrTransient),

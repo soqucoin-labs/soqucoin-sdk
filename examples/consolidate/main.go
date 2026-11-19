@@ -44,11 +44,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
-	"github.com/soqucoin-labs/soqucoin-sdk/internal/loopback"
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
@@ -323,7 +323,13 @@ func loopbackHost(hostport string) bool {
 	if err != nil {
 		host = hostport
 	}
-	return loopback.Host(host)
+	// The same reading the SDK's clients make: the name localhost or a
+	// loopback IP literal, with nothing resolved.
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func soq(shors int64) string {

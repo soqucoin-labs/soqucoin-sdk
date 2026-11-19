@@ -18,7 +18,8 @@ Soqucoin (SOQ) is a post-quantum cryptocurrency built on NIST FIPS 204 (ML-DSA /
 go get github.com/soqucoin-labs/soqucoin-sdk
 ```
 
-Requires **Go 1.26+** (per the `go` directive in `go.mod`).
+Requires **Go 1.26+** (per the `go` directive in `go.mod`). Build with the latest patch release of
+that line: the patch releases carry the standard library's security fixes.
 
 ## Integration model
 
@@ -59,10 +60,11 @@ options and the full walkthrough.
 | **Transaction construction** | Build, serialize, and deserialize SOQ transactions |
 | **Dilithium signing** | Sign and verify with NIST FIPS 204 ML-DSA-44 |
 | **ElectrumX UTXO tracking** | Production-hardened TCP client with 4MB buffer, merge refresh, auto-reconnect; every `listunspent` reply validated as a whole; plaintext only to a loopback host unless allowed |
-| **Node RPC client** | JSON-RPC client for `soqucoind` with Defense 11 (gettxout pre-verify) |
+| **Node RPC client** | JSON-RPC client for `soqucoind`; every input is checked against the node (`gettxout`) before it is signed |
 | **UTXO coin selection** | Largest-first, smallest-first (consolidation), asset-type-aware, dust filtering |
 | **Persistent spent set** | Never re-spend a UTXO: inputs reserved at build time, unconfirmed spends survive restarts |
 | **Withdrawal state machine** | `withdraw.Engine`: idempotency keys, persist-before-broadcast, same-bytes retry on a lost reply, recovery without rebuilding |
+| **Batch payments** | `Engine.SubmitBatch`: up to 500 payees in one transaction and one durable intent, paid whole or refused; a pool's payout run or an exchange's batched withdrawals |
 | **Deposit crediting** | `deposit.Monitor`: credits only what your own node confirms; pauses while syncing or stale; alarms on a vanished credit |
 | **Circuit breaker** | Halts on systemic failures only (per-request errors never count), one probe, recovers; a reconciler trip halts it until an operator's `Reset` |
 | **Reconciliation** | Verifies the indexer cache against the node outpoint by outpoint, reading this process's own spends from the spent set; halts withdrawals on a mismatch |
@@ -95,10 +97,10 @@ client.Start(ctx) // subscribes to every address; ends with ctx or Stop
 
 // Credit through deposit.Monitor, which checks every candidate against your
 // own node before crediting; see docs/EXCHANGE_INTEGRATION.md Step 2. The
-// confirmation table starts at 30 for small amounts, never 6. The balance is
-// the indexer's view; what a payout can spend is what the selector accepts
+// confirmation table credits a standard deposit at 100, never 6. The balance
+// is the indexer's view; what a payout can spend is what the selector accepts
 // against the spent set.
-confirmed, _ := client.GetBalance(30, tipHeight)
+confirmed, _ := client.GetBalance(100, tipHeight)
 ```
 
 Build and broadcast a payment:
@@ -108,7 +110,7 @@ Build and broadcast a payment:
 selector := utxo.NewCoinSelector(spentSet)
 inputs, total, err := selector.SelectUTXOs(allUTXOs, amount+fee, 1, tipHeight, nil)
 
-// 2. Verify on-chain (Defense 11)
+// 2. Ask the node for every input before signing
 verified, err := rpcClient.VerifyAndFilterUTXOs(ctx, inputs, elxClient.EvictUTXO, nil)
 
 // 3. Build, sign, verify and serialize in one call. feeRate is shors per vByte;
@@ -140,7 +142,7 @@ if err := spentSet.MarkBroadcast(verified, sentTxID); err != nil {
 | [`keys`](./keys) | ML-DSA-44 keypair generation, derivation from a seed, keystore encryption, signing |
 | [`tx`](./tx) | Transaction building, signing, serialization (wire format) |
 | [`types`](./types) | Shared types: UTXO, Network, asset type constants |
-| [`electrumx`](./electrumx) | Production-hardened ElectrumX TCP client (PF-018, F5, Defense 12) |
+| [`electrumx`](./electrumx) | Production-hardened ElectrumX TCP client: 4MB read buffer, keepalive, merge refresh |
 | [`rpc`](./rpc) | JSON-RPC client for `soqucoind` (sendrawtransaction, gettxout, getblock) |
 | [`utxo`](./utxo) | UTXO coin selection + persistent spent set tracking |
 | [`withdraw`](./withdraw) | Durable withdrawal state machine: idempotency, reservation, same-bytes retry, recovery |
@@ -150,17 +152,17 @@ if err := spentSet.MarkBroadcast(verified, sentTxID); err != nil {
 ## Provenance
 
 **The UTXO, network and resilience layers were extracted** from the `soq-signer`
-service that has run in production since May 2026. Every defense below exists
-because of a specific incident:
+service that has run in production since May 2026. Each guard answers a condition
+that service met:
 
-| Defense | What it prevents | Origin |
-|---------|-----------------|--------|
-| **Defense 11** | Stale UTXO signing, via `gettxout` pre-verification | 2 weeks of failed payouts |
-| **Defense 12** | Loss of a per-output stamp on refresh (originally a spent-pending flag, now the asset type stamped after node verification), via merge refresh instead of replace | Race condition during refresh |
-| **PF-018** | Bufio panic on large responses, via a 4MB read buffer | 18,000+ UTXO address |
-| **F5** | Broken pipe after idle, via TCP keepalive at 30s | NAT/firewall timeout |
-| **PF-018b** | TCP stream corruption, via a connection mutex | Concurrent broadcast+poll |
-| **Circuit Breaker** | Infinite retry loops, via automatic backoff | Node outage cascade |
+| Guard | What it prevents | When it applies |
+|-------|------------------|-----------------|
+| **Input check against the node** | Signing an output the node no longer has, via `gettxout` before signing | An indexer cache behind the chain |
+| **Merge refresh** | Loss of the asset type stamped on an output after node verification, via merging a refresh into the cache | A refresh during a payment |
+| **4MB read buffer** | A reader failure on a large reply | An address with 18,000 or more outputs |
+| **TCP keepalive at 30s** | A broken pipe after an idle period | A NAT or firewall timeout |
+| **Connection mutex** | Interleaved requests on one TCP stream | A broadcast during a poll |
+| **Circuit breaker** | Retry loops against a failing node, via a halt and one probe | A node outage |
 
 **The transaction construction and signing layer is a separate implementation**,
 so rather than rest on the production record above, it is verified directly:
@@ -204,8 +206,8 @@ it is stated plainly, with the reason, in
 SOQUCOIND=/path/to/soqucoind make integration
 ```
 
-A throwaway regtest node, the real `deposit` and `withdraw` packages, thirteen end-to-end
-scenarios, about seventy seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
+A throwaway regtest node, the real `deposit` and `withdraw` packages, sixteen end-to-end
+scenarios, about ninety seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
 each scenario proves.
 
 `SOQUCOIND` must be a runnable binary. In an autotools build tree that is `src/soqucoind`, the
@@ -216,6 +218,7 @@ not load outside it.
 
 - **[Quick Start](docs/QUICK_START.md)**: Generate an address, check balance, send SOQ in 5 minutes
 - **[Exchange Integration](docs/EXCHANGE_INTEGRATION.md)**: Step-by-step guide for listing SOQ on your exchange
+- **[Pool Payouts](docs/POOL_PAYOUTS.md)**: Pay a payout run as batch transactions: limits, fees, funding, failures and a complete program
 - **[Security](docs/SECURITY.md)**: Key storage, memory hygiene, vulnerability reporting
 - **[Verification](docs/VERIFICATION.md)**: a confirmed transaction built and signed by this SDK, with the identifiers to decode it yourself and the steps to reproduce it
 
@@ -236,7 +239,7 @@ See the [`examples/`](./examples) directory:
 - [`generate_address`](./examples/generate_address): Create a new wallet address
 - [`send_transaction`](./examples/send_transaction): Build and sign a transaction (does not broadcast)
 - [`exchange_deposit`](./examples/exchange_deposit): Credit deposits verified against your own node (exchange flow)
-- [`pool_payout`](./examples/pool_payout): Batch payouts with circuit breaker
+- [`pool_payout`](./examples/pool_payout): Pay a payout run from a file as batch transactions through `withdraw.Engine`: up to 500 payees a transaction, a run id as the idempotency key, a dry run that sends nothing
 - [`consolidate`](./examples/consolidate): Merge the smallest final outputs into one at the hot wallet, through `tx.BuildSignedSweep` against your own node
 - [`stagenet_withdrawal`](./examples/stagenet_withdrawal): The withdrawal recorded in [VERIFICATION.md](docs/VERIFICATION.md), through `withdraw.Engine` against your own node
 - [`exchange_split`](./examples/exchange_split): The same withdrawal path as three processes sharing one directory: a watcher with the node credential, a signer that holds the key and opens no socket, and a broadcaster that sends

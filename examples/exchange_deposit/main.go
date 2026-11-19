@@ -41,12 +41,12 @@ import (
 // deposit as settled. Below it you are taking a position the chain has not
 // taken. See docs/EXCHANGE_INTEGRATION.md for the full table and reasoning.
 const (
-	mediumDepth = 120 // ~2 h
-	smallDepth  = 30  // ~30 min
-	// Value boundaries between those tiers, in shors. These are illustrative.
-	// Set them against your own value at risk; the table is a floor, not a ceiling.
-	smallMax  = 1_000 * types.ShorsPerSOQ
-	mediumMax = 50_000 * types.ShorsPerSOQ
+	standardDepth = 100 // ~1.7 h
+	// largeDeposit is the value line between the two tiers, in shors. The
+	// figure here is a placeholder. Set it to the amount of SOQ worth about
+	// 1,000 USD at your own price, or to the loss you accept on one deposit,
+	// and move it when the price moves.
+	largeDeposit = 10_000_000 * types.ShorsPerSOQ
 )
 
 const (
@@ -62,17 +62,14 @@ const (
 )
 
 // requiredConfirmations returns the depth at which a deposit of this size may be
-// credited. Larger amounts wait longer, so low-latency credit on small deposits
-// does not force the same risk onto large ones.
+// credited. A deposit below the value line is credited at standardDepth; a
+// deposit at or above it waits for types.MaxReorgDepth (288). A deposit is
+// final in the consensus sense one block later, at types.MaxReorgDepth + 1.
 func requiredConfirmations(value int64) int64 {
-	switch {
-	case value <= smallMax:
-		return smallDepth
-	case value <= mediumMax:
-		return mediumDepth
-	default:
-		return types.MaxReorgDepth
+	if value < largeDeposit {
+		return standardDepth
 	}
+	return types.MaxReorgDepth
 }
 
 // memLedger stands in for your database, purely to keep the example
