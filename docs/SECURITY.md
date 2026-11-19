@@ -594,7 +594,7 @@ The depth is a number of confirmations. It depends on the amount.
 
 ### Check your own key
 
-The node refuses a public key whose first byte is `0xff`. One ML-DSA-44 key in 256 begins that way. A payer with such a key could never refund. `htlc.KeyHash` refuses that key. Derive your key hash with it before you agree a contract. Each function that signs or audits checks your key before anything else. You can't check the other party's key.
+The node refuses a public key whose first byte is `0xff`. One ML-DSA-44 key in 256 begins that way. A payer with such a key could never refund. `htlc.KeyHash` refuses that key. Derive your key hash with it before you agree a contract. Each function that signs or audits checks your key before it asks the node and before the signer signs. You can't check the other party's key.
 
 ### Audit before you act
 
@@ -620,7 +620,7 @@ A node started with `-witnessprune` discards the witness data of old blocks. It 
 
 ### The `soq-htlc` command
 
-`cmd/soq-htlc` runs each step from a terminal. Every rule is in package `htlc`. The command reads the keystore passphrase from `SOQ_KEYSTORE_PASSPHRASE`. It reads the secret from a file with mode 0600. Neither is a flag. It writes each record to a new file with mode 0600. It refuses a record file that exists.
+`cmd/soq-htlc` runs each step from a terminal. Every rule of the contract is in package `htlc`. The command checks the inputs of a funding itself: it refuses one named twice, spent, unconfirmed, paying another script, or a coinbase output below maturity. The command reads the keystore passphrase from `SOQ_KEYSTORE_PASSPHRASE`. It reads the secret from a file with mode 0600. Neither is a flag. It writes each record to a new file with mode 0600. It refuses a record file that exists.
 
 ### Swap errors and the circuit breaker
 

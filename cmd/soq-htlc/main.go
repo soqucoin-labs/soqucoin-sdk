@@ -16,10 +16,13 @@
 // -lock-height, the values both parties agreed. PARTY is -keystore and
 // -address, the caller's own key. Run a command with -h for the rest.
 //
-// The command holds no rule of its own. Each step is one function of package
-// htlc, which makes every check and refuses before anything is signed; the
-// command reads the flags, opens the keystore and the node, and writes the
-// record. No flag skips a check.
+// Each step is one function of package htlc, which makes every check of the
+// contract and refuses before anything is signed. The command checks what it
+// handles itself: the inputs of a funding (an outpoint named twice, spent,
+// unconfirmed, paying another script, or a coinbase output below maturity),
+// the mode of the secret file, and a record file that exists. It reads the
+// flags, opens the keystore and the node, and writes the record. No flag
+// skips a check.
 //
 // The keystore passphrase is read from SOQ_KEYSTORE_PASSPHRASE and the node
 // from SOQ_RPC_URL (default: the network's port on 127.0.0.1), SOQ_RPC_USER
@@ -222,9 +225,11 @@ func (e env) run(ctx context.Context, args []string) error {
 	return step(ctx, &o)
 }
 
-// flagError names the flag the parser refused and never its value. No
-// refusal of the arguments prints a value back: one passed to the wrong flag
-// may be the secret.
+// flagError names the flag the parser refused and never its value: one
+// passed to the wrong flag may be the secret. The same holds for the
+// refusals of contract, terms, parseOutpoint and readSecret, except a lock
+// height outside the range of a block height, which is printed. The refusals
+// of -keystore and of key-hash -address print their value.
 func flagError(fs *flag.FlagSet, err error) error {
 	named := errors.New("flag provided but not defined, or malformed; run the command with -h")
 	msg := err.Error()
@@ -241,8 +246,9 @@ func flagError(fs *flag.FlagSet, err error) error {
 }
 
 // contract returns the network and the contract's parameters as the flags
-// name them. No error holds a value of a flag: a secret passed as -hash by
-// mistake is not printed back (flagError).
+// name them. No error holds the value of -network, -hash or a key hash: a
+// secret passed as -hash by mistake is not printed back (flagError). A lock
+// height outside the range of a block height is printed by Params.Validate.
 func (o *options) contract() (types.Network, htlc.Params, error) {
 	var (
 		network types.Network
@@ -412,8 +418,9 @@ func (e env) script(_ context.Context, o *options) error {
 // ownInputs reads each outpoint of the list from the node and returns it as
 // an input of the caller's address. An outpoint that is named twice, is
 // spent, unconfirmed or pays another script, or is a coinbase output below
-// the network's maturity is refused: the node would refuse the transaction
-// after it was signed and recorded.
+// the network's maturity is refused. The node would refuse a transaction
+// that spends any of them but the unconfirmed one, after it was signed and
+// recorded; a funding that spends an unconfirmed output is undone with it.
 func ownInputs(ctx context.Context, node htlc.Node, network types.Network, addr, list string) ([]types.UTXO, error) {
 	script, err := address.ScriptFor(addr)
 	if err != nil {

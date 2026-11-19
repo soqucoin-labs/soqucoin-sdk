@@ -547,8 +547,10 @@ func TestFundRefusesAnInputNamedTwiceOrACoinbaseBelowMaturity(t *testing.T) {
 }
 
 // A value passed to the wrong flag may be the secret. No refusal of the
-// arguments prints a value back, in the error or on the error stream, and -h
-// still prints the flags.
+// parser, of the amount, the depth, the outpoint, the inputs or -secret-file
+// prints it back, in the error or on the error stream, and -h still prints
+// the flags. The refusals of -keystore and of key-hash -address print their
+// value and are left out.
 func TestNoRefusalOfTheArgumentsPrintsAValue(t *testing.T) {
 	b := newBench(t)
 	value := hex.EncodeToString(b.secret[:])
@@ -848,7 +850,8 @@ func TestAuditRefundAndSecretCallTheLibrary(t *testing.T) {
 }
 
 // What the command refuses before it opens a keystore or a node, and that no
-// refusal prints the value of a contract flag.
+// refusal prints the value of a contract flag, a lock height outside the
+// range of a block height apart.
 func TestArgumentsAreRefusedBeforeAnythingIsOpened(t *testing.T) {
 	b := newBench(t)
 	with := func(name, value string) []string {
