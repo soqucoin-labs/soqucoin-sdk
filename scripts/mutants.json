@@ -1773,6 +1773,24 @@
       "find": "\t\t\treturn batchFileVersion\n",
       "replace": "\t\t\treturn 1\n",
       "why": "A release from before batches opens a version 1 file and writes every batch back without its payees. Version 2 is what makes it refuse."
+    },
+    {
+      "id": "withdraw-batch-stored-fee-rate-unchecked",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBuildChecksTheStoredBatch",
+      "find": "\t\tif err == nil && (in.FeeRate <= 0 || in.FeeRate > tx.MaxFeeRateShorsPerVB) {",
+      "replace": "\t\tif err == nil && false {",
+      "why": "The allowance multiplies the stored rate before any signer sees it. A record whose rate was not set by SubmitBatch asks the selector for a wrong target and reserves inputs for it."
+    },
+    {
+      "id": "resilience-batch-refusals-count-as-systemic",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestRecordResultIgnoresPerRequestErrors",
+      "find": "\ttx.ErrNoOutputs, tx.ErrTooHeavy, tx.ErrEmptyScript,\n",
+      "replace": "",
+      "why": "A batch the builder refuses is a fact about that batch. Counted as systemic, three of them open the breaker and stop every other payment."
     }
   ]
 }

@@ -712,6 +712,9 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 		if err == nil && total != in.Amount {
 			err = fmt.Errorf("%w: %s: recorded amount %d is not the sum of its payees, %d", ErrInvalidIntent, in.ID, in.Amount, total)
 		}
+		if err == nil && (in.FeeRate <= 0 || in.FeeRate > tx.MaxFeeRateShorsPerVB) {
+			err = fmt.Errorf("%w: %s: recorded fee rate %d is outside (0, tx.MaxFeeRateShorsPerVB]", ErrInvalidIntent, in.ID, in.FeeRate)
+		}
 		if err != nil {
 			return e.fail(ctx, in, err, false, StateCreated)
 		}

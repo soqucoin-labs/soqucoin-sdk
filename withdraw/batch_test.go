@@ -337,7 +337,9 @@ func TestBuildChecksTheStoredBatch(t *testing.T) {
 		"a payee on another network": tamper("t3", func(in *Intent) {
 			in.Payees[0].Address = payeeAddr(t, types.Mainnet.HRP, 7)
 		}),
-		"a payee repeated": tamper("t4", func(in *Intent) { in.Payees[2].Address = in.Payees[0].Address }),
+		"a payee repeated":         tamper("t4", func(in *Intent) { in.Payees[2].Address = in.Payees[0].Address }),
+		"a fee rate above the cap": tamper("t5", func(in *Intent) { in.FeeRate = tx.MaxFeeRateShorsPerVB + 1 }),
+		"a fee rate of zero":       tamper("t6", func(in *Intent) { in.FeeRate = 0 }),
 	}
 	for name, in := range bad {
 		err := e.Build(ctx, in)
