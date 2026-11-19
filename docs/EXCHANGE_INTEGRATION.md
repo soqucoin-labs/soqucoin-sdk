@@ -1080,7 +1080,7 @@ integration.
 ## Test Coverage, current status
 
 Every package carries unit tests. The figures below are one run of `go test -cover ./...` on the
-commit this document ships with, library packages only: the `examples/` programs and
+commit this document ships with, library packages only: the `examples/` programs, `cmd/soq-htlc` and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Ten of the eleven reproduce exactly. The `electrumx`
 figure moved between 89.7 and 90.4 across fourteen runs on this commit, because several of its tests drive
@@ -1095,7 +1095,7 @@ depends on how those are scheduled.
 | `deposit` | **93.9%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
 | `electrumx` | **90.1%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
 | `tx` | **91.8%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
-| `htlc` | **98.1%** | Swap contract template against the node's vector, lock height encoding, parser refusals, claim and refund, spend verification, two spends a node mined |
+| `htlc` | **99.0%** | Swap contract template against the node's vector, lock height encoding, parser refusals, claim and refund, spend verification, two spends a node mined, the funding builder, the activation rule and each refusal of the functions that ask a node |
 | `keys` | **89.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
 | `withdraw` | **87.4%** | Idempotency, reservation, same-bytes retry, recovery, persist-before-broadcast, transient selector deferral, orphan-reservation release, store state after a failed write |
 | `types` | **85.7%** | Amount parsing and formatting exact at every value the node prints, network records, asset constants |
