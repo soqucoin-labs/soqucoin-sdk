@@ -47,6 +47,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -70,7 +71,7 @@ const usage = `usage: soq-htlc <command> [flags]
   refund    take the output back from the lock height on (the payer)
   secret    read the secret from the mined spend of the output
 
-Run a command with -h for its flags.`
+Run a command with -h for its flags`
 
 // env is what the command reads from outside its arguments.
 type env struct {
@@ -299,7 +300,7 @@ func recorder(path, step string) (htlc.Record, error) {
 		return nil, fmt.Errorf("-record: %s exists; a transaction was already built under it", path)
 	}
 	return func(txid, rawHex string) error {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		f, err := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return err
 		}
@@ -340,8 +341,8 @@ func (e env) keyHash(_ context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.stdout, "%x\n", hash)
-	return nil
+	_, err = fmt.Fprintf(e.stdout, "%x\n", hash)
+	return err
 }
 
 func (e env) script(_ context.Context, o *options) error {
@@ -361,8 +362,8 @@ func (e env) script(_ context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.stdout, "witness script  %x\noutput script   %x\naddress         %s\n", script, output, addr)
-	return nil
+	_, err = fmt.Fprintf(e.stdout, "witness script  %x\noutput script   %x\naddress         %s\n", script, output, addr)
+	return err
 }
 
 // ownInputs reads each outpoint of the list from the node and returns it as
@@ -422,8 +423,8 @@ func (e env) fund(ctx context.Context, o *options) error {
 	if err != nil {
 		return recorded(err, t, o.record)
 	}
-	fmt.Fprintf(e.stdout, "funded %s:%d with %d shors\n", funded.TxID, funded.Vout, funded.Value)
-	return nil
+	_, err = fmt.Fprintf(e.stdout, "funded %s:%d with %d shors\n", funded.TxID, funded.Vout, funded.Value)
+	return err
 }
 
 func (e env) audit(ctx context.Context, o *options) error {
@@ -447,9 +448,9 @@ func (e env) audit(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.stdout, "%s:%d holds %d shors with %d confirmations at tip %d, %d blocks below the lock height\n",
+	_, err = fmt.Fprintf(e.stdout, "%s:%d holds %d shors with %d confirmations at tip %d, %d blocks below the lock height\n",
 		txid, vout, funded.Output.Value, funded.Confirmations, funded.Tip, int64(p.LockHeight)-funded.Tip)
-	return nil
+	return err
 }
 
 // readSecret reads the secret, 64 hexadecimal digits, from a file that its
@@ -463,7 +464,7 @@ func readSecret(path string) ([32]byte, error) {
 	if mode := info.Mode().Perm(); mode&0o077 != 0 && runtime.GOOS != "windows" {
 		return secret, fmt.Errorf("-secret-file: %s has mode %04o, readable by others; want 0600", path, mode)
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return secret, fmt.Errorf("-secret-file: %w", err)
 	}
@@ -507,8 +508,8 @@ func (e env) claim(ctx context.Context, o *options) error {
 	if err != nil {
 		return recorded(err, t, o.record)
 	}
-	fmt.Fprintf(e.stdout, "claim %s sent\n", t.TxID())
-	return nil
+	_, err = fmt.Fprintf(e.stdout, "claim %s sent\n", t.TxID())
+	return err
 }
 
 func (e env) refund(ctx context.Context, o *options) error {
@@ -533,8 +534,8 @@ func (e env) refund(ctx context.Context, o *options) error {
 	if err != nil {
 		return recorded(err, t, o.record)
 	}
-	fmt.Fprintf(e.stdout, "refund %s sent\n", t.TxID())
-	return nil
+	_, err = fmt.Fprintf(e.stdout, "refund %s sent\n", t.TxID())
+	return err
 }
 
 func (e env) secret(ctx context.Context, o *options) error {
@@ -553,6 +554,6 @@ func (e env) secret(ctx context.Context, o *options) error {
 		}
 		return err
 	}
-	fmt.Fprintf(e.stdout, "secret    %x\nspent by  %s\n", secret, spender)
-	return nil
+	_, err = fmt.Fprintf(e.stdout, "secret    %x\nspent by  %s\n", secret, spender)
+	return err
 }
