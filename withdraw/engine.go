@@ -80,6 +80,7 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/internal/logutil"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
+	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 	"github.com/soqucoin-labs/soqucoin-sdk/utxo"
 )
@@ -103,13 +104,33 @@ type Outpoint struct {
 	Address string `json:"address"`
 }
 
+// Payee is one recipient of a batch: an address and the amount it is paid, in
+// shors.
+type Payee struct {
+	Address string `json:"address"`
+	Amount  int64  `json:"amount"`
+}
+
+// MaxBatchPayees is the most recipients one batch intent pays, the batch
+// builder's own limit: with the selector's 80-input cap the largest batch is
+// half the node's standard transaction weight.
+const MaxBatchPayees = tx.MaxBatchOutputs
+
 // Intent is one withdrawal. ID is the caller's idempotency key: submitting
 // the same ID twice returns the same Intent and never a second transaction.
+//
+// An intent made by Submit pays Amount to Address. An intent made by
+// SubmitBatch pays every entry of Payees in one transaction: Address is empty
+// and Amount is the sum of the payees' amounts. From Built onward the two are
+// the same record: one transaction, its bytes and its inputs.
 type Intent struct {
 	ID      string `json:"id"`
 	Address string `json:"address"`
 	Amount  int64  `json:"amount"`
 	FeeRate int64  `json:"fee_rate"`
+	// Payees is set for a batch intent and empty otherwise. Output i of the
+	// transaction pays Payees[i]; the change output, when there is one, is last.
+	Payees []Payee `json:"payees,omitempty"`
 
 	State State  `json:"state"`
 	TxID  string `json:"txid,omitempty"`
@@ -228,6 +249,14 @@ type Selector func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, er
 // lock held and must not call back into the Engine.
 type BuildSigner func(ctx context.Context, inputs []types.UTXO, toAddress string, amount, feeRate int64) (rawHex, txid string, err error)
 
+// BatchBuildSigner turns selected inputs into one signed transaction that
+// pays every payee, in order, the amount recorded for it. tx.BuildAndSignBatch
+// wrapped with the operator's change script and signer is the expected value.
+// It never reduces an amount and never leaves a payee out: a batch it cannot
+// pay in full is an error. The rules of BuildSigner on the context and on the
+// engine's lock apply.
+type BatchBuildSigner func(ctx context.Context, inputs []types.UTXO, payees []Payee, feeRate int64) (rawHex, txid string, err error)
+
 // Engine drives intents through the state machine.
 //
 // One lock covers every transition after Submit, and it is held across the
@@ -236,13 +265,16 @@ type BuildSigner func(ctx context.Context, inputs []types.UTXO, toAddress string
 // node call that does not return holds every transition for as long as its
 // context allows, so give the injected clients a deadline.
 type Engine struct {
-	Store       Store
-	Spent       *utxo.SpentSet
-	Select      Selector
-	BuildSign   BuildSigner
-	Broadcaster Broadcaster
-	Confirmer   Confirmer // optional
-	Chain       Chain     // optional; Abandon refuses without it
+	Store     Store
+	Spent     *utxo.SpentSet
+	Select    Selector
+	BuildSign BuildSigner
+	// BuildSignBatch builds a batch intent. Optional: SubmitBatch refuses
+	// without it, and nothing is recorded.
+	BuildSignBatch BatchBuildSigner
+	Broadcaster    Broadcaster
+	Confirmer      Confirmer // optional
+	Chain          Chain     // optional; Abandon refuses without it
 
 	// Network is the chain every destination must be an address on. The zero
 	// value is types.Mainnet, as for deposit.Monitor, and so is any value with
@@ -509,7 +541,118 @@ func (e *Engine) Submit(ctx context.Context, id, address string, amount, feeRate
 	if !ok {
 		return nil, false, fmt.Errorf("%w: %s: the store refused to create it and does not hold it", ErrInvalidIntent, id)
 	}
-	if !strings.EqualFold(existing.Address, address) || existing.Amount != amount || existing.FeeRate != feeRate {
+	if len(existing.Payees) != 0 || !strings.EqualFold(existing.Address, address) || existing.Amount != amount || existing.FeeRate != feeRate {
+		return existing, false, fmt.Errorf("%w: %s", ErrConflict, id)
+	}
+	return existing, false, nil
+}
+
+// checkPayees applies every rule a batch must pass before anything is
+// recorded or signed, and returns the sum of the amounts. Each payee has an
+// address on the engine's network and an amount in (0, MaxMoney] at or above
+// the node's relay floor for its script; no address appears twice; the sum is
+// at most MaxMoney. Every refusal is ErrInvalidIntent and names the payee.
+func (e *Engine) checkPayees(id string, payees []Payee) (int64, error) {
+	if len(payees) == 0 || len(payees) > MaxBatchPayees {
+		return 0, fmt.Errorf("%w: %s: a batch pays between 1 and %d payees, %d given", ErrInvalidIntent, id, MaxBatchPayees, len(payees))
+	}
+	seen := make(map[string]int, len(payees))
+	var total int64
+	for i, p := range payees {
+		if err := e.checkDestination(id, p.Address); err != nil {
+			return 0, fmt.Errorf("payee %d: %w", i, err)
+		}
+		key := strings.ToLower(p.Address)
+		if first, dup := seen[key]; dup {
+			return 0, fmt.Errorf("%w: %s: payee %d repeats the address of payee %d (%s); a batch pays an address once", ErrInvalidIntent, id, i, first, p.Address)
+		}
+		seen[key] = i
+		if p.Amount <= 0 || p.Amount > types.MaxMoney {
+			return 0, fmt.Errorf("%w: %s: payee %d (%s): amount %d", ErrInvalidIntent, id, i, p.Address, p.Amount)
+		}
+		script, err := address.ScriptFor(p.Address)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s: payee %d (%s): %v", ErrInvalidIntent, id, i, p.Address, err)
+		}
+		if floor := tx.MinOutputValue(script); p.Amount < floor {
+			return 0, fmt.Errorf("%w: %s: payee %d (%s): amount %d is below the relay floor %d", ErrInvalidIntent, id, i, p.Address, p.Amount, floor)
+		}
+		if total > types.MaxMoney-p.Amount {
+			return 0, fmt.Errorf("%w: %s: the batch total exceeds MaxMoney at payee %d", ErrInvalidIntent, id, i)
+		}
+		total += p.Amount
+	}
+	return total, nil
+}
+
+// samePayees reports whether two batches name the same payees in the same
+// order with the same amounts. Addresses are compared as addresses, as Submit
+// compares its destination.
+func samePayees(a, b []Payee) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i].Address, b[i].Address) || a[i].Amount != b[i].Amount {
+			return false
+		}
+	}
+	return true
+}
+
+// SubmitBatch registers one payment to many payees: a pool's payout run, or
+// an exchange's batched withdrawals. The batch is one intent and becomes one
+// transaction, so it is paid whole or not at all, and the same id submitted
+// again returns the same intent and never a second transaction. Output i of
+// the transaction pays payees[i]; the caller's ledger keeps the id with the
+// payees it debited.
+//
+// Calling it again with the same id and the same payees, in the same order
+// with the same amounts and fee rate, returns the existing intent
+// (created=false). Any difference, and an id that Submit registered, is
+// ErrConflict.
+//
+// Refused with ErrInvalidIntent, and nothing recorded: an empty id; a fee
+// rate that is not positive; no payee or more than MaxBatchPayees; a payee
+// whose address is not a witness version 1 address on Network; an address
+// named twice; an amount outside (0, MaxMoney] or below the node's relay
+// floor; a total above MaxMoney; an engine with no BuildSignBatch. One bad
+// payee refuses the batch: the engine does not choose whom a caller pays.
+//
+// The registration is one Store.Create bound to the caller's context, as in
+// Submit.
+func (e *Engine) SubmitBatch(ctx context.Context, id string, payees []Payee, feeRate int64) (intent *Intent, created bool, err error) {
+	if id == "" || feeRate <= 0 {
+		return nil, false, fmt.Errorf("%w: id=%q feeRate=%d", ErrInvalidIntent, id, feeRate)
+	}
+	if e.BuildSignBatch == nil {
+		return nil, false, fmt.Errorf("%w: %s: the engine has no BuildSignBatch", ErrInvalidIntent, id)
+	}
+	total, err := e.checkPayees(id, payees)
+	if err != nil {
+		return nil, false, err
+	}
+	now := e.now()
+	in := &Intent{ID: id, Amount: total, FeeRate: feeRate, Payees: slices.Clone(payees), State: StateCreated, CreatedAt: now, UpdatedAt: now}
+	err = e.Store.Create(ctx, in)
+	if err == nil {
+		// The caller's copy shares no payee storage with the record a store
+		// may keep by reference, so editing it cannot change whom Build pays.
+		out := *in
+		out.Payees = slices.Clone(in.Payees)
+		return &out, true, nil
+	}
+	if !errors.Is(err, ErrExists) {
+		return nil, false, err
+	}
+	existing, ok, err := e.Store.Get(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, fmt.Errorf("%w: %s: the store refused to create it and does not hold it", ErrInvalidIntent, id)
+	}
+	if !samePayees(existing.Payees, payees) || existing.Amount != total || existing.FeeRate != feeRate {
 		return existing, false, fmt.Errorf("%w: %s", ErrConflict, id)
 	}
 	return existing, false, nil
@@ -548,10 +691,34 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	// The stored destination is checked here as well as at Submit: this is
 	// the transition that signs, and the record may have been created by an
 	// engine bound to another network, or by a release that did not check.
-	if err := e.checkDestination(in.ID, in.Address); err != nil {
-		return e.fail(ctx, in, err, false, StateCreated)
+	batch := len(in.Payees) > 0
+	target := in.Amount
+	if batch {
+		if e.BuildSignBatch == nil {
+			// The engine is not configured for the record it holds. Nothing
+			// about the batch is wrong, so it waits for an engine that is.
+			return e.deferBuild(ctx, in, fmt.Errorf("%w: %s is a batch and the engine has no BuildSignBatch", ErrInvalidIntent, in.ID))
+		}
+		// Every rule of SubmitBatch again, on the stored record, and the
+		// recorded total against the payees it is the sum of.
+		total, err := e.checkPayees(in.ID, in.Payees)
+		if err == nil && total != in.Amount {
+			err = fmt.Errorf("%w: %s: recorded amount %d is not the sum of its payees, %d", ErrInvalidIntent, in.ID, in.Amount, total)
+		}
+		if err != nil {
+			return e.fail(ctx, in, err, false, StateCreated)
+		}
+		// A selector budgets the fee of a one-recipient payment; the further
+		// outputs of a batch are asked for here so a funded wallet is not
+		// short by their fee.
+		target += tx.BatchFeeAllowance(len(in.Payees), in.FeeRate)
 	}
-	inputs, err := e.Select(ctx, in.Amount, in.FeeRate)
+	if !batch {
+		if err := e.checkDestination(in.ID, in.Address); err != nil {
+			return e.fail(ctx, in, err, false, StateCreated)
+		}
+	}
+	inputs, err := e.Select(ctx, target, in.FeeRate)
 	if err != nil {
 		err = fmt.Errorf("select inputs: %w", err)
 		if errors.Is(err, rpc.ErrTransient) || contextEnded(err) || ctx.Err() != nil {
@@ -567,7 +734,12 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 		// disk is fixed). Not a failure of this intent.
 		return e.deferBuild(ctx, in, err)
 	}
-	rawHex, txid, err := e.BuildSign(ctx, inputs, in.Address, in.Amount, in.FeeRate)
+	var rawHex, txid string
+	if batch {
+		rawHex, txid, err = e.BuildSignBatch(ctx, inputs, slices.Clone(in.Payees), in.FeeRate)
+	} else {
+		rawHex, txid, err = e.BuildSign(ctx, inputs, in.Address, in.Amount, in.FeeRate)
+	}
 	if err != nil {
 		err = fmt.Errorf("build and sign: %w", err)
 		if contextEnded(err) || ctx.Err() != nil {
