@@ -19,6 +19,20 @@
 // fund the next batch yet, the command stops and the same command line
 // continues the run after the next block.
 //
+// Every batch of the file is checked and registered before the first one is
+// sent, so a bad payee in the last batch stops the run with nothing paid. Once
+// every batch is registered the run is recorded: the payees in order, the
+// batch size and the fee rate. A later start under the same run id with any of
+// them changed, a payee added at the end included, is refused.
+//
+// One process works on a state directory at a time. The command holds
+// payout.lock in it for the length of the run and refuses to start while the
+// file exists. A process that was killed leaves the file behind: make sure no
+// payout process is running, remove it, and run the same command line again.
+//
+// The command exits non-zero with the cause when the run stops. Alert on the
+// exit status from the scheduler that starts it.
+//
 // -dry-run builds and signs every batch against a store and a spent set held
 // in memory. Nothing is written and nothing is sent.
 //
@@ -38,6 +52,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -51,7 +67,6 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/electrumx"
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
-	"github.com/soqucoin-labs/soqucoin-sdk/resilience"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
@@ -73,7 +88,6 @@ func main() {
 	flag.Int64Var(&cfg.feeRate, "fee-rate", types.RecommendedFeeRate, "Fee rate in shors per vByte")
 	flag.IntVar(&cfg.batchSize, "batch-size", withdraw.MaxBatchPayees, "Payees per transaction, at most withdraw.MaxBatchPayees")
 	flag.IntVar(&cfg.minConf, "min-confirmations", 1, "Confirmations an input needs; 288 on mainnet (the coinbase maturity) for a wallet that block rewards pay")
-	flag.StringVar(&cfg.webhookURL, "webhook", "", "Slack webhook URL for alerts (optional)")
 	flag.BoolVar(&cfg.dryRun, "dry-run", false, "Build and sign every batch; write nothing and send nothing")
 	flag.BoolVar(&cfg.regtest, "regtest", false, "The node is a regtest node (the sq address prefix is shared with mainnet)")
 	flag.Parse()
@@ -104,7 +118,6 @@ type runConfig struct {
 	feeRate                  int64
 	batchSize                int
 	minConf                  int
-	webhookURL               string
 	dryRun                   bool
 	regtest                  bool
 }
@@ -187,6 +200,16 @@ func run(ctx context.Context, cfg runConfig) error {
 	var store withdraw.Store = withdraw.NewMemStore()
 	spent := utxo.NewSpentSet("", logger)
 	if !cfg.dryRun {
+		// One process at a time: each holds the store in memory and writes
+		// it whole, so a second one would write over the first one's records.
+		if err := os.MkdirAll(cfg.stateDir, 0700); err != nil {
+			return fmt.Errorf("state directory: %w", err)
+		}
+		unlock, err := lockStateDir(cfg.stateDir)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		if store, err = withdraw.NewFileStore(filepath.Join(cfg.stateDir, "payout_intents.json")); err != nil {
 			return fmt.Errorf("open intent store: %w", err)
 		}
@@ -269,53 +292,67 @@ func run(ctx context.Context, cfg runConfig) error {
 		},
 	}
 
-	// Stop a run that is failing for a systemic reason. One refused request
-	// never counts; three systemic failures in a row hold for 15 minutes.
-	cb := resilience.NewCircuitBreaker(3, 15*time.Minute, logger)
-	resilience.NewAlerter(cfg.webhookURL, logger).WireToCircuitBreaker(cb)
+	// Before anything is sent: the file is the run this id was first started
+	// with, and every batch of it passes the engine's rules and is registered.
+	digest := runDigest(payees, cfg.batchSize, cfg.feeRate)
+	manifest := "run_" + digestOf([]byte(cfg.runID))[:16] + ".json" // in the state directory
+	if !cfg.dryRun {
+		if err := checkManifest(cfg.stateDir, manifest, cfg.runID, digest); err != nil {
+			return err
+		}
+	}
+	type registered struct {
+		id     string
+		intent *withdraw.Intent
+		payees int
+	}
+	var run []registered
+	for n := 0; n*cfg.batchSize < len(payees); n++ {
+		batch := payees[n*cfg.batchSize : min((n+1)*cfg.batchSize, len(payees))]
+		id := fmt.Sprintf("%s/%03d", cfg.runID, n+1)
+		// The same id with other payees is ErrConflict; a payee the engine
+		// refuses is ErrInvalidIntent and names the payee. Neither records
+		// the batch, and no batch of the run has been sent.
+		intent, _, err := engine.SubmitBatch(ctx, id, batch, cfg.feeRate)
+		if err != nil {
+			return fmt.Errorf("submit %s: %w; nothing of this run was sent by this command", id, err)
+		}
+		run = append(run, registered{id, intent, len(batch)})
+	}
 
 	if cfg.dryRun {
 		logger.Info("dry run: every batch is built and signed; nothing is written and nothing is sent")
-	} else if err := engine.Recover(ctx); err != nil {
-		// After a restart: spends the store knows are marked again and built
-		// transactions are sent again with the same bytes. Do not pay while
-		// this fails; withdraw.ErrHeld is a batch an operator resolves first.
+		for _, b := range run {
+			if err := engine.Build(ctx, b.intent); err != nil {
+				return fmt.Errorf("build %s: %w", b.id, err)
+			}
+			logger.Info("would broadcast", "batch", b.id, "payees", b.payees, "shors", b.intent.Amount,
+				"txid", b.intent.TxID, "inputs", len(b.intent.Inputs), "bytes", len(b.intent.RawHex)/2)
+		}
+		return nil
+	}
+	if err := writeManifest(cfg.stateDir, manifest, cfg.runID, digest); err != nil {
+		return err
+	}
+
+	// The node is on this chain and has caught up before any saved bytes go
+	// to it. Then, as after any restart: spends the store knows are marked
+	// again and built transactions are sent again with the same bytes. Do not
+	// pay while Recover fails; withdraw.ErrHeld is a batch an operator
+	// resolves first.
+	if err := node.RequireSynced(ctx); err != nil {
+		return fmt.Errorf("node: %w", err)
+	}
+	if err := engine.Recover(ctx); err != nil {
 		return fmt.Errorf("recover: %w", err)
 	}
 
-	batches := (len(payees) + cfg.batchSize - 1) / cfg.batchSize
-	for n := 0; n < batches; n++ {
+	for i, b := range run {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("stopped before batch %d of %d: %w", n+1, batches, err)
+			return fmt.Errorf("stopped before batch %d of %d: %w", i+1, len(run), err)
 		}
-		batch := payees[n*cfg.batchSize : min((n+1)*cfg.batchSize, len(payees))]
-		id := fmt.Sprintf("%s/%03d", cfg.runID, n+1)
-		var total int64
-		for _, p := range batch {
-			total += p.Amount
-		}
-		log := logger.With("batch", id, "payees", len(batch), "shors", total)
-
-		// The same id with other payees is ErrConflict; a payee the engine
-		// refuses is ErrInvalidIntent and names the payee. Nothing is recorded
-		// for either.
-		intent, _, err := engine.SubmitBatch(ctx, id, batch, cfg.feeRate)
-		if err != nil {
-			return fmt.Errorf("submit %s: %w", id, err)
-		}
-		if cfg.dryRun {
-			if err := engine.Build(ctx, intent); err != nil {
-				return fmt.Errorf("build %s: %w", id, err)
-			}
-			log.Info("would broadcast", "txid", intent.TxID, "inputs", len(intent.Inputs), "bytes", len(intent.RawHex)/2)
-			continue
-		}
-
-		if err := cb.Allow(); err != nil {
-			return fmt.Errorf("circuit breaker stopped the run at %s: %w", id, err)
-		}
-		intent, err = engine.Process(ctx, id)
-		cb.RecordResult(err)
+		log := logger.With("batch", b.id, "payees", b.payees, "shors", b.intent.Amount)
+		intent, err := engine.Process(ctx, b.id)
 		if err != nil {
 			// Created: nothing was built; the next run builds it. Built: the
 			// bytes are saved and may be in a mempool; the next run sends the
@@ -326,7 +363,7 @@ func run(ctx context.Context, cfg runConfig) error {
 			if intent != nil {
 				state = intent.State
 			}
-			return fmt.Errorf("batch %s is %s: %w; run the same command again to continue", id, state, err)
+			return fmt.Errorf("batch %s is %s: %w; run the same command again to continue", b.id, state, err)
 		}
 		if intent.State == withdraw.StateBroadcast {
 			if err := engine.UpdateConfirmations(ctx, intent); err != nil {
@@ -335,7 +372,103 @@ func run(ctx context.Context, cfg runConfig) error {
 		}
 		log.Info("batch sent", "state", intent.State, "txid", intent.TxID, "confirmations", intent.Confirmations)
 	}
-	logger.Info("run complete", "run", cfg.runID, "batches", batches, "payees", len(payees))
+	logger.Info("run complete", "run", cfg.runID, "batches", len(run), "payees", len(payees))
+	return nil
+}
+
+// lockStateDir creates payout.lock in dir, which no other run may hold, and
+// returns the call that removes it.
+func lockStateDir(dir string) (unlock func(), err error) {
+	path := filepath.Join(dir, "payout.lock")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("state directory: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	f, err := root.OpenFile("payout.lock", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if os.IsExist(err) {
+		return nil, fmt.Errorf("%s exists: another payout process works on this directory, or one was killed; when none is running, remove the file and run the same command again", path)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock the state directory: %w", err)
+	}
+	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+	_ = f.Close()
+	return func() { _ = os.Remove(path) }, nil
+}
+
+func digestOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// runDigest is what a run id stands for: the payees in file order with their
+// amounts, the batch size that cuts them, and the fee rate.
+func runDigest(payees []withdraw.Payee, batchSize int, feeRate int64) string {
+	b, _ := json.Marshal(struct {
+		Payees    []withdraw.Payee
+		BatchSize int
+		FeeRate   int64
+	}{payees, batchSize, feeRate})
+	return digestOf(b)
+}
+
+type manifestFile struct {
+	RunID  string `json:"run_id"`
+	Digest string `json:"digest"`
+}
+
+// checkManifest refuses a run id that was recorded with another file, batch
+// size or fee rate. A run id with no record passes: it has not registered
+// every batch yet.
+func checkManifest(dir, name, runID, digest string) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("state directory: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read the run record: %w", err)
+	}
+	var m manifestFile
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("parse the run record %s: %w", name, err)
+	}
+	if m.RunID != runID || m.Digest != digest {
+		return fmt.Errorf("%w: run %q was recorded with other payees, amounts, order, batch size or fee rate; a changed run takes a new run id", withdraw.ErrConflict, runID)
+	}
+	return nil
+}
+
+// writeManifest records the run, synced to disk before the first send.
+func writeManifest(dir, name, runID, digest string) error {
+	data, _ := json.Marshal(manifestFile{RunID: runID, Digest: digest})
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("state directory: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	tmp := name + ".tmp"
+	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("write the run record: %w", err)
+	}
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = root.Rename(tmp, name)
+	}
+	if err != nil {
+		return fmt.Errorf("write the run record: %w", err)
+	}
 	return nil
 }
 

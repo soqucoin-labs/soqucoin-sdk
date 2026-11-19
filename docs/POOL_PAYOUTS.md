@@ -120,7 +120,17 @@ batch. Merge them first with [`examples/consolidate`](../examples/consolidate), 
 | `withdraw.ErrInvalidIntent` from `SubmitBatch` | Nothing recorded | A payee broke a limit. The error names it. | Correct the ledger row and submit again. |
 
 **After a restart, call `Engine.Recover` before paying.** It marks every recorded spend again and
-sends every saved transaction again with the same bytes. Do not pay while it returns an error.
+sends every saved transaction again with the same bytes. Call `RequireSynced` on the node client
+first, so the saved bytes go only to a node on this chain that has caught up. Do not pay while
+either returns an error.
+
+**Register every batch of a run before the first is sent.** `SubmitBatch` sends nothing, so a bad
+payee in the last batch stops the run with no miner paid. Keep the run's whole payee list with the
+run id in the ledger, and refuse a run id whose list has changed. A batch added to a finished run
+has an id the engine has never seen.
+
+**One process works on a state directory at a time.** Each process holds the intent store in
+memory and writes it whole. Two at once write over each other's records.
 
 **Keep the state directory.** It holds the intent store and the spent set. Losing it loses the
 record of what was signed, and a new directory would let the selector pick inputs a sent
@@ -260,7 +270,12 @@ func main() {
 		},
 	}
 
-	// After a restart: mark the recorded spends, send the saved bytes again.
+	// The node is on this chain and has caught up before any saved bytes go
+	// to it. Then, after a restart: mark the recorded spends, send the saved
+	// bytes again.
+	if err := node.RequireSynced(ctx); err != nil {
+		log.Fatalf("node: %v", err)
+	}
 	if err := engine.Recover(ctx); err != nil {
 		log.Fatalf("recover: %v", err)
 	}
@@ -285,8 +300,9 @@ func main() {
 ```
 
 [`examples/pool_payout`](../examples/pool_payout) is the same path as a command. It reads a run
-from a file and cuts it into batches. It continues a run that stopped. Its dry run signs every
-batch and sends nothing.
+from a file and cuts it into batches. It registers every batch before it sends the first, records
+the run, and holds a lock on the state directory. It continues a run that stopped. Its dry run
+signs every batch and sends nothing.
 
 ## Before mainnet
 

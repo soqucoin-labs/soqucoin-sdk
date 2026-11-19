@@ -78,12 +78,13 @@ func TestPoolPayoutCommandPaysARunOnce(t *testing.T) {
 	if err := os.Mkdir(state, 0700); err != nil {
 		t.Fatal(err)
 	}
+	runID := "run-1"
 	command := func(file string, extra ...string) (string, error) {
 		t.Helper()
 		args := append([]string{
 			"-rpc-url", "http://127.0.0.1:" + strconv.Itoa(n.port), "-rpc-user", "it",
 			"-electrumx", idx.addr(), "-keystore", keystore, "-pool-address", pool,
-			"-state-dir", state, "-payouts", file, "-run-id", "run-1", "-batch-size", "2",
+			"-state-dir", state, "-payouts", file, "-run-id", runID, "-batch-size", "2",
 			"-min-confirmations", strconv.FormatInt(types.Regtest.CoinbaseMaturity, 10), "-regtest",
 		}, extra...)
 		cmd := exec.Command(bin, args...)
@@ -162,5 +163,39 @@ func TestPoolPayoutCommandPaysARunOnce(t *testing.T) {
 	}
 	if got := len(mempool()); got != 0 {
 		t.Fatalf("the refused run sent %d transactions\n%s", got, out)
+	}
+
+	// Two payees added at the end are a batch no id of the run holds yet.
+	// The run's record refuses them.
+	longer := append(append([]withdraw.Payee(nil), payees...), batchPayees(t, 3)[1:]...)
+	out, err = command(writeRun("longer.json", longer))
+	if err == nil || !strings.Contains(out, withdraw.ErrConflict.Error()) || len(mempool()) != 0 {
+		t.Fatalf("payees added under the same run id: err %v, %d in the mempool, want the conflict and nothing sent\n%s", err, len(mempool()), out)
+	}
+
+	// A second process on the same state directory is refused.
+	lock := filepath.Join(state, "payout.lock")
+	if err := os.WriteFile(lock, []byte("1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = command(runFile)
+	if err == nil || !strings.Contains(out, "payout.lock") {
+		t.Fatalf("a run while the lock is held: err %v, want a refusal that names the lock\n%s", err, out)
+	}
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new run whose last batch holds a payee under the relay floor stops
+	// before its first batch is sent.
+	runID = "run-2"
+	bad := batchPayees(t, 5)
+	bad[4].Amount = 1
+	out, err = command(writeRun("bad.json", bad))
+	if err == nil || !strings.Contains(out, withdraw.ErrInvalidIntent.Error()) || len(mempool()) != 0 {
+		t.Fatalf("a bad payee in the last batch: err %v, %d in the mempool, want the refusal and nothing sent\n%s", err, len(mempool()), out)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Error("a run that stopped left the lock behind")
 	}
 }
