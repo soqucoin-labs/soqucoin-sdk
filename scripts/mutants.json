@@ -1854,6 +1854,87 @@
       "find": "\tif info.InitialSync || info.Headers > info.Blocks {\n\t\treturn [32]byte{}, \"\", fmt.Errorf(",
       "replace": "\tif info.InitialSync {\n\t\treturn [32]byte{}, \"\", fmt.Errorf(",
       "why": "A node that knows of headers it has not connected has not read the chain to its end. ErrNoSpend from it tells the party that waits for the secret that no claim is mined when one may be."
+    },
+    {
+      "id": "cmd-record-not-looked-for-before-the-keystore-signs",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestFundRecordsThenSendsAndRefusesASecondRun",
+      "find": "\tif _, err := os.Lstat(path); err == nil {",
+      "replace": "\tif _, err := os.Lstat(path); false && err == nil {",
+      "why": "A record that exists means a transaction was already built under it. The refusal comes before the node is asked and before anything is signed; the exclusive create alone would refuse only after a second funding had been built and signed."
+    },
+    {
+      "id": "cmd-record-readable-by-others",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestFundRecordsThenSendsAndRefusesASecondRun",
+      "find": "\t\treturn atomicfile.WriteFile(path, append(data, '\\n'), 0o600)",
+      "replace": "\t\treturn atomicfile.WriteFile(path, append(data, '\\n'), 0o644)",
+      "why": "The record of a claim holds the secret before the node has the claim. It is a file of its owner alone."
+    },
+    {
+      "id": "cmd-secret-file-readable-by-others",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimReadsTheSecretFromAFileOfItsOwner",
+      "find": "\tif mode := info.Mode().Perm(); mode&0o077 != 0 && runtime.GOOS != \"windows\" {",
+      "replace": "\tif mode := info.Mode().Perm(); false && mode&0o077 != 0 && runtime.GOOS != \"windows\" {",
+      "why": "Whoever reads the secret before the claim is mined can claim on the other chain. A file that others on the host can read is refused, as a private key file is."
+    },
+    {
+      "id": "cmd-secret-refusal-prints-the-file",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimReadsTheSecretFromAFileOfItsOwner",
+      "find": "\tif _, err := hex.Decode(secret[:], digits); err != nil {\n\t\treturn [32]byte{}, errors.New(\"-secret-file: want 64 hexadecimal digits\")",
+      "replace": "\tif _, err := hex.Decode(secret[:], digits); err != nil {\n\t\treturn [32]byte{}, fmt.Errorf(\"-secret-file: %q: %w\", digits, err)",
+      "why": "A file with one wrong character is a secret with a typing error. Its refusal goes to a terminal and often to a log."
+    },
+    {
+      "id": "cmd-input-of-another-script",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestFundRefusesAnInputThatIsNotTheCallersOwn",
+      "find": " || out.ScriptPubKey.Hex != hex.EncodeToString(script) {",
+      "replace": " || len(out.ScriptPubKey.Hex) != len(hex.EncodeToString(script)) {",
+      "why": "The input is signed as an output of the caller's address. An output of another script is signed over a script the node does not hold, recorded as a funding and refused."
+    },
+    {
+      "id": "cmd-input-unconfirmed",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestFundRefusesAnInputThatIsNotTheCallersOwn",
+      "find": "\t\tif out == nil || out.Confirmations < 1 || ",
+      "replace": "\t\tif out == nil || ",
+      "why": "A funding that spends an unconfirmed output is undone with it. The contract's depth is counted from a transaction whose own inputs are in the chain."
+    },
+    {
+      "id": "cmd-unknown-outcome-does-not-name-the-record",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestAnUnknownOutcomeNamesTheRecord",
+      "find": "\tif t == nil || errors.Is(err, htlc.ErrRecord) {",
+      "replace": "\tif t == nil || !errors.Is(err, htlc.ErrRecord) {",
+      "why": "After a lost reply the node may hold the transaction. The error says where its bytes are, so the caller sends those again and does not build a second funding."
+    },
+    {
+      "id": "cmd-flag-value-printed",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestArgumentsAreRefusedBeforeAnythingIsOpened",
+      "find": "\t\t\treturn network, p, fmt.Errorf(\"-%s: want 64 hexadecimal digits\", f.name)",
+      "replace": "\t\t\treturn network, p, fmt.Errorf(\"-%s: %q: want 64 hexadecimal digits\", f.name, f.value)",
+      "why": "The hash and the secret are both 64 digits. A secret passed as -hash by mistake is not printed back to the terminal."
+    },
+    {
+      "id": "cmd-node-address-of-the-environment-ignored",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestArgumentsAreRefusedBeforeAnythingIsOpened",
+      "find": "\tif url == \"\" {",
+      "replace": "\tif true {",
+      "why": "A caller whose node listens on another port names it in SOQ_RPC_URL. The default port could be another node's."
     }
   ]
 }
