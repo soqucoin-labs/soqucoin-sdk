@@ -206,7 +206,7 @@ it is stated plainly, with the reason, in
 SOQUCOIND=/path/to/soqucoind make integration
 ```
 
-A throwaway regtest node, the real `deposit` and `withdraw` packages, fifteen end-to-end
+A throwaway regtest node, the real `deposit` and `withdraw` packages, sixteen end-to-end
 scenarios, about ninety seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
 each scenario proves.
 

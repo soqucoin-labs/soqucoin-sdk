@@ -221,7 +221,7 @@ SOQUCOIND=/path/to/soqucoind make integration   # a soqucoind build, v2.3.0 or l
 ```
 
 The harness starts a throwaway regtest node, mines to SDK-generated addresses, and drives the same
-`deposit` and `withdraw` packages this guide uses through fifteen scenarios. Nine cover deposits and withdrawals: a deposit credited only
+`deposit` and `withdraw` packages this guide uses through sixteen scenarios. Nine cover deposits and withdrawals: a deposit credited only
 after the node confirms it, a withdrawal built, signed, broadcast, mined and confirmed, a lost
 broadcast reply survived with exactly one payment, two withdrawals that cannot share an input,
 refused inputs (a USDSOQ-form destination, an amount below the relay floor, a fee-rate typo) that
@@ -236,9 +236,11 @@ sends, covered by the reconcile pass; an indexer outage across which a deposit i
 from the status in the re-subscribe reply; and one address the indexer fails, skipped and alarmed
 while the other is credited.
 
-Two more cover batch payments. A 120-payee batch is mined as one transaction and every output is
+Three more cover batch payments. A 120-payee batch is mined as one transaction and every output is
 read back from the node. A batch whose broadcast reply is lost is sent again with the same bytes,
-and each payee holds one output. [Pool Payouts](POOL_PAYOUTS.md) is the guide to that path.
+and each payee holds one output. The third builds `examples/pool_payout` and runs it as a process:
+a dry run, a run of three batches, the same command again, and a changed file under the same run
+id. [Pool Payouts](POOL_PAYOUTS.md) is the guide to that path.
 
 The indexer role is played by an in-test block scanner, and for the push scenarios by an in-process
 fake ElectrumX over that scanner, so the harness needs no ElectrumX build. The methods that fake

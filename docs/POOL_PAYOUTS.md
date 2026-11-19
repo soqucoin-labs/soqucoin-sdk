@@ -292,7 +292,9 @@ batch and sends nothing.
 
 1. **Run the harness.** `SOQUCOIND=/path/to/soqucoind make integration` pays a 120-payee batch on a
    throwaway regtest node and reads every output back from the node. It also drops the reply to a
-   broadcast and shows that the retry sends the same bytes and each payee holds one output.
+   broadcast and shows that the retry sends the same bytes and each payee holds one output. It
+   builds `examples/pool_payout` and runs it as a process: a dry run, a run of three batches, the
+   same command a second time, and a changed file under the same run id.
 2. **Dry-run a real run.** `examples/pool_payout -dry-run` builds and signs every batch of your
    file against your wallet and reports the inputs, the size and the id of each.
 3. **Pay a run twice.** On regtest or stagenet, run the same command line a second time. The
