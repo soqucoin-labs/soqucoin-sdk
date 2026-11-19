@@ -652,6 +652,11 @@ type BlockchainInfo struct {
 	Difficulty    float64 `json:"difficulty"`
 	MedianTime    int64   `json:"mediantime"`
 	InitialSync   bool    `json:"initialblockdownload"`
+	// ActivationHeights holds, by the node's name of each height-gated
+	// deployment it reports, the first height the deployment is active at:
+	// 0 from genesis, 2147483647 for a deployment with no height. Nil when
+	// the node does not print the object.
+	ActivationHeights map[string]int64 `json:"activation_heights"`
 }
 
 // RequireSynced returns ErrNodeSyncing (a transient error) unless the node
