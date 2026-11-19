@@ -704,6 +704,89 @@ func TestClaimRefusesBeforeTheSignerIsAsked(t *testing.T) {
 	}
 }
 
+// slow is a signer during whose signature something else happens.
+type slow struct {
+	inner     tx.Signer
+	meanwhile func()
+}
+
+func (s slow) Sign(a string, d []byte) ([]byte, error) {
+	s.meanwhile()
+	return s.inner.Sign(a, d)
+}
+func (s slow) PublicKeyFor(a string) ([]byte, error) { return s.inner.PublicKeyFor(a) }
+
+// Claim audits, then asks the signer and the record, and neither is bounded
+// in time. It reads the tip a second time after the record and sends only
+// while the margin still holds, so a slow signer or a slow record does not
+// put the secret on the network at a tip from which the refund can win. The
+// claim is returned beside the refusal: it is signed and the record holds it.
+func TestClaimReadsTheTipAgainBeforeItSends(t *testing.T) {
+	const inclusion = 6
+	const edge = testLockHeight - testDepth - inclusion // the last tip that leaves the margin
+	at := func(tip int64) func(*bench) {
+		return func(b *bench) { b.node.info.Blocks, b.node.info.Headers = tip, tip }
+	}
+	down := fmt.Errorf("%w: connection refused", rpc.ErrTransient)
+	cases := []struct {
+		name      string
+		meanwhile func(*bench)
+		cause     error
+		sent      bool
+	}{
+		{"the tip reaches the last block that leaves the margin", at(edge), nil, true},
+		{"the tip moves one block inside the margin", at(edge + 1), nil, false},
+		{"the tip passes the lock height", at(testLockHeight + 1), nil, false},
+		{"the node does not answer", func(b *bench) { b.node.infoErr = down }, down, false},
+		{"the node is on another chain", func(b *bench) { b.node.info.Chain = "stagenet" }, rpc.ErrWrongChain, false},
+		{"the node is behind its headers", func(b *bench) { b.node.info.Headers++ }, rpc.ErrNodeSyncing, false},
+		{"the node is in initial block download", func(b *bench) { b.node.info.InitialSync = true }, rpc.ErrNodeSyncing, false},
+	}
+	for _, tc := range cases {
+		for _, during := range []string{"the record", "the signature"} {
+			name := tc.name + " during " + during
+			b := newBench(t)
+			party, record := b.party(b.payee), b.keep
+			if during == "the record" {
+				record = func(txid, rawHex string) error { tc.meanwhile(b); return b.keep(txid, rawHex) }
+			} else {
+				party.Signer = slow{inner: b.signer, meanwhile: func() { tc.meanwhile(b) }}
+			}
+			tr, err := Claim(context.Background(), b.node, party, b.terms, b.funded.TxID, b.funded.Vout, b.preimage,
+				Spend{PayToAddress: b.payee.addr, FeeRate: testFeeRate}, inclusion, record)
+			if tr == nil || b.signer.signs != 1 || len(b.record) != 1 {
+				t.Fatalf("%s: transaction returned %v, %d signatures, %d records; want the claim signed and recorded once", name, tr != nil, b.signer.signs, len(b.record))
+			}
+			if tc.sent {
+				if err != nil || len(b.node.sent) != 1 || b.node.sent[0] != tr.SerializeHex() || b.node.calls != 4 {
+					t.Errorf("%s: got %v, %d broadcasts and %d calls of the node; want the claim sent after one more read", name, err, len(b.node.sent), b.node.calls)
+				}
+				continue
+			}
+			if !errors.Is(err, ErrLockTooNear) || len(b.node.sent) != 0 {
+				t.Errorf("%s: got %v and %d broadcasts, want ErrLockTooNear and none", name, err, len(b.node.sent))
+			}
+			if tc.cause != nil && !errors.Is(err, tc.cause) {
+				t.Errorf("%s: got %v, want the cause %v kept", name, err, tc.cause)
+			}
+			if err != nil {
+				if !strings.Contains(err.Error(), "nothing was sent") {
+					t.Errorf("%s: the refusal does not say that nothing was sent: %v", name, err)
+				}
+				holdsNoItem(t, name, err, [][]byte{b.preimage[:]})
+			}
+		}
+	}
+
+	// A record that refuses ends the call there: the node is not asked again.
+	b := newBench(t)
+	_, err := Claim(context.Background(), b.node, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, b.preimage,
+		Spend{PayToAddress: b.payee.addr, FeeRate: testFeeRate}, inclusion, func(string, string) error { return errors.New("no") })
+	if !errors.Is(err, ErrRecord) || errors.Is(err, ErrLockTooNear) || b.node.calls != 2 {
+		t.Errorf("a refusing record: got %v after %d calls of the node, want ErrRecord after the two of the audit", err, b.node.calls)
+	}
+}
+
 // Refund sends from the lock height on and refuses below it.
 func TestRefundFromTheLockHeightOn(t *testing.T) {
 	spend := func(b *bench) Spend { return Spend{PayToAddress: b.stranger.addr, FeeRate: testFeeRate} }

@@ -305,6 +305,54 @@ func TestClaimAndFindSecretAgainstTheNode(t *testing.T) {
 	}
 }
 
+// The record of a claim takes longer than the margin: while it runs, the node
+// mines to one block inside depth and inclusion of the lock height. Claim
+// reads the tip again, returns the signed claim with ErrLockTooNear, and the
+// node has no transaction. With a record that returns at once the same claim
+// is taken.
+func TestClaimIsHeldBackWhenTheTipMovesDuringTheRecord(t *testing.T) {
+	b := newSwapBench(t)
+	ctx := context.Background()
+	secret := sha256.Sum256([]byte("held back"))
+	const inclusion = 6
+	payee, signer := b.party(b.payee)
+	spend := htlc.Spend{PayToAddress: b.stranger, FeeRate: htlcFeeRate}
+	lock := b.n.height() + 100
+	terms := htlc.Terms{Params: b.contract(secret[:], htlc.Height(lock)), Amount: htlcAmount}
+	funded := b.fundThrough(terms)
+	b.n.mine(b.stranger, 30)
+
+	edge := lock - 30 - inclusion // the last tip that leaves the margin
+	records := 0
+	slow := func(to int64) htlc.Record {
+		return func(string, string) error { records++; b.mineTo(to); return nil }
+	}
+	claim, err := htlc.Claim(ctx, b.n.rpc, payee, terms, funded.TxID, funded.Vout, secret, spend, inclusion, slow(edge+1))
+	if !errors.Is(err, htlc.ErrLockTooNear) || claim == nil || records != 1 || signer.signs != 1 {
+		t.Fatalf("the tip one block inside the margin after the record: got %v, claim returned %v, %d records, %d signatures; want ErrLockTooNear beside the signed claim", err, claim != nil, records, signer.signs)
+	}
+	if n := b.mempoolSize(); n != 0 || b.spent(funded) {
+		t.Fatalf("after the claim was held back the mempool holds %d transactions and the output is spent: %v", n, b.spent(funded))
+	}
+
+	// The margin is gone for this contract now, and a new call refuses before
+	// the signer.
+	if tr, err := htlc.Claim(ctx, b.n.rpc, payee, terms, funded.TxID, funded.Vout, secret, spend, inclusion, nil); !errors.Is(err, htlc.ErrLockTooNear) || tr != nil || signer.signs != 1 {
+		t.Fatalf("a second call inside the margin: got %v and %d signatures, want ErrLockTooNear before the signer", err, signer.signs)
+	}
+
+	// A record during which the tip reaches the last block of the margin, on
+	// a second contract: the claim is sent.
+	lock = b.n.height() + 100
+	terms = htlc.Terms{Params: b.contract(secret[:], htlc.Height(lock)), Amount: htlcAmount}
+	funded = b.fundThrough(terms)
+	b.n.mine(b.stranger, 30)
+	claim, err = htlc.Claim(ctx, b.n.rpc, payee, terms, funded.TxID, funded.Vout, secret, spend, inclusion, slow(lock-30-inclusion))
+	if err != nil || !b.inMempool(claim.TxID()) {
+		t.Fatalf("the tip at the last block of the margin after the record: got %v, want the claim taken", err)
+	}
+}
+
 // Refund against the node: refused one block below the lock height with the
 // signer not asked, accepted with the tip at it, mined in the next block, and
 // FindSecret reports a spend that shows no secret.

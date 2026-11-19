@@ -37,11 +37,17 @@ type replies struct {
 	sent         []string
 	withMempool  []bool
 	read         []int64
+	// later, when set, is the tip from the second read of the chain on.
+	later, reads int64
 }
 
 func (r *replies) GetBlockchainInfo(context.Context) (*rpc.BlockchainInfo, error) {
 	r.calls++
+	r.reads++
 	info := r.info
+	if r.later != 0 && r.reads > 1 {
+		info.Blocks, info.Headers = r.later, r.later
+	}
 	return &info, nil
 }
 
@@ -466,6 +472,36 @@ func TestAnUnknownOutcomeNamesTheRecord(t *testing.T) {
 	_, txid, rawHex := b.record(rec)
 	if !errors.Is(err, rpc.ErrUnknownOutcome) || !strings.Contains(err.Error(), rec) || !strings.Contains(err.Error(), txid) || rawHex == "" {
 		t.Errorf("got %v; want the node's error with the record %s and the transaction %s named", err, rec, txid)
+	}
+}
+
+// The tip moves into the margin while the claim is signed and recorded. The
+// claim is in the record and was not sent, and the error says what that means:
+// the record holds the secret and its bytes are not for the node.
+func TestClaimHeldBackAfterTheRecordSaysNothingWasSent(t *testing.T) {
+	b := newBench(t)
+	b.node.later = benchTip + 1 // one block inside the depth and the inclusion
+	rec := filepath.Join(b.dir, "claim.json")
+	err := b.run(args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
+		"-inclusion", "6", "-secret-file", b.file("secret", hex.EncodeToString(b.secret[:]), 0o600), "-record", rec})...)
+	if !errors.Is(err, htlc.ErrLockTooNear) || len(b.node.sent) != 0 {
+		t.Fatalf("got %v and %d broadcasts, want htlc.ErrLockTooNear and none", err, len(b.node.sent))
+	}
+	step, txid, rawHex := b.record(rec)
+	if step != "claim" || rawHex == "" {
+		t.Fatalf("the record holds step %q and %d bytes, want the claim that was held back", step, len(rawHex)/2)
+	}
+	text := err.Error()
+	for _, want := range []string{"nothing was sent", rec, txid, "holds the secret", "do not send"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the error does not hold %q: %v", want, err)
+		}
+	}
+	if strings.Contains(text, "send those bytes again") {
+		t.Errorf("the error tells the caller to send the bytes of a claim that was held back: %v", err)
+	}
+	if strings.Contains(text, hex.EncodeToString(b.secret[:])) {
+		t.Error("the error prints the secret")
 	}
 }
 
