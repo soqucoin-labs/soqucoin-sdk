@@ -1935,6 +1935,105 @@
       "find": "\tif url == \"\" {",
       "replace": "\tif true {",
       "why": "A caller whose node listens on another port names it in SOQ_RPC_URL. The default port could be another node's."
+    },
+    {
+      "id": "htlc-find-secret-block-not-held-to-the-one-below",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretGivesNoNegativeAnswerForAChainThatMoved",
+      "find": "\t\tmoved := below != \"\" && block.Previous != below",
+      "replace": "\t\tmoved := false && block.Previous != below",
+      "why": "A reorganisation while the blocks are read can put the claim into a height already read. A block that does not name the one read before it is of another chain, and ErrNoSpend over two chains is no answer."
+    },
+    {
+      "id": "htlc-find-secret-last-block-not-asked-again",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretGivesNoNegativeAnswerForAChainThatMoved",
+      "find": "\t\tif tip != below {",
+      "replace": "\t\tif false && tip != below {",
+      "why": "A reorganisation after the last block was read leaves every block naming the one below it. Only the hash at the last height, asked again, shows it."
+    },
+    {
+      "id": "htlc-find-secret-refund-of-a-replaced-block",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretGivesNoNegativeAnswerForAChainThatMoved",
+      "find": "\t\t\t\t\tmoved = still != hash",
+      "replace": "\t\t\t\t\tmoved = still == \"\"",
+      "why": "A refund in a block that has left the chain says nothing: the chain that replaced it may hold the claim, and the payer would stop looking for the secret."
+    },
+    {
+      "id": "cmd-input-named-twice",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestFundRefusesAnInputNamedTwiceOrACoinbaseBelowMaturity",
+      "find": "\t\tif named[key] {",
+      "replace": "\t\tif false && named[key] {",
+      "why": "An outpoint named twice is counted twice, and the transaction is signed and recorded before the node refuses it."
+    },
+    {
+      "id": "cmd-input-named-twice-in-another-case",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestFundRefusesAnInputNamedTwiceOrACoinbaseBelowMaturity",
+      "find": "\t\tkey := fmt.Sprintf(\"%s:%d\", strings.ToLower(txid), vout)",
+      "replace": "\t\tkey := fmt.Sprintf(\"%s:%d\", txid, vout)",
+      "why": "A node takes a transaction id in either case, so the same outpoint can be named twice with different letters."
+    },
+    {
+      "id": "cmd-coinbase-input-below-maturity",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestFundRefusesAnInputNamedTwiceOrACoinbaseBelowMaturity",
+      "find": "\t\tif out.Coinbase && out.Confirmations < maturity {",
+      "replace": "\t\tif out.Coinbase && out.Confirmations < maturity-1 {",
+      "why": "A coinbase output one block below maturity cannot be spent. The funding would be signed and recorded, and the record's name used up, before the node refuses it."
+    },
+    {
+      "id": "cmd-parser-prints-the-refused-value",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestNoRefusalOfTheArgumentsPrintsAValue",
+      "find": "\tfs.SetOutput(io.Discard) // the parser prints the value it refuses",
+      "replace": "\tfs.SetOutput(e.stderr)",
+      "why": "The flag parser prints the value it refuses. A secret passed as -lock-height by mistake would be on the terminal."
+    },
+    {
+      "id": "cmd-parser-error-returned-with-the-value",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestNoRefusalOfTheArgumentsPrintsAValue",
+      "find": "\t\treturn flagError(fs, err)",
+      "replace": "\t\treturn err",
+      "why": "The parser's error holds the value it refused, and main prints the error."
+    },
+    {
+      "id": "cmd-outpoint-printed-back",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestNoRefusalOfTheArgumentsPrintsAValue",
+      "find": "\t\treturn \"\", 0, fmt.Errorf(\"-%s: want txid:vout\", name)",
+      "replace": "\t\treturn \"\", 0, fmt.Errorf(\"-%s: %q: want txid:vout\", name, s)",
+      "why": "A secret passed as -outpoint or in -inputs by mistake is not printed back."
+    },
+    {
+      "id": "cmd-argument-printed-back",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestNoRefusalOfTheArgumentsPrintsAValue",
+      "find": "\t\treturn errors.New(\"unexpected argument after the flags\")",
+      "replace": "\t\treturn fmt.Errorf(\"unexpected argument after the flags: %q\", fs.Arg(0))",
+      "why": "A secret left after the flags by mistake is not printed back."
+    },
+    {
+      "id": "cmd-amount-printed-back",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestNoRefusalOfTheArgumentsPrintsAValue",
+      "find": "\t\treturn htlc.Terms{}, fmt.Errorf(\"-amount: want a decimal number of SOQ: %w\", types.ErrAmountFormat)",
+      "replace": "\t\treturn htlc.Terms{}, fmt.Errorf(\"-amount: %w\", err)",
+      "why": "The amount parser's error holds the text it refused. A secret passed as -amount by mistake is not printed back."
     }
   ]
 }
