@@ -486,6 +486,12 @@ func Refund(ctx context.Context, node Node, party Party, p Params, txid string, 
 // no spend the answer is rpc.ErrNodeSyncing, which is transient, in place of
 // ErrNoSpend. The node's chain is not compared with a network: ErrNoSpend
 // from a node of another chain says nothing about the party's.
+//
+// ErrNoSpend and ErrNoSecret are answers for one chain. Each block read must
+// name the block read before it, and the last one read, or the one that holds
+// the refund, must still be at its height when the answer is given;
+// otherwise the chain was reorganised under the read and the answer is
+// ErrTipMoved, which is transient.
 func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint32, fromHeight int64) (secret [32]byte, spender string, err error) {
 	if id, err := hex.DecodeString(txid); err != nil || len(id) != sha256.Size {
 		return [32]byte{}, "", fmt.Errorf("%w: %q", ErrOutpoint, txid)
@@ -494,6 +500,7 @@ func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint
 	if err != nil {
 		return [32]byte{}, "", err
 	}
+	var below string // the hash of the block read before this one
 	for height := fromHeight; height <= info.Blocks; height++ {
 		hash, err := node.GetBlockHash(ctx, height)
 		if err != nil {
@@ -504,7 +511,8 @@ func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint
 			return [32]byte{}, "", err
 		}
 		var block struct {
-			Tx []struct {
+			Previous string `json:"previousblockhash"`
+			Tx       []struct {
 				TxID string `json:"txid"`
 				Vin  []struct {
 					TxID    string   `json:"txid"`
@@ -516,6 +524,8 @@ func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint
 		if err := json.Unmarshal(raw, &block); err != nil {
 			return [32]byte{}, "", fmt.Errorf("block %d: %w", height, err)
 		}
+		moved := below != "" && block.Previous != below
+		below = hash
 		for _, t := range block.Tx {
 			for _, in := range t.Vin {
 				if !strings.EqualFold(in.TxID, txid) || in.Vout != vout {
@@ -528,8 +538,33 @@ func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint
 					}
 				}
 				secret, err := SecretFromWitness(items, p)
+				if err == nil {
+					return secret, t.TxID, nil
+				}
+				if !moved {
+					still, askErr := node.GetBlockHash(ctx, height)
+					if askErr != nil {
+						return [32]byte{}, "", askErr
+					}
+					moved = still != hash
+				}
+				if moved {
+					return [32]byte{}, "", fmt.Errorf("%w: block %d was replaced while the blocks were read", ErrTipMoved, height)
+				}
 				return secret, t.TxID, err
 			}
+		}
+		if moved {
+			return [32]byte{}, "", fmt.Errorf("%w: block %d does not name the block read at %d", ErrTipMoved, height, height-1)
+		}
+	}
+	if below != "" {
+		tip, err := node.GetBlockHash(ctx, info.Blocks)
+		if err != nil {
+			return [32]byte{}, "", err
+		}
+		if tip != below {
+			return [32]byte{}, "", fmt.Errorf("%w: block %d was replaced while the blocks were read", ErrTipMoved, info.Blocks)
 		}
 	}
 	if info.InitialSync || info.Headers > info.Blocks {

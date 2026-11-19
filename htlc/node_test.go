@@ -37,6 +37,8 @@ type replies struct {
 	prev  map[int64]string
 	moved map[int64]string
 	asked map[int64]int
+	// againErr answers a height asked for a second time.
+	againErr error
 
 	calls       int
 	withMempool []bool
@@ -83,6 +85,9 @@ func (r *replies) GetBlockHash(_ context.Context, height int64) (string, error) 
 		r.asked = map[int64]int{}
 	}
 	r.asked[height]++
+	if r.againErr != nil && r.asked[height] > 1 {
+		return "", r.againErr
+	}
 	if hash, ok := r.moved[height]; ok && r.asked[height] > 1 {
 		return hash, nil
 	}
@@ -240,6 +245,18 @@ func TestFindSecretGivesNoNegativeAnswerForAChainThatMoved(t *testing.T) {
 	if _, spender, err := find(); !errors.Is(err, ErrNoSecret) || spender != refund.TxID() {
 		t.Errorf("a refund on one chain: got %q and %v, want ErrNoSecret with its id", spender, err)
 	}
+
+	// The node's error for the height asked again is the answer, for a
+	// refund and for no spend.
+	b.node.againErr = fmt.Errorf("%w: asked again", rpc.ErrTransient)
+	if _, spender, err := find(); !errors.Is(err, b.node.againErr) || errors.Is(err, ErrNoSecret) || spender != "" {
+		t.Errorf("a refund, and the node fails on its height asked again: got %q and %v, want the node's error", spender, err)
+	}
+	empty()
+	if _, _, err := find(); !errors.Is(err, b.node.againErr) || errors.Is(err, ErrNoSpend) {
+		t.Errorf("no spend, and the node fails on the last height asked again: got %v, want the node's error", err)
+	}
+	b.node.againErr = nil
 
 	// The secret is accepted by its hash, so a claim is returned from any
 	// block, one that has moved included.

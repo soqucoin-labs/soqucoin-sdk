@@ -178,7 +178,7 @@ func (e env) run(ctx context.Context, args []string) error {
 		step func(context.Context, *options) error
 		fs   = flag.NewFlagSet("soq-htlc "+args[0], flag.ContinueOnError)
 	)
-	fs.SetOutput(e.stderr)
+	fs.SetOutput(io.Discard) // the parser prints the value it refuses
 	switch args[0] {
 	case "key-hash":
 		o.register(fs, partyFlags)
@@ -202,20 +202,44 @@ func (e env) run(ctx context.Context, args []string) error {
 		o.register(fs, contractFlags, []string{"outpoint", "from-height"})
 		step = e.secret
 	default:
-		return fmt.Errorf("unknown command %q\n%s", args[0], usage)
+		return fmt.Errorf("unknown command\n%s", usage)
 	}
 	if err := fs.Parse(args[1:]); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			fs.SetOutput(e.stderr)
+			_, _ = fmt.Fprintf(e.stderr, "flags of %s:\n", fs.Name())
+			fs.PrintDefaults()
+			return err
+		}
+		return flagError(fs, err)
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+		return errors.New("unexpected argument after the flags")
 	}
 	return step(ctx, &o)
 }
 
+// flagError names the flag the parser refused and never its value. No
+// refusal of the arguments prints a value back: one passed to the wrong flag
+// may be the secret.
+func flagError(fs *flag.FlagSet, err error) error {
+	named := errors.New("flag provided but not defined, or malformed; run the command with -h")
+	msg := err.Error()
+	fs.VisitAll(func(f *flag.Flag) {
+		refused := " for flag -" + f.Name + ": "
+		switch {
+		case msg == "flag needs an argument: -"+f.Name:
+			named = fmt.Errorf("-%s: needs a value", f.Name)
+		case strings.HasSuffix(msg, refused+"parse error"), strings.HasSuffix(msg, refused+"value out of range"):
+			named = fmt.Errorf("-%s: want a whole number in range", f.Name)
+		}
+	})
+	return named
+}
+
 // contract returns the network and the contract's parameters as the flags
 // name them. No error holds a value of a flag: a secret passed as -hash by
-// mistake is not printed back.
+// mistake is not printed back (flagError).
 func (o *options) contract() (types.Network, htlc.Params, error) {
 	var (
 		network types.Network
@@ -250,7 +274,7 @@ func (o *options) contract() (types.Network, htlc.Params, error) {
 func (o *options) terms(p htlc.Params) (htlc.Terms, error) {
 	amount, err := types.ParseSOQ(o.amount)
 	if err != nil {
-		return htlc.Terms{}, fmt.Errorf("-amount: %w", err)
+		return htlc.Terms{}, fmt.Errorf("-amount: want a decimal number of SOQ: %w", types.ErrAmountFormat)
 	}
 	return htlc.Terms{Params: p, Amount: amount, Depth: o.depth}, nil
 }
@@ -277,12 +301,12 @@ func (e env) node(network types.Network) htlc.Node {
 	return e.dial(url, e.getenv("SOQ_RPC_USER"), e.getenv("SOQ_RPC_PASSWORD"), network)
 }
 
-// parseOutpoint reads txid:vout.
-func parseOutpoint(s string) (string, uint32, error) {
+// parseOutpoint reads txid:vout, the value of the flag name.
+func parseOutpoint(name, s string) (string, uint32, error) {
 	txid, index, ok := strings.Cut(s, ":")
 	vout, err := strconv.ParseUint(index, 10, 32)
 	if !ok || err != nil {
-		return "", 0, fmt.Errorf("outpoint %q: want txid:vout", s)
+		return "", 0, fmt.Errorf("-%s: want txid:vout", name)
 	}
 	return txid, uint32(vout), nil
 }
@@ -367,25 +391,40 @@ func (e env) script(_ context.Context, o *options) error {
 }
 
 // ownInputs reads each outpoint of the list from the node and returns it as
-// an input of the caller's address. An outpoint that is spent, unconfirmed or
-// pays another script is refused.
-func ownInputs(ctx context.Context, node htlc.Node, addr, list string) ([]types.UTXO, error) {
+// an input of the caller's address. An outpoint that is named twice, is
+// spent, unconfirmed or pays another script, or is a coinbase output below
+// the network's maturity is refused: the node would refuse the transaction
+// after it was signed and recorded.
+func ownInputs(ctx context.Context, node htlc.Node, network types.Network, addr, list string) ([]types.UTXO, error) {
 	script, err := address.ScriptFor(addr)
 	if err != nil {
 		return nil, err
 	}
+	maturity := network.CoinbaseMaturity
+	if maturity <= 0 {
+		maturity = types.Mainnet.CoinbaseMaturity
+	}
 	var inputs []types.UTXO
+	named := map[string]bool{}
 	for _, item := range strings.Split(list, ",") {
-		txid, vout, err := parseOutpoint(strings.TrimSpace(item))
+		txid, vout, err := parseOutpoint("inputs", strings.TrimSpace(item))
 		if err != nil {
-			return nil, fmt.Errorf("-inputs: %w", err)
+			return nil, err
 		}
+		key := fmt.Sprintf("%s:%d", strings.ToLower(txid), vout)
+		if named[key] {
+			return nil, fmt.Errorf("-inputs: %s is named twice", key)
+		}
+		named[key] = true
 		out, err := node.GetTxOut(ctx, txid, vout, true)
 		if err != nil {
 			return nil, err
 		}
 		if out == nil || out.Confirmations < 1 || out.ScriptPubKey.Hex != hex.EncodeToString(script) {
 			return nil, fmt.Errorf("-inputs: %s is not a confirmed unspent output of %s", item, addr)
+		}
+		if out.Coinbase && out.Confirmations < maturity {
+			return nil, fmt.Errorf("-inputs: %s is a coinbase output with %d confirmations, spendable at %d", item, out.Confirmations, maturity)
 		}
 		inputs = append(inputs, types.UTXO{TxID: txid, Vout: vout, Value: out.Value, Address: addr})
 	}
@@ -410,7 +449,7 @@ func (e env) fund(ctx context.Context, o *options) error {
 		return err
 	}
 	node := e.node(network)
-	inputs, err := ownInputs(ctx, node, o.address, o.inputs)
+	inputs, err := ownInputs(ctx, node, network, o.address, o.inputs)
 	if err != nil {
 		return err
 	}
@@ -436,7 +475,7 @@ func (e env) audit(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	txid, vout, err := parseOutpoint(o.outpoint)
+	txid, vout, err := parseOutpoint("outpoint", o.outpoint)
 	if err != nil {
 		return err
 	}
@@ -487,7 +526,7 @@ func (e env) claim(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	txid, vout, err := parseOutpoint(o.outpoint)
+	txid, vout, err := parseOutpoint("outpoint", o.outpoint)
 	if err != nil {
 		return err
 	}
@@ -517,7 +556,7 @@ func (e env) refund(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	txid, vout, err := parseOutpoint(o.outpoint)
+	txid, vout, err := parseOutpoint("outpoint", o.outpoint)
 	if err != nil {
 		return err
 	}
@@ -543,7 +582,7 @@ func (e env) secret(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	txid, vout, err := parseOutpoint(o.outpoint)
+	txid, vout, err := parseOutpoint("outpoint", o.outpoint)
 	if err != nil {
 		return err
 	}
