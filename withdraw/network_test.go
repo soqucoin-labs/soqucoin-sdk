@@ -73,6 +73,14 @@ func TestBuildFailsAStoredIntentWhoseDestinationIsOnAnotherNetwork(t *testing.T)
 	net := &fakeNet{mode: "ok"}
 	e := newEngine(t, store, spent, net, coins())
 	e.Network = types.Stagenet
+	// The selector is counted: Build releases a failed intent's reservation
+	// before it returns, so the spent set read afterwards is empty either way.
+	selects := 0
+	realSelect := e.Select
+	e.Select = func(ctx context.Context, amount, feeRate int64) ([]types.UTXO, error) {
+		selects++
+		return realSelect(ctx, amount, feeRate)
+	}
 	foreign := &Intent{ID: "w-foreign", Address: addrOn(t, types.Mainnet, 0x44), Amount: 1_000_000, FeeRate: 1000, State: StateCreated}
 	if err := store.Create(context.Background(), foreign); err != nil {
 		t.Fatal(err)
@@ -85,8 +93,8 @@ func TestBuildFailsAStoredIntentWhoseDestinationIsOnAnotherNetwork(t *testing.T)
 	if stored.State != StateFailed || !strings.Contains(stored.LastError, foreign.Address) {
 		t.Fatalf("stored %s with LastError %q; want Failed naming the destination", stored.State, stored.LastError)
 	}
-	if len(spent.ReservedIntents()) != 0 || net.builds != 0 {
-		t.Fatalf("reserved %v, builds %d; want nothing reserved and the signer never called", spent.ReservedIntents(), net.builds)
+	if selects != 0 || len(spent.ReservedIntents()) != 0 || net.builds != 0 {
+		t.Fatalf("selector calls %d, reserved %v, builds %d; want the selector and the signer never called and nothing reserved", selects, spent.ReservedIntents(), net.builds)
 	}
 	if _, err := e.Process(context.Background(), "w-foreign"); !errors.Is(err, ErrFailed) {
 		t.Fatalf("process after the refusal: %v, want ErrFailed", err)

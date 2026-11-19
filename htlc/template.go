@@ -21,11 +21,14 @@
 // funded the output and takes it back from the lock height on. A key hash is
 // the SHA-256 of a raw 1,312-byte ML-DSA-44 public key.
 //
-// No function here reads a node, a clock or a file, so none knows whether the
-// chain enforces witness version 6 yet, whether an output exists, or how far
-// the tip is from the lock height. A caller checks those against a node
-// before it funds, claims or refunds. The two builders read the fee limits of
-// package tx (MaxFeeRateShorsPerVB, MaxFeeShors) and ask the signer, whose
+// The template, BuildFunding, the two builders of a spend and VerifySpend
+// read no node, no clock and no file, so none of them knows whether the chain
+// enforces witness version 6 yet, whether an output exists, or how far the
+// tip is from the lock height. Fund, Audit, Claim, Refund and FindSecret ask
+// a node for those and refuse on its answers; a caller that uses the others
+// alone makes the same checks before it funds, claims or refunds. The
+// builders read the fee limits of package tx (MaxFeeRateShorsPerVB,
+// MaxFeeShors), and the two builders of a spend ask the signer, whose
 // signatures may differ from call to call.
 package htlc
 
