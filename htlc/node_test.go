@@ -563,6 +563,8 @@ func TestClaimRefusesBeforeTheSignerIsAsked(t *testing.T) {
 		{"another preimage", func(c *call) { c.preimage[31] ^= 1 }, ErrPreimage, true},
 		{"a depth below the floor", func(c *call) { c.terms.Depth = 1 }, ErrDepth, true},
 		{"no block allowed for inclusion", func(c *call) { c.inclusion = 0 }, ErrLockTooNear, true},
+		{"an inclusion that leaves int64 when the depth is added", func(c *call) { c.inclusion = math.MaxInt64 }, ErrLockTooNear, true},
+		{"the largest inclusion that does not", func(c *call) { c.inclusion = math.MaxInt64 - testDepth }, ErrLockTooNear, false},
 		{"the node is on another chain", func(c *call) { c.b.node.info.Chain = "stagenet" }, rpc.ErrWrongChain, false},
 		{"the node prints no activation heights", func(c *call) { c.b.node.info.ActivationHeights = nil }, ErrNoActivationHeights, false},
 		{"one deployment is a block short of the depth", func(c *call) { c.b.node.info.ActivationHeights["p2wsh_dilithium"]++ }, ErrNotActive, false},
@@ -748,6 +750,21 @@ func TestFindSecretReadsTheMinedSpendOfTheOutpoint(t *testing.T) {
 	}
 	if fmt.Sprint(b.node.read) != "[5 6 7]" {
 		t.Errorf("blocks read: %v, want 5, 6 and 7", b.node.read)
+	}
+
+	// A node takes a transaction id in either case, so Audit passes with one
+	// in upper case. FindSecret finds the same spend under it.
+	if secret, spender, err := FindSecret(ctx, b.node, b.p, strings.ToUpper(b.funded.TxID), b.funded.Vout, 5); err != nil || secret != b.preimage || spender != claim.TxID() {
+		t.Errorf("the outpoint's id in upper case: got %x, %q and %v; want the secret from the claim", secret, spender, err)
+	}
+	// An id that is not 64 hexadecimal digits names no output, and the node
+	// is not asked. The empty id equals the absent id of a coinbase input, so
+	// without the refusal output 0 of it reads as refunded by the coinbase.
+	for _, id := range []string{"", b.funded.TxID[:62], b.funded.TxID + "7a", "zz" + b.funded.TxID[2:]} {
+		calls := b.node.calls
+		if _, spender, err := FindSecret(ctx, b.node, b.p, id, 0, 5); !errors.Is(err, ErrOutpoint) || spender != "" || b.node.calls != calls {
+			t.Errorf("the id %q: got %q and %v after %d calls of the node; want ErrOutpoint, no spender and no call", id, spender, err, b.node.calls-calls)
+		}
 	}
 
 	if _, spender, err := FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 8); !errors.Is(err, ErrNoSpend) || spender != "" {

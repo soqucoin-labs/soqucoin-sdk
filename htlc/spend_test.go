@@ -799,7 +799,7 @@ func holdsNoItem(t *testing.T, name string, err error, items [][]byte) {
 			"hexadecimal":            lower,
 			"upper-case hexadecimal": strings.ToUpper(lower),
 			"spaced hexadecimal":     fmt.Sprintf("% x", item),
-			"a decimal list":         strings.Trim(fmt.Sprint(item), "[]"),
+			"a decimal list":         strings.Trim(fmt.Sprintf("%d", item), "[]"),
 			"base 64":                base64.StdEncoding.EncodeToString(item),
 			"quoted":                 strings.Trim(strconv.Quote(string(item)), `"`),
 			"raw bytes":              string(item),

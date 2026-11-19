@@ -116,6 +116,9 @@ var (
 	// lock height.
 	ErrBeforeLockHeight = errors.New("htlc: the tip is below the lock height")
 
+	// ErrOutpoint marks a transaction id that is not 64 hexadecimal digits.
+	ErrOutpoint = errors.New("htlc: transaction id is not 64 hexadecimal digits")
+
 	// ErrTipMoved marks two replies of the node that were given at different
 	// tips. It is transient: ask again.
 	ErrTipMoved = fmt.Errorf("%w: the tip moved between two replies", rpc.ErrTransient)
