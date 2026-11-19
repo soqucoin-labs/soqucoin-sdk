@@ -133,9 +133,11 @@ func TestScriptCodeDigestCommitsToTheNamedScriptCode(t *testing.T) {
 }
 
 // The hash type the caller names is the last field of the preimage: the
-// digest at 0x00 and at 0x04 is the independent writing's for that value and
-// is not the digest at SIGHASH_ALL. The preimage keeps the SIGHASH_ALL form
-// at every value, which is the node's form for these two.
+// digest at 0x00, at 0x04 and at 0x40 is the independent writing's for that
+// value and is not the digest at SIGHASH_ALL. 0x40 has a bit above the low
+// five, so a digest that masks the hash type is refused here. The preimage
+// keeps the SIGHASH_ALL form at every value, which is the node's form for
+// these three.
 func TestScriptCodeDigestCommitsToTheHashType(t *testing.T) {
 	v := loadNodeVector(t)
 	tr := buildNodeVector(t, v)
@@ -144,7 +146,7 @@ func TestScriptCodeDigestCommitsToTheHashType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, hashType := range []uint32{0x00, 0x04} {
+	for _, hashType := range []uint32{0x00, 0x04, 0x40} {
 		got, err := tr.ComputeSigHashWithScriptCode(0, code, hashType)
 		if err != nil {
 			t.Fatalf("hash type %#02x: %v", hashType, err)

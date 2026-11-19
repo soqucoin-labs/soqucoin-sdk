@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -163,4 +164,183 @@ func TestTheNodeTakesAFundingBelowTheActivationHeight(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.accepted("a funding below the activation height", unsigned)
+}
+
+// fundThrough funds a contract with Fund as the bench's payer and returns the
+// outpoint. On a default regtest node the three deployments are active from
+// genesis, so the rule asks for a tip at the depth and no more.
+func (b *swapBench) fundThrough(terms htlc.Terms) types.UTXO {
+	b.t.Helper()
+	payer, _ := b.party(b.payer)
+	funded, _, err := htlc.Fund(context.Background(), b.n.rpc, payer, terms,
+		htlc.Funding{Inputs: []types.UTXO{b.coin()}, ChangeAddress: b.hot, FeeRate: htlcFeeRate}, nil)
+	if err != nil {
+		b.t.Fatalf("Fund: %v", err)
+	}
+	return funded
+}
+
+// Audit against the node: a funding is refused in the mempool and one block
+// below the depth and passes at it; terms that name another contract or a
+// higher amount are refused on the same output; and once a claim of the
+// output is in the mempool, and after it is mined, the output is refused.
+func TestAuditAgainstTheNode(t *testing.T) {
+	b := newSwapBench(t)
+	ctx := context.Background()
+	secret := sha256.Sum256([]byte("audit"))
+	terms := htlc.Terms{Params: b.contract(secret[:], htlc.Height(b.n.height()+200)), Amount: htlcAmount}
+	funded := b.fundThrough(terms)
+	payee, signer := b.party(b.payee)
+	audit := func(tm htlc.Terms, blocksToLock int64) (htlc.Funded, error) {
+		return htlc.Audit(ctx, b.n.rpc, payee, tm, funded.TxID, funded.Vout, blocksToLock)
+	}
+
+	if _, err := audit(terms, 0); !errors.Is(err, htlc.ErrShallow) {
+		t.Fatalf("a funding in the mempool: got %v, want ErrShallow", err)
+	}
+	b.n.mine(b.stranger, 29)
+	if _, err := audit(terms, 0); !errors.Is(err, htlc.ErrShallow) {
+		t.Fatalf("29 confirmations: got %v, want ErrShallow", err)
+	}
+	b.n.mine(b.stranger, 1)
+	got, err := audit(terms, 0)
+	if err != nil {
+		t.Fatalf("30 confirmations: %v", err)
+	}
+	tip := b.n.height()
+	if got.Output.TxID != funded.TxID || got.Output.Value != htlcAmount || got.Confirmations != 30 || got.Tip != tip || got.Output.Height != tip-29 {
+		t.Fatalf("Audit returned %+v at tip %d", got, tip)
+	}
+
+	otherLock, otherKey, more := terms, terms, terms
+	otherLock.Params.LockHeight++
+	otherKey.Params.PayerKeyHash = b.keyHash(b.stranger)
+	more.Amount++
+	for name, tm := range map[string]htlc.Terms{"another lock height": otherLock, "another payer": otherKey, "one shor more": more} {
+		if _, err := audit(tm, 0); !errors.Is(err, htlc.ErrFundedOutput) {
+			t.Errorf("terms with %s: got %v, want ErrFundedOutput", name, err)
+		}
+	}
+	left := int64(terms.Params.LockHeight) - tip
+	if _, err := audit(terms, left); err != nil {
+		t.Errorf("%d blocks asked with %d left: %v", left, left, err)
+	}
+	if _, err := audit(terms, left+1); !errors.Is(err, htlc.ErrLockTooNear) {
+		t.Errorf("%d blocks asked with %d left: got %v, want ErrLockTooNear", left+1, left, err)
+	}
+	if stranger, _ := b.party(b.stranger); true {
+		if _, err := htlc.Audit(ctx, b.n.rpc, stranger, terms, funded.TxID, funded.Vout, 0); !errors.Is(err, htlc.ErrWrongKey) {
+			t.Errorf("a party the contract does not name: got %v, want ErrWrongKey", err)
+		}
+	}
+
+	claim, err := htlc.BuildClaim(terms.Params, got.Output, secret, b.payee, htlcFeeRate, b.keys, b.payee)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.accepted("a claim", claim)
+	if _, err := audit(terms, 0); !errors.Is(err, htlc.ErrNotFunded) {
+		t.Errorf("with a claim in the mempool: got %v, want ErrNotFunded", err)
+	}
+	b.minedAt("the claim", claim)
+	if _, err := audit(terms, 0); !errors.Is(err, htlc.ErrNotFunded) {
+		t.Errorf("after the claim is mined: got %v, want ErrNotFunded", err)
+	}
+	if signer.signs != 0 {
+		t.Errorf("Audit asked for %d signatures", signer.signs)
+	}
+}
+
+// Claim against the node: refused while the funding is below the depth and
+// when the tip is inside depth and inclusion of the lock height, with the
+// signer not asked; then a claim through the function is mined, pays the
+// destination, and FindSecret reads the secret from its block.
+func TestClaimAndFindSecretAgainstTheNode(t *testing.T) {
+	b := newSwapBench(t)
+	ctx := context.Background()
+	secret := sha256.Sum256([]byte("claim"))
+	const inclusion = 6
+	payee, signer := b.party(b.payee)
+	spend := htlc.Spend{PayToAddress: b.stranger, FeeRate: htlcFeeRate}
+
+	// A lock height that leaves one block too few once the funding has its depth.
+	near := htlc.Terms{Params: b.contract(secret[:], htlc.Height(b.n.height()+30+30+inclusion-1)), Amount: htlcAmount}
+	nearFunded := b.fundThrough(near)
+	terms := htlc.Terms{Params: b.contract(secret[:], htlc.Height(b.n.height()+200)), Amount: htlcAmount}
+	funded := b.fundThrough(terms)
+
+	b.n.mine(b.stranger, 29)
+	if tr, err := htlc.Claim(ctx, b.n.rpc, payee, terms, funded.TxID, funded.Vout, secret, spend, inclusion, nil); !errors.Is(err, htlc.ErrShallow) || tr != nil {
+		t.Fatalf("29 confirmations: got %v, want ErrShallow", err)
+	}
+	b.n.mine(b.stranger, 1)
+	if tr, err := htlc.Claim(ctx, b.n.rpc, payee, near, nearFunded.TxID, nearFunded.Vout, secret, spend, inclusion, nil); !errors.Is(err, htlc.ErrLockTooNear) || tr != nil {
+		t.Fatalf("one block inside depth and inclusion of the lock height: got %v, want ErrLockTooNear", err)
+	}
+	if signer.signs != 0 || b.mempoolSize() != 0 {
+		t.Fatalf("after two refused claims: %d signatures, %d transactions in the mempool", signer.signs, b.mempoolSize())
+	}
+
+	var recorded string
+	claim, err := htlc.Claim(ctx, b.n.rpc, payee, terms, funded.TxID, funded.Vout, secret, spend, inclusion,
+		func(txid, rawHex string) error { recorded = txid; return nil })
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if recorded != claim.TxID() || !b.inMempool(claim.TxID()) {
+		t.Fatalf("recorded %q, in the mempool %v; want the claim %s recorded and accepted", recorded, b.inMempool(claim.TxID()), claim.TxID())
+	}
+	fundedAt := b.n.height() - 29
+	if _, _, err := htlc.FindSecret(ctx, b.n.rpc, terms.Params, funded.TxID, funded.Vout, fundedAt); !errors.Is(err, htlc.ErrNoSpend) {
+		t.Errorf("FindSecret with the claim in the mempool: got %v, want ErrNoSpend", err)
+	}
+	b.minedAt("the claim", claim)
+	b.paysTo("the claim", claim, b.stranger)
+	got, spender, err := htlc.FindSecret(ctx, b.n.rpc, terms.Params, funded.TxID, funded.Vout, fundedAt)
+	if err != nil || got != secret || spender != claim.TxID() {
+		t.Fatalf("FindSecret: got %x, %q and %v; want the secret from %s", got, spender, err, claim.TxID())
+	}
+	if _, _, err := htlc.FindSecret(ctx, b.n.rpc, terms.Params, nearFunded.TxID, nearFunded.Vout, fundedAt-1); !errors.Is(err, htlc.ErrNoSpend) {
+		t.Errorf("FindSecret for the unspent contract: got %v, want ErrNoSpend", err)
+	}
+}
+
+// Refund against the node: refused one block below the lock height with the
+// signer not asked, accepted with the tip at it, mined in the next block, and
+// FindSecret reports a spend that shows no secret.
+func TestRefundAgainstTheNode(t *testing.T) {
+	b := newSwapBench(t)
+	ctx := context.Background()
+	secret := sha256.Sum256([]byte("refund"))
+	lock := b.n.height() + 40
+	terms := htlc.Terms{Params: b.contract(secret[:], htlc.Height(lock)), Amount: htlcAmount}
+	funded := b.fundThrough(terms)
+	fundedAt := b.n.height() + 1
+	payer, signer := b.party(b.payer)
+	spend := htlc.Spend{PayToAddress: b.hot, FeeRate: htlcFeeRate}
+
+	b.mineTo(lock - 1)
+	if tr, err := htlc.Refund(ctx, b.n.rpc, payer, terms.Params, funded.TxID, funded.Vout, spend, nil); !errors.Is(err, htlc.ErrBeforeLockHeight) || tr != nil || signer.signs != 0 {
+		t.Fatalf("tip one below the lock height: got %v and %d signatures, want ErrBeforeLockHeight and none", err, signer.signs)
+	}
+	if payee, _ := b.party(b.payee); true {
+		if _, err := htlc.Refund(ctx, b.n.rpc, payee, terms.Params, funded.TxID, funded.Vout, spend, nil); !errors.Is(err, htlc.ErrWrongKey) {
+			t.Errorf("the payee asks for the refund: got %v, want ErrWrongKey", err)
+		}
+	}
+	b.mineTo(lock)
+	refund, err := htlc.Refund(ctx, b.n.rpc, payer, terms.Params, funded.TxID, funded.Vout, spend, nil)
+	if err != nil {
+		t.Fatalf("tip at the lock height: %v", err)
+	}
+	if at := b.minedAt("the refund", refund); at != lock+1 {
+		t.Fatalf("the refund is in block %d, want %d", at, lock+1)
+	}
+	b.paysTo("the refund", refund, b.hot)
+	if _, spender, err := htlc.FindSecret(ctx, b.n.rpc, terms.Params, funded.TxID, funded.Vout, fundedAt); !errors.Is(err, htlc.ErrNoSecret) || spender != refund.TxID() {
+		t.Errorf("FindSecret after the refund: got %q and %v, want ErrNoSecret with %s", spender, err, refund.TxID())
+	}
+	if _, err := htlc.Refund(ctx, b.n.rpc, payer, terms.Params, funded.TxID, funded.Vout, spend, nil); !errors.Is(err, htlc.ErrNotFunded) {
+		t.Errorf("a second refund: got %v, want ErrNotFunded", err)
+	}
 }
