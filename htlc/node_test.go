@@ -736,7 +736,7 @@ func TestFindSecretReadsTheMinedSpendOfTheOutpoint(t *testing.T) {
 	claim, refund := b.claim(t), b.refund(t)
 	other := b.funded
 	other.Vout++
-	b.node.info.Blocks = 8
+	b.node.info.Blocks, b.node.info.Headers = 8, 8
 	b.node.blocks = map[int64]string{
 		5: block(),
 		6: block([3]any{"spend-of-another-output", other, claim.Inputs[0].WitnessData}),
@@ -776,6 +776,23 @@ func TestFindSecretReadsTheMinedSpendOfTheOutpoint(t *testing.T) {
 	if _, _, err := FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 4); !errors.Is(err, rpc.ErrPermanent) {
 		t.Errorf("from a height the node has no block for: got %v, want the node's error", err)
 	}
+
+	// A node that is behind its headers or in initial block download has not
+	// read the chain to its end: where it finds no spend it says so in place
+	// of ErrNoSpend, and a spend it does hold is returned all the same.
+	for name, behind := range map[string]func(){
+		"behind its headers":        func() { b.node.info.Headers = 9 },
+		"in initial block download": func() { b.node.info.Headers, b.node.info.InitialSync = 8, true },
+	} {
+		behind()
+		if _, spender, err := FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 8); !errors.Is(err, rpc.ErrNodeSyncing) || errors.Is(err, ErrNoSpend) || spender != "" {
+			t.Errorf("no spend on a node %s: got %q and %v, want rpc.ErrNodeSyncing", name, spender, err)
+		}
+		if secret, _, err := FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 5); err != nil || secret != b.preimage {
+			t.Errorf("the claim on a node %s: got %x and %v, want the secret", name, secret, err)
+		}
+	}
+	b.node.info.Headers, b.node.info.InitialSync = 8, false
 
 	b.node.blocks[7] = block([3]any{refund.TxID(), b.funded, refund.Inputs[0].WitnessData})
 	secret, spender, err = FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 5)
