@@ -21,6 +21,7 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/htlc"
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
+	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
@@ -33,6 +34,8 @@ type replies struct {
 	broadcastErr error
 	calls        int
 	sent         []string
+	withMempool  []bool
+	read         []int64
 }
 
 func (r *replies) GetBlockchainInfo(context.Context) (*rpc.BlockchainInfo, error) {
@@ -41,8 +44,9 @@ func (r *replies) GetBlockchainInfo(context.Context) (*rpc.BlockchainInfo, error
 	return &info, nil
 }
 
-func (r *replies) GetTxOut(_ context.Context, txid string, vout uint32, _ bool) (*rpc.TxOut, error) {
+func (r *replies) GetTxOut(_ context.Context, txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error) {
 	r.calls++
+	r.withMempool = append(r.withMempool, includeMempool)
 	out, ok := r.outs[fmt.Sprintf("%s:%d", txid, vout)]
 	if !ok {
 		return nil, nil
@@ -62,6 +66,7 @@ func (r *replies) Broadcast(_ context.Context, rawTxHex, txid string) (string, e
 
 func (r *replies) GetBlockHash(_ context.Context, height int64) (string, error) {
 	r.calls++
+	r.read = append(r.read, height)
 	return fmt.Sprint(height), nil
 }
 
@@ -182,6 +187,16 @@ func (b *bench) file(name, content string, mode os.FileMode) string {
 	return path
 }
 
+// pays reports whether the raw transaction holds the payment script of addr.
+func (b *bench) pays(rawHex, addr string) bool {
+	b.t.Helper()
+	script, err := address.ScriptFor(addr)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	return strings.Contains(rawHex, hex.EncodeToString(script))
+}
+
 func args(groups ...[]string) []string {
 	var all []string
 	for _, g := range groups {
@@ -258,6 +273,12 @@ func TestFundRecordsThenSendsAndRefusesASecondRun(t *testing.T) {
 	if len(b.dialed) != 1 || b.dialed[0] != fmt.Sprintf("regtest http://127.0.0.1:%d", types.Regtest.RPCPort) {
 		t.Errorf("dialed %v, want the regtest port on this machine", b.dialed)
 	}
+	if len(b.node.withMempool) != 1 || !b.node.withMempool[0] {
+		t.Errorf("the input was read with the mempool %v, want once with it, so that an output a transaction there spends is refused", b.node.withMempool)
+	}
+	if !b.pays(rawHex, b.payer) || b.pays(rawHex, b.payee) {
+		t.Error("with no -change named, the change does not go to the caller's own address")
+	}
 
 	calls := b.node.calls
 	err := b.run(fund...)
@@ -266,6 +287,59 @@ func TestFundRecordsThenSendsAndRefusesASecondRun(t *testing.T) {
 	}
 	if _, again, _ := b.record(rec); again != txid {
 		t.Errorf("the record changed from %s to %s", txid, again)
+	}
+}
+
+// The flags of fund reach the library: the change address, the fee rate, the
+// lock margin and the depth.
+func TestFundPassesItsFlagsOn(t *testing.T) {
+	fund := func(b *bench, more ...string) error {
+		return b.run(args([]string{"fund"}, b.contract(), b.as(b.payer),
+			[]string{"-amount", "1", "-inputs", coin, "-record", filepath.Join(b.dir, "fund.json")}, more)...)
+	}
+	b := newBench(t)
+	if err := fund(b, "-change", b.payee); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, rawHex := b.record(filepath.Join(b.dir, "fund.json")); !b.pays(rawHex, b.payee) || b.pays(rawHex, b.payer) {
+		t.Error("the change does not go to the address -change names")
+	}
+	for name, c := range map[string]struct {
+		flag, value string
+		want        error
+	}{
+		"a fee rate of zero":                     {"-fee-rate", "0", tx.ErrInvalidAmount},
+		"a lock margin one above what is left":   {"-lock-margin", "37", htlc.ErrLockTooNear},
+		"a depth below the floor":                {"-depth", "29", htlc.ErrDepth},
+		"a depth the rules have not been active": {"-depth", "1001", htlc.ErrNotActive},
+	} {
+		b := newBench(t)
+		if err := fund(b, c.flag, c.value); !errors.Is(err, c.want) || len(b.node.sent) != 0 {
+			t.Errorf("%s: got %v and %d broadcasts, want %v and none", name, err, len(b.node.sent), c.want)
+		}
+	}
+	b = newBench(t)
+	if err := fund(b, "-lock-margin", "36"); err != nil {
+		t.Errorf("a lock margin of what is left: %v", err)
+	}
+}
+
+// The record is made exclusively: a file that appears at the path between the
+// look and the write is not written over.
+func TestTheRecordIsNeverWrittenOverAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "record.json")
+	record, err := recorder(path, "fund")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("an earlier record"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := record("id", "00"); err == nil {
+		t.Error("the record was written over a file that appeared after the look")
+	}
+	if data, _ := os.ReadFile(path); string(data) != "an earlier record" {
+		t.Errorf("the file now holds %q", data)
 	}
 }
 
@@ -316,7 +390,7 @@ func TestClaimReadsTheSecretFromAFileOfItsOwner(t *testing.T) {
 	rec := filepath.Join(b.dir, "claim.json")
 	claim := func(secretFile, record string, more ...string) []string {
 		return args([]string{"claim"}, b.contract(), b.as(b.payee),
-			[]string{"-amount", "1", "-outpoint", contract, "-to", b.payee, "-inclusion", "6", "-secret-file", secretFile, "-record", record}, more)
+			[]string{"-amount", "1", "-outpoint", contract, "-to", b.payer, "-inclusion", "6", "-secret-file", secretFile, "-record", record}, more)
 	}
 	if err := b.run(claim(b.file("secret", digits+"\n", 0o600), rec)...); err != nil {
 		t.Fatal(err)
@@ -327,6 +401,9 @@ func TestClaimReadsTheSecretFromAFileOfItsOwner(t *testing.T) {
 	}
 	if !strings.Contains(rawHex, digits) {
 		t.Error("the claim sent does not hold the secret of the file")
+	}
+	if !b.pays(rawHex, b.payer) || b.pays(rawHex, b.payee) {
+		t.Error("the claim does not pay the address -to names")
 	}
 
 	refusals := map[string]string{
@@ -371,8 +448,12 @@ func TestAuditRefundAndSecretCallTheLibrary(t *testing.T) {
 		t.Errorf("audit for one shor more than the output holds: got %v, want htlc.ErrFundedOutput", err)
 	}
 
+	if err := b.run(args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-depth", "31"})...); !errors.Is(err, htlc.ErrShallow) {
+		t.Errorf("audit at a depth of 31 with 30 confirmations: got %v, want htlc.ErrShallow", err)
+	}
+
 	rec := filepath.Join(b.dir, "refund.json")
-	refund := args([]string{"refund"}, b.contract(), b.as(b.payer), []string{"-outpoint", contract, "-to", b.payer, "-record", rec})
+	refund := args([]string{"refund"}, b.contract(), b.as(b.payer), []string{"-outpoint", contract, "-to", b.payee, "-record", rec})
 	if err := b.run(refund...); !errors.Is(err, htlc.ErrBeforeLockHeight) {
 		t.Errorf("refund below the lock height: got %v, want htlc.ErrBeforeLockHeight", err)
 	}
@@ -385,6 +466,8 @@ func TestAuditRefundAndSecretCallTheLibrary(t *testing.T) {
 	}
 	if step, txid, rawHex := b.record(rec); step != "refund" || len(b.node.sent) != 1 || b.node.sent[0] != rawHex || b.stdout.String() != "refund "+txid+" sent\n" {
 		t.Errorf("step %q, %d broadcasts, printed %q; want the refund recorded, sent once and named", step, len(b.node.sent), b.stdout.String())
+	} else if !b.pays(rawHex, b.payee) || b.pays(rawHex, b.payer) {
+		t.Error("the refund does not pay the address -to names")
 	}
 
 	txid, _, _ := strings.Cut(contract, ":")
@@ -400,6 +483,9 @@ func TestAuditRefundAndSecretCallTheLibrary(t *testing.T) {
 	find := args([]string{"secret"}, b.contract(), []string{"-outpoint", contract, "-from-height", "990"})
 	if err := b.run(find...); !errors.Is(err, htlc.ErrNoSpend) {
 		t.Errorf("secret with no spend mined: got %v, want htlc.ErrNoSpend", err)
+	}
+	if len(b.node.read) != benchLock-990+1 || b.node.read[0] != 990 || b.node.read[len(b.node.read)-1] != benchLock {
+		t.Errorf("blocks read: %v, want those from -from-height to the tip", b.node.read)
 	}
 	b.node.blocks = map[int64]string{995: spend("the-claim", []byte{0x01}, b.secret[:])}
 	if err := b.run(find...); err != nil {

@@ -35,6 +35,7 @@ type replies struct {
 	calls       int
 	withMempool []bool
 	sent        []string
+	ids         []string
 	read        []int64
 }
 
@@ -63,6 +64,7 @@ func (r *replies) Broadcast(_ context.Context, rawTxHex, txid string) (string, e
 		return "", r.broadcastErr
 	}
 	r.sent = append(r.sent, rawTxHex)
+	r.ids = append(r.ids, txid)
 	return txid, nil
 }
 
@@ -248,6 +250,7 @@ func TestFundRefusesBeforeTheSignerIsAsked(t *testing.T) {
 		{"the party's key begins 0xff and the contract commits to it", invalid, keys.ErrInvalidPublicKey, true},
 		{"the party's address is of another network", func(c *call) { c.party.Address = c.b.elsewhere.addr }, ErrNetwork, true},
 		{"the party names no network", func(c *call) { c.party.Network = types.Network{} }, ErrNetwork, true},
+		{"the party names a prefix and no chain", func(c *call) { c.party.Network = types.Network{HRP: types.Mainnet.HRP} }, ErrNetwork, true},
 		{"the party names no signer", func(c *call) { c.party.Signer = nil }, ErrNetwork, true},
 		{"the party's address is no address", func(c *call) { c.party.Address = "payer" }, ErrNetwork, true},
 		{"a depth one below the floor", func(c *call) { c.terms.Depth = testDepth - 1 }, ErrDepth, true},
@@ -358,8 +361,8 @@ func TestFundRecordsThenSends(t *testing.T) {
 	if len(b.record) != 1 || b.record[0] != tr.TxID()+" "+tr.SerializeHex() || sentAtRecord != 0 {
 		t.Errorf("%d records, %d broadcasts before the record; want the id and the bytes recorded once, before any broadcast", len(b.record), sentAtRecord)
 	}
-	if len(b.node.sent) != 1 || b.node.sent[0] != tr.SerializeHex() {
-		t.Errorf("the node was sent %d transactions, want the one returned", len(b.node.sent))
+	if len(b.node.sent) != 1 || b.node.sent[0] != tr.SerializeHex() || b.node.ids[0] != tr.TxID() {
+		t.Errorf("the node was sent %d transactions under the ids %v, want the one returned under its id, by which a lost reply is resolved", len(b.node.sent), b.node.ids)
 	}
 
 	// A lock margin holds at its own figure, and a depth above the floor
@@ -532,6 +535,9 @@ func TestClaimBuildsOnTheNodesValue(t *testing.T) {
 	if !bytes.Equal(tr.Outputs[0].ScriptPubKey, pay) {
 		t.Errorf("the claim pays %x, want the destination %x", tr.Outputs[0].ScriptPubKey, pay)
 	}
+	if fee := testFundedValue + 7 - tr.Outputs[0].Value; fee != tr.EstimateFee(testFeeRate) {
+		t.Errorf("the claim pays a fee of %d, want %d at the rate asked", fee, tr.EstimateFee(testFeeRate))
+	}
 	if len(b.record) != 1 || b.record[0] != tr.TxID()+" "+tr.SerializeHex() || len(b.node.sent) != 1 || b.node.sent[0] != tr.SerializeHex() {
 		t.Errorf("%d records and %d broadcasts, want the claim recorded once and sent once", len(b.record), len(b.node.sent))
 	}
@@ -632,6 +638,9 @@ func TestRefundFromTheLockHeightOn(t *testing.T) {
 	if err := VerifySpend(tr, b.p, testFundedValue+7); err != nil {
 		t.Errorf("the refund does not verify against the node's value: %v", err)
 	}
+	if fee := testFundedValue + 7 - tr.Outputs[0].Value; fee != tr.EstimateFee(testFeeRate) {
+		t.Errorf("the refund pays a fee of %d, want %d at the rate asked", fee, tr.EstimateFee(testFeeRate))
+	}
 	if len(tr.Inputs[0].WitnessData) != refundItems {
 		t.Errorf("%d witness items, want a refund's %d", len(tr.Inputs[0].WitnessData), refundItems)
 	}
@@ -650,16 +659,17 @@ func TestRefundFromTheLockHeightOn(t *testing.T) {
 
 	otherScript := func(b *bench) { b.node.out.ScriptPubKey.Hex = "5620" + strings.Repeat("11", 32) }
 	for name, c := range map[string]struct {
-		change func(*bench) (Party, Params)
-		want   error
+		change     func(*bench) (Party, Params)
+		want       error
+		beforeNode bool
 	}{
-		"the party is the payee":                    {func(b *bench) (Party, Params) { return b.party(b.payee), b.p }, ErrWrongKey},
-		"the party's address is of another network": {func(b *bench) (Party, Params) { return b.party(b.elsewhere), b.p }, ErrNetwork},
-		"a lock height of zero":                     {func(b *bench) (Party, Params) { p := b.p; p.LockHeight = 0; return b.party(b.payer), p }, ErrLockHeight},
-		"the node is on another chain":              {func(b *bench) (Party, Params) { b.node.info.Chain = "stagenet"; return b.party(b.payer), b.p }, rpc.ErrWrongChain},
-		"the node is in initial sync":               {func(b *bench) (Party, Params) { b.node.info.InitialSync = true; return b.party(b.payer), b.p }, rpc.ErrNodeSyncing},
-		"the output is spent or absent":             {func(b *bench) (Party, Params) { b.node.out = nil; return b.party(b.payer), b.p }, ErrNotFunded},
-		"the output is another contract":            {func(b *bench) (Party, Params) { otherScript(b); return b.party(b.payer), b.p }, ErrFundedOutput},
+		"the party is the payee":                    {func(b *bench) (Party, Params) { return b.party(b.payee), b.p }, ErrWrongKey, true},
+		"the party's address is of another network": {func(b *bench) (Party, Params) { return b.party(b.elsewhere), b.p }, ErrNetwork, true},
+		"a lock height of zero":                     {func(b *bench) (Party, Params) { p := b.p; p.LockHeight = 0; return b.party(b.payer), p }, ErrLockHeight, true},
+		"the node is on another chain":              {func(b *bench) (Party, Params) { b.node.info.Chain = "stagenet"; return b.party(b.payer), b.p }, rpc.ErrWrongChain, false},
+		"the node is in initial sync":               {func(b *bench) (Party, Params) { b.node.info.InitialSync = true; return b.party(b.payer), b.p }, rpc.ErrNodeSyncing, false},
+		"the output is spent or absent":             {func(b *bench) (Party, Params) { b.node.out = nil; return b.party(b.payer), b.p }, ErrNotFunded, false},
+		"the output is another contract":            {func(b *bench) (Party, Params) { otherScript(b); return b.party(b.payer), b.p }, ErrFundedOutput, false},
 	} {
 		b := newBench(t)
 		at(b, testLockHeight)
@@ -667,6 +677,9 @@ func TestRefundFromTheLockHeightOn(t *testing.T) {
 		tr, err := Refund(context.Background(), b.node, party, p, b.funded.TxID, b.funded.Vout, spend(b), b.keep)
 		if !errors.Is(err, c.want) || tr != nil {
 			t.Errorf("%s: got %v (transaction returned: %v), want %v", name, err, tr != nil, c.want)
+		}
+		if c.beforeNode && b.node.calls != 0 {
+			t.Errorf("%s: the node was asked %d times before the refusal", name, b.node.calls)
 		}
 		b.quiet(t, name)
 	}
@@ -793,6 +806,13 @@ func TestFindSecretReadsTheMinedSpendOfTheOutpoint(t *testing.T) {
 		}
 	}
 	b.node.info.Headers, b.node.info.InitialSync = 8, false
+
+	// The block at the tip is read.
+	b.node.blocks[7], b.node.blocks[8] = block(), block([3]any{claim.TxID(), b.funded, claim.Inputs[0].WitnessData})
+	if secret, _, err := FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 5); err != nil || secret != b.preimage {
+		t.Errorf("the claim in the block at the tip: got %x and %v, want the secret", secret, err)
+	}
+	b.node.blocks[8] = block()
 
 	b.node.blocks[7] = block([3]any{refund.TxID(), b.funded, refund.Inputs[0].WitnessData})
 	secret, spender, err = FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 5)
