@@ -1590,8 +1590,8 @@
       "file": "htlc/node.go",
       "package": "./htlc",
       "test": "TestFundRefusesBeforeTheSignerIsAsked",
-      "find": "\tif info.InitialSync || info.Headers > info.Blocks {",
-      "replace": "\tif info.InitialSync {",
+      "find": "\tif info.InitialSync || info.Headers > info.Blocks {\n\t\treturn nil, fmt.Errorf(",
+      "replace": "\tif info.InitialSync {\n\t\treturn nil, fmt.Errorf(",
       "why": "A node that knows of headers it has not connected answers for an older tip: its heights, its unspent set and its confirmations are those of the past."
     },
     {
@@ -1845,6 +1845,15 @@
       "find": "\tpublicKey = bytes.Clone(publicKey)",
       "replace": "\tif preimage != nil {\n\t\tpublicKey = bytes.Clone(publicKey)\n\t}",
       "why": "Both builders share the statement. Without the copy a refund's key item is the signer's slice, and a signer that reuses its buffer changes a transaction it already returned."
+    },
+    {
+      "id": "htlc-find-secret-no-spend-on-a-node-that-is-behind",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretReadsTheMinedSpendOfTheOutpoint",
+      "find": "\tif info.InitialSync || info.Headers > info.Blocks {\n\t\treturn [32]byte{}, \"\", fmt.Errorf(",
+      "replace": "\tif info.InitialSync {\n\t\treturn [32]byte{}, \"\", fmt.Errorf(",
+      "why": "A node that knows of headers it has not connected has not read the chain to its end. ErrNoSpend from it tells the party that waits for the secret that no claim is mined when one may be."
     }
   ]
 }

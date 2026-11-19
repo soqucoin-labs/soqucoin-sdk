@@ -481,8 +481,11 @@ func Refund(ctx context.Context, node Node, party Party, p Params, txid string, 
 //
 // The transaction id is 64 hexadecimal digits in either case, as a node takes
 // it (ErrOutpoint otherwise, before the node is asked). The secret is accepted
-// by its hash alone, so a node cannot supply a wrong one. A node can leave a spend out: ErrNoSpend from a node that is behind
-// says nothing about the chain.
+// by its hash alone, so a node cannot supply a wrong one, and a spend found
+// on a node that is still synchronising is returned. Where such a node holds
+// no spend the answer is rpc.ErrNodeSyncing, which is transient, in place of
+// ErrNoSpend. The node's chain is not compared with a network: ErrNoSpend
+// from a node of another chain says nothing about the party's.
 func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint32, fromHeight int64) (secret [32]byte, spender string, err error) {
 	if id, err := hex.DecodeString(txid); err != nil || len(id) != sha256.Size {
 		return [32]byte{}, "", fmt.Errorf("%w: %q", ErrOutpoint, txid)
@@ -528,6 +531,10 @@ func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint
 				return secret, t.TxID, err
 			}
 		}
+	}
+	if info.InitialSync || info.Headers > info.Blocks {
+		return [32]byte{}, "", fmt.Errorf("%w: no spend of %s:%d up to height %d, and the node has not read its chain to the end (headers %d, initialblockdownload %v)",
+			rpc.ErrNodeSyncing, txid, vout, info.Blocks, info.Headers, info.InitialSync)
 	}
 	return [32]byte{}, "", fmt.Errorf("%w: %s:%d from height %d to %d", ErrNoSpend, txid, vout, fromHeight, info.Blocks)
 }
