@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -54,8 +55,17 @@ func (m *MemStore) Get(_ context.Context, id string) (*Intent, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
+	return in.clone(), true, nil
+}
+
+// clone is the copy a store keeps and the copy it hands out. The payees and
+// the inputs are copied with it, so a caller that edits an intent it was
+// given never changes the record, and whom Build pays is what was stored.
+func (in *Intent) clone() *Intent {
 	cp := *in
-	return &cp, true, nil
+	cp.Payees = slices.Clone(in.Payees)
+	cp.Inputs = slices.Clone(in.Inputs)
+	return &cp
 }
 
 // Create implements Store.
@@ -65,8 +75,7 @@ func (m *MemStore) Create(_ context.Context, in *Intent) error {
 	if _, had := m.intents[in.ID]; had {
 		return fmt.Errorf("%w: %s", ErrExists, in.ID)
 	}
-	cp := *in
-	m.intents[in.ID] = &cp
+	m.intents[in.ID] = in.clone()
 	return nil
 }
 
@@ -77,8 +86,7 @@ func (m *MemStore) Update(_ context.Context, in *Intent, from State) error {
 	if err := expectState(m.intents, in.ID, from); err != nil {
 		return err
 	}
-	cp := *in
-	m.intents[in.ID] = &cp
+	m.intents[in.ID] = in.clone()
 	return nil
 }
 
@@ -128,6 +136,21 @@ type fileStoreFile struct {
 	Intents []*Intent `json:"intents"`
 }
 
+// batchFileVersion is the version of a store file that holds a batch. A
+// release from before batches reads version 1 only, and it would write a
+// batch back without its payees; it refuses this file. A store with no batch
+// is still written as version 1, which every release reads.
+const batchFileVersion = 2
+
+func fileVersion(all []*Intent) int {
+	for _, in := range all {
+		if len(in.Payees) > 0 {
+			return batchFileVersion
+		}
+	}
+	return 1
+}
+
 // NewFileStore opens or creates the store at path (mode 0600).
 func NewFileStore(path string) (*FileStore, error) {
 	fs := &FileStore{path: path, intents: map[string]*Intent{}}
@@ -142,7 +165,7 @@ func NewFileStore(path string) (*FileStore, error) {
 	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("parse intents %s: %w", path, err)
 	}
-	if f.Version != 1 {
+	if f.Version != 1 && f.Version != batchFileVersion {
 		return nil, fmt.Errorf("intents %s: unsupported version %d", path, f.Version)
 	}
 	for _, in := range f.Intents {
@@ -159,8 +182,7 @@ func (fs *FileStore) Get(_ context.Context, id string) (*Intent, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
-	cp := *in
-	return &cp, true, nil
+	return in.clone(), true, nil
 }
 
 // Create implements Store. It writes as Update does, once the id is known to
@@ -201,8 +223,7 @@ func (fs *FileStore) Update(_ context.Context, in *Intent, from State) error {
 // returned, because durability is unconfirmed; only the rollback is skipped.
 func (fs *FileStore) put(in *Intent) error {
 	prev, had := fs.intents[in.ID]
-	cp := *in
-	fs.intents[in.ID] = &cp
+	fs.intents[in.ID] = in.clone()
 	if err := fs.write(); err != nil {
 		if errors.Is(err, atomicfile.ErrWrittenNotDurable) {
 			return err
@@ -219,7 +240,7 @@ func (fs *FileStore) put(in *Intent) error {
 
 func (fs *FileStore) write() error {
 	all := filterSorted(fs.intents, nil)
-	buf, err := json.MarshalIndent(fileStoreFile{Version: 1, Updated: time.Now().UTC(), Intents: all}, "", "  ")
+	buf, err := json.MarshalIndent(fileStoreFile{Version: fileVersion(all), Updated: time.Now().UTC(), Intents: all}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal intents: %w", err)
 	}
@@ -247,8 +268,7 @@ func filterSorted(m map[string]*Intent, states []State) []*Intent {
 	out := make([]*Intent, 0, len(m))
 	for _, in := range m {
 		if len(want) == 0 || want[in.State] {
-			cp := *in
-			out = append(out, &cp)
+			out = append(out, in.clone())
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

@@ -771,7 +771,7 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestLegacyRecordWithAttemptsIsHeldOnARejection",
-      "find": "\tprior := in.MaybeRelayed || (in.Attempts > 0 && in.SentAt.IsZero())",
+      "find": "\tprior := in.MaybeRelayed || (in.Attempts > in.BuildAttempts && in.SentAt.IsZero())",
       "replace": "\tprior := in.MaybeRelayed",
       "why": "A record written before the mark existed carries attempts whose outcomes are not on record. Reading them as answered lets a rejection fail the intent and release inputs an earlier attempt may have relayed."
     },
@@ -1494,6 +1494,303 @@
       "find": "\tbinary.Write(&preimage, binary.LittleEndian, hashType)",
       "replace": "\tbinary.Write(&preimage, binary.LittleEndian, uint32(SigHashAll))",
       "why": "The hash type is the last field of the preimage. A digest that writes SIGHASH_ALL whatever the caller names gives one digest for two hash types, so a signature made for one verifies under the other."
+    },
+    {
+      "id": "withdraw-batch-address-named-twice",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchRefusesAndRecordsNothing",
+      "find": "\t\tif first, dup := seen[key]; dup {",
+      "replace": "\t\tif first, dup := seen[key]; dup && false {",
+      "why": "A ledger that lists one miner twice has a defect. A batch that pays the address twice hides it and pays the second line too."
+    },
+    {
+      "id": "withdraw-batch-floor-off-by-one",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchRefusesAndRecordsNothing",
+      "find": "if floor := tx.MinOutputValue(script); p.Amount < floor {",
+      "replace": "if floor := tx.MinOutputValue(script); p.Amount < floor-1 {",
+      "why": "An amount one shor under the relay floor is recorded, the builder refuses it, and the whole batch fails for one payee the submission should have named."
+    },
+    {
+      "id": "withdraw-batch-total-unchecked",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchRefusesAndRecordsNothing",
+      "find": "\t\tif total > types.MaxMoney-p.Amount {",
+      "replace": "\t\tif false {",
+      "why": "Two amounts that each pass can sum past MaxMoney, and past int64 with enough of them; the recorded total is then not the sum of what is paid."
+    },
+    {
+      "id": "withdraw-batch-cap-off-by-one",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchRefusesAndRecordsNothing",
+      "find": "if len(payees) == 0 || len(payees) > MaxBatchPayees {",
+      "replace": "if len(payees) == 0 || len(payees) > MaxBatchPayees+1 {",
+      "why": "The cap is what keeps the largest batch inside the node's standard weight; one payee over it is recorded and then refused by the builder."
+    },
+    {
+      "id": "withdraw-batch-accepted-with-no-signer",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchRefusesAndRecordsNothing",
+      "find": "\tif e.BuildSignBatch == nil {\n\t\treturn nil, false,",
+      "replace": "\tif false {\n\t\treturn nil, false,",
+      "why": "A batch recorded by an engine that cannot build it sits Created until someone notices; the caller is told at submission instead."
+    },
+    {
+      "id": "withdraw-batch-selection-without-the-outputs-fee",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBatchIsBuiltOnceAndASecondProcessSendsNothingNew",
+      "find": "\t\ttarget += tx.BatchFeeAllowance(len(in.Payees), in.FeeRate)",
+      "replace": "\t\ttarget += 0",
+      "why": "A selector budgets the fee of two outputs. Without the allowance a wallet that holds the total and the real fee is selected short, and the batch fails for insufficient funds."
+    },
+    {
+      "id": "withdraw-batch-signer-given-part-of-the-payees",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBatchIsBuiltOnceAndASecondProcessSendsNothingNew",
+      "find": "rawHex, txid, err = e.BuildSignBatch(ctx, inputs, slices.Clone(in.Payees), in.FeeRate)",
+      "replace": "rawHex, txid, err = e.BuildSignBatch(ctx, inputs, slices.Clone(in.Payees[:1]), in.FeeRate)",
+      "why": "The transaction must pay every recorded payee. A signer handed fewer builds a transaction the intent records as the whole batch."
+    },
+    {
+      "id": "withdraw-batch-stored-total-unchecked",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBuildChecksTheStoredBatch",
+      "find": "\t\tif err == nil && total != in.Amount {",
+      "replace": "\t\tif err == nil && false {",
+      "why": "The selector is asked for the recorded amount. A record whose amount is not the sum of its payees selects for one figure and pays another."
+    },
+    {
+      "id": "withdraw-batch-stored-payees-unchecked",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBuildChecksTheStoredBatch",
+      "find": "\t\ttotal, err := e.checkPayees(in.ID, in.Payees)\n",
+      "replace": "\t\ttotal, err := in.Amount, error(nil)\n",
+      "why": "Build is the transition that signs. A record written by another engine, or changed in the store, is signed as it stands unless the rules of the submission are applied to it again."
+    },
+    {
+      "id": "withdraw-batch-resubmit-ignores-the-payees",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchIsIdempotentAndConflictSafe",
+      "find": "\tif !samePayees(existing.Payees, payees) || existing.Amount != total || existing.FeeRate != feeRate {",
+      "replace": "\tif existing.Amount != total || existing.FeeRate != feeRate {",
+      "why": "An id reused for other payees with the same total is answered as the same batch, and the caller believes the second set was paid."
+    },
+    {
+      "id": "withdraw-batch-resubmit-ignores-the-amounts",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchIsIdempotentAndConflictSafe",
+      "find": "\t\tif !strings.EqualFold(a[i].Address, b[i].Address) || a[i].Amount != b[i].Amount {",
+      "replace": "\t\tif !strings.EqualFold(a[i].Address, b[i].Address) {",
+      "why": "The same payees with value moved between two of them is another payment under the same total."
+    },
+    {
+      "id": "withdraw-single-submit-accepts-a-batch-id",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchIsIdempotentAndConflictSafe",
+      "find": "\tif len(existing.Payees) != 0 || !strings.EqualFold(existing.Address, address)",
+      "replace": "\tif !strings.EqualFold(existing.Address, address) && existing.Address != \"\"",
+      "why": "A batch record has no address. A single withdrawal submitted under its id and total would be answered as already registered."
+    },
+    {
+      "id": "withdraw-batch-returned-intent-shares-the-record",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchIsIdempotentAndConflictSafe",
+      "find": "\t\tout.Payees = slices.Clone(in.Payees)\n",
+      "replace": "",
+      "why": "A store that keeps the record by reference shares the payee slice with the caller, so an edit of the returned intent changes whom Build pays."
+    },
+    {
+      "id": "tx-batch-floor-off-by-one",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchRefusals",
+      "find": "if floor := MinOutputValue(o.ScriptPubKey); o.Value < floor {",
+      "replace": "if floor := MinOutputValue(o.ScriptPubKey); o.Value < floor-1 {",
+      "why": "An output one shor under the relay floor makes the whole transaction non-standard, and no payee in it is paid."
+    },
+    {
+      "id": "tx-batch-cap-off-by-one",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchRefusals",
+      "find": "\tif len(outputs) == 0 || len(outputs) > MaxBatchOutputs {",
+      "replace": "\tif len(outputs) == 0 || len(outputs) > MaxBatchOutputs+1 {",
+      "why": "The documented weight and fee of the largest batch hold for MaxBatchOutputs recipients, not one more."
+    },
+    {
+      "id": "tx-batch-total-unchecked",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchRefusals",
+      "find": "\t\tif total > MaxMoney-o.Value {",
+      "replace": "\t\tif false {",
+      "why": "Outputs that each pass can sum past MaxMoney, which the node refuses, and past int64, where the change is computed from a wrapped total."
+    },
+    {
+      "id": "tx-batch-fee-not-deducted-from-the-change",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchPaysEveryRecipientExactlyInOrder",
+      "find": "\tchange := totalInput - total - fee",
+      "replace": "\tchange := totalInput - total",
+      "why": "The change takes the whole remainder and the transaction pays no fee, so no node relays it."
+    },
+    {
+      "id": "tx-batch-last-recipient-dropped",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchPaysEveryRecipientExactlyInOrder",
+      "find": "\ttx.Outputs = tx.Outputs[:len(outputs)]",
+      "replace": "\ttx.Outputs = tx.Outputs[:len(outputs)-1]",
+      "why": "The measurement placeholder is removed by truncating the outputs; one too many removes the last payee, whose amount goes to the change."
+    },
+    {
+      "id": "tx-batch-change-floor-off-by-one",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchChangeAtTheRelayFloor",
+      "find": "\tif change >= MinOutputValue(changeScriptPubKey) {",
+      "replace": "\tif change > MinOutputValue(changeScriptPubKey) {",
+      "why": "A remainder exactly at the floor is a spendable output; folding it into the fee gives it away."
+    },
+    {
+      "id": "tx-batch-one-shor-short-accepted",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchChangeAtTheRelayFloor",
+      "find": "\tif change < 0 {",
+      "replace": "\tif change < -1 {",
+      "why": "Inputs one shor short of the total and the fee build a transaction that pays less fee than was measured, under the floor the margin exists to clear."
+    },
+    {
+      "id": "tx-batch-allowance-counts-one-output-too-many",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestLargestBatchIsStandardAndTheAllowanceIsExact",
+      "find": "\tvbytes := int64(recipients-1) * (EstimatedOutputWeight / 4)",
+      "replace": "\tvbytes := int64(recipients) * (EstimatedOutputWeight / 4)",
+      "why": "The allowance is the fee of the outputs beyond the one a selector already budgets. Counting that one again asks a wallet for funds the batch does not need."
+    },
+    {
+      "id": "tx-batch-signed-but-not-verified",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBuildSignedBatchVerifiesEveryInput",
+      "find": "\tif err := t.VerifyAll(); err != nil {\n\t\treturn nil, err\n\t}\n\treturn t, nil\n}\n\n// BuildAndSignBatch",
+      "replace": "\treturn t, nil\n}\n\n// BuildAndSignBatch",
+      "why": "A signer that returns a signature over another digest, or the wrong key, produces a batch the node refuses; the builder says so before the bytes are persisted."
+    },
+    {
+      "id": "tx-batch-allowance-omits-the-output-count-bytes",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchFeeAllowanceFundsTheBatchAtEverySize",
+      "find": "\tif recipients+1 >= 0xfd {",
+      "replace": "\tif false {",
+      "why": "From 252 recipients the output count takes three bytes. A selector that budgets the fee exactly is two vBytes short, the builder refuses the inputs, and a funded batch fails."
+    },
+    {
+      "id": "tx-batch-allowance-count-boundary-off-by-one",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchFeeAllowanceFundsTheBatchAtEverySize",
+      "find": "\tif recipients+1 >= 0xfd {",
+      "replace": "\tif recipients+1 > 0xfd {",
+      "why": "The count grows at 253 outputs, which is 252 recipients and the change. One later leaves exactly that batch two vBytes short."
+    },
+    {
+      "id": "tx-batch-output-with-no-script",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchRefusals",
+      "find": "\t\tif len(o.ScriptPubKey) == 0 {",
+      "replace": "\t\tif false {",
+      "why": "An output with an empty script passes the relay floor and the node accepts it. Nobody holds a key for it."
+    },
+    {
+      "id": "tx-batch-change-with-no-script",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchRefusals",
+      "find": "\tif len(changeScriptPubKey) == 0 {",
+      "replace": "\tif false {",
+      "why": "A caller that passes no change script sends the remainder of its inputs to an empty script."
+    },
+    {
+      "id": "withdraw-store-shares-payees-with-the-caller",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestStoresShareNoPayeesOrInputsWithTheCaller",
+      "find": "\tcp.Payees = slices.Clone(in.Payees)\n",
+      "replace": "",
+      "why": "A caller that edits an intent a store handed out changes the stored payees with no Update, and Build signs a payment to them under the original id."
+    },
+    {
+      "id": "withdraw-store-shares-inputs-with-the-caller",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestStoresShareNoPayeesOrInputsWithTheCaller",
+      "find": "\tcp.Inputs = slices.Clone(in.Inputs)\n",
+      "replace": "",
+      "why": "The inputs of a record are what Recover marks spent again. A caller's edit of a returned intent must not reach them."
+    },
+    {
+      "id": "withdraw-batch-fee-rate-unbounded",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchRefusesAndRecordsNothing",
+      "find": "\tif feeRate > tx.MaxFeeRateShorsPerVB {",
+      "replace": "\tif false {",
+      "why": "The fee allowance multiplies the rate by the payee count. An unbounded rate wraps it, and the selector is asked for a wrong target."
+    },
+    {
+      "id": "withdraw-attempts-before-build-count-as-sent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBatchThatWaitedBeforeBuildFailsOnAFirstRejection",
+      "find": "\tin.State, in.BuildAttempts = StateBuilt, in.Attempts",
+      "replace": "\tin.State = StateBuilt",
+      "why": "An intent that waited while Created has sent nothing. Counting those attempts as sends holds its inputs for an operator when the node refuses the first send."
+    },
+    {
+      "id": "withdraw-batch-store-written-as-version-one",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestFileStoreWithABatchIsVersionTwo",
+      "find": "\t\t\treturn batchFileVersion\n",
+      "replace": "\t\t\treturn 1\n",
+      "why": "A release from before batches opens a version 1 file and writes every batch back without its payees. Version 2 is what makes it refuse."
+    },
+    {
+      "id": "withdraw-batch-stored-fee-rate-unchecked",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBuildChecksTheStoredBatch",
+      "find": "\t\tif err == nil && (in.FeeRate <= 0 || in.FeeRate > tx.MaxFeeRateShorsPerVB) {",
+      "replace": "\t\tif err == nil && false {",
+      "why": "The allowance multiplies the stored rate before any signer sees it. A record whose rate was not set by SubmitBatch asks the selector for a wrong target and reserves inputs for it."
+    },
+    {
+      "id": "resilience-batch-refusals-count-as-systemic",
+      "file": "resilience/circuit_breaker.go",
+      "package": "./resilience",
+      "test": "TestRecordResultIgnoresPerRequestErrors",
+      "find": "\ttx.ErrNoOutputs, tx.ErrTooHeavy, tx.ErrEmptyScript,\n",
+      "replace": "",
+      "why": "A batch the builder refuses is a fact about that batch. Counted as systemic, three of them open the breaker and stop every other payment."
     }
   ]
 }
