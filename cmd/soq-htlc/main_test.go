@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -114,6 +115,7 @@ type bench struct {
 	environment    map[string]string
 	stdout, stderr bytes.Buffer
 	dialed         []string
+	credentials    []string
 	// closed makes every write of the result stream fail.
 	closed bool
 }
@@ -178,8 +180,9 @@ func (b *bench) run(args ...string) error {
 	e := env{
 		getenv: func(name string) string { return b.environment[name] },
 		stdout: stdout, stderr: &b.stderr,
-		dial: func(url, _, _ string, network types.Network) htlc.Node {
+		dial: func(url, user, password string, network types.Network) htlc.Node {
 			b.dialed = append(b.dialed, network.Name+" "+url)
+			b.credentials = append(b.credentials, "user "+user+" password "+password)
 			return b.node
 		},
 	}
@@ -393,6 +396,24 @@ func TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling(t *testing.T) {
 		return string(data)
 	}
 
+	// With a file at one reading of the name alone, the look and the create
+	// agree: either the look refuses, before anything is signed, or the
+	// record is made. A look that passes before a create that refuses means
+	// the two acted on different files.
+	for _, at := range []func(string) string{lexical, kernel} {
+		for _, path := range []string{kernel("held.json"), lexical("held.json")} {
+			_ = os.Remove(path)
+		}
+		if err := os.WriteFile(at("held.json"), []byte("held"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := recorder(named("held.json"), "fund"); err == nil {
+			if err := r("id", "00"); err != nil {
+				t.Errorf("the look passed and the record then refused: %v", err)
+			}
+		}
+	}
+
 	record, err := recorder(named("rec.json"), "fund")
 	if err != nil {
 		t.Fatal(err)
@@ -439,19 +460,7 @@ func TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling(t *testing.T) {
 // names it and its record, so that a caller who reads the exit status as "not
 // funded" does not fund a second time.
 func TestAResultLineThatCannotBeWrittenNamesTheSentTransaction(t *testing.T) {
-	for step, run := range map[string]func(b *bench, rec string) error{
-		"fund": func(b *bench, rec string) error {
-			return b.run(args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin, "-record", rec})...)
-		},
-		"claim": func(b *bench, rec string) error {
-			return b.run(args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
-				"-inclusion", "6", "-secret-file", b.file("secret", hex.EncodeToString(b.secret[:]), 0o600), "-record", rec})...)
-		},
-		"refund": func(b *bench, rec string) error {
-			b.node.info.Blocks, b.node.info.Headers = benchLock, benchLock
-			return b.run(args([]string{"refund"}, b.contract(), b.as(b.payer), []string{"-outpoint", contract, "-to", b.payee, "-record", rec})...)
-		},
-	} {
+	for step, run := range steps {
 		b := newBench(t)
 		b.closed = true
 		rec := filepath.Join(b.dir, step+".json")
@@ -585,16 +594,101 @@ func TestNoRefusalOfTheArgumentsPrintsAValue(t *testing.T) {
 	}
 }
 
-// After a broadcast whose outcome is unknown the error names the record,
-// which holds the bytes to send again.
+// steps runs each step that sends a transaction, under the record rec.
+var steps = map[string]func(b *bench, rec string, more ...string) error{
+	"fund": func(b *bench, rec string, more ...string) error {
+		return b.run(args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin, "-record", rec}, more)...)
+	},
+	"claim": func(b *bench, rec string, more ...string) error {
+		return b.run(args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
+			"-inclusion", "6", "-secret-file", b.file("secret", hex.EncodeToString(b.secret[:]), 0o600), "-record", rec}, more)...)
+	},
+	"refund": func(b *bench, rec string, more ...string) error {
+		b.node.info.Blocks, b.node.info.Headers = benchLock, benchLock
+		return b.run(args([]string{"refund"}, b.contract(), b.as(b.payer), []string{"-outpoint", contract, "-to", b.payee, "-record", rec}, more)...)
+	},
+}
+
+// After a broadcast whose outcome is unknown the error of each step names the
+// record, which holds the bytes to send again.
 func TestAnUnknownOutcomeNamesTheRecord(t *testing.T) {
-	b := newBench(t)
-	b.node.broadcastErr = rpc.ErrUnknownOutcome
-	rec := filepath.Join(b.dir, "fund.json")
-	err := b.run(args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin, "-record", rec})...)
-	_, txid, rawHex := b.record(rec)
-	if !errors.Is(err, rpc.ErrUnknownOutcome) || !strings.Contains(err.Error(), rec) || !strings.Contains(err.Error(), txid) || rawHex == "" {
-		t.Errorf("got %v; want the node's error with the record %s and the transaction %s named", err, rec, txid)
+	for step, run := range steps {
+		b := newBench(t)
+		b.node.broadcastErr = rpc.ErrUnknownOutcome
+		rec := filepath.Join(b.dir, step+".json")
+		err := run(b, rec)
+		_, txid, rawHex := b.record(rec)
+		if !errors.Is(err, rpc.ErrUnknownOutcome) || !strings.Contains(err.Error(), rec) || !strings.Contains(err.Error(), txid) || rawHex == "" {
+			t.Errorf("%s: got %v; want the node's error with the record %s and the transaction %s named", step, err, rec, txid)
+		}
+		if err != nil && !strings.Contains(err.Error(), "send those bytes again") {
+			t.Errorf("%s: the error does not say what to do with the record: %v", step, err)
+		}
+	}
+}
+
+// paid is one output as a raw transaction holds it: the value in eight bytes,
+// the length of the script and the script.
+func paid(t *testing.T, value int64, addr string) string {
+	t.Helper()
+	script, err := address.ScriptFor(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var le [8]byte
+	binary.LittleEndian.PutUint64(le[:], uint64(value))
+	return hex.EncodeToString(le[:]) + fmt.Sprintf("%02x", len(script)) + hex.EncodeToString(script)
+}
+
+// The values the command hands on, read from the bytes it records. The change
+// of a funding is the node's value of the input less the amount and the fee,
+// so the input's value is the node's; a claim and a refund pay the output's
+// value less the fee at the rate of -fee-rate.
+func TestTheRecordedTransactionsCarryTheNodesValueAndTheFeeRateAsked(t *testing.T) {
+	id, _, _ := strings.Cut(coin, ":")
+	funded, _, _ := strings.Cut(contract, ":")
+	for _, rate := range []int64{types.RecommendedFeeRate, 2 * types.RecommendedFeeRate} {
+		flags := []string{"-fee-rate", fmt.Sprint(rate)}
+
+		b := newBench(t)
+		rec := filepath.Join(b.dir, "fund.json")
+		if err := steps["fund"](b, rec, flags...); err != nil {
+			t.Fatal(err)
+		}
+		want, err := htlc.BuildFunding(b.p, []types.UTXO{{TxID: id, Value: 5 * benchAmount, Address: b.payer}}, benchAmount, b.payer, rate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, rawHex := b.record(rec); !strings.Contains(rawHex, paid(t, want.Outputs[1].Value, b.payer)) {
+			t.Errorf("fund at %d shors a virtual byte: the change is not %d shors, the node's value of the input less the amount and the fee", rate, want.Outputs[1].Value)
+		}
+
+		b = newBench(t)
+		rec = filepath.Join(b.dir, "claim.json")
+		if err := steps["claim"](b, rec, flags...); err != nil {
+			t.Fatal(err)
+		}
+		output := types.UTXO{TxID: funded, Vout: 1, Value: benchAmount}
+		claim, err := htlc.BuildClaim(b.p, output, b.secret, b.payer, rate, b.manager, b.payee)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, rawHex := b.record(rec); !strings.Contains(rawHex, paid(t, claim.Outputs[0].Value, b.payer)) {
+			t.Errorf("claim at %d shors a virtual byte: the claim does not pay %d shors, the output less the fee at that rate", rate, claim.Outputs[0].Value)
+		}
+
+		b = newBench(t)
+		rec = filepath.Join(b.dir, "refund.json")
+		if err := steps["refund"](b, rec, flags...); err != nil {
+			t.Fatal(err)
+		}
+		refund, err := htlc.BuildRefund(b.p, output, b.payee, rate, b.manager, b.payer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, rawHex := b.record(rec); !strings.Contains(rawHex, paid(t, refund.Outputs[0].Value, b.payee)) {
+			t.Errorf("refund at %d shors a virtual byte: the refund does not pay %d shors, the output less the fee at that rate", rate, refund.Outputs[0].Value)
+		}
 	}
 }
 
@@ -654,6 +748,8 @@ func TestClaimReadsTheSecretFromAFileOfItsOwner(t *testing.T) {
 
 	refusals := map[string]string{
 		"a file others can read":          b.file("open", digits, 0o644),
+		"a file its group can read":       b.file("group", digits, 0o640),
+		"a file its group can write":      b.file("shared", digits, 0o620),
 		"63 digits":                       b.file("short", digits[:63], 0o600),
 		"66 digits":                       b.file("long", digits+"00", 0o600),
 		"a character that is not a digit": b.file("other", "zz"+digits[2:], 0o600),
@@ -661,6 +757,8 @@ func TestClaimReadsTheSecretFromAFileOfItsOwner(t *testing.T) {
 	}
 	if runtime.GOOS == "windows" {
 		delete(refusals, "a file others can read")
+		delete(refusals, "a file its group can read")
+		delete(refusals, "a file its group can write")
 	}
 	for name, path := range refusals {
 		calls, sent := b.node.calls, len(b.node.sent)
@@ -774,7 +872,8 @@ func TestArgumentsAreRefusedBeforeAnythingIsOpened(t *testing.T) {
 		"a hash that is not hex":       {args([]string{"script"}, with("-hash", notHex)), "-hash"},
 		"a key hash of 31 bytes":       {args([]string{"script"}, with("-payee-key-hash", strings.Repeat("ab", 31))), "-payee-key-hash"},
 		"a lock height of zero":        {args([]string{"script"}, with("-lock-height", "0")), "lock height"},
-		"a lock height past uint32":    {args([]string{"script"}, with("-lock-height", "4294967296")), "lock height"},
+		"a lock height past uint32":    {args([]string{"script"}, with("-lock-height", "4294967297")), "lock height"}, // its low 32 bits are the lock height 1
+		"a depth past the range":       {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-depth", "9223372036854775808", "-outpoint", contract}), "-depth: want a whole number in range"},
 		"an amount that is no decimal": {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "one", "-outpoint", contract}), "-amount"},
 		"an outpoint without an index": {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", "7a7a"}), "outpoint"},
 		"no record for a fund":         {args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin}), "-record"},
@@ -803,9 +902,13 @@ func TestArgumentsAreRefusedBeforeAnythingIsOpened(t *testing.T) {
 	}
 	b.environment["SOQ_KEYSTORE_PASSPHRASE"] = passphrase
 	b.environment["SOQ_RPC_URL"] = "http://127.0.0.1:1"
+	b.environment["SOQ_RPC_USER"], b.environment["SOQ_RPC_PASSWORD"] = "the-user", "the-password"
 	_ = b.run(args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract})...)
 	if len(b.dialed) != 1 || b.dialed[0] != "regtest http://127.0.0.1:1" {
 		t.Errorf("dialed %v, want the address of SOQ_RPC_URL", b.dialed)
+	}
+	if len(b.credentials) != 1 || b.credentials[0] != "user the-user password the-password" {
+		t.Errorf("dialed with %v, want SOQ_RPC_USER as the user and SOQ_RPC_PASSWORD as the password", b.credentials)
 	}
 }
 
@@ -842,6 +945,7 @@ func TestEveryCommandPassesOnARefusal(t *testing.T) {
 		"claim, no keystore":                              {args([]string{"claim"}, b.contract(), terms, at, pay(fresh()), claim), nil},
 		"claim, a record that exists":                     {args([]string{"claim"}, b.contract(), b.as(b.payee), terms, at, pay(held), claim), nil},
 		"claim, the payer asks":                           {args([]string{"claim"}, b.contract(), b.as(b.payer), terms, at, pay(fresh()), claim), htlc.ErrWrongKey},
+		"claim, a depth above the confirmations":          {args([]string{"claim"}, b.contract(), b.as(b.payee), terms, at, pay(fresh()), claim, []string{"-depth", "31"}), htlc.ErrShallow},
 		"claim, no block for inclusion":                   {args([]string{"claim"}, b.contract(), b.as(b.payee), terms, at, pay(fresh()), []string{"-secret-file", secretFile}), htlc.ErrLockTooNear},
 		"refund, a contract that is none":                 {args([]string{"refund"}, bad, b.as(b.payer), at, pay(fresh())), nil},
 		"refund, an outpoint that is none":                {args([]string{"refund"}, b.contract(), b.as(b.payer), nowhere, pay(fresh())), nil},
@@ -873,5 +977,12 @@ func TestDialHoldsTheClientToTheNetwork(t *testing.T) {
 	c, ok := dial("http://127.0.0.1:1", "user", "password", types.Stagenet).(*rpc.Client)
 	if !ok || c.Network.ChainID != types.Stagenet.ChainID {
 		t.Errorf("dial returned %T on %q, want *rpc.Client on stagenet", c, c.Network.ChainID)
+	}
+	if c.AllowRemote {
+		t.Error("dial returned a client that takes a node on another machine")
+	}
+	remote, _ := dial("http://node.example:33389", "user", "password", types.Stagenet).(*rpc.Client)
+	if _, err := remote.GetBlockchainInfo(context.Background()); !errors.Is(err, rpc.ErrRemoteNode) {
+		t.Errorf("a node on another machine: got %v, want rpc.ErrRemoteNode", err)
 	}
 }

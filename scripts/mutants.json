@@ -1502,7 +1502,7 @@
       "test": "TestFundRefusesBeforeTheSignerIsAsked",
       "find": "\t\tif info.Blocks-depth < height {",
       "replace": "\t\tif info.Blocks-depth+1 < height {",
-      "why": "The rule is blocks >= height + depth. One block early, a funding sent at the tip can confirm in a block that a reorganisation of the depth puts below the height, where anyone who gets a block spends it."
+      "why": "The rule is blocks >= height + depth. One block early, a funding sent at the tip can confirm in a block that a reorganisation of one block more than the depth puts below the height, where anyone who gets a block spends it."
     },
     {
       "id": "htlc-activation-height-missing-reads-as-active",
@@ -1520,7 +1520,7 @@
       "test": "TestFundRefusesBeforeTheSignerIsAsked",
       "find": "\tfor _, name := range deployments {",
       "replace": "\tfor _, name := range deployments[:1] {",
-      "why": "The contract's script needs all three deployments. With one read, a chain that has the script path and not the key hash opcode passes, and the output is spendable without a signature."
+      "why": "The contract's script needs all three deployments. With one read, a chain that has the script path and not the key hash opcode passes, and the node takes no spend of the output until the opcode is active."
     },
     {
       "id": "htlc-fund-checks-the-height-without-the-depth",
@@ -1529,7 +1529,7 @@
       "test": "TestFundRefusesBeforeTheSignerIsAsked",
       "find": "\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn types.UTXO{}, nil, err\n\t}\n\tif err := active(info, depth); err != nil {",
       "replace": "\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn types.UTXO{}, nil, err\n\t}\n\tif err := active(info, depth*0); err != nil {",
-      "why": "Fund carries the activation rule with the swap's depth. At depth 0 it funds at the activation height itself, and the tip moving back one block leaves the output below it."
+      "why": "Fund carries the activation rule with the swap's depth. At depth 0 it funds at the activation height itself, and the tip moving back two blocks leaves the output below it."
     },
     {
       "id": "htlc-audit-checks-the-height-without-the-depth",
@@ -1725,8 +1725,8 @@
       "file": "htlc/node.go",
       "package": "./htlc",
       "test": "TestFundRecordsThenSends",
-      "find": "\tif record != nil {\n\t\tif err := record(txid, rawHex); err != nil {\n\t\t\treturn fmt.Errorf(\"%w: %w\", ErrRecord, err)\n\t\t}\n\t}\n\t_, err := node.Broadcast(ctx, rawHex, txid)\n\treturn err",
-      "replace": "\t_, err := node.Broadcast(ctx, rawHex, txid)\n\tif record != nil {\n\t\tif rerr := record(txid, rawHex); rerr != nil {\n\t\t\treturn fmt.Errorf(\"%w: %w\", ErrRecord, rerr)\n\t\t}\n\t}\n\treturn err",
+      "find": "\tif err := keep(t, record); err != nil {\n\t\treturn err\n\t}\n\t_, err := node.Broadcast(ctx, t.SerializeHex(), t.TxID())\n\treturn err",
+      "replace": "\t_, err := node.Broadcast(ctx, t.SerializeHex(), t.TxID())\n\tif rerr := keep(t, record); rerr != nil {\n\t\treturn rerr\n\t}\n\treturn err",
       "why": "The record comes first so that a process that dies after the broadcast leaves the bytes behind: a second run then sends the same transaction and does not build a second funding."
     },
     {
@@ -2331,6 +2331,294 @@
       "find": "\ttx.ErrNoOutputs, tx.ErrTooHeavy, tx.ErrEmptyScript,\n",
       "replace": "",
       "why": "A batch the builder refuses is a fact about that batch. Counted as systemic, three of them open the breaker and stop every other payment."
+    },
+    {
+      "id": "htlc-claim-sends-on-the-first-read-alone",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimReadsTheTipAgainBeforeItSends",
+      "find": "\tif left := int64(terms.Params.LockHeight) - info.Blocks; left < depth+inclusion {\n\t\treturn t, fmt.Errorf(\"%w: %d blocks from the tip at %d after the record",
+      "replace": "\tif left := int64(terms.Params.LockHeight) - info.Blocks; false && left < depth+inclusion {\n\t\treturn t, fmt.Errorf(\"%w: %d blocks from the tip at %d after the record",
+      "why": "The signer and the record are not bounded in time. A claim sent on the tip read before them can reach the network at or past the lock height, where the refund is valid and the secret is public."
+    },
+    {
+      "id": "htlc-claim-second-read-one-block-late",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimReadsTheTipAgainBeforeItSends",
+      "find": "- info.Blocks; left < depth+inclusion {\n\t\treturn t,",
+      "replace": "- info.Blocks; left < depth+inclusion-1 {\n\t\treturn t,",
+      "why": "The second read holds the claim to the same margin as the first. One block late, a claim goes out with one block fewer than the depth between it and the lock height."
+    },
+    {
+      "id": "htlc-claim-second-read-before-the-record",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimReadsTheTipAgainBeforeItSends",
+      "find": "\tif err := keep(t, record); err != nil {\n\t\treturn t, err\n\t}\n\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn t, fmt.Errorf(\"%w: the tip could not be read again after the record, and nothing was sent: %w\", ErrLockTooNear, err)\n\t}\n\tif left := int64(terms.Params.LockHeight) - info.Blocks; left < depth+inclusion {\n\t\treturn t, fmt.Errorf(\"%w: %d blocks from the tip at %d after the record, want %d; nothing was sent\", ErrLockTooNear, left, info.Blocks, depth+inclusion)\n\t}\n",
+      "replace": "\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn t, fmt.Errorf(\"%w: the tip could not be read again after the record, and nothing was sent: %w\", ErrLockTooNear, err)\n\t}\n\tif left := int64(terms.Params.LockHeight) - info.Blocks; left < depth+inclusion {\n\t\treturn t, fmt.Errorf(\"%w: %d blocks from the tip at %d after the record, want %d; nothing was sent\", ErrLockTooNear, left, info.Blocks, depth+inclusion)\n\t}\n\tif err := keep(t, record); err != nil {\n\t\treturn t, err\n\t}\n",
+      "why": "The record is the last step that takes time. A second read made before it does not see a tip that moves while the record is written."
+    },
+    {
+      "id": "htlc-claim-second-read-of-a-node-that-is-behind",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimReadsTheTipAgainBeforeItSends",
+      "find": "\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn t,",
+      "replace": "\tinfo, err := node.GetBlockchainInfo(ctx)\n\tif err != nil {\n\t\treturn t,",
+      "why": "A node behind its headers, or on another chain, reports a tip below the real one, which reads as a margin that holds. The second read refuses such a node as the first does."
+    },
+    {
+      "id": "htlc-claim-failed-second-read-is-not-the-margin-error",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimReadsTheTipAgainBeforeItSends",
+      "find": "\t\treturn t, fmt.Errorf(\"%w: the tip could not be read again after the record, and nothing was sent: %w\", ErrLockTooNear, err)",
+      "replace": "\t\treturn t, err",
+      "why": "After a read that failed the margin is not known to hold. The caller tells a claim that was held back from a broadcast that failed by ErrLockTooNear, and sends the recorded bytes again only after the latter."
+    },
+    {
+      "id": "cmd-claim-held-back-is-told-to-send-again",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimHeldBackAfterTheRecordSaysNothingWasSent",
+      "find": "\tif errors.Is(err, htlc.ErrLockTooNear) {",
+      "replace": "\tif false && errors.Is(err, htlc.ErrLockTooNear) {",
+      "why": "A claim held back after the record was not sent, and its bytes show the secret at a tip from which the refund can win. The text for an unknown outcome tells the caller to send them."
+    },
+    {
+      "id": "htlc-find-secret-reads-a-spend-without-witness-as-a-refund",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretNamesASpendPrintedWithoutItsWitness",
+      "find": "\t\t\t\tif len(in.Witness) == 0 {",
+      "replace": "\t\t\t\tif false && len(in.Witness) == 0 {",
+      "why": "A node that has discarded the witness data of a block prints a mined claim with no items. Read as a witness that shows no secret, the claim is reported as a refund."
+    },
+    {
+      "id": "htlc-output-read-under-any-spelling-of-the-id",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAnOutpointIdIsSixtyFourHexadecimalDigitsWhereverAnOutputIsRead",
+      "find": "\tif err := outpointID(txid); err != nil {\n\t\treturn nil, err\n\t}\n\tout, err := node.GetTxOut(ctx, txid, vout, true)",
+      "replace": "\tout, err := node.GetTxOut(ctx, txid, vout, true)",
+      "why": "A node reads 0x before an id and characters after it as the id alone. Audit then passes and returns an id the builders and FindSecret refuse."
+    },
+    {
+      "id": "htlc-terms-take-an-amount-no-claim-spends",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestTermsRefuseAnAmountNoClaimCanSpend",
+      "find": "\tif t.Amount < MinAmount {",
+      "replace": "\tif false && t.Amount < MinAmount {",
+      "why": "An output below MinAmount is funded and then spent by no claim and no refund of the package: each would leave its one output below the relay floor."
+    },
+    {
+      "id": "htlc-min-amount-one-shor-low",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestTermsRefuseAnAmountNoClaimCanSpend",
+      "find": "const MinAmount = 419_300",
+      "replace": "const MinAmount = 419_299",
+      "why": "MinAmount is the least value BuildClaim takes at the least relay fee rate. One shor lower, the terms pass an amount whose claim the builder refuses."
+    },
+    {
+      "id": "htlc-min-amount-one-shor-high",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestTermsRefuseAnAmountNoClaimCanSpend",
+      "find": "const MinAmount = 419_300",
+      "replace": "const MinAmount = 419_301",
+      "why": "The constant is pinned from both sides: one shor higher, the terms refuse an amount a claim can spend."
+    },
+    {
+      "id": "rpc-null-height-read-as-zero",
+      "file": "rpc/client.go",
+      "package": "./htlc",
+      "test": "TestAHeightPrintedAsNullIsNoActivationHeight",
+      "find": "\t\tif height != nil {\n\t\t\theights[name] = *height\n\t\t}",
+      "replace": "\t\tif height == nil {\n\t\t\theight = new(int64)\n\t\t}\n\t\theights[name] = *height",
+      "why": "A height printed as null and read as 0 is the height of a deployment active from genesis. Fund then signs and sends on a node that reports no height."
+    },
+    {
+      "id": "cmd-record-looked-at-under-another-spelling",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling",
+      "find": "\tpath = filepath.Clean(path) // one spelling for the look, the create and the write\n\tif _, err := os.Lstat(path); err == nil {",
+      "replace": "\tgiven := path\n\tpath = filepath.Clean(path)\n\tif _, err := os.Lstat(given); err == nil {",
+      "why": "Through a symbolic link followed by .. the path as given and the cleaned path are two files. A look at one and a create at the other refuses a record that exists only after the keystore has signed."
+    },
+    {
+      "id": "cmd-secret-file-mode-read-under-another-spelling",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling",
+      "find": "\tpath = filepath.Clean(path) // one spelling for the look and the read\n\tinfo, err := os.Stat(path)",
+      "replace": "\tgiven := path\n\tpath = filepath.Clean(path)\n\tinfo, err := os.Stat(given)",
+      "why": "The mode is the check that others cannot read the secret. Read at one file while the bytes come from another, it passes a file that others can read."
+    },
+    {
+      "id": "cmd-result-line-error-is-bare",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestAResultLineThatCannotBeWrittenNamesTheSentTransaction",
+      "find": "\t\treturn fmt.Errorf(\"the node took transaction %s, recorded in %s, and the result line could not be written: %w; build no second one\", t.TxID(), path, err)",
+      "replace": "\t\treturn err",
+      "why": "The step fails with status 1 after the node took the transaction. An error that names neither the transaction nor the record reads as a refusal, and a caller funds a second time."
+    },
+    {
+      "id": "cmd-secret-file-refusal-prints-the-path",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestNoRefusalOfTheArgumentsPrintsAValue",
+      "find": "\tinfo, err := os.Stat(path)\n\tif err != nil {\n\t\treturn secret, fmt.Errorf(\"-secret-file: %w\", withoutPath(err))",
+      "replace": "\tinfo, err := os.Stat(path)\n\tif err != nil {\n\t\treturn secret, fmt.Errorf(\"-secret-file: %w\", err)",
+      "why": "The secret passed in place of its file's name is a path that does not exist, and the file error holds the path."
+    },
+    {
+      "id": "cmd-secret-file-mode-refusal-prints-the-path",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimReadsTheSecretFromAFileOfItsOwner",
+      "find": "fmt.Errorf(\"-secret-file: the file has mode %04o, open to others; want 0600\", mode)",
+      "replace": "fmt.Errorf(\"-secret-file: %s has mode %04o, open to others; want 0600\", path, mode)",
+      "why": "No refusal of -secret-file holds its value: the flag is the one a secret is most likely passed to by mistake."
+    },
+    {
+      "id": "htlc-audit-coinbase-needs-maturity-and-not-the-depth",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditHoldsACoinbaseOutputToTheDepthAndToItsNetworksMaturity",
+      "find": "\t\tneed = max(need, maturity)",
+      "replace": "\t\tneed = maturity",
+      "why": "A coinbase output at maturity is spendable and no deeper than that. Under terms with a depth above the maturity it is below the depth both parties agreed."
+    },
+    {
+      "id": "htlc-audit-coinbase-held-to-mainnets-maturity",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditHoldsACoinbaseOutputToTheDepthAndToItsNetworksMaturity",
+      "find": "\t\tmaturity := network.CoinbaseMaturity\n\t\tif maturity <= 0 {",
+      "replace": "\t\tmaturity := types.Mainnet.CoinbaseMaturity\n\t\tif maturity <= 0 {",
+      "why": "The maturity is the network's. Mainnet's figure on regtest refuses an output the node lets its owner spend."
+    },
+    {
+      "id": "htlc-claim-audits-at-the-floor",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimRefusesBeforeTheSignerIsAsked",
+      "find": "\tfunded, err := audit(ctx, node, party.Network, terms, depth, script, txid, vout, depth+inclusion)",
+      "replace": "\tfunded, err := audit(ctx, node, party.Network, terms, MinDepth(terms.Amount), script, txid, vout, depth+inclusion)",
+      "why": "A party that agreed a depth above the floor shows the secret only on a funding that deep. Audited at the floor, the claim goes out on a shallower one."
+    },
+    {
+      "id": "cmd-claim-drops-the-depth",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestEveryCommandPassesOnARefusal",
+      "find": "\tt, err := htlc.Claim(ctx, e.node(network), party, terms, txid, vout, secret,",
+      "replace": "\tterms.Depth = 0\n\tt, err := htlc.Claim(ctx, e.node(network), party, terms, txid, vout, secret,",
+      "why": "-depth is the caller's own floor for the claim. Dropped, the claim is sent on a funding below it."
+    },
+    {
+      "id": "cmd-input-value-is-not-the-nodes",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestTheRecordedTransactionsCarryTheNodesValueAndTheFeeRateAsked",
+      "find": "types.UTXO{TxID: txid, Vout: vout, Value: out.Value, Address: addr})",
+      "replace": "types.UTXO{TxID: txid, Vout: vout, Value: out.Value + 1, Address: addr})",
+      "why": "The signature of an input commits to its value. A value that is not the node's is signed, recorded and refused by the node."
+    },
+    {
+      "id": "cmd-claim-drops-the-fee-rate",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestTheRecordedTransactionsCarryTheNodesValueAndTheFeeRateAsked",
+      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, o.inclusion, record)",
+      "replace": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: types.RecommendedFeeRate}, o.inclusion, record)",
+      "why": "A claim does not signal replacement, so the fee it starts with is the fee it has. The rate the caller named for the blocks left is the one that is paid."
+    },
+    {
+      "id": "cmd-refund-drops-the-fee-rate",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestTheRecordedTransactionsCarryTheNodesValueAndTheFeeRateAsked",
+      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, record)",
+      "replace": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: types.RecommendedFeeRate}, record)",
+      "why": "The refund pays the rate the caller named."
+    },
+    {
+      "id": "cmd-node-user-and-password-exchanged",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestArgumentsAreRefusedBeforeAnythingIsOpened",
+      "find": "\treturn e.dial(url, e.getenv(\"SOQ_RPC_USER\"), e.getenv(\"SOQ_RPC_PASSWORD\"), network)",
+      "replace": "\treturn e.dial(url, e.getenv(\"SOQ_RPC_PASSWORD\"), e.getenv(\"SOQ_RPC_USER\"), network)",
+      "why": "The node's user and password reach the client as the environment names them."
+    },
+    {
+      "id": "cmd-lock-height-cut-to-32-bits",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestArgumentsAreRefusedBeforeAnythingIsOpened",
+      "find": "\tif o.lockHeight > math.MaxUint32 {",
+      "replace": "\tif false && o.lockHeight > math.MaxUint32 {",
+      "why": "A lock height above 32 bits cut to its low bits is another contract: 4294967297 becomes the lock height 1."
+    },
+    {
+      "id": "cmd-dial-takes-a-remote-node",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestDialHoldsTheClientToTheNetwork",
+      "find": "\tc.Network = network\n\treturn c",
+      "replace": "\tc.Network = network\n\tc.AllowRemote = true\n\treturn c",
+      "why": "The node's answers are taken as given because the node is the caller's own, on this machine."
+    },
+    {
+      "id": "cmd-claim-error-after-the-record-is-bare",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestAnUnknownOutcomeNamesTheRecord",
+      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, o.inclusion, record)\n\tif err != nil {\n\t\treturn recorded(err, t, o.record)",
+      "replace": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, o.inclusion, record)\n\tif err != nil {\n\t\treturn err",
+      "why": "After an unknown outcome the record holds the one copy of a claim the node may have. The error names it."
+    },
+    {
+      "id": "cmd-refund-error-after-the-record-is-bare",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestAnUnknownOutcomeNamesTheRecord",
+      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, record)\n\tif err != nil {\n\t\treturn recorded(err, t, o.record)",
+      "replace": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, record)\n\tif err != nil {\n\t\treturn err",
+      "why": "After an unknown outcome the record holds the one copy of a refund the node may have. The error names it."
+    },
+    {
+      "id": "cmd-secret-file-of-its-group-is-read",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimReadsTheSecretFromAFileOfItsOwner",
+      "find": "mode&0o077 != 0 && runtime.GOOS",
+      "replace": "mode&0o007 != 0 && runtime.GOOS",
+      "why": "The secret file is its owner's alone. A file the group can read is refused like one everyone can."
+    },
+    {
+      "id": "cmd-secret-file-others-can-write-is-read",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimReadsTheSecretFromAFileOfItsOwner",
+      "find": "mode&0o077 != 0 && runtime.GOOS",
+      "replace": "mode&0o004 != 0 && runtime.GOOS",
+      "why": "Every bit of the group and of others refuses the file, the write bits among them."
+    },
+    {
+      "id": "cmd-range-refusal-of-the-parser-is-not-named",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestArgumentsAreRefusedBeforeAnythingIsOpened",
+      "find": "\t\tcase strings.HasSuffix(msg, refused+\"parse error\"), strings.HasSuffix(msg, refused+\"value out of range\"):",
+      "replace": "\t\tcase strings.HasSuffix(msg, refused+\"parse error\"):",
+      "why": "A number out of range is refused under the name of its flag, as one that does not parse is."
     }
   ]
 }

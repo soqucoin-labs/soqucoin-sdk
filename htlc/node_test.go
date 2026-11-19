@@ -610,6 +610,42 @@ func TestAuditReturnsTheOutputAsTheNodeHoldsIt(t *testing.T) {
 	}
 }
 
+// A coinbase output needs the depth and its network's maturity, whichever is
+// the greater: at maturity it is still refused below a depth above it, and on
+// a network with a shorter maturity it passes at that maturity.
+func TestAuditHoldsACoinbaseOutputToTheDepthAndToItsNetworksMaturity(t *testing.T) {
+	b := newBench(t)
+	deep := b.terms
+	deep.Depth = 300
+	for name := range b.node.info.ActivationHeights {
+		b.node.info.ActivationHeights[name] = testTip - 300
+	}
+	b.node.out.Coinbase, b.node.out.Confirmations = true, types.Mainnet.CoinbaseMaturity
+	if _, err := Audit(context.Background(), b.node, b.party(b.payee), deep, b.funded.TxID, b.funded.Vout, 0); !errors.Is(err, ErrShallow) {
+		t.Errorf("a coinbase output at maturity under a depth of 300: got %v, want ErrShallow", err)
+	}
+	b.node.out.Confirmations = 300
+	if _, err := Audit(context.Background(), b.node, b.party(b.payee), deep, b.funded.TxID, b.funded.Vout, 0); err != nil {
+		t.Errorf("a coinbase output at the depth of 300: %v", err)
+	}
+
+	b = newBench(t)
+	b.node.info.Chain = types.Regtest.ChainID
+	party := b.party(b.payee)
+	party.Network = types.Regtest
+	if types.Regtest.CoinbaseMaturity >= types.Mainnet.CoinbaseMaturity || types.Regtest.CoinbaseMaturity <= testDepth {
+		t.Fatalf("the case needs a regtest maturity between the depth and mainnet's, got %d", types.Regtest.CoinbaseMaturity)
+	}
+	b.node.out.Coinbase, b.node.out.Confirmations = true, types.Regtest.CoinbaseMaturity
+	if _, err := Audit(context.Background(), b.node, party, b.terms, b.funded.TxID, b.funded.Vout, 0); err != nil {
+		t.Errorf("a regtest coinbase output at regtest's maturity: %v", err)
+	}
+	b.node.out.Confirmations--
+	if _, err := Audit(context.Background(), b.node, party, b.terms, b.funded.TxID, b.funded.Vout, 0); !errors.Is(err, ErrShallow) {
+		t.Errorf("a regtest coinbase output one below regtest's maturity: got %v, want ErrShallow", err)
+	}
+}
+
 // Claim sends a claim of the output as the node holds it, recorded first.
 func TestClaimBuildsOnTheNodesValue(t *testing.T) {
 	b := newBench(t)
@@ -673,6 +709,12 @@ func TestClaimRefusesBeforeTheSignerIsAsked(t *testing.T) {
 		{"the output is another contract", func(c *call) { c.b.node.out.ScriptPubKey.Hex = "5620" + strings.Repeat("00", 32) }, ErrFundedOutput, false},
 		{"the output holds less than the amount", func(c *call) { c.b.node.out.Value-- }, ErrFundedOutput, false},
 		{"the funding is one confirmation below the depth", func(c *call) { c.b.node.out.Confirmations-- }, ErrShallow, false},
+		{"a depth of 31, active for 31 blocks, on a funding at the floor of 30", func(c *call) {
+			c.terms.Depth = testDepth + 1
+			for name := range c.b.node.info.ActivationHeights {
+				c.b.node.info.ActivationHeights[name] = testTip - testDepth - 1
+			}
+		}, ErrShallow, false},
 		{"the tip is one block inside depth and inclusion of the lock height", func(c *call) {
 			c.b.node.info.Blocks, c.b.node.info.Headers = testLockHeight-testDepth-5, testLockHeight-testDepth-5
 		}, ErrLockTooNear, false},
@@ -948,8 +990,9 @@ func TestFindSecretReadsTheMinedSpendOfTheOutpoint(t *testing.T) {
 	if secret, spender, err := FindSecret(ctx, b.node, b.p, strings.ToUpper(b.funded.TxID), b.funded.Vout, 5); err != nil || secret != b.preimage || spender != claim.TxID() {
 		t.Errorf("the outpoint's id in upper case: got %x, %q and %v; want the secret from the claim", secret, spender, err)
 	}
-	// An id that is not 64 hexadecimal digits names no output, and the node
-	// is not asked. The empty id equals the absent id of a coinbase input, so
+	// An id that is not 64 hexadecimal digits is refused, and the node is not
+	// asked: a node reads some such spellings as an id, and no block prints
+	// one of them. The empty id equals the absent id of a coinbase input, so
 	// without the refusal output 0 of it reads as refunded by the coinbase.
 	for _, id := range []string{"", b.funded.TxID[:62], b.funded.TxID + "7a", "zz" + b.funded.TxID[2:]} {
 		calls := b.node.calls
