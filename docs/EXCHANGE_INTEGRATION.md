@@ -494,16 +494,19 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-// requiredConfirmations is the policy from Step 4: deeper for larger values.
+// largeDeposit is the value line from Step 4, in shors. The figure is a
+// placeholder: set it to the amount of SOQ worth about 1,000 USD at your own
+// price, and move it when the price moves.
+const largeDeposit = 10_000_000 * types.ShorsPerSOQ
+
+// requiredConfirmations is the policy from Step 4: 100 below the value line,
+// types.MaxReorgDepth (288) at or above it. A deposit is final in the
+// consensus sense one block later, at types.MaxReorgDepth + 1.
 func requiredConfirmations(value int64) int64 {
-	switch {
-	case value <= 100*types.ShorsPerSOQ:
-		return 30
-	case value <= 10_000*types.ShorsPerSOQ:
-		return 120
-	default:
-		return types.MaxReorgDepth // the chain's own finality horizon
+	if value < largeDeposit {
+		return 100
 	}
+	return types.MaxReorgDepth
 }
 
 // memLedger stands in for your database. Credit must be idempotent on the
@@ -1030,11 +1033,18 @@ Recommended thresholds:
 | Use Case | Confirmations | Approximate Time | Rationale |
 |----------|:-------------:|:----------------:|-----------|
 | Zero-confirmation display | 0 | instant | Show as *pending only*. Never credit |
-| Small deposits | 30 | ~30 min | Bounded, recoverable loss if reorganised |
-| Medium deposits | 120 | ~2 h | Materially past any plausible reorg depth |
-| Large deposits | **288** | ~4.8 h | Matches the chain's own finality horizon |
+| Standard deposits, below your value line | 100 | ~1.7 h | The loss if one is reorganised is bounded by the line |
+| Large deposits, at or above your value line | **288** | ~4.8 h | The chain's finality horizon; final in the consensus sense at 289 |
 | Mining / coinbase payouts | **288 minimum** | ~4.8 h | Consensus-enforced; the output cannot be spent earlier regardless of policy |
 | Withdrawal release | 288 | ~4.8 h | Do not release outbound value against inbound funds the chain does not yet treat as final |
+
+The value line is yours to set. We suggest the amount of SOQ worth about 1,000 USD at your own
+price, moved when the price moves. State the line by value: a fixed number of SOQ drifts with the
+price until every deposit falls in one tier.
+
+288 is the credit count for a large deposit. It is not the wait for every deposit. It is also one
+short of the consensus guarantee: a synced node refuses a fork deeper than 288 blocks, so a deposit
+is final at 289 confirmations (`types.MaxReorgDepth + 1`). Use 289 where you need that guarantee.
 
 **Set your own thresholds against value at risk. The table is a floor, not a ceiling.**
 
@@ -1051,8 +1061,9 @@ Two reasons, both worth understanding before tuning them down:
    the same N blocks would cost on a mature network. Prefer depth over speed until sustained
    third-party hashrate exists.
 
-If low-latency credit matters to your product, credit small amounts quickly against your own risk
-budget and hold larger amounts to 288, rather than lowering the threshold uniformly.
+If low-latency credit matters to your product, raise the value line or lower the standard count
+against your own risk budget and hold larger amounts to 288, rather than lowering the threshold
+uniformly.
 
 ---
 
