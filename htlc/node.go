@@ -132,7 +132,18 @@ var (
 
 	// ErrNoSpend marks a range of blocks in which nothing spends the output.
 	ErrNoSpend = errors.New("htlc: no block in the range spends the output")
+
+	// ErrNoWitness marks a spend of the output that the node prints with no
+	// witness items. A node started with -witnessprune discards the witness
+	// data of old blocks; ask a node that keeps it.
+	ErrNoWitness = errors.New("htlc: the node printed the spend without its witness")
 )
+
+// MinAmount is the least amount of a contract, in shors: the least value a
+// claim built by BuildClaim spends at types.MinRelayFeeRate, the relay floor
+// of its one output and its fee. A smaller output can be funded and never
+// spent by a transaction of this package.
+const MinAmount = 419_300
 
 // deployments are the node's names of the three height-gated deployments the
 // contract needs: the witness version 6 script path, the key hash opcode and

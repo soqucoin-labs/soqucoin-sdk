@@ -11,7 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -1010,6 +1013,163 @@ func TestFindSecretReadsTheMinedSpendOfTheOutpoint(t *testing.T) {
 	b.node.infoErr = rpc.ErrTransient
 	if _, _, err := FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 5); !errors.Is(err, rpc.ErrTransient) {
 		t.Errorf("a node that fails: got %v, want its error", err)
+	}
+}
+
+// A node started with -witnessprune prints an old block without witness
+// data. The claim in such a block shows no items at all, which is no refund:
+// every spend of the contract that a node runs carries the witnessScript.
+// FindSecret gives that spend an error of its own, with the spender's id.
+func TestFindSecretNamesASpendPrintedWithoutItsWitness(t *testing.T) {
+	b := newBench(t)
+	claim := b.claim(t)
+	b.node.info.Blocks, b.node.info.Headers = 8, 8
+	absent := block([3]any{claim.TxID(), b.funded, [][]byte{}})
+	empty := strings.Replace(absent, fmt.Sprintf(`"txid":%q,"vout":%d}`, b.funded.TxID, b.funded.Vout),
+		fmt.Sprintf(`"txid":%q,"vout":%d,"txinwitness":[]}`, b.funded.TxID, b.funded.Vout), 1)
+	if strings.Contains(absent, "txinwitness") || !strings.Contains(empty, `"txinwitness":[]`) {
+		t.Fatalf("the fixture: %s and %s", absent, empty)
+	}
+	for name, printed := range map[string]string{"no txinwitness field": absent, "an empty txinwitness": empty} {
+		b.node.blocks = map[int64]string{7: printed, 8: block()}
+		b.node.asked = nil
+		secret, spender, err := FindSecret(context.Background(), b.node, b.p, b.funded.TxID, b.funded.Vout, 7)
+		if !errors.Is(err, ErrNoWitness) || errors.Is(err, ErrNoSecret) || spender != claim.TxID() || secret != ([32]byte{}) {
+			t.Errorf("%s: got %x, %q and %v; want ErrNoWitness with the spender's id", name, secret, spender, err)
+		}
+	}
+}
+
+// A node's gettxout reads "0x" before an id, and characters after it, as the
+// id alone. The functions that read an output hold the id to 64 hexadecimal
+// digits, as FindSecret does, so the outpoint they return is one the builders
+// and FindSecret take.
+func TestAnOutpointIdIsSixtyFourHexadecimalDigitsWhereverAnOutputIsRead(t *testing.T) {
+	spend := func(b *bench) Spend { return Spend{PayToAddress: b.payee.addr, FeeRate: testFeeRate} }
+	id := strings.Repeat("7a", 32)
+	for _, spelled := range []string{"0x" + id, id + "zz", " " + id, id[:62], ""} {
+		b := newBench(t)
+		if got, err := Audit(context.Background(), b.node, b.party(b.payee), b.terms, spelled, 1, 0); !errors.Is(err, ErrOutpoint) || !none(got.Output) {
+			t.Errorf("Audit of the id %q: got %+v and %v, want ErrOutpoint", spelled, got.Output, err)
+		}
+		if tr, err := Claim(context.Background(), b.node, b.party(b.payee), b.terms, spelled, 1, b.preimage, spend(b), 6, b.keep); !errors.Is(err, ErrOutpoint) || tr != nil {
+			t.Errorf("Claim of the id %q: got %v, want ErrOutpoint", spelled, err)
+		}
+		b.node.info.Blocks, b.node.info.Headers = testLockHeight, testLockHeight
+		if tr, err := Refund(context.Background(), b.node, b.party(b.payer), b.p, spelled, 1, spend(b), b.keep); !errors.Is(err, ErrOutpoint) || tr != nil {
+			t.Errorf("Refund of the id %q: got %v, want ErrOutpoint", spelled, err)
+		}
+		for _, asked := range b.node.withMempool {
+			t.Errorf("the id %q: the node was asked for the output (mempool %v)", spelled, asked)
+		}
+		b.quiet(t, "the id "+spelled)
+	}
+	b := newBench(t)
+	if _, err := Audit(context.Background(), b.node, b.party(b.payee), b.terms, strings.ToUpper(id), 1, 0); err != nil {
+		t.Errorf("Audit of the id in upper case, which a node takes: %v", err)
+	}
+}
+
+// An amount below MinAmount can be funded and never claimed or refunded by a
+// transaction of this package. The terms refuse it before the node is asked,
+// and MinAmount is the least value BuildClaim takes at the least fee rate a
+// node relays; a refund is the smaller transaction and takes it too.
+func TestTermsRefuseAnAmountNoClaimCanSpend(t *testing.T) {
+	b := newBench(t)
+	at := func(amount int64) types.UTXO { u := b.funded; u.Value = amount; return u }
+	if _, err := BuildClaim(b.p, at(MinAmount), b.preimage, b.payee.addr, types.MinRelayFeeRate, b.m, b.payee.addr); err != nil {
+		t.Errorf("a claim of MinAmount at the least relay fee rate: %v", err)
+	}
+	if _, err := BuildClaim(b.p, at(MinAmount-1), b.preimage, b.payee.addr, types.MinRelayFeeRate, b.m, b.payee.addr); !errors.Is(err, tx.ErrBelowDust) {
+		t.Errorf("a claim of one shor less: got %v, want tx.ErrBelowDust; MinAmount is not the least amount a claim takes", err)
+	}
+	if _, err := BuildRefund(b.p, at(MinAmount), b.payer.addr, types.MinRelayFeeRate, b.m, b.payer.addr); err != nil {
+		t.Errorf("a refund of MinAmount at the least relay fee rate: %v", err)
+	}
+
+	small := b.terms
+	small.Amount = MinAmount - 1
+	f := b.funding()
+	funded, tr, err := Fund(context.Background(), b.node, b.party(b.payer), small, f, b.keep)
+	if !errors.Is(err, tx.ErrBelowDust) || tr != nil || !none(funded) || b.node.calls != 0 {
+		t.Errorf("Fund of MinAmount less one shor: got %v, transaction returned %v, %d calls of the node; want tx.ErrBelowDust before the node is asked", err, tr != nil, b.node.calls)
+	}
+	b.quiet(t, "an amount below MinAmount")
+	if _, err := Audit(context.Background(), b.node, b.party(b.payee), small, b.funded.TxID, b.funded.Vout, 0); !errors.Is(err, tx.ErrBelowDust) {
+		t.Errorf("Audit of terms below MinAmount: got %v, want tx.ErrBelowDust", err)
+	}
+
+	least := b.terms
+	least.Amount = MinAmount
+	if _, _, err := Fund(context.Background(), b.node, b.party(b.payer), least, f, nil); err != nil {
+		t.Errorf("Fund of MinAmount: %v", err)
+	}
+}
+
+// through returns the SDK's client of a stand-in node that prints info for
+// getblockchaininfo and out for gettxout, and counts what it is sent.
+func through(t *testing.T, info, out string) (*rpc.Client, *int) {
+	t.Helper()
+	sent := new(int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &req)
+		switch req.Method {
+		case "getblockchaininfo":
+			_, _ = fmt.Fprintf(w, `{"result":%s,"error":null,"id":1}`, info)
+		case "gettxout":
+			_, _ = fmt.Fprintf(w, `{"result":%s,"error":null,"id":1}`, out)
+		default:
+			*sent++
+			_, _ = fmt.Fprint(w, `{"result":null,"error":{"code":-26,"message":"not taken"},"id":1}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client := rpc.NewClient(srv.URL, "user", "password", nil)
+	client.Network = types.Mainnet
+	return client, sent
+}
+
+// The activation heights as the SDK's client reads them from the node's JSON.
+// A height printed as null says nothing, and read as 0 it would say "active
+// from genesis": Fund would sign and send on a node that reports no height.
+func TestAHeightPrintedAsNullIsNoActivationHeight(t *testing.T) {
+	b := newBench(t)
+	script, _ := b.p.OutputScript()
+	out := fmt.Sprintf(`{"bestblock":"aa","confirmations":30,"value":5.00000000,"scriptPubKey":{"hex":"%x"},"coinbase":false}`, script)
+	info := func(heights string) string {
+		return `{"chain":"main","blocks":1000,"headers":1000,"bestblockhash":"aa","initialblockdownload":false,"activation_heights":` + heights + `}`
+	}
+	for name, heights := range map[string]string{
+		"every height null": `{"p2wsh_dilithium":null,"dilithium_keyhash":null,"v6_controlflow":null}`,
+		"one height null":   `{"p2wsh_dilithium":0,"dilithium_keyhash":null,"v6_controlflow":0}`,
+		"the object null":   `null`,
+		"no object":         `{}`,
+	} {
+		client, sent := through(t, info(heights), out)
+		b := newBench(t)
+		_, tr, err := Fund(context.Background(), client, b.party(b.payer), b.terms, b.funding(), b.keep)
+		if !errors.Is(err, ErrNoActivationHeights) || tr != nil || *sent != 0 {
+			t.Errorf("%s: Fund returned %v, a transaction (%v) and sent %d; want ErrNoActivationHeights and nothing", name, err, tr != nil, *sent)
+		}
+		b.quiet(t, name)
+		if _, err := Audit(context.Background(), client, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, 0); !errors.Is(err, ErrNoActivationHeights) {
+			t.Errorf("%s: Audit returned %v, want ErrNoActivationHeights", name, err)
+		}
+	}
+
+	// The heights as a node prints them, numbers, are read: the audit passes
+	// at heights the tip is the depth above, and is refused one block short.
+	client, _ := through(t, info(`{"p2wsh_dilithium":970,"dilithium_keyhash":970,"v6_controlflow":0}`), out)
+	if _, err := Audit(context.Background(), client, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, 0); err != nil {
+		t.Errorf("heights of 970 and 0 at tip 1000: %v", err)
+	}
+	client, _ = through(t, info(`{"p2wsh_dilithium":970,"dilithium_keyhash":971,"v6_controlflow":0}`), out)
+	if _, err := Audit(context.Background(), client, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, 0); !errors.Is(err, ErrNotActive) {
+		t.Errorf("one height at 971 with the tip at 1000: got %v, want ErrNotActive", err)
 	}
 }
 

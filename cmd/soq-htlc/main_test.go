@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -113,7 +114,14 @@ type bench struct {
 	environment    map[string]string
 	stdout, stderr bytes.Buffer
 	dialed         []string
+	// closed makes every write of the result stream fail.
+	closed bool
 }
+
+// unwritable is a result stream that takes nothing.
+type unwritable struct{}
+
+func (unwritable) Write([]byte) (int, error) { return 0, errors.New("the stream is closed") }
 
 func newBench(t *testing.T) *bench {
 	t.Helper()
@@ -163,9 +171,13 @@ func newBench(t *testing.T) *bench {
 func (b *bench) run(args ...string) error {
 	b.stdout.Reset()
 	b.stderr.Reset()
+	var stdout io.Writer = &b.stdout
+	if b.closed {
+		stdout = unwritable{}
+	}
 	e := env{
 		getenv: func(name string) string { return b.environment[name] },
-		stdout: &b.stdout, stderr: &b.stderr,
+		stdout: stdout, stderr: &b.stderr,
 		dial: func(url, _, _ string, network types.Network) htlc.Node {
 			b.dialed = append(b.dialed, network.Name+" "+url)
 			return b.node
@@ -351,6 +363,115 @@ func TestTheRecordIsNeverWrittenOverAFile(t *testing.T) {
 	}
 }
 
+// A path with a symbolic link followed by ".." names one file to the kernel
+// and another once it is cleaned as text. The record and the secret file are
+// each looked at, made and read under one spelling, so the refusal of a file
+// that exists and the refusal by mode act on the file that is written or read.
+func TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links and file modes")
+	}
+	dir := t.TempDir()
+	for _, sub := range []string{filepath.Join(dir, "real", "sub"), filepath.Join(dir, "cwd")} {
+		if err := os.MkdirAll(sub, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "real", "sub"), filepath.Join(dir, "cwd", "link")); err != nil {
+		t.Fatal(err)
+	}
+	// As text the two names below are files of cwd; the kernel follows the
+	// link first and reads them as files of real.
+	named := func(name string) string { return filepath.Join(dir, "cwd") + "/link/../" + name }
+	kernel := func(name string) string { return filepath.Join(dir, "real", name) }
+	lexical := func(name string) string { return filepath.Join(dir, "cwd", name) }
+	holds := func(path string) string {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "absent"
+		}
+		return string(data)
+	}
+
+	record, err := recorder(named("rec.json"), "fund")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A file appears after the look at each of the two places in turn. Neither
+	// is written over, and no second file is left behind.
+	if err := os.WriteFile(kernel("rec.json"), []byte("an earlier record"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = record("id", "00")
+	if got := holds(kernel("rec.json")); got != "an earlier record" {
+		t.Errorf("the file the kernel reads the name as now holds %q (record returned %v)", got, err)
+	}
+	if err == nil {
+		if got := holds(lexical("rec.json")); !strings.Contains(got, `"txid":"id"`) {
+			t.Errorf("the record returned no error and the file it made holds %q", got)
+		}
+	} else if got := holds(lexical("rec.json")); got != "absent" {
+		t.Errorf("the record refused (%v) and left a file holding %q", err, got)
+	}
+
+	digits := strings.Repeat("ab", 32)
+	for path, mode := range map[string]os.FileMode{kernel("secret"): 0o600, lexical("secret"): 0o644} {
+		if err := os.WriteFile(path, []byte(strings.Repeat("cd", 32)), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(kernel("secret"), []byte(digits), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The mode is read at the file the bytes are read from: either the file
+	// of mode 0600 is read, or the file of mode 0644 is refused.
+	got, err := readSecret(named("secret"))
+	if err == nil && hex.EncodeToString(got[:]) != digits {
+		t.Errorf("the secret was read from a file of mode 0644 after the mode of another file was checked")
+	}
+}
+
+// After the node took the transaction, a result line that cannot be written
+// is no refusal of the step. The error says that the transaction was sent and
+// names it and its record, so that a caller who reads the exit status as "not
+// funded" does not fund a second time.
+func TestAResultLineThatCannotBeWrittenNamesTheSentTransaction(t *testing.T) {
+	for step, run := range map[string]func(b *bench, rec string) error{
+		"fund": func(b *bench, rec string) error {
+			return b.run(args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin, "-record", rec})...)
+		},
+		"claim": func(b *bench, rec string) error {
+			return b.run(args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
+				"-inclusion", "6", "-secret-file", b.file("secret", hex.EncodeToString(b.secret[:]), 0o600), "-record", rec})...)
+		},
+		"refund": func(b *bench, rec string) error {
+			b.node.info.Blocks, b.node.info.Headers = benchLock, benchLock
+			return b.run(args([]string{"refund"}, b.contract(), b.as(b.payer), []string{"-outpoint", contract, "-to", b.payee, "-record", rec})...)
+		},
+	} {
+		b := newBench(t)
+		b.closed = true
+		rec := filepath.Join(b.dir, step+".json")
+		err := run(b, rec)
+		if len(b.node.sent) != 1 {
+			t.Fatalf("%s: the node was sent %d transactions, want one", step, len(b.node.sent))
+		}
+		_, txid, _ := b.record(rec)
+		if err == nil {
+			t.Errorf("%s: no error for a result line that could not be written", step)
+			continue
+		}
+		for _, want := range []string{"the node took", txid, rec, "the stream is closed"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: the error does not hold %q: %v", step, want, err)
+			}
+		}
+	}
+}
+
 // An input the node does not hold as a confirmed output of the caller's
 // address is refused, and no record is written.
 func TestFundRefusesAnInputThatIsNotTheCallersOwn(t *testing.T) {
@@ -435,13 +556,15 @@ func TestNoRefusalOfTheArgumentsPrintsAValue(t *testing.T) {
 		args []string
 		want string
 	}{
-		"as the lock height":        {args([]string{"script"}, with("-lock-height")), "-lock-height"},
-		"as the depth":              {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-depth", value, "-outpoint", contract}), "-depth"},
-		"as the amount":             {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", value, "-outpoint", contract}), "-amount"},
-		"as the outpoint":           {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", value}), "-outpoint"},
-		"as an input":               {args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", value, "-record", filepath.Join(b.dir, "r.json")}), "-inputs"},
-		"as an argument":            {args([]string{"script"}, b.contract(), []string{value}), "unexpected argument"},
-		"as the name of a flag":     {args([]string{"script"}, b.contract(), []string{"-" + value}), "flag provided but not defined"},
+		"as the lock height":    {args([]string{"script"}, with("-lock-height")), "-lock-height"},
+		"as the depth":          {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-depth", value, "-outpoint", contract}), "-depth"},
+		"as the amount":         {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", value, "-outpoint", contract}), "-amount"},
+		"as the outpoint":       {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", value}), "-outpoint"},
+		"as an input":           {args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", value, "-record", filepath.Join(b.dir, "r.json")}), "-inputs"},
+		"as an argument":        {args([]string{"script"}, b.contract(), []string{value}), "unexpected argument"},
+		"as the name of a flag": {args([]string{"script"}, b.contract(), []string{"-" + value}), "flag provided but not defined"},
+		"as the secret file": {args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
+			"-inclusion", "6", "-secret-file", value, "-record", filepath.Join(b.dir, "r.json")}), "-secret-file"},
 		"as the command":            {[]string{value}, "unknown command"},
 		"where a flag has no value": {args([]string{"script"}, b.contract()[:9]), "-lock-height"},
 	} {
@@ -547,6 +670,9 @@ func TestClaimReadsTheSecretFromAFileOfItsOwner(t *testing.T) {
 		}
 		if err != nil && (strings.Contains(err.Error(), digits[2:40]) || strings.Contains(err.Error(), "zz")) {
 			t.Errorf("%s: the refusal prints what the file holds: %v", name, err)
+		}
+		if err != nil && strings.Contains(err.Error(), path) {
+			t.Errorf("%s: the refusal prints the value of -secret-file, which may be the secret: %v", name, err)
 		}
 	}
 	for _, flagName := range []string{"-secret", "-preimage", "-passphrase", "-rpc-password"} {
