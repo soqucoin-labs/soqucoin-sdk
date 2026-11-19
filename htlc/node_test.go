@@ -31,6 +31,12 @@ type replies struct {
 	broadcastErr error
 	blocks       map[int64]string
 	blockErr     error
+	// prev names, by height, a block whose previousblockhash is not the
+	// hash of the block below it; moved names a height whose hash differs
+	// from the second time it is asked for.
+	prev  map[int64]string
+	moved map[int64]string
+	asked map[int64]int
 
 	calls       int
 	withMempool []bool
@@ -73,6 +79,13 @@ func (r *replies) GetBlockHash(_ context.Context, height int64) (string, error) 
 	if _, ok := r.blocks[height]; !ok {
 		return "", fmt.Errorf("%w: no block at %d", rpc.ErrPermanent, height)
 	}
+	if r.asked == nil {
+		r.asked = map[int64]int{}
+	}
+	r.asked[height]++
+	if hash, ok := r.moved[height]; ok && r.asked[height] > 1 {
+		return hash, nil
+	}
 	return fmt.Sprintf("hash-%d", height), nil
 }
 
@@ -83,7 +96,15 @@ func (r *replies) GetBlock(_ context.Context, hash string, verbosity int) (json.
 		return nil, fmt.Errorf("%w: block %q at verbosity %d", rpc.ErrPermanent, hash, verbosity)
 	}
 	r.read = append(r.read, height)
-	return json.RawMessage(r.blocks[height]), r.blockErr
+	block := r.blocks[height]
+	if strings.HasPrefix(block, `{"`) {
+		prev, ok := r.prev[height]
+		if !ok {
+			prev = fmt.Sprintf("hash-%d", height-1)
+		}
+		block = fmt.Sprintf(`{"previousblockhash":%q,`, prev) + block[1:]
+	}
+	return json.RawMessage(block), r.blockErr
 }
 
 const (
@@ -172,6 +193,60 @@ func TestMinDepthAtTheAmountLines(t *testing.T) {
 		if got := MinDepth(c.amount); got != c.want {
 			t.Errorf("MinDepth(%d) = %d, want %d", c.amount, got, c.want)
 		}
+	}
+}
+
+// A reorganisation while the blocks are read can put the spend into a height
+// already read. FindSecret gives a negative answer only for one chain: each
+// block read names the one before it, and the last is still at its height.
+func TestFindSecretGivesNoNegativeAnswerForAChainThatMoved(t *testing.T) {
+	b := newBench(t)
+	claim, refund := b.claim(t), b.refund(t)
+	b.node.info.Blocks, b.node.info.Headers = 8, 8
+	ctx := context.Background()
+	find := func() ([32]byte, string, error) {
+		b.node.asked = nil
+		return FindSecret(ctx, b.node, b.p, b.funded.TxID, b.funded.Vout, 5)
+	}
+	empty := func() { b.node.blocks = map[int64]string{5: block(), 6: block(), 7: block(), 8: block()} }
+
+	empty()
+	if _, _, err := find(); !errors.Is(err, ErrNoSpend) {
+		t.Fatalf("one chain with no spend: got %v, want ErrNoSpend", err)
+	}
+	b.node.prev = map[int64]string{7: "hash-of-another-6"}
+	if _, spender, err := find(); !errors.Is(err, ErrTipMoved) || errors.Is(err, ErrNoSpend) || spender != "" {
+		t.Errorf("block 7 does not name the block read at 6: got %q and %v, want ErrTipMoved", spender, err)
+	}
+	b.node.prev = nil
+	b.node.moved = map[int64]string{8: "hash-of-another-8"}
+	if _, spender, err := find(); !errors.Is(err, ErrTipMoved) || errors.Is(err, ErrNoSpend) || spender != "" {
+		t.Errorf("the last block read is no longer at its height: got %q and %v, want ErrTipMoved", spender, err)
+	}
+
+	// A refund in a block that has left the chain says nothing: the chain
+	// that replaced it may hold the claim.
+	b.node.blocks[7] = block([3]any{refund.TxID(), b.funded, refund.Inputs[0].WitnessData})
+	b.node.moved = map[int64]string{7: "hash-of-another-7"}
+	if secret, spender, err := find(); !errors.Is(err, ErrTipMoved) || errors.Is(err, ErrNoSecret) || spender != "" || secret != ([32]byte{}) {
+		t.Errorf("a refund in a block no longer at its height: got %x, %q and %v; want ErrTipMoved", secret, spender, err)
+	}
+	b.node.moved = nil
+	b.node.prev = map[int64]string{7: "hash-of-another-6"}
+	if _, spender, err := find(); !errors.Is(err, ErrTipMoved) || errors.Is(err, ErrNoSecret) || spender != "" {
+		t.Errorf("a refund in a block that does not name the block read below it: got %q and %v, want ErrTipMoved", spender, err)
+	}
+	b.node.prev = nil
+	if _, spender, err := find(); !errors.Is(err, ErrNoSecret) || spender != refund.TxID() {
+		t.Errorf("a refund on one chain: got %q and %v, want ErrNoSecret with its id", spender, err)
+	}
+
+	// The secret is accepted by its hash, so a claim is returned from any
+	// block, one that has moved included.
+	b.node.blocks[7] = block([3]any{claim.TxID(), b.funded, claim.Inputs[0].WitnessData})
+	b.node.prev, b.node.moved = map[int64]string{7: "hash-of-another-6"}, map[int64]string{7: "hash-of-another-7"}
+	if secret, spender, err := find(); err != nil || secret != b.preimage || spender != claim.TxID() {
+		t.Errorf("a claim in a block that moved: got %x, %q and %v; want the secret", secret, spender, err)
 	}
 }
 

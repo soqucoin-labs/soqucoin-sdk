@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,7 +48,7 @@ func (r *replies) GetBlockchainInfo(context.Context) (*rpc.BlockchainInfo, error
 func (r *replies) GetTxOut(_ context.Context, txid string, vout uint32, includeMempool bool) (*rpc.TxOut, error) {
 	r.calls++
 	r.withMempool = append(r.withMempool, includeMempool)
-	out, ok := r.outs[fmt.Sprintf("%s:%d", txid, vout)]
+	out, ok := r.outs[fmt.Sprintf("%s:%d", strings.ToLower(txid), vout)] // a node takes an id in either case
 	if !ok {
 		return nil, nil
 	}
@@ -66,7 +67,6 @@ func (r *replies) Broadcast(_ context.Context, rawTxHex, txid string) (string, e
 
 func (r *replies) GetBlockHash(_ context.Context, height int64) (string, error) {
 	r.calls++
-	r.read = append(r.read, height)
 	return fmt.Sprint(height), nil
 }
 
@@ -74,10 +74,12 @@ func (r *replies) GetBlock(_ context.Context, hash string, _ int) (json.RawMessa
 	r.calls++
 	var height int64
 	fmt.Sscan(hash, &height)
-	if block, ok := r.blocks[height]; ok {
-		return json.RawMessage(block), nil
+	r.read = append(r.read, height)
+	block, ok := r.blocks[height]
+	if !ok {
+		block = `{"tx":[]}`
 	}
-	return json.RawMessage(`{"tx":[]}`), nil
+	return json.RawMessage(fmt.Sprintf(`{"previousblockhash":"%d",`, height-1) + block[1:]), nil
 }
 
 const (
@@ -366,6 +368,91 @@ func TestFundRefusesAnInputThatIsNotTheCallersOwn(t *testing.T) {
 		if _, statErr := os.Lstat(rec); statErr == nil {
 			t.Errorf("%s: a record was written", name)
 		}
+	}
+}
+
+// An outpoint named twice would be counted twice and signed into a
+// transaction no node takes, and a coinbase output below the network's
+// maturity cannot be spent yet. Both are refused before the keystore signs
+// and before the record is made.
+func TestFundRefusesAnInputNamedTwiceOrACoinbaseBelowMaturity(t *testing.T) {
+	id, _, _ := strings.Cut(coin, ":")
+	for name, c := range map[string]struct {
+		inputs string
+		change func(*bench)
+		want   string
+	}{
+		"the same outpoint twice":             {coin + "," + coin, nil, "twice"},
+		"the same outpoint, once upper case":  {coin + "," + strings.ToUpper(id) + ":0", nil, "twice"},
+		"the same outpoint, the index padded": {coin + ", " + id + ":00", nil, "twice"},
+		"a coinbase one block below maturity": {coin, func(b *bench) {
+			b.node.outs[coin].Coinbase, b.node.outs[coin].Confirmations = true, types.Regtest.CoinbaseMaturity-1
+		}, "coinbase"},
+	} {
+		b := newBench(t)
+		if c.change != nil {
+			c.change(b)
+		}
+		rec := filepath.Join(b.dir, "fund.json")
+		err := b.run(args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", c.inputs, "-record", rec})...)
+		if err == nil || !strings.Contains(err.Error(), "-inputs") || !strings.Contains(err.Error(), c.want) || len(b.node.sent) != 0 {
+			t.Errorf("%s: got %v and %d broadcasts, want a refusal of -inputs that says %q and none", name, err, len(b.node.sent), c.want)
+		}
+		if _, statErr := os.Lstat(rec); statErr == nil {
+			t.Errorf("%s: a record was written", name)
+		}
+	}
+
+	b := newBench(t)
+	b.node.outs[coin].Coinbase, b.node.outs[coin].Confirmations = true, types.Regtest.CoinbaseMaturity
+	if err := b.run(args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin, "-record", filepath.Join(b.dir, "fund.json")})...); err != nil {
+		t.Errorf("a coinbase at maturity: got %v, want the funding sent", err)
+	}
+}
+
+// A value passed to the wrong flag may be the secret. No refusal of the
+// arguments prints a value back, in the error or on the error stream, and -h
+// still prints the flags.
+func TestNoRefusalOfTheArgumentsPrintsAValue(t *testing.T) {
+	b := newBench(t)
+	value := hex.EncodeToString(b.secret[:])
+	with := func(name string) []string {
+		c := b.contract()
+		for i := range c {
+			if c[i] == name {
+				c[i+1] = value
+			}
+		}
+		return c
+	}
+	for name, c := range map[string]struct {
+		args []string
+		want string
+	}{
+		"as the lock height":        {args([]string{"script"}, with("-lock-height")), "-lock-height"},
+		"as the depth":              {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-depth", value, "-outpoint", contract}), "-depth"},
+		"as the amount":             {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", value, "-outpoint", contract}), "-amount"},
+		"as the outpoint":           {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", value}), "-outpoint"},
+		"as an input":               {args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", value, "-record", filepath.Join(b.dir, "r.json")}), "-inputs"},
+		"as an argument":            {args([]string{"script"}, b.contract(), []string{value}), "unexpected argument"},
+		"as the name of a flag":     {args([]string{"script"}, b.contract(), []string{"-" + value}), "flag provided but not defined"},
+		"as the command":            {[]string{value}, "unknown command"},
+		"where a flag has no value": {args([]string{"script"}, b.contract()[:9]), "-lock-height"},
+	} {
+		err := b.run(c.args...)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("the secret %s: got %v, want a refusal that names %q", name, err, c.want)
+		}
+		if (err != nil && strings.Contains(err.Error(), value)) || strings.Contains(b.stderr.String(), value) {
+			t.Errorf("the secret %s: the refusal prints it back", name)
+		}
+		if b.node.calls != 0 {
+			t.Fatalf("the secret %s: the node was asked", name)
+		}
+	}
+
+	if err := b.run("claim", "-h"); !errors.Is(err, flag.ErrHelp) || !strings.Contains(b.stderr.String(), "-secret-file") || !strings.Contains(b.stderr.String(), "-inclusion") {
+		t.Errorf("-h: got %v and %q, want flag.ErrHelp and the flags of the command", err, b.stderr.String())
 	}
 }
 
