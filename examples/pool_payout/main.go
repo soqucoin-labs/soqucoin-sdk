@@ -363,11 +363,21 @@ func run(ctx context.Context, cfg runConfig) error {
 			if intent != nil {
 				state = intent.State
 			}
+			if state == withdraw.StateFailed {
+				// This id stays Failed, so the same command cannot pass it.
+				// The batches before it were sent: a new run holds only the
+				// payees of this batch and of the batches after it.
+				return fmt.Errorf("batch %s failed: %w; batches before it in this run were sent; after the cause is corrected, pay the payees of this batch and of the later ones under a new run id, in a file that holds only them", b.id, err)
+			}
 			return fmt.Errorf("batch %s is %s: %w; run the same command again to continue", b.id, state, err)
 		}
 		if intent.State == withdraw.StateBroadcast {
+			// A sent transaction the node no longer knows is rpc.ErrUnknownOutcome
+			// here. The run stops with a non-zero exit so it is seen; the same
+			// command reads it again, and Engine.Rebroadcast sends the same
+			// bytes again when the node has dropped them.
 			if err := engine.UpdateConfirmations(ctx, intent); err != nil {
-				log.Warn("confirmations not read", "err", err)
+				return fmt.Errorf("batch %s was sent as %s and its confirmations could not be read: %w; run the same command again", b.id, intent.TxID, err)
 			}
 		}
 		log.Info("batch sent", "state", intent.State, "txid", intent.TxID, "confirmations", intent.Confirmations)
