@@ -1494,6 +1494,357 @@
       "find": "\tbinary.Write(&preimage, binary.LittleEndian, hashType)",
       "replace": "\tbinary.Write(&preimage, binary.LittleEndian, uint32(SigHashAll))",
       "why": "The hash type is the last field of the preimage. A digest that writes SIGHASH_ALL whatever the caller names gives one digest for two hash types, so a signature made for one verifies under the other."
+    },
+    {
+      "id": "htlc-activation-rule-one-block-early",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\t\tif info.Blocks-depth < height {",
+      "replace": "\t\tif info.Blocks-depth+1 < height {",
+      "why": "The rule is blocks >= height + depth. One block early, a funding sent at the tip can confirm in a block that a reorganisation of the depth puts below the height, where anyone who gets a block spends it."
+    },
+    {
+      "id": "htlc-activation-height-missing-reads-as-active",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\t\tif !ok || height < 0 {",
+      "replace": "\t\tif ok && height < 0 {",
+      "why": "A name the node does not report reads as height 0 from the map, which is active from genesis. A node of a build without the field, or without one of the three deployments, would then be funded against."
+    },
+    {
+      "id": "htlc-activation-rule-reads-one-deployment",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\tfor _, name := range deployments {",
+      "replace": "\tfor _, name := range deployments[:1] {",
+      "why": "The contract's script needs all three deployments. With one read, a chain that has the script path and not the key hash opcode passes, and the output is spendable without a signature."
+    },
+    {
+      "id": "htlc-fund-checks-the-height-without-the-depth",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn types.UTXO{}, nil, err\n\t}\n\tif err := active(info, depth); err != nil {",
+      "replace": "\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn types.UTXO{}, nil, err\n\t}\n\tif err := active(info, depth*0); err != nil {",
+      "why": "Fund carries the activation rule with the swap's depth. At depth 0 it funds at the activation height itself, and the tip moving back one block leaves the output below it."
+    },
+    {
+      "id": "htlc-audit-checks-the-height-without-the-depth",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditRefusesAnOutputThatIsNotTheAgreedOne",
+      "find": "\tif err := active(info, depth); err != nil {\n\t\treturn Funded{}, err",
+      "replace": "\tif err := active(info, 0); err != nil {\n\t\treturn Funded{}, err",
+      "why": "The payee audits before it claims or funds its own side. An output on a chain where the rules have been active for less than the depth can still fall below the height."
+    },
+    {
+      "id": "htlc-fund-takes-a-party-that-is-not-the-payer",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\tif own != terms.Params.PayerKeyHash {",
+      "replace": "\tif false && own != terms.Params.PayerKeyHash {",
+      "why": "A party that funds a contract whose payer key hash is not the hash of a key it holds can never refund it."
+    },
+    {
+      "id": "htlc-own-key-skips-the-invalid-key-marker",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\treturn KeyHash(publicKey)\n}",
+      "replace": "\treturn sha256.Sum256(publicKey), nil\n}",
+      "why": "The node refuses a key that begins 0xff in every spend. A payer whose own key begins so funds a contract whose refund can never be spent; KeyHash is where the party's key is held to the rule."
+    },
+    {
+      "id": "htlc-own-address-of-another-network",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\tif hrp != party.Network.HRP {",
+      "replace": "\tif false && hrp != party.Network.HRP {",
+      "why": "The party names its network and the node is held to it. An address of another network is a key of another chain's keystore."
+    },
+    {
+      "id": "htlc-claim-takes-a-party-that-is-not-the-payee",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimRefusesBeforeTheSignerIsAsked",
+      "find": "\tif own != terms.Params.PayeeKeyHash {",
+      "replace": "\tif false && own != terms.Params.PayeeKeyHash {",
+      "why": "The refusal comes before the node is asked and before anything is built, so a claim that cannot be valid never reaches the signer."
+    },
+    {
+      "id": "htlc-depth-below-the-floor",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\tcase t.Depth < floor:",
+      "replace": "\tcase t.Depth < 0:",
+      "why": "The depth is a floor by amount: 30, 120 or 288. A caller that names a smaller one waits for fewer confirmations than a reorganisation of that amount's worth is taken to cost."
+    },
+    {
+      "id": "htlc-node-behind-its-headers",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\tif info.InitialSync || info.Headers > info.Blocks {",
+      "replace": "\tif info.InitialSync {",
+      "why": "A node that knows of headers it has not connected answers for an older tip: its heights, its unspent set and its confirmations are those of the past."
+    },
+    {
+      "id": "htlc-node-on-another-chain",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "\tif info.Chain != network.ChainID {",
+      "replace": "\tif false && info.Chain != network.ChainID {",
+      "why": "Regtest shares mainnet's address prefix, so the address check does not tell the two apart. The chain name the node reports does."
+    },
+    {
+      "id": "htlc-output-read-without-the-mempool",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditReturnsTheOutputAsTheNodeHoldsIt",
+      "find": "\tout, err := node.GetTxOut(ctx, txid, vout, true)",
+      "replace": "\tout, err := node.GetTxOut(ctx, txid, vout, false)",
+      "why": "With the mempool left out, an output that a transaction in the mempool already spends passes the audit, and a claim built on it shows the secret for an output that is being taken."
+    },
+    {
+      "id": "htlc-output-script-compared-by-length",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditRefusesAnOutputThatIsNotTheAgreedOne",
+      "find": "\tif out.ScriptPubKey.Hex != hex.EncodeToString(want) {",
+      "replace": "\tif len(out.ScriptPubKey.Hex) != len(hex.EncodeToString(want)) {",
+      "why": "Every version 6 output is 34 bytes. The audit holds the output to the bytes derived from the agreed parameters, which is the whole of what ties it to the contract."
+    },
+    {
+      "id": "htlc-audit-takes-a-lower-value",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditRefusesAnOutputThatIsNotTheAgreedOne",
+      "find": "\tif out.Value < terms.Amount {",
+      "replace": "\tif out.Value < 0 {",
+      "why": "The right script with less than the agreed amount is not the agreed contract."
+    },
+    {
+      "id": "htlc-audit-one-confirmation-short",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditRefusesAnOutputThatIsNotTheAgreedOne",
+      "find": "\tif out.Confirmations < need {",
+      "replace": "\tif out.Confirmations < need-1 {",
+      "why": "The depth is the number of confirmations, counted as the node counts them: the block that holds the funding is the first."
+    },
+    {
+      "id": "htlc-audit-coinbase-at-the-depth",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditRefusesAnOutputThatIsNotTheAgreedOne",
+      "find": "\tif out.Coinbase {",
+      "replace": "\tif false && out.Coinbase {",
+      "why": "A coinbase output cannot be spent before the network's maturity. A claim of one at the depth and below maturity shows the secret in a transaction no block takes."
+    },
+    {
+      "id": "htlc-audit-two-replies-at-two-tips",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditRefusesAnOutputThatIsNotTheAgreedOne",
+      "find": "\tif out.BestBlock != info.BestBlockHash {",
+      "replace": "\tif false && out.BestBlock != info.BestBlockHash {",
+      "why": "The height is from one reply and the confirmations from another. Read at two tips, the margin to the lock height is computed for a tip the output was not counted at."
+    },
+    {
+      "id": "htlc-audit-lock-margin-one-block-short",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestAuditRefusesAnOutputThatIsNotTheAgreedOne",
+      "find": "\tif left := int64(terms.Params.LockHeight) - info.Blocks; left < blocksToLock {",
+      "replace": "\tif left := int64(terms.Params.LockHeight) - info.Blocks; left < blocksToLock-1 {",
+      "why": "The caller names how many blocks the tip must leave before the lock height. One fewer is a claim or a second funding one block closer to the refund."
+    },
+    {
+      "id": "htlc-fund-lock-height-at-the-tip",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRefusesBeforeTheSignerIsAsked",
+      "find": "left < max(f.LockMargin, 1) {",
+      "replace": "left < f.LockMargin {",
+      "why": "With no margin named, a lock height at or below the tip funds a contract whose refund is valid at once and whose claim Claim refuses."
+    },
+    {
+      "id": "htlc-claim-margin-without-the-depth",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimRefusesBeforeTheSignerIsAsked",
+      "find": "txid, vout, depth+inclusion)",
+      "replace": "txid, vout, inclusion)",
+      "why": "A claim shows the secret. It must lie the depth below the lock height, or the refund, valid from that height, can take the output after the secret is public."
+    },
+    {
+      "id": "htlc-claim-inclusion-overflows",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimRefusesBeforeTheSignerIsAsked",
+      "find": "\tif inclusion < 1 || inclusion > math.MaxInt64-depth {",
+      "replace": "\tif inclusion < 1 || inclusion > math.MaxInt64 {",
+      "why": "depth + inclusion past int64 is a negative margin, which every tip satisfies: the claim is sent however near the lock height is."
+    },
+    {
+      "id": "htlc-claim-preimage-checked-after-the-node",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimRefusesBeforeTheSignerIsAsked",
+      "find": "\tif sha256.Sum256(preimage[:]) != terms.Params.Hash {",
+      "replace": "\tif false && sha256.Sum256(preimage[:]) != terms.Params.Hash {",
+      "why": "A preimage that is not the contract's is refused before the node is asked; BuildClaim would refuse it later, after the audit's requests."
+    },
+    {
+      "id": "htlc-claim-built-on-the-agreed-amount",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimBuildsOnTheNodesValue",
+      "find": "\tt, err := BuildClaim(terms.Params, funded.Output, preimage,",
+      "replace": "\tt, err := BuildClaim(terms.Params, types.UTXO{TxID: funded.Output.TxID, Vout: funded.Output.Vout, Value: terms.Amount}, preimage,",
+      "why": "The signature commits to the value of the output spent. An output funded above the amount is claimed on the value the node holds, or the node refuses the signature after the secret was sent."
+    },
+    {
+      "id": "htlc-refund-one-block-early",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestRefundFromTheLockHeightOn",
+      "find": "\tif info.Blocks < int64(p.LockHeight) {",
+      "replace": "\tif info.Blocks+1 < int64(p.LockHeight) {",
+      "why": "A node takes a refund from a tip at the lock height on. One block below, it refuses it as not final."
+    },
+    {
+      "id": "htlc-broadcast-before-the-record",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundRecordsThenSends",
+      "find": "\tif record != nil {\n\t\tif err := record(txid, rawHex); err != nil {\n\t\t\treturn fmt.Errorf(\"%w: %w\", ErrRecord, err)\n\t\t}\n\t}\n\t_, err := node.Broadcast(ctx, rawHex, txid)\n\treturn err",
+      "replace": "\t_, err := node.Broadcast(ctx, rawHex, txid)\n\tif record != nil {\n\t\tif rerr := record(txid, rawHex); rerr != nil {\n\t\t\treturn fmt.Errorf(\"%w: %w\", ErrRecord, rerr)\n\t\t}\n\t}\n\treturn err",
+      "why": "The record comes first so that a process that dies after the broadcast leaves the bytes behind: a second run then sends the same transaction and does not build a second funding."
+    },
+    {
+      "id": "htlc-fund-sends-without-verifying",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFundSendsNothingAnInputDoesNotVerifyIn",
+      "find": "\tif err := t.VerifyAll(); err != nil {\n\t\treturn types.UTXO{}, nil, err\n\t}\n",
+      "replace": "",
+      "why": "A funding with an input whose signature does not verify is refused by the node. Recorded and sent, it leaves a record of a funding that does not exist."
+    },
+    {
+      "id": "htlc-find-secret-ignores-the-output-index",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretReadsTheMinedSpendOfTheOutpoint",
+      "find": "\t\t\t\tif !strings.EqualFold(in.TxID, txid) || in.Vout != vout {",
+      "replace": "\t\t\t\tif !strings.EqualFold(in.TxID, txid) {",
+      "why": "A transaction has several outputs. The spend of another output of the funding transaction is not the spend of the contract."
+    },
+    {
+      "id": "htlc-find-secret-compares-the-id-by-case",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretReadsTheMinedSpendOfTheOutpoint",
+      "find": "\t\t\t\tif !strings.EqualFold(in.TxID, txid) || in.Vout != vout {",
+      "replace": "\t\t\t\tif strings.Compare(in.TxID, txid) != 0 || in.Vout != vout {",
+      "why": "A node takes a transaction id in either case and prints it in lower case. Compared by case, an id that passed Audit finds no spend, and the party that waits for the secret reads the claim as absent."
+    },
+    {
+      "id": "htlc-find-secret-takes-an-empty-id",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestFindSecretReadsTheMinedSpendOfTheOutpoint",
+      "find": "\tif id, err := hex.DecodeString(txid); err != nil || len(id) != sha256.Size {",
+      "replace": "\tif _, err := hex.DecodeString(txid); err != nil {",
+      "why": "A coinbase input prints no id and no index, which read as the empty id and index 0. The empty id then finds the coinbase of the first block and reports it as a refund."
+    },
+    {
+      "id": "htlc-min-depth-line-at-100",
+      "file": "htlc/funding.go",
+      "package": "./htlc",
+      "test": "TestMinDepthAtTheAmountLines",
+      "find": "\tcase amount <= 100*types.ShorsPerSOQ:",
+      "replace": "\tcase amount < 100*types.ShorsPerSOQ:",
+      "why": "The lines are 30 up to and including 100 SOQ and 120 up to and including 10,000 SOQ, as the exchange guide's sample has them."
+    },
+    {
+      "id": "htlc-min-depth-line-at-10000",
+      "file": "htlc/funding.go",
+      "package": "./htlc",
+      "test": "TestMinDepthAtTheAmountLines",
+      "find": "\tcase amount <= 10_000*types.ShorsPerSOQ:",
+      "replace": "\tcase amount <= 100_000*types.ShorsPerSOQ:",
+      "why": "Above 10,000 SOQ the depth is the chain's reorganisation depth limit, 288."
+    },
+    {
+      "id": "htlc-funding-pays-the-change-first",
+      "file": "htlc/funding.go",
+      "package": "./htlc",
+      "test": "TestBuildFundingPaysTheContractFirst",
+      "find": "\treturn tx.BuildSendTransaction(inputs, contract, amount, change, feeRate)",
+      "replace": "\treturn tx.BuildSendTransaction(inputs, change, amount, contract, feeRate)",
+      "why": "Fund returns output 0 as the contract's. With the two scripts exchanged the amount goes to the change address and the remainder to the contract."
+    },
+    {
+      "id": "htlc-funding-change-of-another-network",
+      "file": "htlc/funding.go",
+      "package": "./htlc",
+      "test": "TestBuildFundingPaysTheContractFirst",
+      "find": "\tif len(inputs) > 0 {\n\t\tif err := sameNetwork(changeAddress, inputs[0].Address); err != nil {",
+      "replace": "\tif false {\n\t\tif err := sameNetwork(changeAddress, inputs[0].Address); err != nil {",
+      "why": "Package tx holds the inputs to one network and takes the change as script bytes, which name no network. The change address is compared here."
+    },
+    {
+      "id": "htlc-secret-of-another-length",
+      "file": "htlc/funding.go",
+      "package": "./htlc",
+      "test": "TestSecretFromWitnessTakesTheItemThatHashesToTheHash",
+      "find": "\t\tif len(item) == sha256.Size && sha256.Sum256(item) == p.Hash {",
+      "replace": "\t\tif len(item) >= sha256.Size && sha256.Sum256(item) == p.Hash {",
+      "why": "The secret is exactly 32 bytes; the script checks the size before it hashes. A longer item that hashes to the hash is not a secret the other chain's contract takes."
+    },
+    {
+      "id": "htlc-secret-taken-by-length-alone",
+      "file": "htlc/funding.go",
+      "package": "./htlc",
+      "test": "TestSecretFromWitnessTakesTheItemThatHashesToTheHash",
+      "find": "\t\tif len(item) == sha256.Size && sha256.Sum256(item) == p.Hash {",
+      "replace": "\t\tif len(item) == sha256.Size {",
+      "why": "The hash is the whole acceptance. By length alone, the first 32-byte item of any witness is returned as the secret."
+    },
+    {
+      "id": "tx-sighash-masks-the-hash-type",
+      "file": "tx/builder.go",
+      "package": "./tx",
+      "test": "TestScriptCodeDigestCommitsToTheHashType",
+      "find": "\tbinary.Write(&preimage, binary.LittleEndian, hashType)",
+      "replace": "\tbinary.Write(&preimage, binary.LittleEndian, hashType&0x1f)",
+      "why": "The whole hash type is the last field of the preimage. Masked to its low five bits, 0x40 and 0x00 give one digest, and the node takes 0x40 in this form."
+    },
+    {
+      "id": "htlc-item-count-refusal-prints-the-items",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestVerifySpendRefusesEachChange",
+      "find": "\t\treturn fmt.Errorf(\"%w: %d witness items\", ErrSpendForm, len(w))",
+      "replace": "\t\treturn fmt.Errorf(\"%w: %d witness items %x\", ErrSpendForm, len(w), w)",
+      "why": "A claim's witness holds the secret. A refusal that prints the items of a claim with one item too many prints the secret into whatever log the caller keeps."
+    },
+    {
+      "id": "htlc-key-copy-for-a-claim-alone",
+      "file": "htlc/spend.go",
+      "package": "./htlc",
+      "test": "TestSpendHoldsItsOwnCopyOfTheKey",
+      "find": "\tpublicKey = bytes.Clone(publicKey)",
+      "replace": "\tif preimage != nil {\n\t\tpublicKey = bytes.Clone(publicKey)\n\t}",
+      "why": "Both builders share the statement. Without the copy a refund's key item is the signer's slice, and a signer that reuses its buffer changes a transaction it already returned."
     }
   ]
 }
