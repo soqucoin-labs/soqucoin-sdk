@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
@@ -394,7 +396,8 @@ func audit(ctx context.Context, node Node, network types.Network, terms Terms, d
 // blocks allowed for the claim to get into a block, at least 1; the claim
 // then lies at least the depth below the lock height, from which the payer's
 // refund is valid. Past that point Claim refuses (ErrLockTooNear) and the
-// secret stays private.
+// secret stays private. An inclusion whose sum with the depth leaves int64
+// is refused with the same error before the node is asked.
 //
 // The claim is built by BuildClaim on the value the node holds. record, when
 // set, receives it before it is sent; its bytes hold the secret. The
@@ -415,8 +418,8 @@ func Claim(ctx context.Context, node Node, party Party, terms Terms, txid string
 	if err != nil {
 		return nil, err
 	}
-	if inclusion < 1 {
-		return nil, fmt.Errorf("%w: inclusion of %d blocks, want 1 or more", ErrLockTooNear, inclusion)
+	if inclusion < 1 || inclusion > math.MaxInt64-depth {
+		return nil, fmt.Errorf("%w: inclusion of %d blocks, want 1 or more and a sum with the depth that int64 holds", ErrLockTooNear, inclusion)
 	}
 	funded, err := audit(ctx, node, party.Network, terms, depth, script, txid, vout, depth+inclusion)
 	if err != nil {
@@ -476,10 +479,14 @@ func Refund(ctx context.Context, node Node, party Party, p Params, txid string, 
 // secret, a refund, gives ErrNoSecret with the id; no spend in the range
 // gives ErrNoSpend. The node's mempool is not read.
 //
-// The secret is accepted by its hash alone, so a node cannot supply a wrong
-// one. A node can leave a spend out: ErrNoSpend from a node that is behind
+// The transaction id is 64 hexadecimal digits in either case, as a node takes
+// it (ErrOutpoint otherwise, before the node is asked). The secret is accepted
+// by its hash alone, so a node cannot supply a wrong one. A node can leave a spend out: ErrNoSpend from a node that is behind
 // says nothing about the chain.
 func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint32, fromHeight int64) (secret [32]byte, spender string, err error) {
+	if id, err := hex.DecodeString(txid); err != nil || len(id) != sha256.Size {
+		return [32]byte{}, "", fmt.Errorf("%w: %q", ErrOutpoint, txid)
+	}
 	info, err := node.GetBlockchainInfo(ctx)
 	if err != nil {
 		return [32]byte{}, "", err
@@ -508,7 +515,7 @@ func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint
 		}
 		for _, t := range block.Tx {
 			for _, in := range t.Vin {
-				if in.TxID != txid || in.Vout != vout {
+				if !strings.EqualFold(in.TxID, txid) || in.Vout != vout {
 					continue
 				}
 				items := make([][]byte, len(in.Witness))
