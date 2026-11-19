@@ -111,7 +111,9 @@ var (
 	ErrShallow = errors.New("htlc: the funding is below the depth")
 
 	// ErrLockTooNear marks a lock height with too few blocks left above the
-	// tip for the step asked.
+	// tip for the step asked. Beside a transaction it comes from the second
+	// read of Claim, which also gives it, with the cause, for a tip it could
+	// not read: the claim was not sent and its bytes are not sent later.
 	ErrLockTooNear = errors.New("htlc: the lock height is too near the tip")
 
 	// ErrBeforeLockHeight marks a refund asked while the tip is below the
@@ -233,15 +235,23 @@ func output(ctx context.Context, node Node, want []byte, txid string, vout uint3
 	return out, nil
 }
 
+// keep hands the signed transaction to the record, when one is set.
+func keep(t *tx.Transaction, record Record) error {
+	if record == nil {
+		return nil
+	}
+	if err := record(t.TxID(), t.SerializeHex()); err != nil {
+		return fmt.Errorf("%w: %w", ErrRecord, err)
+	}
+	return nil
+}
+
 // send hands the signed transaction to the record and then to the node.
 func send(ctx context.Context, node Node, t *tx.Transaction, record Record) error {
-	rawHex, txid := t.SerializeHex(), t.TxID()
-	if record != nil {
-		if err := record(txid, rawHex); err != nil {
-			return fmt.Errorf("%w: %w", ErrRecord, err)
-		}
+	if err := keep(t, record); err != nil {
+		return err
 	}
-	_, err := node.Broadcast(ctx, rawHex, txid)
+	_, err := node.Broadcast(ctx, t.SerializeHex(), t.TxID())
 	return err
 }
 
@@ -401,8 +411,20 @@ func audit(ctx context.Context, node Node, network types.Network, terms Terms, d
 //
 // The claim is built by BuildClaim on the value the node holds. record, when
 // set, receives it before it is sent; its bytes hold the secret. The
-// transaction is returned whenever one was signed. A claim does not signal
-// replacement: its fee is raised by a transaction that spends its output.
+// transaction is returned whenever one was signed, also beside an error of
+// the record, of the second read below or of the broadcast. A claim does not
+// signal replacement: its fee is raised by a transaction that spends its
+// output.
+//
+// Neither the signer nor the record is bounded in time, so the tip is read a
+// second time after the record returned and just before the broadcast. When
+// the lock height is then nearer than depth + inclusion, or the node does not
+// answer, is on another chain or is not synchronised, Claim returns
+// ErrLockTooNear, with the cause where the read failed, beside the signed
+// claim. Nothing was sent, and those bytes are not sent later, by Claim or by
+// the caller: they show the secret, and from the lock height on the payer's
+// refund is valid. A caller that still wants the output calls Claim again,
+// which audits again and refuses before the signer once the margin is gone.
 func Claim(ctx context.Context, node Node, party Party, terms Terms, txid string, vout uint32, preimage [32]byte, s Spend, inclusion int64, record Record) (*tx.Transaction, error) {
 	own, err := party.keyHash()
 	if err != nil {
@@ -429,7 +451,18 @@ func Claim(ctx context.Context, node Node, party Party, terms Terms, txid string
 	if err != nil {
 		return nil, err
 	}
-	return t, send(ctx, node, t, record)
+	if err := keep(t, record); err != nil {
+		return t, err
+	}
+	info, err := chain(ctx, node, party.Network)
+	if err != nil {
+		return t, fmt.Errorf("%w: the tip could not be read again after the record, and nothing was sent: %w", ErrLockTooNear, err)
+	}
+	if left := int64(terms.Params.LockHeight) - info.Blocks; left < depth+inclusion {
+		return t, fmt.Errorf("%w: %d blocks from the tip at %d after the record, want %d; nothing was sent", ErrLockTooNear, left, info.Blocks, depth+inclusion)
+	}
+	_, err = node.Broadcast(ctx, t.SerializeHex(), t.TxID())
+	return t, err
 }
 
 // Refund builds, signs and broadcasts the refund that takes the contract's

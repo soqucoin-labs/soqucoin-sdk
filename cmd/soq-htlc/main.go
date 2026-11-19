@@ -32,7 +32,9 @@
 // error that leaves the outcome unknown, send the recorded bytes again with
 // the node's sendrawtransaction; running the step again under another record
 // builds a second transaction, and a second funding locks a second amount
-// until the lock height. The record of a claim holds the secret.
+// until the lock height. The record of a claim holds the secret. A claim that
+// ends with "nothing was sent" was held back because the tip moved too near
+// the lock height while it was signed and recorded: its bytes are never sent.
 package main
 
 import (
@@ -344,10 +346,15 @@ func recorder(path, step string) (htlc.Record, error) {
 }
 
 // recorded adds, to an error that came after a transaction was recorded,
-// where its bytes are.
+// where its bytes are and what to do with them. htlc.ErrLockTooNear beside a
+// transaction is the second read of htlc.Claim: the claim was not sent, and
+// its bytes show the secret at a tip from which the refund can win.
 func recorded(err error, t *tx.Transaction, path string) error {
 	if t == nil || errors.Is(err, htlc.ErrRecord) {
 		return err
+	}
+	if errors.Is(err, htlc.ErrLockTooNear) {
+		return fmt.Errorf("%w\nnothing was sent. transaction %s is in %s, which holds the secret: do not send those bytes, now or later. Run the step again under a new record; it refuses before it signs once the margin is gone", err, t.TxID(), path)
 	}
 	return fmt.Errorf("%w\ntransaction %s is in %s: if the node may hold it, send those bytes again and build no second one", err, t.TxID(), path)
 }

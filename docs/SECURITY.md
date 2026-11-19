@@ -602,6 +602,8 @@ The node refuses a public key whose first byte is `0xff`. One ML-DSA-44 key in 2
 
 A claim shows the secret to every node it reaches. `htlc.Claim` makes every check before it asks the signer. It adds the depth to the blocks you allow for inclusion. It refuses when the lock height is nearer than that sum. Past that point a refund could take the output after the secret is public.
 
+Signing and recording take time. `Claim` reads the tip again after your `Record` function returns. If the margin no longer holds, it returns `htlc.ErrLockTooNear` with the signed claim. It does the same when the node doesn't answer. Nothing was sent. Don't send those bytes later. They show the secret, and the payer's refund is valid from the lock height. Call `Claim` again if you still want the output. It refuses before it signs when the margin is gone.
+
 A claim doesn't signal replacement. Sending it again with a higher fee doesn't replace it. Raise the fee with a transaction that spends the claim's output. Leave room in the fee you start with.
 
 ### Keep a record of each transaction
