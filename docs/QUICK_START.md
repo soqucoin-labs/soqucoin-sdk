@@ -189,7 +189,7 @@ func main() {
 	}
 	fmt.Printf("Selected %d UTXOs totaling %.4f SOQ\n", len(selected), float64(total)/1e8)
 
-	// 5. Defense 11: Verify each UTXO is still unspent on-chain
+	// 5. Verify each UTXO is still unspent on-chain
 	verified, err := rpcClient.VerifyAndFilterUTXOs(ctx, selected, elx.EvictUTXO, elx.SetAssetType)
 	if err != nil {
 		log.Fatal("UTXO verification failed:", err)
