@@ -155,12 +155,16 @@ type Intent struct {
 	AbandonedAt time.Time `json:"abandoned_at,omitempty"`
 	// Hold names why a Built intent is held (HoldRejectedAfterUnknown); empty
 	// when it is not. NodeTxID set is a hold in its own right.
-	Hold          string     `json:"hold,omitempty"`
-	RawHex        string     `json:"raw_hex,omitempty"`
-	Inputs        []Outpoint `json:"inputs,omitempty"`
-	Attempts      int        `json:"attempts"`
-	LastError     string     `json:"last_error,omitempty"`
-	Confirmations int64      `json:"confirmations"`
+	Hold     string     `json:"hold,omitempty"`
+	RawHex   string     `json:"raw_hex,omitempty"`
+	Inputs   []Outpoint `json:"inputs,omitempty"`
+	Attempts int        `json:"attempts"`
+	// BuildAttempts is the value of Attempts when the intent became Built:
+	// the Build calls that waited (a selector's transient error, an ended
+	// context, an engine with no batch signer). None of them sent anything.
+	BuildAttempts int    `json:"build_attempts,omitempty"`
+	LastError     string `json:"last_error,omitempty"`
+	Confirmations int64  `json:"confirmations"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -613,7 +617,7 @@ func samePayees(a, b []Payee) bool {
 // ErrConflict.
 //
 // Refused with ErrInvalidIntent, and nothing recorded: an empty id; a fee
-// rate that is not positive; no payee or more than MaxBatchPayees; a payee
+// rate that is not positive or is above tx.MaxFeeRateShorsPerVB; no payee or more than MaxBatchPayees; a payee
 // whose address is not a witness version 1 address on Network; an address
 // named twice; an amount outside (0, MaxMoney] or below the node's relay
 // floor; a total above MaxMoney; an engine with no BuildSignBatch. One bad
@@ -624,6 +628,9 @@ func samePayees(a, b []Payee) bool {
 func (e *Engine) SubmitBatch(ctx context.Context, id string, payees []Payee, feeRate int64) (intent *Intent, created bool, err error) {
 	if id == "" || feeRate <= 0 {
 		return nil, false, fmt.Errorf("%w: id=%q feeRate=%d", ErrInvalidIntent, id, feeRate)
+	}
+	if feeRate > tx.MaxFeeRateShorsPerVB {
+		return nil, false, fmt.Errorf("%w: %s: fee rate %d is above tx.MaxFeeRateShorsPerVB", ErrInvalidIntent, id, feeRate)
 	}
 	if e.BuildSignBatch == nil {
 		return nil, false, fmt.Errorf("%w: %s: the engine has no BuildSignBatch", ErrInvalidIntent, id)
@@ -755,7 +762,8 @@ func (e *Engine) Build(ctx context.Context, in *Intent) error {
 	for _, u := range inputs {
 		in.Inputs = append(in.Inputs, Outpoint{TxID: u.TxID, Vout: u.Vout, Value: u.Value, Address: u.Address})
 	}
-	in.State = StateBuilt
+	// The attempts so far were made while Created and sent nothing.
+	in.State, in.BuildAttempts = StateBuilt, in.Attempts
 	if err := e.save(ctx, in, StateCreated); err != nil {
 		if errors.Is(err, ErrWrittenNotDurable) {
 			// The store has the record and says so: only its durability is
@@ -832,7 +840,9 @@ func (e *Engine) Broadcast(ctx context.Context, in *Intent) error {
 	}
 	// A record from before the mark existed (no SentAt) with attempts on it
 	// has outcomes that are not on record; they count as possibly relayed.
-	prior := in.MaybeRelayed || (in.Attempts > 0 && in.SentAt.IsZero())
+	// Attempts recorded before the intent was Built sent nothing and do not
+	// count: a first send the node refuses fails the intent, and is not held.
+	prior := in.MaybeRelayed || (in.Attempts > in.BuildAttempts && in.SentAt.IsZero())
 	in.Attempts++
 	in.MaybeRelayed, in.SentAt = true, e.now()
 	if err := e.save(ctx, in, StateBuilt); err != nil {

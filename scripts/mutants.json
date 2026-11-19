@@ -771,7 +771,7 @@
       "file": "withdraw/engine.go",
       "package": "./withdraw",
       "test": "TestLegacyRecordWithAttemptsIsHeldOnARejection",
-      "find": "\tprior := in.MaybeRelayed || (in.Attempts > 0 && in.SentAt.IsZero())",
+      "find": "\tprior := in.MaybeRelayed || (in.Attempts > in.BuildAttempts && in.SentAt.IsZero())",
       "replace": "\tprior := in.MaybeRelayed",
       "why": "A record written before the mark existed carries attempts whose outcomes are not on record. Reading them as answered lets a rejection fail the intent and release inputs an earlier attempt may have relayed."
     },
@@ -1680,8 +1680,8 @@
       "file": "tx/batch.go",
       "package": "./tx",
       "test": "TestLargestBatchIsStandardAndTheAllowanceIsExact",
-      "find": "\treturn int64(recipients-1) * (EstimatedOutputWeight / 4) * feeRate",
-      "replace": "\treturn int64(recipients) * (EstimatedOutputWeight / 4) * feeRate",
+      "find": "\tvbytes := int64(recipients-1) * (EstimatedOutputWeight / 4)",
+      "replace": "\tvbytes := int64(recipients) * (EstimatedOutputWeight / 4)",
       "why": "The allowance is the fee of the outputs beyond the one a selector already budgets. Counting that one again asks a wallet for funds the batch does not need."
     },
     {
@@ -1692,6 +1692,87 @@
       "find": "\tif err := t.VerifyAll(); err != nil {\n\t\treturn nil, err\n\t}\n\treturn t, nil\n}\n\n// BuildAndSignBatch",
       "replace": "\treturn t, nil\n}\n\n// BuildAndSignBatch",
       "why": "A signer that returns a signature over another digest, or the wrong key, produces a batch the node refuses; the builder says so before the bytes are persisted."
+    },
+    {
+      "id": "tx-batch-allowance-omits-the-output-count-bytes",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchFeeAllowanceFundsTheBatchAtEverySize",
+      "find": "\tif recipients+1 >= 0xfd {",
+      "replace": "\tif false {",
+      "why": "From 252 recipients the output count takes three bytes. A selector that budgets the fee exactly is two vBytes short, the builder refuses the inputs, and a funded batch fails."
+    },
+    {
+      "id": "tx-batch-allowance-count-boundary-off-by-one",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchFeeAllowanceFundsTheBatchAtEverySize",
+      "find": "\tif recipients+1 >= 0xfd {",
+      "replace": "\tif recipients+1 > 0xfd {",
+      "why": "The count grows at 253 outputs, which is 252 recipients and the change. One later leaves exactly that batch two vBytes short."
+    },
+    {
+      "id": "tx-batch-output-with-no-script",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchRefusals",
+      "find": "\t\tif len(o.ScriptPubKey) == 0 {",
+      "replace": "\t\tif false {",
+      "why": "An output with an empty script passes the relay floor and the node accepts it. Nobody holds a key for it."
+    },
+    {
+      "id": "tx-batch-change-with-no-script",
+      "file": "tx/batch.go",
+      "package": "./tx",
+      "test": "TestBatchRefusals",
+      "find": "\tif len(changeScriptPubKey) == 0 {",
+      "replace": "\tif false {",
+      "why": "A caller that passes no change script sends the remainder of its inputs to an empty script."
+    },
+    {
+      "id": "withdraw-store-shares-payees-with-the-caller",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestStoresShareNoPayeesOrInputsWithTheCaller",
+      "find": "\tcp.Payees = slices.Clone(in.Payees)\n",
+      "replace": "",
+      "why": "A caller that edits an intent a store handed out changes the stored payees with no Update, and Build signs a payment to them under the original id."
+    },
+    {
+      "id": "withdraw-store-shares-inputs-with-the-caller",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestStoresShareNoPayeesOrInputsWithTheCaller",
+      "find": "\tcp.Inputs = slices.Clone(in.Inputs)\n",
+      "replace": "",
+      "why": "The inputs of a record are what Recover marks spent again. A caller's edit of a returned intent must not reach them."
+    },
+    {
+      "id": "withdraw-batch-fee-rate-unbounded",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestSubmitBatchRefusesAndRecordsNothing",
+      "find": "\tif feeRate > tx.MaxFeeRateShorsPerVB {",
+      "replace": "\tif false {",
+      "why": "The fee allowance multiplies the rate by the payee count. An unbounded rate wraps it, and the selector is asked for a wrong target."
+    },
+    {
+      "id": "withdraw-attempts-before-build-count-as-sent",
+      "file": "withdraw/engine.go",
+      "package": "./withdraw",
+      "test": "TestBatchThatWaitedBeforeBuildFailsOnAFirstRejection",
+      "find": "\tin.State, in.BuildAttempts = StateBuilt, in.Attempts",
+      "replace": "\tin.State = StateBuilt",
+      "why": "An intent that waited while Created has sent nothing. Counting those attempts as sends holds its inputs for an operator when the node refuses the first send."
+    },
+    {
+      "id": "withdraw-batch-store-written-as-version-one",
+      "file": "withdraw/store.go",
+      "package": "./withdraw",
+      "test": "TestFileStoreWithABatchIsVersionTwo",
+      "find": "\t\t\treturn batchFileVersion\n",
+      "replace": "\t\t\treturn 1\n",
+      "why": "A release from before batches opens a version 1 file and writes every batch back without its payees. Version 2 is what makes it refuse."
     }
   ]
 }

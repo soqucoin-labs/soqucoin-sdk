@@ -28,17 +28,26 @@ var (
 	ErrNoOutputs = errors.New("tx: a batch pays between 1 and MaxBatchOutputs recipients")
 	// ErrTooHeavy is returned for a transaction above MaxStandardTxWeight.
 	ErrTooHeavy = errors.New("tx: transaction exceeds the node's standard weight limit")
+	// ErrEmptyScript is returned for a batch output, or a change script, with
+	// no script: the node accepts the output and nobody holds its key.
+	ErrEmptyScript = errors.New("tx: an output has no script")
 )
 
 // BatchFeeAllowance is the fee the recipient outputs of a batch add over a
 // one-recipient payment, at feeRate (shors per vByte): each further output is
-// 43 bytes for a witness version 1 address. A coin selector that budgets the
-// fee of a one-recipient payment is asked for the batch total plus this.
+// 43 bytes for a witness version 1 address, and from 252 recipients the
+// output count, change included, takes 3 bytes where it took 1. A coin
+// selector that budgets the fee of a one-recipient payment is asked for the
+// batch total plus this.
 func BatchFeeAllowance(recipients int, feeRate int64) int64 {
 	if recipients <= 1 || feeRate <= 0 {
 		return 0
 	}
-	return int64(recipients-1) * (EstimatedOutputWeight / 4) * feeRate
+	vbytes := int64(recipients-1) * (EstimatedOutputWeight / 4)
+	if recipients+1 >= 0xfd {
+		vbytes += 2
+	}
+	return vbytes * feeRate
 }
 
 // BuildBatchTransaction constructs an unsigned transaction that pays every
@@ -71,8 +80,14 @@ func BuildBatchTransaction(
 	if err := requireSameNetwork(inputs); err != nil {
 		return nil, err
 	}
+	if len(changeScriptPubKey) == 0 {
+		return nil, fmt.Errorf("%w: the change script", ErrEmptyScript)
+	}
 	var total int64
 	for i, o := range outputs {
+		if len(o.ScriptPubKey) == 0 {
+			return nil, fmt.Errorf("%w: output %d", ErrEmptyScript, i)
+		}
 		if err := checkAmount(o.Value); err != nil {
 			return nil, fmt.Errorf("output %d: %w", i, err)
 		}

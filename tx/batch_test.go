@@ -53,6 +53,7 @@ func TestBatchRefusals(t *testing.T) {
 		{"no inputs", nil, batchOutputs(2, 1_000_000_000), 1000, ErrInsufficientFunds},
 		{"zero rate", one, batchOutputs(2, 1_000_000_000), 0, ErrInvalidAmount},
 		{"rate above the cap", one, batchOutputs(2, 1_000_000_000), MaxFeeRateShorsPerVB + 1, ErrFeeTooHigh},
+		{"a recipient with no script", one, []TxOutput{{Value: 1_000_000_000}}, 1000, ErrEmptyScript},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -64,6 +65,10 @@ func TestBatchRefusals(t *testing.T) {
 				t.Error("a refused batch returned a transaction")
 			}
 		})
+	}
+
+	if _, err := BuildBatchTransaction(one, batchOutputs(2, 1_000_000_000), nil, 1000); !errors.Is(err, ErrEmptyScript) {
+		t.Errorf("no change script: err = %v, want ErrEmptyScript", err)
 	}
 
 	sq, err := address.Encode(types.Mainnet.HRP, 1, hash32(0x20))
@@ -262,5 +267,32 @@ func TestBuildSignedBatchVerifiesEveryInput(t *testing.T) {
 	empty := keys.NewManager(filepath.Join(t.TempDir(), "e.enc"), "pw")
 	if _, err := BuildSignedBatch(inputs, outputs, change, types.RecommendedFeeRate, empty); err == nil {
 		t.Error("a signer without the key produced a batch")
+	}
+}
+
+// A wallet that holds the batch total, the fee of a one-recipient payment and
+// BatchFeeAllowance funds the batch at every size. From 252 recipients the
+// output count takes three bytes, and the allowance carries those two bytes.
+func TestBatchFeeAllowanceFundsTheBatchAtEverySize(t *testing.T) {
+	change := ScriptP2WPKH(hash32(0x03))
+	const amount, rate = 1_000_000, 1000
+	single, err := BuildBatchTransaction([]types.UTXO{realUTXO(t, 0x10, 0, 50_000_000_000)}, batchOutputs(1, amount), change, rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oneFee := single.EstimateFee(rate)
+	for _, n := range []int{2, 251, 252, 253, MaxBatchOutputs} {
+		funds := int64(n)*amount + oneFee + BatchFeeAllowance(n, rate)
+		tr, err := BuildBatchTransaction([]types.UTXO{realUTXO(t, 0x10, 0, funds)}, batchOutputs(n, amount), change, rate)
+		if err != nil {
+			t.Errorf("%d recipients with the total, the one-recipient fee and the allowance: %v", n, err)
+			continue
+		}
+		if len(tr.Outputs) != n {
+			t.Errorf("%d recipients: %d outputs, want no change from exact funds", n, len(tr.Outputs))
+		}
+		if _, err := BuildBatchTransaction([]types.UTXO{realUTXO(t, 0x10, 0, funds-1)}, batchOutputs(n, amount), change, rate); !errors.Is(err, ErrInsufficientFunds) {
+			t.Errorf("%d recipients, one shor under: err = %v, want ErrInsufficientFunds (the allowance is not exact)", n, err)
+		}
 	}
 }

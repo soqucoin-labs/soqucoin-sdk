@@ -5,9 +5,12 @@ package withdraw
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -66,6 +69,18 @@ func (b *batchRecorder) sign(_ context.Context, inputs []types.UTXO, ps []Payee,
 	return "batchhex-" + id, "batchtxid-" + id, nil
 }
 
+// keepStore is a Store that keeps the pointer Create was handed, as a
+// caller's own store may.
+type keepStore struct {
+	*MemStore
+	kept map[string]*Intent
+}
+
+func (k *keepStore) Create(ctx context.Context, in *Intent) error {
+	k.kept[in.ID] = in
+	return k.MemStore.Create(ctx, in)
+}
+
 func bigCoins() []types.UTXO {
 	return []types.UTXO{
 		{TxID: txA, Vout: 0, Value: 500_000_000_000, Height: 10, Address: "ssq1pa"},
@@ -104,6 +119,7 @@ func TestSubmitBatchRefusesAndRecordsNothing(t *testing.T) {
 	}{
 		{"empty id", "", good, 1000},
 		{"zero fee rate", "b", good, 0},
+		{"a fee rate above the builder's cap", "b", good, tx.MaxFeeRateShorsPerVB + 1},
 		{"no payee", "b", nil, 1000},
 		{"one more payee than the cap", "b", payees(t, MaxBatchPayees+1, 1_000_000_000), 1000},
 		{"an address on another network", "b", with(func(ps []Payee) []Payee {
@@ -221,6 +237,18 @@ func TestSubmitBatchIsIdempotentAndConflictSafe(t *testing.T) {
 	stored, _, _ := e.Store.Get(ctx, "run-1")
 	if stored.Payees[0].Amount != ps[0].Amount {
 		t.Error("an edit of the returned intent reached the stored record")
+	}
+
+	// The same holds over a store that keeps the record it was handed.
+	keep := &keepStore{MemStore: NewMemStore(), kept: map[string]*Intent{}}
+	ke, _ := newBatchEngine(t, keep, utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"})
+	got, _, err := ke.SubmitBatch(ctx, "run-1", ps, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Payees[0].Amount = 1
+	if keep.kept["run-1"].Payees[0].Amount != ps[0].Amount {
+		t.Error("an edit of the returned intent reached the record a store kept by reference")
 	}
 }
 
@@ -408,5 +436,142 @@ func TestBatchSurvivesARestartAndPaysOutputsInPayeeOrder(t *testing.T) {
 	}
 	if net.sentCount() != 1 || net.sent[0] != built.SerializeHex() || done.TxID != built.TxID() {
 		t.Error("the bytes sent are not the transaction the builder signed")
+	}
+}
+
+// Neither store shares the payees or the inputs of a record with a caller:
+// an edit of what Get, List, SubmitBatch or Process returned never changes
+// whom Build pays.
+func TestStoresShareNoPayeesOrInputsWithTheCaller(t *testing.T) {
+	ctx := context.Background()
+	fs, err := NewFileStore(filepath.Join(t.TempDir(), "intents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, store := range map[string]Store{"MemStore": NewMemStore(), "FileStore": fs} {
+		t.Run(name, func(t *testing.T) {
+			e, rec := newBatchEngine(t, store, utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"})
+			ps := payees(t, 3, 1_000_000_000)
+			if _, _, err := e.SubmitBatch(ctx, "run", ps, 1000); err != nil {
+				t.Fatal(err)
+			}
+			spoil := func(in *Intent) {
+				in.Payees[0].Amount, in.Payees[1].Amount = in.Payees[1].Amount, in.Payees[0].Amount
+				in.Payees[2].Address = payeeAddrN(t, types.Stagenet.HRP, 900)
+				for i := range in.Inputs {
+					in.Inputs[i].TxID = "edited"
+				}
+			}
+			again, created, err := e.SubmitBatch(ctx, "run", ps, 1000)
+			if err != nil || created {
+				t.Fatalf("resubmission: %v created=%v", err, created)
+			}
+			spoil(again)
+			got, _, _ := store.Get(ctx, "run")
+			spoil(got)
+			listed, _ := store.List(ctx)
+			spoil(listed[0])
+
+			sent, err := e.Process(ctx, "run")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rec.got) != 1 || !samePayees(rec.got[0], ps) {
+				t.Fatalf("the signer was asked to pay %+v, want the payees submitted", rec.got)
+			}
+			want := append([]Outpoint(nil), sent.Inputs...)
+			spoil(sent)
+			stored, _, _ := store.Get(ctx, "run")
+			if !samePayees(stored.Payees, ps) || !slices.Equal(stored.Inputs, want) {
+				t.Error("an edit of the intent Process returned reached the stored record")
+			}
+			if _, _, err := e.SubmitBatch(ctx, "run", ps, 1000); err != nil {
+				t.Errorf("the batch as submitted is no longer the stored batch: %v", err)
+			}
+		})
+	}
+}
+
+// A batch that waited while Created, here on an engine with no batch signer,
+// has sent nothing. When the node refuses its first send it is Failed with
+// its inputs free, as any first send is; it is not held for an operator.
+func TestBatchThatWaitedBeforeBuildFailsOnAFirstRejection(t *testing.T) {
+	ctx := context.Background()
+	spent := utxo.NewSpentSet("", nil)
+	net := &fakeNet{mode: "reject"}
+	e, rec := newBatchEngine(t, NewMemStore(), spent, net)
+	if _, _, err := e.SubmitBatch(ctx, "run", payees(t, 3, 1_000_000_000), 1000); err != nil {
+		t.Fatal(err)
+	}
+	e.BuildSignBatch = nil
+	for i := 0; i < 2; i++ {
+		if in, err := e.Process(ctx, "run"); err == nil || in.State != StateCreated {
+			t.Fatalf("with no batch signer: err %v, state %s; want an error and Created", err, in.State)
+		}
+	}
+	e.BuildSignBatch = rec.sign
+	in, err := e.Process(ctx, "run")
+	if err == nil || errors.Is(err, ErrHeld) || in.State != StateFailed || in.Hold != "" {
+		t.Fatalf("first send refused: err %v, state %s, hold %q; want the rejection, Failed, no hold", err, in.State, in.Hold)
+	}
+	if net.sentCount() != 1 {
+		t.Fatalf("sent %d times, want 1", net.sentCount())
+	}
+	if n := spent.Size(); n != 0 {
+		t.Errorf("%d inputs still marked after a first send the node refused", n)
+	}
+}
+
+// A store file that holds a batch is version 2, which a release from before
+// batches refuses to open: it would write the batch back without its payees.
+// A store with no batch stays version 1.
+func TestFileStoreWithABatchIsVersionTwo(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "intents.json")
+	version := func() int {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f struct {
+			Version int `json:"version"`
+		}
+		if err := json.Unmarshal(data, &f); err != nil {
+			t.Fatal(err)
+		}
+		return f.Version
+	}
+	fs, err := NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := newBatchEngine(t, fs, utxo.NewSpentSet("", nil), &fakeNet{mode: "ok"})
+	ps := payees(t, 2, 1_000_000_000)
+	if _, _, err := e.Submit(ctx, "single", ps[0].Address, ps[0].Amount, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if v := version(); v != 1 {
+		t.Fatalf("a store with no batch is version %d, want 1", v)
+	}
+	if _, _, err := e.SubmitBatch(ctx, "run", ps, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if v := version(); v != 2 {
+		t.Fatalf("a store with a batch is version %d, want 2", v)
+	}
+	reopened, err := NewFileStore(path)
+	if err != nil {
+		t.Fatalf("this release does not open its own batch store: %v", err)
+	}
+	got, ok, _ := reopened.Get(ctx, "run")
+	if !ok || !samePayees(got.Payees, ps) {
+		t.Fatalf("the reopened store holds %+v, want the batch with its payees", got)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":3,"intents":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFileStore(path); err == nil {
+		t.Error("a store file of a later version was opened")
 	}
 }
