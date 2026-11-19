@@ -588,6 +588,8 @@ The depth is a number of confirmations. It depends on the amount.
 
 `htlc.MinDepth` gives the depth for an amount. You can ask for more. `Fund` refuses less.
 
+`Fund` refuses an amount below `htlc.MinAmount`, 419,300 shors. A claim of a smaller output can't pay its fee and stay above the node's relay floor.
+
 `htlc.BuildFunding` builds the same transaction in every chain state. It can't see the chain. Make the check of `Fund` yourself before you broadcast what it built.
 
 ### Check your own key
@@ -613,6 +615,8 @@ A claim doesn't signal replacement. Sending it again with a higher fee doesn't r
 ### Read the secret from a block
 
 `htlc.FindSecret` reads mined blocks for the spend of the contract. It accepts a secret by its SHA-256. It doesn't read the mempool. A node that is still syncing may not hold the spend yet. `FindSecret` then answers `rpc.ErrNodeSyncing`. Ask again.
+
+A node started with `-witnessprune` discards the witness data of old blocks. It prints a claim there with no witness. `FindSecret` answers `htlc.ErrNoWitness` for such a spend. That answer says nothing about the secret. Ask a node that keeps the data.
 
 ### The `soq-htlc` command
 

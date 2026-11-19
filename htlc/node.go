@@ -174,13 +174,16 @@ func (party Party) keyHash() ([32]byte, error) {
 
 // check returns the depth of the terms and the contract's output script
 // after refusing parameters Validate refuses, an amount outside the node's
-// range and a depth below the floor.
+// range or below MinAmount, and a depth below the floor.
 func (t Terms) check() (depth int64, script []byte, err error) {
 	if script, err = t.Params.OutputScript(); err != nil {
 		return 0, nil, err
 	}
 	if t.Amount <= 0 || t.Amount > tx.MaxMoney {
 		return 0, nil, fmt.Errorf("%w: amount %d", tx.ErrInvalidAmount, t.Amount)
+	}
+	if t.Amount < MinAmount {
+		return 0, nil, fmt.Errorf("%w: amount %d, and no claim spends an output below %d", tx.ErrBelowDust, t.Amount, int64(MinAmount))
 	}
 	floor := MinDepth(t.Amount)
 	switch {
@@ -229,10 +232,25 @@ func active(info *rpc.BlockchainInfo, depth int64) error {
 	return nil
 }
 
+// outpointID refuses a transaction id that is not 64 hexadecimal digits. A
+// node reads more spellings than that as one id: "0x" before it, and
+// characters after it.
+func outpointID(txid string) error {
+	if id, err := hex.DecodeString(txid); err != nil || len(id) != sha256.Size {
+		return fmt.Errorf("%w: %q", ErrOutpoint, txid)
+	}
+	return nil
+}
+
 // output returns what the node holds at the outpoint, its mempool counted,
-// and refuses an absent or spent output (ErrNotFunded) and one whose script
-// is not want, the contract's 34 bytes (ErrFundedOutput).
+// and refuses an id that is not 64 hexadecimal digits before the node is
+// asked for the output (ErrOutpoint), an absent or spent output
+// (ErrNotFunded) and one whose script is not want, the contract's 34 bytes
+// (ErrFundedOutput).
 func output(ctx context.Context, node Node, want []byte, txid string, vout uint32) (*rpc.TxOut, error) {
+	if err := outpointID(txid); err != nil {
+		return nil, err
+	}
 	out, err := node.GetTxOut(ctx, txid, vout, true)
 	if err != nil {
 		return nil, err
@@ -280,16 +298,17 @@ func send(ctx context.Context, node Node, t *tx.Transaction, record Record) erro
 // Refused before the node is asked: a party whose own key begins 0xff
 // (keys.ErrInvalidPublicKey) or does not hash to Params.PayerKeyHash
 // (ErrWrongKey), since the payer of such a contract can never refund; terms
-// with parameters Validate refuses, an amount outside the node's range or a
-// depth below MinDepth; a change address of another network. Refused on the
+// with parameters Validate refuses, an amount outside the node's range or
+// below MinAmount (tx.ErrBelowDust), which no claim could spend, or a depth
+// below MinDepth; a change address of another network. Refused on the
 // node's reply: another chain, a node that is not synchronised, the
 // activation rule above, and a lock height fewer than LockMargin blocks above
 // the tip (ErrLockTooNear). Then BuildFunding, and every input is signed and
 // verified.
 //
 // record, when set, receives the signed transaction before it is sent. The
-// transaction is returned whenever one was signed, also beside an error of
-// the record or of the broadcast. After rpc.ErrUnknownOutcome the caller
+// transaction is returned whenever one was signed and verified, also beside
+// an error of the record or of the broadcast. After rpc.ErrUnknownOutcome the caller
 // sends those bytes again and does not call Fund again: a second call builds
 // a second funding. Fund cannot see an earlier funding of the same contract.
 func Fund(ctx context.Context, node Node, party Party, terms Terms, f Funding, record Record) (types.UTXO, *tx.Transaction, error) {
@@ -422,8 +441,8 @@ func audit(ctx context.Context, node Node, network types.Network, terms Terms, d
 //
 // The claim is built by BuildClaim on the value the node holds. record, when
 // set, receives it before it is sent; its bytes hold the secret. The
-// transaction is returned whenever one was signed, also beside an error of
-// the record, of the second read below or of the broadcast. A claim does not
+// transaction is returned whenever one was signed and verified, also beside
+// an error of the record, of the second read below or of the broadcast. A claim does not
 // signal replacement: its fee is raised by a transaction that spends its
 // output.
 //
@@ -519,9 +538,15 @@ func Refund(ctx context.Context, node Node, party Party, p Params, txid string, 
 
 // FindSecret reads the blocks from fromHeight to the node's tip for the
 // transaction that spends the outpoint and returns the secret its witness
-// shows (SecretFromWitness) with the transaction's id. A spend that shows no
-// secret, a refund, gives ErrNoSecret with the id; no spend in the range
-// gives ErrNoSpend. The node's mempool is not read.
+// shows (SecretFromWitness) with the transaction's id. A spend whose witness
+// shows no secret, as a refund's does not, gives ErrNoSecret with the id; no
+// spend in the range gives ErrNoSpend. The node's mempool is not read.
+//
+// A spend the node prints with no witness items gives ErrNoWitness with the
+// id, and says nothing about the secret: a node started with -witnessprune
+// discards the witness data of blocks below its reorganisation depth limit,
+// and prints a claim there as it prints a refund. Ask a node that keeps the
+// data.
 //
 // The transaction id is 64 hexadecimal digits in either case, as a node takes
 // it (ErrOutpoint otherwise, before the node is asked). The secret is accepted
@@ -537,8 +562,8 @@ func Refund(ctx context.Context, node Node, party Party, p Params, txid string, 
 // otherwise the chain was reorganised under the read and the answer is
 // ErrTipMoved, which is transient.
 func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint32, fromHeight int64) (secret [32]byte, spender string, err error) {
-	if id, err := hex.DecodeString(txid); err != nil || len(id) != sha256.Size {
-		return [32]byte{}, "", fmt.Errorf("%w: %q", ErrOutpoint, txid)
+	if err := outpointID(txid); err != nil {
+		return [32]byte{}, "", err
 	}
 	info, err := node.GetBlockchainInfo(ctx)
 	if err != nil {
@@ -574,6 +599,9 @@ func FindSecret(ctx context.Context, node Node, p Params, txid string, vout uint
 			for _, in := range t.Vin {
 				if !strings.EqualFold(in.TxID, txid) || in.Vout != vout {
 					continue
+				}
+				if len(in.Witness) == 0 {
+					return [32]byte{}, t.TxID, fmt.Errorf("%w: %s in block %d", ErrNoWitness, t.TxID, height)
 				}
 				items := make([][]byte, len(in.Witness))
 				for i, item := range in.Witness {

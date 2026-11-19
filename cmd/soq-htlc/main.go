@@ -46,6 +46,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"os/signal"
@@ -322,11 +323,12 @@ func recorder(path, step string) (htlc.Record, error) {
 	if path == "" {
 		return nil, errors.New("-record: name a new file for the signed transaction")
 	}
+	path = filepath.Clean(path) // one spelling for the look, the create and the write
 	if _, err := os.Lstat(path); err == nil {
 		return nil, fmt.Errorf("-record: %s exists; a transaction was already built under it", path)
 	}
 	return func(txid, rawHex string) error {
-		f, err := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return err
 		}
@@ -357,6 +359,16 @@ func recorded(err error, t *tx.Transaction, path string) error {
 		return fmt.Errorf("%w\nnothing was sent. transaction %s is in %s, which holds the secret: do not send those bytes, now or later. Run the step again under a new record; it refuses before it signs once the margin is gone", err, t.TxID(), path)
 	}
 	return fmt.Errorf("%w\ntransaction %s is in %s: if the node may hold it, send those bytes again and build no second one", err, t.TxID(), path)
+}
+
+// result prints the line of a step whose transaction the node took. A line
+// that cannot be written is no refusal of the step, and the error says so:
+// the transaction was sent, and the record holds it.
+func (e env) result(t *tx.Transaction, path, format string, values ...any) error {
+	if _, err := fmt.Fprintf(e.stdout, format, values...); err != nil {
+		return fmt.Errorf("the node took transaction %s, recorded in %s, and the result line could not be written: %w; build no second one", t.TxID(), path, err)
+	}
+	return nil
 }
 
 func (e env) keyHash(_ context.Context, o *options) error {
@@ -469,8 +481,7 @@ func (e env) fund(ctx context.Context, o *options) error {
 	if err != nil {
 		return recorded(err, t, o.record)
 	}
-	_, err = fmt.Fprintf(e.stdout, "funded %s:%d with %d shors\n", funded.TxID, funded.Vout, funded.Value)
-	return err
+	return e.result(t, o.record, "funded %s:%d with %d shors\n", funded.TxID, funded.Vout, funded.Value)
 }
 
 func (e env) audit(ctx context.Context, o *options) error {
@@ -500,19 +511,22 @@ func (e env) audit(ctx context.Context, o *options) error {
 }
 
 // readSecret reads the secret, 64 hexadecimal digits, from a file that its
-// owner alone can read. No error holds a byte of the file.
+// owner alone can read. No error holds a byte of the file, and none holds
+// the path: the secret itself, passed in place of its file's name, is a path
+// that does not exist.
 func readSecret(path string) ([32]byte, error) {
 	var secret [32]byte
+	path = filepath.Clean(path) // one spelling for the look and the read
 	info, err := os.Stat(path)
 	if err != nil {
-		return secret, fmt.Errorf("-secret-file: %w", err)
+		return secret, fmt.Errorf("-secret-file: %w", withoutPath(err))
 	}
 	if mode := info.Mode().Perm(); mode&0o077 != 0 && runtime.GOOS != "windows" {
-		return secret, fmt.Errorf("-secret-file: %s has mode %04o, readable by others; want 0600", path, mode)
+		return secret, fmt.Errorf("-secret-file: the file has mode %04o, open to others; want 0600", mode)
 	}
-	data, err := os.ReadFile(filepath.Clean(path))
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return secret, fmt.Errorf("-secret-file: %w", err)
+		return secret, fmt.Errorf("-secret-file: %w", withoutPath(err))
 	}
 	digits := bytes.TrimSpace(data)
 	if len(digits) != hex.EncodedLen(len(secret)) {
@@ -522,6 +536,15 @@ func readSecret(path string) ([32]byte, error) {
 		return [32]byte{}, errors.New("-secret-file: want 64 hexadecimal digits")
 	}
 	return secret, nil
+}
+
+// withoutPath returns the cause of a file error without the path it names.
+func withoutPath(err error) error {
+	var named *fs.PathError
+	if errors.As(err, &named) {
+		return named.Err
+	}
+	return err
 }
 
 func (e env) claim(ctx context.Context, o *options) error {
@@ -554,8 +577,7 @@ func (e env) claim(ctx context.Context, o *options) error {
 	if err != nil {
 		return recorded(err, t, o.record)
 	}
-	_, err = fmt.Fprintf(e.stdout, "claim %s sent\n", t.TxID())
-	return err
+	return e.result(t, o.record, "claim %s sent\n", t.TxID())
 }
 
 func (e env) refund(ctx context.Context, o *options) error {
@@ -580,8 +602,7 @@ func (e env) refund(ctx context.Context, o *options) error {
 	if err != nil {
 		return recorded(err, t, o.record)
 	}
-	_, err = fmt.Fprintf(e.stdout, "refund %s sent\n", t.TxID())
-	return err
+	return e.result(t, o.record, "refund %s sent\n", t.TxID())
 }
 
 func (e env) secret(ctx context.Context, o *options) error {

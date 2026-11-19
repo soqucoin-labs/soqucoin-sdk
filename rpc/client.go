@@ -656,7 +656,33 @@ type BlockchainInfo struct {
 	// deployment it reports, the first height the deployment is active at:
 	// 0 from genesis, 2147483647 for a deployment with no height. Nil when
 	// the node does not print the object.
-	ActivationHeights map[string]int64 `json:"activation_heights"`
+	ActivationHeights ActivationHeights `json:"activation_heights"`
+}
+
+// ActivationHeights are the heights of BlockchainInfo by deployment name.
+type ActivationHeights map[string]int64
+
+// UnmarshalJSON reads the node's object and leaves out a name whose height is
+// printed as null. Read into an int64, null would be 0, the height of a
+// deployment active from genesis; left out, the name is one the node does not
+// report. A height that is no whole number is an error, as before.
+func (h *ActivationHeights) UnmarshalJSON(data []byte) error {
+	var printed map[string]*int64
+	if err := json.Unmarshal(data, &printed); err != nil {
+		return err
+	}
+	if printed == nil {
+		*h = nil
+		return nil
+	}
+	heights := make(ActivationHeights, len(printed))
+	for name, height := range printed {
+		if height != nil {
+			heights[name] = *height
+		}
+	}
+	*h = heights
+	return nil
 }
 
 // RequireSynced returns ErrNodeSyncing (a transient error) unless the node
