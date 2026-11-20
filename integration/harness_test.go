@@ -79,7 +79,9 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func startNode(t *testing.T) *node {
+// startNode starts a regtest node. extra is appended to its arguments, for a
+// case that needs a chain option of its own.
+func startNode(t *testing.T, extra ...string) *node {
 	t.Helper()
 	if *soqucoind == "" {
 		t.Skip("set -soqucoind or SOQUCOIND to a regtest-capable soqucoind to run the integration harness")
@@ -93,6 +95,7 @@ func startNode(t *testing.T) *node {
 		"-maxreorgdepth=" + strconv.FormatInt(types.MaxReorgDepth, 10), // mirror mainnet's horizon
 		"-port=" + strconv.Itoa(p2p), "-rpcport=" + strconv.Itoa(rpcPort), "-datadir=" + dir, "-daemon=0",
 	}
+	args = append(args, extra...)
 	cmd := exec.Command(*soqucoind, args...)
 	logf, err := os.Create(filepath.Join(dir, "stdout.log"))
 	if err != nil {

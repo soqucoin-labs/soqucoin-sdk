@@ -68,9 +68,9 @@ type swapBench struct {
 	used                        map[string]bool
 }
 
-func newSwapBench(t *testing.T) *swapBench {
+func newSwapBench(t *testing.T, nodeArgs ...string) *swapBench {
 	t.Helper()
-	b := &swapBench{t: t, n: startNode(t), keys: signers{}, used: map[string]bool{}}
+	b := &swapBench{t: t, n: startNode(t, nodeArgs...), keys: signers{}, used: map[string]bool{}}
 	add := func() string {
 		m, addr := newKey(t)
 		b.keys[addr] = m

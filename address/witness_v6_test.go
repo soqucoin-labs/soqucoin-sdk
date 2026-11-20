@@ -3,7 +3,8 @@
 //
 // DecodeWitnessV6 on strings the vectors shared with the node do not hold:
 // bytes above 126, bytes at the edges of the ranges the byte and case checks
-// test, and strings that fail two checks at once.
+// test, and strings that fail two checks or more, where the order of the
+// checks decides the reason, with two under each prefix that fail one.
 
 package address
 

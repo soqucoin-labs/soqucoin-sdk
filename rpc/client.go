@@ -652,6 +652,43 @@ type BlockchainInfo struct {
 	Difficulty    float64 `json:"difficulty"`
 	MedianTime    int64   `json:"mediantime"`
 	InitialSync   bool    `json:"initialblockdownload"`
+	// ActivationHeights holds, by the node's name of each height-gated
+	// deployment it reports, the first height the deployment is active at:
+	// 0 from genesis, 2147483647 for a deployment with no height. Nil when
+	// the node does not print the member as an object. A name whose height
+	// the client cannot read is not in the map (ActivationHeights).
+	ActivationHeights ActivationHeights `json:"activation_heights"`
+}
+
+// ActivationHeights are the heights of BlockchainInfo by deployment name.
+type ActivationHeights map[string]int64
+
+// UnmarshalJSON reads the node's object and returns no error: the same reply
+// tells every caller of GetBlockchainInfo whether the node is synchronised,
+// and no form of this member takes that answer away. A member that is no
+// object reads as no member. A name is kept when its height is printed as an
+// integer in digits alone that an int64 holds. It is left out when the height
+// is null or anything else: a fraction, exponent form, a string, a number
+// past int64. Read into an int64, null would be 0, the height of a deployment
+// active from genesis; left out, the name is one the node does not report.
+func (h *ActivationHeights) UnmarshalJSON(data []byte) error {
+	var printed map[string]json.RawMessage
+	if json.Unmarshal(data, &printed) != nil || printed == nil {
+		*h = nil
+		return nil
+	}
+	heights := make(ActivationHeights, len(printed))
+	for name, raw := range printed {
+		var height *int64
+		if json.Unmarshal(raw, &height) != nil {
+			continue
+		}
+		if height != nil {
+			heights[name] = *height
+		}
+	}
+	*h = heights
+	return nil
 }
 
 // RequireSynced returns ErrNodeSyncing (a transient error) unless the node

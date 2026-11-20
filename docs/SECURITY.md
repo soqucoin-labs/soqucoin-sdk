@@ -521,7 +521,9 @@ A witness version 6 address starts with `sq1x` or `ssq1x`. It names a script out
 
 An address doesn't show which script it commits to. Derive the witnessScript yourself. Compare its SHA-256 with the decoded bytes.
 
-`tx.ScriptWitnessV6` builds the same script in every chain state. A chain runs a version 6 script only from its activation height. Below that height, consensus does not check the script the address commits to. Fund a version 6 output only after the block at the activation height has `nMaxReorgDepth` confirmations. `nMaxReorgDepth` is the node's reorganisation depth limit. The node's relay rule reads the tip once. The mempool does not apply the relay rule again when the tip moves back. An accepted transaction can then confirm in a block below the activation height.
+`tx.ScriptWitnessV6` builds the same script in every chain state. A chain runs a version 6 script from its activation height on. Below that height, consensus does not check the script the address commits to. Fund a version 6 output after the block at the activation height has `nMaxReorgDepth` confirmations. `nMaxReorgDepth` is the node's reorganisation depth limit. The node applies the limit when a header arrives. It doesn't apply it during initial block download. Regtest has no limit and no relay rule for these outputs. `htlc.Fund` waits the swap's depth instead. [Swap contracts](#swap-contracts) has the figures.
+
+The node's relay rule reads the tip once. Through v2.6.1, the mempool keeps what it holds when the tip moves back. The transactions of a disconnected block meet the relay rule again. A transaction the mempool kept can then confirm in a block below the activation height.
 
 ### Amounts
 
@@ -565,6 +567,64 @@ soqucoin-cli testmempoolaccept '["<rawHex>"]'
 
 See [Exchange Integration](EXCHANGE_INTEGRATION.md#fee-estimation) for converting
 a node fee estimate into a per-vByte rate.
+
+---
+
+## Swap contracts
+
+`htlc` builds the Soqucoin side of a cross-chain swap. The contract is one witness version 6 output. The payee claims it with a 32-byte secret. The payer takes it back from the lock height on.
+
+### Fund through `htlc.Fund`
+
+Below the activation height, anyone who gets a block can spend a version 6 output. `htlc.Fund` asks your node for three activation heights. Their names are `p2wsh_dilithium`, `dilithium_keyhash` and `v6_controlflow`. `Fund` sends nothing until the tip is the swap's depth above each height. It refuses a node that doesn't report all three. Node releases through v2.6.1 don't report them.
+
+The depth is a number of confirmations. It depends on the amount.
+
+| Amount | Depth |
+|--------|:-----:|
+| Up to 100 SOQ | 30 |
+| Up to 10,000 SOQ | 120 |
+| Above 10,000 SOQ | 288 |
+
+`htlc.MinDepth` gives the depth for an amount. You can ask for more. `Fund` refuses less.
+
+`Fund` refuses an amount below `htlc.MinAmount`, 419,300 shors. A claim of a smaller output can't pay its fee and stay above the node's relay floor.
+
+`htlc.BuildFunding` builds the same transaction in every chain state. It can't see the chain. Make the check of `Fund` yourself before you broadcast what it built.
+
+### Check your own key
+
+The node refuses a public key whose first byte is `0xff`. One ML-DSA-44 key in 256 begins that way. A payer with such a key could never refund. `htlc.KeyHash` refuses that key. Derive your key hash with it before you agree a contract. Each function that signs or audits checks your key before it asks the node and before the signer signs. You can't check the other party's key.
+
+### Audit before you act
+
+`htlc.Audit` compares the funded output with the terms you agreed. It derives the script from the four parameters. An address the other party sent takes no part. `Audit` refuses a spent output and an output with a spend in the mempool. It refuses a value below the amount. It refuses a funding below the depth.
+
+### Claim with a margin
+
+A claim shows the secret to every node it reaches. `htlc.Claim` makes every check of the audit before it asks the signer. It adds the depth to the blocks you allow for inclusion. It refuses when the lock height is nearer than that sum. Past that point a refund could take the output after the secret is public.
+
+Signing and recording take time. `Claim` reads the tip again once your `Record` function is done. That read can find the tip too near the lock height. It can also fail. In both cases `Claim` answers `htlc.ErrLockTooNear` and hands you the signed claim. Nothing was sent. Your next step depends on the secret. Has no chain shown the secret yet? Then don't send those bytes later. They show the secret. The payer's refund is valid from the lock height. Call `Claim` again if you still want the output. It refuses before it signs when the margin is gone. Does the other chain already show your secret? Then you have nothing to keep private. Send the recorded bytes at once with the node's `sendrawtransaction`. Your claim has to be mined before the payer's refund.
+
+A claim doesn't signal replacement. Sending it again with a higher fee doesn't replace it. Raise the fee with a transaction that spends the claim's output. Leave room in the fee you start with.
+
+### Keep a record of each transaction
+
+`Fund`, `Claim` and `Refund` pass the signed transaction to your `Record` function. The node gets it after that. Store the bytes. After `rpc.ErrUnknownOutcome`, send the same bytes again. Don't call `Fund` a second time. A second call builds a second funding. Its amount stays locked until the lock height. The record of a claim holds the secret.
+
+### Read the secret from a block
+
+`htlc.FindSecret` reads mined blocks for the spend of the contract. It accepts a secret by its SHA-256. It doesn't read the mempool. A node that is still syncing may not hold the spend yet. `FindSecret` then answers `rpc.ErrNodeSyncing`. Ask again.
+
+A node started with `-witnessprune` discards the witness data of old blocks. It prints a claim there with no witness. `FindSecret` answers `htlc.ErrNoWitness` for such a spend. That answer says nothing about the secret. Ask a node that keeps the data.
+
+### The `soq-htlc` command
+
+`cmd/soq-htlc` runs each step from a terminal. Every rule of the contract is in package `htlc`. The command checks the inputs of a funding itself: it refuses one named twice, spent, unconfirmed, paying another script, or a coinbase output below maturity. The command reads the keystore passphrase from `SOQ_KEYSTORE_PASSPHRASE`. It reads the secret from a file with mode 0600. Neither is a flag. It writes each record to a new file with mode 0600. It refuses a record file that exists.
+
+### Swap errors and the circuit breaker
+
+`resilience.CircuitBreaker` doesn't list the errors of `htlc`. It counts a refusal like `htlc.ErrShallow` as a system failure. That refusal is about one contract. Add the `htlc` errors you expect to `PerRequestErrors` before you pass swap calls through a breaker.
 
 ---
 

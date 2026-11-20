@@ -6,9 +6,12 @@ package htlc
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -608,6 +611,13 @@ func TestVerifySpendRefusesEachChange(t *testing.T) {
 		if want == tx.ErrHashType && !errors.Is(err, ErrSpendForm) {
 			t.Errorf("%s, %s: %v is not ErrSpendForm", kind, name, err)
 		}
+		// No refusal prints an item of the witness it refused: a claim's
+		// witness holds the secret.
+		if err != nil {
+			for _, in := range tr.Inputs {
+				holdsNoItem(t, kind+", "+name, err, in.WitnessData)
+			}
+		}
 	}
 	claim, refund := w.claim(t), w.refund(t)
 	for _, c := range both {
@@ -773,6 +783,34 @@ func TestBuildersRefuseTheInvalidKeyMarkerBeforeTheSignerIsAsked(t *testing.T) {
 	}
 }
 
+// holdsNoItem fails when the text of err holds one of the items in a form a
+// formatter writes: hexadecimal in either case or spaced, a decimal list,
+// base 64, quoted, or the raw bytes. Items under eight bytes are left out: a
+// selector or a count is in many texts by chance.
+func holdsNoItem(t *testing.T, name string, err error, items [][]byte) {
+	t.Helper()
+	text := err.Error()
+	for i, item := range items {
+		if len(item) < 8 {
+			continue
+		}
+		lower := hex.EncodeToString(item)
+		for form, written := range map[string]string{
+			"hexadecimal":            lower,
+			"upper-case hexadecimal": strings.ToUpper(lower),
+			"spaced hexadecimal":     fmt.Sprintf("% x", item),
+			"a decimal list":         strings.Trim(fmt.Sprintf("%d", item), "[]"),
+			"base 64":                base64.StdEncoding.EncodeToString(item),
+			"quoted":                 strings.Trim(strconv.Quote(string(item)), `"`),
+			"raw bytes":              string(item),
+		} {
+			if strings.Contains(text, written) {
+				t.Errorf("%s: the refusal holds witness item %d (%d bytes) as %s", name, i, len(item), form)
+			}
+		}
+	}
+}
+
 // sharing is a signer that hands out one slice of its own for the key.
 type sharing struct {
 	inner tx.Signer
@@ -787,22 +825,33 @@ func (s sharing) PublicKeyFor(string) ([]byte, error)     { return s.key, nil }
 // to the key item does not change the signer's key.
 func TestSpendHoldsItsOwnCopyOfTheKey(t *testing.T) {
 	w := newWorld(t)
-	own := append([]byte(nil), w.payee.pub...)
-	tr, err := BuildClaim(w.p, w.funded, w.preimage, w.payee.addr, testFeeRate, sharing{inner: w.m, key: own}, w.payee.addr)
-	if err != nil {
-		t.Fatalf("BuildClaim: %v", err)
-	}
-	own[5] ^= 1
-	if !bytes.Equal(tr.Inputs[0].WitnessData[1], w.payee.pub) {
-		t.Error("the key item changed with the signer's slice")
-	}
-	if err := VerifySpend(tr, w.p, testFundedValue); err != nil {
-		t.Errorf("after the signer's slice changed: %v", err)
-	}
-	own[5] ^= 1
-	tr.Inputs[0].WitnessData[1][7] ^= 1
-	if !bytes.Equal(own, w.payee.pub) {
-		t.Error("the signer's slice changed with the key item")
+	for kind, who := range map[string]party{"claim": w.payee, "refund": w.payer} {
+		own := append([]byte(nil), who.pub...)
+		signer := sharing{inner: w.m, key: own}
+		var (
+			tr  *tx.Transaction
+			err error
+		)
+		if kind == "claim" {
+			tr, err = BuildClaim(w.p, w.funded, w.preimage, who.addr, testFeeRate, signer, who.addr)
+		} else {
+			tr, err = BuildRefund(w.p, w.funded, who.addr, testFeeRate, signer, who.addr)
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		own[5] ^= 1
+		if !bytes.Equal(tr.Inputs[0].WitnessData[1], who.pub) {
+			t.Errorf("%s: the key item changed with the signer's slice", kind)
+		}
+		if err := VerifySpend(tr, w.p, testFundedValue); err != nil {
+			t.Errorf("%s: after the signer's slice changed: %v", kind, err)
+		}
+		own[5] ^= 1
+		tr.Inputs[0].WitnessData[1][7] ^= 1
+		if !bytes.Equal(own, who.pub) {
+			t.Errorf("%s: the signer's slice changed with the key item", kind)
+		}
 	}
 }
 
