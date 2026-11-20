@@ -1216,5 +1216,47 @@ func TestAHeightPrintedAsNullIsNoActivationHeight(t *testing.T) {
 	}
 }
 
+// A member activation_heights that the client cannot read is a height the node
+// does not report, and no error of the reply: the functions that ask whether
+// a node is synchronised read the same reply and take no part in a swap. Fund
+// and Audit refuse such a node as they refuse one that prints no heights, and
+// nothing is signed, recorded or sent.
+func TestAHeightTheClientCannotReadIsNoActivationHeight(t *testing.T) {
+	b := newBench(t)
+	script, _ := b.p.OutputScript()
+	out := fmt.Sprintf(`{"bestblock":"aa","confirmations":30,"value":5.00000000,"scriptPubKey":{"hex":"%x"},"coinbase":false}`, script)
+	info := func(heights string) string {
+		return `{"chain":"main","blocks":1000,"headers":1000,"bestblockhash":"aa","initialblockdownload":false,"activation_heights":` + heights + `}`
+	}
+	others := `,"dilithium_keyhash":0,"v6_controlflow":0}`
+	for name, heights := range map[string]string{
+		"a height with a fraction":  `{"p2wsh_dilithium":970.5` + others,
+		"a height in exponent form": `{"p2wsh_dilithium":1e2` + others,
+		"a height as a string":      `{"p2wsh_dilithium":"970"` + others,
+		"a height above int64":      `{"p2wsh_dilithium":9223372036854775808` + others,
+		"a height as an object":     `{"p2wsh_dilithium":{"height":970,"status":"active"}` + others,
+		"the member as an array":    `[{"name":"p2wsh_dilithium","height":970}]`,
+		"the member as a string":    `"none"`,
+	} {
+		client, sent := through(t, info(heights), out)
+		b := newBench(t)
+		_, tr, err := Fund(context.Background(), client, b.party(b.payer), b.terms, b.funding(), b.keep)
+		if !errors.Is(err, ErrNoActivationHeights) || tr != nil || *sent != 0 {
+			t.Errorf("%s: Fund returned %v, a transaction (%v) and sent %d; want ErrNoActivationHeights and nothing", name, err, tr != nil, *sent)
+		}
+		b.quiet(t, name)
+		if _, err := Audit(context.Background(), client, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, 0); !errors.Is(err, ErrNoActivationHeights) {
+			t.Errorf("%s: Audit returned %v, want ErrNoActivationHeights", name, err)
+		}
+	}
+
+	// A further name in a form the client cannot read leaves the three names
+	// the contract needs as the node printed them.
+	client, _ := through(t, info(`{"p2wsh_dilithium":970,"dilithium_keyhash":970,"v6_controlflow":0,"another":"soon"}`), out)
+	if _, err := Audit(context.Background(), client, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, 0); err != nil {
+		t.Errorf("the three heights as numbers beside a name that is none: %v", err)
+	}
+}
+
 // *rpc.Client is a Node.
 var _ Node = (*rpc.Client)(nil)
