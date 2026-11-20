@@ -2445,8 +2445,8 @@
       "file": "cmd/soq-htlc/main.go",
       "package": "./cmd/soq-htlc",
       "test": "TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling",
-      "find": "\tif _, err := os.Lstat(path); err == nil {\n\t\treturn nil, fmt.Errorf(\"-record: %s exists",
-      "replace": "\tif _, err := os.Lstat(filepath.Clean(path)); err == nil {\n\t\treturn nil, fmt.Errorf(\"-record: %s exists",
+      "find": "\tpath = filepath.Clean(path) // one spelling for the look, the create and the write\n\tif _, err := os.Lstat(path); err == nil {",
+      "replace": "\tgiven := path\n\tpath = filepath.Clean(path)\n\tif _, err := os.Lstat(given); err == nil {",
       "why": "Through a symbolic link followed by .. the path as given and the cleaned path are two files. A look at one and a create at the other refuses a record that exists only after the keystore has signed."
     },
     {

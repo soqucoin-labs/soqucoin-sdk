@@ -326,11 +326,13 @@ func parseOutpoint(name, s string) (string, uint32, error) {
 
 // recordPath returns the value of -record in the one spelling a step uses:
 // for the look, the create and the write of recorder and in every text that
-// names the record. The flag is cleaned once, here. Cleaned as text, a path
-// through a symbolic link followed by ".." is another file than the path as
-// given, so a text with the one beside a record at the other would name a
-// file the transaction is not in. An empty value stays empty and recorder
-// refuses it by its own text: cleaned, it would be the working directory.
+// names the record. The flag is cleaned here, once for all of them; recorder
+// cleans what it is handed, which leaves a cleaned path as it is. Cleaned as
+// text, a path through a symbolic link followed by ".." is another file than
+// the path as given, so a text with the one beside a record at the other
+// would name a file the transaction is not in. An empty value stays empty and
+// recorder refuses it by its own text: cleaned, it would be the working
+// directory.
 func (o *options) recordPath() string {
 	if o.record == "" {
 		return ""
@@ -343,11 +345,13 @@ func (o *options) recordPath() string {
 // A path that exists is refused here, before the keystore signs anything, and
 // again when the file is made: the file of an earlier run may be the one copy
 // of a transaction the node already has. The look, the create and the write
-// use path as recordPath returned it.
+// use one spelling, the cleaned one, which is the path as recordPath returned
+// it.
 func recorder(path, step string) (htlc.Record, error) {
 	if path == "" {
 		return nil, errors.New("-record: name a new file for the signed transaction")
 	}
+	path = filepath.Clean(path) // one spelling for the look, the create and the write
 	if _, err := os.Lstat(path); err == nil {
 		return nil, fmt.Errorf("-record: %s exists; a transaction was already built under it", path)
 	}
