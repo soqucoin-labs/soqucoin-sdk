@@ -1772,7 +1772,7 @@
       "test": "TestMinDepthAtTheAmountLines",
       "find": "\tcase amount <= 100*types.ShorsPerSOQ:",
       "replace": "\tcase amount < 100*types.ShorsPerSOQ:",
-      "why": "The lines are 30 up to and including 100 SOQ and 120 up to and including 10,000 SOQ, as the exchange guide's sample has them."
+      "why": "The lines are 30 up to and including 100 SOQ and 120 up to and including 10,000 SOQ."
     },
     {
       "id": "htlc-min-depth-line-at-10000",
@@ -2411,7 +2411,7 @@
       "test": "TestTermsRefuseAnAmountNoClaimCanSpend",
       "find": "\tif t.Amount < MinAmount {",
       "replace": "\tif false && t.Amount < MinAmount {",
-      "why": "An output below MinAmount is funded and then spent by no claim and no refund of the package: each would leave its one output below the relay floor."
+      "why": "An output below MinAmount is funded and then spent by no claim of the package: the claim would leave its one output below the relay floor. A refund takes it back from 418,500 shors up."
     },
     {
       "id": "htlc-min-amount-one-shor-low",

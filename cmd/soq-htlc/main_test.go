@@ -773,8 +773,10 @@ func TestTheRecordedTransactionsCarryTheNodesValueAndTheFeeRateAsked(t *testing.
 }
 
 // The tip moves into the margin while the claim is signed and recorded. The
-// claim is in the record and was not sent, and the error says what that means:
-// the record holds the secret and its bytes are not for the node.
+// claim is in the record and was not sent, and the error says what that means
+// for each party: a claim that would show the secret for the first time stays
+// unsent, and a payee whose secret the other chain already shows sends the
+// recorded bytes at once.
 func TestClaimHeldBackAfterTheRecordSaysNothingWasSent(t *testing.T) {
 	b := newBench(t)
 	b.node.later = benchTip + 1 // one block inside the depth and the inclusion
@@ -789,7 +791,8 @@ func TestClaimHeldBackAfterTheRecordSaysNothingWasSent(t *testing.T) {
 		t.Fatalf("the record holds step %q and %d bytes, want the claim that was held back", step, len(rawHex)/2)
 	}
 	text := err.Error()
-	for _, want := range []string{"nothing was sent", rec, txid, "holds the secret", "do not send"} {
+	for _, want := range []string{"nothing was sent", rec, txid, "holds the secret", "for the first time, do not send",
+		"If the other chain already shows the secret", "send those bytes at once"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the error does not hold %q: %v", want, err)
 		}

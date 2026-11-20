@@ -113,7 +113,9 @@ var (
 	// ErrLockTooNear marks a lock height with too few blocks left above the
 	// tip for the step asked. Beside a transaction it comes from the second
 	// read of Claim, which also gives it, with the cause, for a tip it could
-	// not read: the claim was not sent and its bytes are not sent later.
+	// not read: the claim was not sent. The bytes of a claim that shows the
+	// secret for the first time are not sent later; a payee whose secret the
+	// other chain already shows sends them at once (Claim).
 	ErrLockTooNear = errors.New("htlc: the lock height is too near the tip")
 
 	// ErrBeforeLockHeight marks a refund asked while the tip is below the
@@ -142,7 +144,8 @@ var (
 // MinAmount is the least amount of a contract, in shors: the least value a
 // claim built by BuildClaim spends at types.MinRelayFeeRate, the relay floor
 // of its one output and its fee. A smaller output can be funded and never
-// spent by a transaction of this package.
+// claimed by a transaction of this package; Refund takes one back from
+// 418,500 shors up at that rate.
 const MinAmount = 419_300
 
 // deployments are the node's names of the three height-gated deployments the
@@ -435,9 +438,10 @@ func audit(ctx context.Context, node Node, network types.Network, terms Terms, d
 // the tip must leave before the lock height. inclusion is the number of
 // blocks allowed for the claim to get into a block, at least 1; the claim
 // then lies at least the depth below the lock height, from which the payer's
-// refund is valid. Past that point Claim refuses (ErrLockTooNear) and the
-// secret stays private. An inclusion whose sum with the depth leaves int64
-// is refused with the same error before the node is asked.
+// refund is valid. Past that point Claim refuses (ErrLockTooNear), and a
+// secret that no chain shows yet stays private. An inclusion whose sum with
+// the depth leaves int64 is refused with the same error before the node is
+// asked.
 //
 // The claim is built by BuildClaim on the value the node holds. record, when
 // set, receives it before it is sent; its bytes hold the secret. The
@@ -448,13 +452,20 @@ func audit(ctx context.Context, node Node, network types.Network, terms Terms, d
 //
 // Neither the signer nor the record is bounded in time, so the tip is read a
 // second time after the record returned and just before the broadcast. When
-// the lock height is then nearer than depth + inclusion, or the node does not
-// answer, is on another chain or is not synchronised, Claim returns
-// ErrLockTooNear, with the cause where the read failed, beside the signed
-// claim. Nothing was sent, and those bytes are not sent later, by Claim or by
-// the caller: they show the secret, and from the lock height on the payer's
-// refund is valid. A caller that still wants the output calls Claim again,
-// which audits again and refuses before the signer once the margin is gone.
+// that read finds the lock height nearer than depth + inclusion, or cannot
+// read the tip (the node does not answer, is on another chain or is not
+// synchronised), Claim returns ErrLockTooNear, with the cause where the read
+// failed, beside the signed claim. Nothing was sent.
+//
+// What the caller does with those bytes depends on the secret. The rule is
+// for a claim that shows the secret for the first time: its bytes are not
+// sent later, by Claim or by the caller, since they show the secret and from
+// the lock height on the payer's refund is valid. A caller that still wants
+// the output calls Claim again, which audits again and refuses before the
+// signer once the margin is gone. A payee whose secret the other chain
+// already shows has nothing to keep private: its claim has to be mined before
+// the payer's refund, so it sends the recorded bytes at once. Claim does not
+// send for that payee either; inside the margin it refuses every caller.
 func Claim(ctx context.Context, node Node, party Party, terms Terms, txid string, vout uint32, preimage [32]byte, s Spend, inclusion int64, record Record) (*tx.Transaction, error) {
 	own, err := party.keyHash()
 	if err != nil {

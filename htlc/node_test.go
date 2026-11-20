@@ -1128,8 +1128,8 @@ func TestAnOutpointIdIsSixtyFourHexadecimalDigitsWhereverAnOutputIsRead(t *testi
 	}
 }
 
-// An amount below MinAmount can be funded and never claimed or refunded by a
-// transaction of this package. The terms refuse it before the node is asked,
+// An amount below MinAmount can be funded and never claimed by a transaction
+// of this package. The terms refuse it before the node is asked,
 // and MinAmount is the least value BuildClaim takes at the least fee rate a
 // node relays; a refund is the smaller transaction and takes it too.
 func TestTermsRefuseAnAmountNoClaimCanSpend(t *testing.T) {

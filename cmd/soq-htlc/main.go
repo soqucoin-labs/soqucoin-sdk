@@ -17,7 +17,8 @@
 // -address, the caller's own key. Run a command with -h for the rest.
 //
 // Each step is one function of package htlc, which makes every check of the
-// contract and refuses before anything is signed. The command checks what it
+// contract before anything is signed; Claim reads the tip once more after the
+// record. The command checks what it
 // handles itself: the inputs of a funding (an outpoint named twice, spent,
 // unconfirmed, paying another script, or a coinbase output below maturity),
 // the mode of the secret file, and a record file that exists. It reads the
@@ -36,8 +37,11 @@
 // the node's sendrawtransaction; running the step again under another record
 // builds a second transaction, and a second funding locks a second amount
 // until the lock height. The record of a claim holds the secret. A claim that
-// ends with "nothing was sent" was held back because the tip moved too near
-// the lock height while it was signed and recorded: its bytes are never sent.
+// ends with "nothing was sent" was held back because the second read found
+// the tip too near the lock height or could not read it. The bytes of a claim
+// that would show the secret for the first time are never sent. A payee whose
+// secret the other chain already shows has nothing to keep private and sends
+// the recorded bytes at once.
 package main
 
 import (
@@ -320,16 +324,30 @@ func parseOutpoint(name, s string) (string, uint32, error) {
 	return txid, uint32(vout), nil
 }
 
+// recordPath returns the value of -record in the one spelling a step uses:
+// for the look, the create and the write of recorder and in every text that
+// names the record. The flag is cleaned once, here. Cleaned as text, a path
+// through a symbolic link followed by ".." is another file than the path as
+// given, so a text with the one beside a record at the other would name a
+// file the transaction is not in. An empty value stays empty and recorder
+// refuses it by its own text: cleaned, it would be the working directory.
+func (o *options) recordPath() string {
+	if o.record == "" {
+		return ""
+	}
+	return filepath.Clean(o.record)
+}
+
 // recorder returns the record of one step: a new file at path, readable by
 // its owner alone, that holds the step, the transaction id and the raw bytes.
 // A path that exists is refused here, before the keystore signs anything, and
 // again when the file is made: the file of an earlier run may be the one copy
-// of a transaction the node already has.
+// of a transaction the node already has. The look, the create and the write
+// use path as recordPath returned it.
 func recorder(path, step string) (htlc.Record, error) {
 	if path == "" {
 		return nil, errors.New("-record: name a new file for the signed transaction")
 	}
-	path = filepath.Clean(path) // one spelling for the look, the create and the write
 	if _, err := os.Lstat(path); err == nil {
 		return nil, fmt.Errorf("-record: %s exists; a transaction was already built under it", path)
 	}
@@ -355,14 +373,16 @@ func recorder(path, step string) (htlc.Record, error) {
 
 // recorded adds, to an error that came after a transaction was recorded,
 // where its bytes are and what to do with them. htlc.ErrLockTooNear beside a
-// transaction is the second read of htlc.Claim: the claim was not sent, and
-// its bytes show the secret at a tip from which the refund can win.
+// transaction is the second read of htlc.Claim: the claim was not sent. Its
+// bytes show the secret at a tip from which the refund can win, so a claim
+// that shows the secret for the first time stays unsent; a payee whose secret
+// the other chain already shows sends them at once.
 func recorded(err error, t *tx.Transaction, path string) error {
 	if t == nil || errors.Is(err, htlc.ErrRecord) {
 		return err
 	}
 	if errors.Is(err, htlc.ErrLockTooNear) {
-		return fmt.Errorf("%w\nnothing was sent. transaction %s is in %s, which holds the secret: do not send those bytes, now or later. Run the step again under a new record; it refuses before it signs once the margin is gone", err, t.TxID(), path)
+		return fmt.Errorf("%w\nnothing was sent. transaction %s is in %s, which holds the secret. If this claim would show the secret for the first time, do not send those bytes, now or later: run the step again under a new record; it refuses before it signs once the margin is gone. If the other chain already shows the secret, there is nothing to keep private: send those bytes at once with the node's sendrawtransaction", err, t.TxID(), path)
 	}
 	return fmt.Errorf("%w\ntransaction %s is in %s: if the node may hold it, send those bytes again and build no second one", err, t.TxID(), path)
 }
@@ -470,7 +490,8 @@ func (e env) fund(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	record, err := recorder(o.record, "fund")
+	path := o.recordPath()
+	record, err := recorder(path, "fund")
 	if err != nil {
 		return err
 	}
@@ -486,9 +507,9 @@ func (e env) fund(ctx context.Context, o *options) error {
 	funded, t, err := htlc.Fund(ctx, node, party, terms,
 		htlc.Funding{Inputs: inputs, ChangeAddress: change, FeeRate: o.feeRate, LockMargin: o.lockMargin}, record)
 	if err != nil {
-		return recorded(err, t, o.record)
+		return recorded(err, t, path)
 	}
-	return e.result(t, o.record, "funded %s:%d with %d shors\n", funded.TxID, funded.Vout, funded.Value)
+	return e.result(t, path, "funded %s:%d with %d shors\n", funded.TxID, funded.Vout, funded.Value)
 }
 
 func (e env) audit(ctx context.Context, o *options) error {
@@ -523,6 +544,9 @@ func (e env) audit(ctx context.Context, o *options) error {
 // that does not exist.
 func readSecret(path string) ([32]byte, error) {
 	var secret [32]byte
+	if path == "" {
+		return secret, errors.New("-secret-file: name the file that holds the secret")
+	}
 	path = filepath.Clean(path) // one spelling for the look and the read
 	info, err := os.Stat(path)
 	if err != nil {
@@ -575,16 +599,17 @@ func (e env) claim(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	record, err := recorder(o.record, "claim")
+	path := o.recordPath()
+	record, err := recorder(path, "claim")
 	if err != nil {
 		return err
 	}
 	t, err := htlc.Claim(ctx, e.node(network), party, terms, txid, vout, secret,
 		htlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, o.inclusion, record)
 	if err != nil {
-		return recorded(err, t, o.record)
+		return recorded(err, t, path)
 	}
-	return e.result(t, o.record, "claim %s sent\n", t.TxID())
+	return e.result(t, path, "claim %s sent\n", t.TxID())
 }
 
 func (e env) refund(ctx context.Context, o *options) error {
@@ -600,16 +625,17 @@ func (e env) refund(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	record, err := recorder(o.record, "refund")
+	path := o.recordPath()
+	record, err := recorder(path, "refund")
 	if err != nil {
 		return err
 	}
 	t, err := htlc.Refund(ctx, e.node(network), party, p, txid, vout,
 		htlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, record)
 	if err != nil {
-		return recorded(err, t, o.record)
+		return recorded(err, t, path)
 	}
-	return e.result(t, o.record, "refund %s sent\n", t.TxID())
+	return e.result(t, path, "refund %s sent\n", t.TxID())
 }
 
 func (e env) secret(ctx context.Context, o *options) error {
