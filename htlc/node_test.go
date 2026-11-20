@@ -672,6 +672,9 @@ func TestClaimBuildsOnTheNodesValue(t *testing.T) {
 	if len(b.record) != 1 || b.record[0] != tr.TxID()+" "+tr.SerializeHex() || len(b.node.sent) != 1 || b.node.sent[0] != tr.SerializeHex() {
 		t.Errorf("%d records and %d broadcasts, want the claim recorded once and sent once", len(b.record), len(b.node.sent))
 	}
+	if len(b.node.ids) != 1 || b.node.ids[0] != tr.TxID() {
+		t.Errorf("the claim was sent under the ids %v, want its own, by which a lost reply is resolved", b.node.ids)
+	}
 	if len(b.node.withMempool) != 1 || !b.node.withMempool[0] {
 		t.Errorf("the output was read with the mempool %v, want once with it", b.node.withMempool)
 	}
@@ -823,9 +826,21 @@ func TestClaimReadsTheTipAgainBeforeItSends(t *testing.T) {
 		}
 	}
 
-	// A record that refuses ends the call there: the node is not asked again.
+	// The second read is made with no record too: the signer alone can take
+	// the tip into the margin.
 	b := newBench(t)
-	_, err := Claim(context.Background(), b.node, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, b.preimage,
+	party := b.party(b.payee)
+	party.Signer = slow{inner: b.signer, meanwhile: func() { at(edge + 1)(b) }}
+	tr, err := Claim(context.Background(), b.node, party, b.terms, b.funded.TxID, b.funded.Vout, b.preimage,
+		Spend{PayToAddress: b.payee.addr, FeeRate: testFeeRate}, inclusion, nil)
+	if !errors.Is(err, ErrLockTooNear) || tr == nil || b.signer.signs != 1 || len(b.node.sent) != 0 {
+		t.Errorf("no record, the tip moves one block inside the margin during the signature: got %v, transaction returned %v, %d signatures, %d broadcasts; want ErrLockTooNear beside the signed claim and no broadcast",
+			err, tr != nil, b.signer.signs, len(b.node.sent))
+	}
+
+	// A record that refuses ends the call there: the node is not asked again.
+	b = newBench(t)
+	_, err = Claim(context.Background(), b.node, b.party(b.payee), b.terms, b.funded.TxID, b.funded.Vout, b.preimage,
 		Spend{PayToAddress: b.payee.addr, FeeRate: testFeeRate}, inclusion, func(string, string) error { return errors.New("no") })
 	if !errors.Is(err, ErrRecord) || errors.Is(err, ErrLockTooNear) || b.node.calls != 2 {
 		t.Errorf("a refusing record: got %v after %d calls of the node, want ErrRecord after the two of the audit", err, b.node.calls)

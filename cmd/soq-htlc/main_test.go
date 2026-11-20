@@ -418,8 +418,8 @@ func TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A file appears after the look at each of the two places in turn. Neither
-	// is written over, and no second file is left behind.
+	// A file appears after the look at the place the kernel reads the name as.
+	// It is not written over, and no second file is left behind.
 	if err := os.WriteFile(kernel("rec.json"), []byte("an earlier record"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -452,6 +452,84 @@ func TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling(t *testing.T) {
 	got, err := readSecret(named("secret"))
 	if err == nil && hex.EncodeToString(got[:]) != digits {
 		t.Errorf("the secret was read from a file of mode 0644 after the mode of another file was checked")
+	}
+	// The same with the two files exchanged: the file of mode 0600 at the name
+	// cleaned as text, the file of mode 0644 where the kernel reads the name.
+	for path, mode := range map[string]os.FileMode{lexical("mirrored"): 0o600, kernel("mirrored"): 0o644} {
+		held := strings.Repeat("cd", 32)
+		if mode == 0o600 {
+			held = digits
+		}
+		if err := os.WriteFile(path, []byte(held), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err = readSecret(named("mirrored"))
+	if err == nil && hex.EncodeToString(got[:]) != digits {
+		t.Errorf("with the two files exchanged, the secret was read from the file of mode 0644 after the mode of the other was checked")
+	}
+}
+
+// Every text that names the record names the file the transaction is in. With
+// -record given through a symbolic link followed by "..", the name as given
+// and the name cleaned as text are two files: a text with one of them beside
+// a record at the other sends the caller to a file that is absent, or that
+// holds an earlier transaction.
+func TestEveryTextNamesTheFileTheRecordIsIn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links")
+	}
+	states := map[string]func(*bench){
+		"an unknown outcome":                   func(b *bench) { b.node.broadcastErr = rpc.ErrUnknownOutcome },
+		"a result line that cannot be written": func(b *bench) { b.closed = true },
+		"a claim held back by the second read": func(b *bench) { b.node.later = benchTip + 1 },
+	}
+	for state, arrange := range states {
+		for step, run := range steps {
+			if state == "a claim held back by the second read" && step != "claim" {
+				continue
+			}
+			b := newBench(t)
+			for _, sub := range []string{filepath.Join(b.dir, "real", "sub"), filepath.Join(b.dir, "cwd")} {
+				if err := os.MkdirAll(sub, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(filepath.Join(b.dir, "real", "sub"), filepath.Join(b.dir, "cwd", "link")); err != nil {
+				t.Fatal(err)
+			}
+			given := filepath.Join(b.dir, "cwd") + "/link/../" + step + ".json"
+			cleaned := filepath.Join(b.dir, "cwd", step+".json")
+			arrange(b)
+			err := run(b, given)
+			if err == nil {
+				t.Errorf("%s of %s: no error", state, step)
+				continue
+			}
+			// The text names the record under one of the two spellings. Opened
+			// as printed, that file holds the transaction the text names.
+			text, spelled := err.Error(), cleaned
+			if strings.Contains(text, given) {
+				spelled = given
+			} else if !strings.Contains(text, cleaned) {
+				t.Errorf("%s of %s: the text names no record: %v", state, step, err)
+				continue
+			}
+			data, readErr := os.ReadFile(spelled)
+			var held struct {
+				TxID string `json:"txid"`
+			}
+			if readErr != nil || json.Unmarshal(data, &held) != nil || held.TxID == "" {
+				t.Errorf("%s of %s: the text names %s, which holds no record (%v): %v", state, step, spelled, readErr, err)
+				continue
+			}
+			if !strings.Contains(text, held.TxID) {
+				t.Errorf("%s of %s: the file the text names holds transaction %s, which the text does not name: %v", state, step, held.TxID, err)
+			}
+		}
 	}
 }
 
@@ -756,6 +834,10 @@ func TestClaimReadsTheSecretFromAFileOfItsOwner(t *testing.T) {
 		"66 digits":                       b.file("long", digits+"00", 0o600),
 		"a character that is not a digit": b.file("other", "zz"+digits[2:], 0o600),
 		"no file":                         filepath.Join(b.dir, "absent"),
+		"a directory of its owner alone":  filepath.Join(b.dir, "a-directory"),
+	}
+	if err := os.Mkdir(refusals["a directory of its owner alone"], 0o700); err != nil {
+		t.Fatal(err)
 	}
 	if runtime.GOOS == "windows" {
 		delete(refusals, "a file others can read")
@@ -879,9 +961,17 @@ func TestArgumentsAreRefusedBeforeAnythingIsOpened(t *testing.T) {
 		"a depth past the range":       {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-depth", "9223372036854775808", "-outpoint", contract}), "-depth: want a whole number in range"},
 		"an amount that is no decimal": {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "one", "-outpoint", contract}), "-amount"},
 		"an outpoint without an index": {args([]string{"audit"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", "7a7a"}), "outpoint"},
-		"no record for a fund":         {args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin}), "-record"},
-		"no keystore":                  {args([]string{"key-hash"}, []string{"-address", b.payee}), "-keystore"},
-		"a flag of another command":    {args([]string{"script"}, b.contract(), []string{"-record", "r"}), "flag provided but not defined"},
+		"no record for a fund":         {args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin}), "-record: name a new file"},
+		"an empty record for a fund":   {args([]string{"fund"}, b.contract(), b.as(b.payer), []string{"-amount", "1", "-inputs", coin, "-record", ""}), "-record: name a new file"},
+		"no record for a claim": {args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
+			"-inclusion", "6", "-secret-file", b.file("held-secret", hex.EncodeToString(b.secret[:]), 0o600)}), "-record: name a new file"},
+		"no record for a refund": {args([]string{"refund"}, b.contract(), b.as(b.payer), []string{"-outpoint", contract, "-to", b.payee}), "-record: name a new file"},
+		"no secret file for a claim": {args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
+			"-inclusion", "6", "-record", filepath.Join(b.dir, "r.json")}), "-secret-file: name the file"},
+		"an empty secret file for a claim": {args([]string{"claim"}, b.contract(), b.as(b.payee), []string{"-amount", "1", "-outpoint", contract, "-to", b.payer,
+			"-inclusion", "6", "-secret-file", "", "-record", filepath.Join(b.dir, "r.json")}), "-secret-file: name the file"},
+		"no keystore":               {args([]string{"key-hash"}, []string{"-address", b.payee}), "-keystore"},
+		"a flag of another command": {args([]string{"script"}, b.contract(), []string{"-record", "r"}), "flag provided but not defined"},
 	} {
 		err := b.run(c.args...)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
