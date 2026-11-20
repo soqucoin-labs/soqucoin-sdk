@@ -2445,8 +2445,8 @@
       "file": "cmd/soq-htlc/main.go",
       "package": "./cmd/soq-htlc",
       "test": "TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling",
-      "find": "\tpath = filepath.Clean(path) // one spelling for the look, the create and the write\n\tif _, err := os.Lstat(path); err == nil {",
-      "replace": "\tgiven := path\n\tpath = filepath.Clean(path)\n\tif _, err := os.Lstat(given); err == nil {",
+      "find": "\tif _, err := os.Lstat(path); err == nil {\n\t\treturn nil, fmt.Errorf(\"-record: %s exists",
+      "replace": "\tif _, err := os.Lstat(filepath.Clean(path)); err == nil {\n\t\treturn nil, fmt.Errorf(\"-record: %s exists",
       "why": "Through a symbolic link followed by .. the path as given and the cleaned path are two files. A look at one and a create at the other refuses a record that exists only after the keystore has signed."
     },
     {
@@ -2580,7 +2580,7 @@
       "file": "cmd/soq-htlc/main.go",
       "package": "./cmd/soq-htlc",
       "test": "TestAnUnknownOutcomeNamesTheRecord",
-      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, o.inclusion, record)\n\tif err != nil {\n\t\treturn recorded(err, t, o.record)",
+      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, o.inclusion, record)\n\tif err != nil {\n\t\treturn recorded(err, t, path)",
       "replace": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, o.inclusion, record)\n\tif err != nil {\n\t\treturn err",
       "why": "After an unknown outcome the record holds the one copy of a claim the node may have. The error names it."
     },
@@ -2589,7 +2589,7 @@
       "file": "cmd/soq-htlc/main.go",
       "package": "./cmd/soq-htlc",
       "test": "TestAnUnknownOutcomeNamesTheRecord",
-      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, record)\n\tif err != nil {\n\t\treturn recorded(err, t, o.record)",
+      "find": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, record)\n\tif err != nil {\n\t\treturn recorded(err, t, path)",
       "replace": "\t\thtlc.Spend{PayToAddress: o.to, FeeRate: o.feeRate}, record)\n\tif err != nil {\n\t\treturn err",
       "why": "After an unknown outcome the record holds the one copy of a refund the node may have. The error names it."
     },
@@ -2619,6 +2619,159 @@
       "find": "\t\tcase strings.HasSuffix(msg, refused+\"parse error\"), strings.HasSuffix(msg, refused+\"value out of range\"):",
       "replace": "\t\tcase strings.HasSuffix(msg, refused+\"parse error\"):",
       "why": "A number out of range is refused under the name of its flag, as one that does not parse is."
+    },
+    {
+      "id": "rpc-height-that-is-no-integer-fails-the-reply",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestNoFormOfTheActivationHeightsFailsTheReply",
+      "find": "\t\tif json.Unmarshal(raw, &height) != nil {\n\t\t\tcontinue\n\t\t}\n",
+      "replace": "\t\tif err := json.Unmarshal(raw, &height); err != nil {\n\t\t\treturn err\n\t\t}\n",
+      "why": "GetBlockchainInfo decodes the whole reply, and RequireSynced and RequireChain read it. An error for one height stops the deposit and withdrawal paths of a caller that never asks for a height."
+    },
+    {
+      "id": "rpc-member-that-is-no-object-fails-the-reply",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestNoFormOfTheActivationHeightsFailsTheReply",
+      "find": "\tif json.Unmarshal(data, &printed) != nil || printed == nil {\n\t\t*h = nil\n\t\treturn nil\n\t}",
+      "replace": "\tif err := json.Unmarshal(data, &printed); err != nil {\n\t\treturn err\n\t}\n\tif printed == nil {\n\t\t*h = nil\n\t\treturn nil\n\t}",
+      "why": "A member printed as an array or a string says nothing about a height. As an error it fails every function that reads the reply for the chain and the synchronisation."
+    },
+    {
+      "id": "rpc-unreadable-height-read-as-zero",
+      "file": "rpc/client.go",
+      "package": "./htlc",
+      "test": "TestAHeightTheClientCannotReadIsNoActivationHeight",
+      "find": "\t\tif json.Unmarshal(raw, &height) != nil {\n\t\t\tcontinue\n\t\t}\n",
+      "replace": "\t\t_ = json.Unmarshal(raw, &height)\n",
+      "why": "A height the decoder cannot read leaves a zero behind. Kept, it is the height of a deployment active from genesis, and Fund signs and sends on a node whose height is unknown."
+    },
+    {
+      "id": "rpc-null-height-drops-every-height",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestNoFormOfTheActivationHeightsFailsTheReply",
+      "find": "\t\tif height != nil {\n\t\t\theights[name] = *height\n\t\t}\n",
+      "replace": "\t\tif height == nil {\n\t\t\t*h = nil\n\t\t\treturn nil\n\t\t}\n\t\theights[name] = *height\n",
+      "why": "A null height leaves out its own name. The names printed beside it keep their heights."
+    },
+    {
+      "id": "htlc-claim-second-read-only-with-a-record",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimReadsTheTipAgainBeforeItSends",
+      "find": "\tinfo, err := chain(ctx, node, party.Network)\n\tif err != nil {\n\t\treturn t, fmt.Errorf(\"%w: the tip could not be read again after the record, and nothing was sent: %w\", ErrLockTooNear, err)\n\t}\n\tif left := int64(terms.Params.LockHeight) - info.Blocks; left < depth+inclusion {\n\t\treturn t, fmt.Errorf(\"%w: %d blocks from the tip at %d after the record, want %d; nothing was sent\", ErrLockTooNear, left, info.Blocks, depth+inclusion)\n\t}\n",
+      "replace": "\tif record != nil {\n\t\tinfo, err := chain(ctx, node, party.Network)\n\t\tif err != nil {\n\t\t\treturn t, fmt.Errorf(\"%w: the tip could not be read again after the record, and nothing was sent: %w\", ErrLockTooNear, err)\n\t\t}\n\t\tif left := int64(terms.Params.LockHeight) - info.Blocks; left < depth+inclusion {\n\t\t\treturn t, fmt.Errorf(\"%w: %d blocks from the tip at %d after the record, want %d; nothing was sent\", ErrLockTooNear, left, info.Blocks, depth+inclusion)\n\t\t}\n\t}\n",
+      "why": "The signer is not bounded in time either. A caller that sets no record gets the second read all the same."
+    },
+    {
+      "id": "htlc-claim-broadcasts-under-another-id",
+      "file": "htlc/node.go",
+      "package": "./htlc",
+      "test": "TestClaimBuildsOnTheNodesValue",
+      "find": "\t_, err = node.Broadcast(ctx, t.SerializeHex(), t.TxID())\n\treturn t, err\n}",
+      "replace": "\t_, err = node.Broadcast(ctx, t.SerializeHex(), txid)\n\treturn t, err\n}",
+      "why": "The client resolves a lost reply by the id it is handed. Under the id of the funding it finds that transaction and reports the claim as accepted."
+    },
+    {
+      "id": "cmd-secret-file-bytes-read-under-another-spelling",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestTheRecordAndTheSecretFileAreOneFileUnderEverySpelling",
+      "find": "\tpath = filepath.Clean(path) // one spelling for the look and the read\n\tinfo, err := os.Stat(path)\n\tif err != nil {\n\t\treturn secret, fmt.Errorf(\"-secret-file: %w\", withoutPath(err))\n\t}\n\tif mode := info.Mode().Perm(); mode&0o077 != 0 && runtime.GOOS != \"windows\" {\n\t\treturn secret, fmt.Errorf(\"-secret-file: the file has mode %04o, open to others; want 0600\", mode)\n\t}\n\tdata, err := os.ReadFile(path)\n",
+      "replace": "\tgiven := path\n\tpath = filepath.Clean(path) // one spelling for the look and the read\n\tinfo, err := os.Stat(path)\n\tif err != nil {\n\t\treturn secret, fmt.Errorf(\"-secret-file: %w\", withoutPath(err))\n\t}\n\tif mode := info.Mode().Perm(); mode&0o077 != 0 && runtime.GOOS != \"windows\" {\n\t\treturn secret, fmt.Errorf(\"-secret-file: the file has mode %04o, open to others; want 0600\", mode)\n\t}\n\tdata, err := os.ReadFile(given)\n",
+      "why": "The mode checked at the cleaned name says nothing about the file the kernel reads the name as. Read from there, a file that others can read passes."
+    },
+    {
+      "id": "cmd-secret-file-read-error-prints-the-path",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimReadsTheSecretFromAFileOfItsOwner",
+      "find": "\tdata, err := os.ReadFile(path)\n\tif err != nil {\n\t\treturn secret, fmt.Errorf(\"-secret-file: %w\", withoutPath(err))",
+      "replace": "\tdata, err := os.ReadFile(path)\n\tif err != nil {\n\t\treturn secret, fmt.Errorf(\"-secret-file: %w\", err)",
+      "why": "A file that passes the look can still fail the read, as a directory does. The file error holds the path, and no refusal of -secret-file holds its value."
+    },
+    {
+      "id": "cmd-fund-error-names-the-record-as-given",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestEveryTextNamesTheFileTheRecordIsIn",
+      "find": "\t\treturn recorded(err, t, path)\n\t}\n\treturn e.result(t, path, \"funded",
+      "replace": "\t\treturn recorded(err, t, o.record)\n\t}\n\treturn e.result(t, path, \"funded",
+      "why": "The record of the fund is at the cleaned path. Through a symbolic link followed by .. the flag as given is another file, and a text that names it sends the caller to a file the transaction is not in."
+    },
+    {
+      "id": "cmd-fund-result-names-the-record-as-given",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestEveryTextNamesTheFileTheRecordIsIn",
+      "find": "\treturn e.result(t, path, \"funded",
+      "replace": "\treturn e.result(t, o.record, \"funded",
+      "why": "After a result line that cannot be written the error is all the caller has of a fund the node took. It names the file the record is in."
+    },
+    {
+      "id": "cmd-claim-error-names-the-record-as-given",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestEveryTextNamesTheFileTheRecordIsIn",
+      "find": "\t\treturn recorded(err, t, path)\n\t}\n\treturn e.result(t, path, \"claim %s sent",
+      "replace": "\t\treturn recorded(err, t, o.record)\n\t}\n\treturn e.result(t, path, \"claim %s sent",
+      "why": "The record of the claim is at the cleaned path. Through a symbolic link followed by .. the flag as given is another file, and a text that names it sends the caller to a file the transaction is not in."
+    },
+    {
+      "id": "cmd-claim-result-names-the-record-as-given",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestEveryTextNamesTheFileTheRecordIsIn",
+      "find": "\treturn e.result(t, path, \"claim %s sent",
+      "replace": "\treturn e.result(t, o.record, \"claim %s sent",
+      "why": "After a result line that cannot be written the error is all the caller has of a claim the node took. It names the file the record is in."
+    },
+    {
+      "id": "cmd-refund-error-names-the-record-as-given",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestEveryTextNamesTheFileTheRecordIsIn",
+      "find": "\t\treturn recorded(err, t, path)\n\t}\n\treturn e.result(t, path, \"refund %s sent",
+      "replace": "\t\treturn recorded(err, t, o.record)\n\t}\n\treturn e.result(t, path, \"refund %s sent",
+      "why": "The record of the refund is at the cleaned path. Through a symbolic link followed by .. the flag as given is another file, and a text that names it sends the caller to a file the transaction is not in."
+    },
+    {
+      "id": "cmd-refund-result-names-the-record-as-given",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestEveryTextNamesTheFileTheRecordIsIn",
+      "find": "\treturn e.result(t, path, \"refund %s sent",
+      "replace": "\treturn e.result(t, o.record, \"refund %s sent",
+      "why": "After a result line that cannot be written the error is all the caller has of a refund the node took. It names the file the record is in."
+    },
+    {
+      "id": "cmd-empty-record-cleaned-to-the-working-directory",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestArgumentsAreRefusedBeforeAnythingIsOpened",
+      "find": "\tif o.record == \"\" {\n\t\treturn \"\"\n\t}\n\treturn filepath.Clean(o.record)",
+      "replace": "\treturn filepath.Clean(o.record)",
+      "why": "The empty path cleans to the working directory, which exists. The refusal then says a transaction was already built under it, where no record was named."
+    },
+    {
+      "id": "cmd-empty-secret-file-cleaned-to-the-working-directory",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestArgumentsAreRefusedBeforeAnythingIsOpened",
+      "find": "\tif path == \"\" {\n\t\treturn secret, errors.New(\"-secret-file: name",
+      "replace": "\tif false && path == \"\" {\n\t\treturn secret, errors.New(\"-secret-file: name",
+      "why": "The empty path cleans to the working directory, and the refusal names its mode or says it is a directory, where no secret file was named."
+    },
+    {
+      "id": "cmd-claim-held-back-text-is-for-one-party",
+      "file": "cmd/soq-htlc/main.go",
+      "package": "./cmd/soq-htlc",
+      "test": "TestClaimHeldBackAfterTheRecordSaysNothingWasSent",
+      "find": ". If the other chain already shows the secret, there is nothing to keep private: send those bytes at once with the node's sendrawtransaction\", err, t.TxID(), path)",
+      "replace": "\", err, t.TxID(), path)",
+      "why": "A payee whose secret the other chain already shows loses the output when it leaves the recorded claim unsent. The text for a claim held back says what that party does."
     }
   ]
 }
