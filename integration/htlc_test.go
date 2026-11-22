@@ -68,9 +68,71 @@ type swapBench struct {
 	used                        map[string]bool
 }
 
+// swapDeployments are the deployments of witness version 6 the contract runs
+// under, by the node's names for them.
+var swapDeployments = []string{"p2wsh_dilithium", "dilithium_keyhash", "v6_controlflow"}
+
+// lastVersionWithoutTheHeights is the node's number for release 2.6.1, the
+// last release that neither reports the activation heights of swapDeployments
+// nor takes -activationheight. A node does both from commit 8de57e851 of
+// soqucoin main, which builds under the same number until the next release.
+const lastVersionWithoutTheHeights = 2060100
+
+// swapCases says what a node of that version, reporting those heights, can do
+// with the cases of a swapBench. Both results empty: it runs them. skip set:
+// the node is a release from before the heights were reported, htlc.Fund
+// refuses to fund through it, and every case would fail for the node's age.
+// fault set: the node reports some of the three and not the others, or it is
+// newer than those releases and reports none, and the case fails.
+func swapCases(version int64, heights map[string]int64) (skip, fault string) {
+	var missing []string
+	for _, name := range swapDeployments {
+		if _, ok := heights[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	switch {
+	case len(missing) == 0:
+		return "", ""
+	case len(missing) == len(swapDeployments) && version <= lastVersionWithoutTheHeights:
+		return fmt.Sprintf("the node (version %d) reports no activation height for %s; the swap contract cases need a build of soqucoin main from 8de57e851, which no release carries yet",
+			version, strings.Join(missing, ", ")), ""
+	default:
+		return "", fmt.Sprintf("the node (version %d) reports no activation height for %s", version, strings.Join(missing, ", "))
+	}
+}
+
+// needsTheHeights skips or fails the case as swapCases reads the node.
+func (b *swapBench) needsTheHeights() {
+	b.t.Helper()
+	ctx := context.Background()
+	info, err := b.n.rpc.GetBlockchainInfo(ctx)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	raw, err := b.n.rpc.Call(ctx, "getnetworkinfo")
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	var network struct {
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &network); err != nil {
+		b.t.Fatalf("getnetworkinfo: %v", err)
+	}
+	skip, fault := swapCases(network.Version, info.ActivationHeights)
+	if fault != "" {
+		b.t.Fatal(fault)
+	}
+	if skip != "" {
+		b.t.Skip(skip)
+	}
+}
+
 func newSwapBench(t *testing.T, nodeArgs ...string) *swapBench {
 	t.Helper()
 	b := &swapBench{t: t, n: startNode(t, nodeArgs...), keys: signers{}, used: map[string]bool{}}
+	b.needsTheHeights()
 	add := func() string {
 		m, addr := newKey(t)
 		b.keys[addr] = m
@@ -81,6 +143,36 @@ func newSwapBench(t *testing.T, nodeArgs ...string) *swapBench {
 	b.n.mine(b.stranger, int(types.Regtest.CoinbaseMaturity)+2)
 	b.scan = newScanner(b.n, b.hot)
 	return b
+}
+
+// The reading of the node that decides between a run, a skip and a failure,
+// held without a node: only a release from before the heights is skipped.
+func TestTheSwapCasesAreSkippedOnlyOnAReleaseFromBeforeTheHeights(t *testing.T) {
+	three := map[string]int64{"p2wsh_dilithium": 0, "dilithium_keyhash": 0, "v6_controlflow": 80}
+	two := map[string]int64{"p2wsh_dilithium": 0, "dilithium_keyhash": 0}
+	for _, c := range []struct {
+		name          string
+		version       int64
+		heights       map[string]int64
+		skips, faults bool
+	}{
+		{"a node that reports the three runs the cases", lastVersionWithoutTheHeights, three, false, false},
+		{"a later version that reports the three runs them", lastVersionWithoutTheHeights + 1, three, false, false},
+		{"release 2.6.1 reporting none is skipped", lastVersionWithoutTheHeights, nil, true, false},
+		{"an older release reporting none is skipped", 2040000, map[string]int64{}, true, false},
+		{"a later version reporting none is at fault", lastVersionWithoutTheHeights + 1, nil, false, true},
+		{"release 2.6.1 reporting two of the three is at fault", lastVersionWithoutTheHeights, two, false, true},
+		{"a later version reporting two of the three is at fault", lastVersionWithoutTheHeights + 1, two, false, true},
+	} {
+		skip, fault := swapCases(c.version, c.heights)
+		if (skip != "") != c.skips || (fault != "") != c.faults {
+			t.Errorf("%s: skip %q, fault %q", c.name, skip, fault)
+		}
+	}
+	if _, fault := swapCases(lastVersionWithoutTheHeights, two); !strings.Contains(fault, "v6_controlflow") ||
+		strings.Contains(fault, "p2wsh_dilithium") {
+		t.Errorf("the fault names what the node does not report and nothing else: %q", fault)
+	}
 }
 
 func (b *swapBench) keyHash(addr string) [32]byte {

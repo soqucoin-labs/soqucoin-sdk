@@ -207,8 +207,13 @@ SOQUCOIND=/path/to/soqucoind make integration
 ```
 
 A throwaway regtest node, the real `deposit` and `withdraw` packages, sixteen end-to-end
-scenarios, about ninety seconds. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
+scenarios, about two and a half minutes. See the [Exchange Integration](docs/EXCHANGE_INTEGRATION.md) guide for what
 each scenario proves.
+
+The harness also holds ten cases for the swap contract of the `htlc` package. They need a node
+that reports the activation heights of witness version 6. A node does that from commit `8de57e851`
+of soqucoin `main`, and no release carries that commit yet. On a release the harness skips the ten
+and prints the reason.
 
 `SOQUCOIND` must be a runnable binary. In an autotools build tree that is `src/soqucoind`, the
 wrapper that resolves the uninstalled shared libraries, and not `src/.libs/soqucoind`, which does
