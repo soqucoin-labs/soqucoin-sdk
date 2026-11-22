@@ -75,7 +75,7 @@ func (b *swapBench) mempoolSize() int {
 func TestFundRefusesUntilTheContractHasBeenActiveForTheDepth(t *testing.T) {
 	const activation = 80
 	var args []string
-	for _, name := range []string{"p2wsh_dilithium", "dilithium_keyhash", "v6_controlflow"} {
+	for _, name := range swapDeployments {
 		args = append(args, fmt.Sprintf("-activationheight=%s:%d", name, activation))
 	}
 	b := newSwapBench(t, args...)
@@ -87,7 +87,7 @@ func TestFundRefusesUntilTheContractHasBeenActiveForTheDepth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"p2wsh_dilithium", "dilithium_keyhash", "v6_controlflow"} {
+	for _, name := range swapDeployments {
 		if got, ok := info.ActivationHeights[name]; !ok || got != activation {
 			t.Fatalf("the node reports %s at %d (present %v), started with %d", name, got, ok, activation)
 		}
@@ -151,7 +151,7 @@ func TestFundRefusesUntilTheContractHasBeenActiveForTheDepth(t *testing.T) {
 func TestTheNodeTakesAFundingBelowTheActivationHeight(t *testing.T) {
 	const activation = 200
 	var args []string
-	for _, name := range []string{"p2wsh_dilithium", "dilithium_keyhash", "v6_controlflow"} {
+	for _, name := range swapDeployments {
 		args = append(args, fmt.Sprintf("-activationheight=%s:%d", name, activation))
 	}
 	b := newSwapBench(t, args...)

@@ -272,6 +272,11 @@ answers are checked against the client's own call sites, because a double that h
 client is believed rather than noticed. The ElectrumX client's wire behaviour is exercised by its
 own protocol tests against a scripted server.
 
+The harness also holds ten cases for the swap contract of the `htlc` package, which this guide does
+not cover. They need a node that reports the activation heights of witness version 6. A node does
+that from commit `8de57e851` of `main`, and no release carries that commit yet. On a release the
+harness skips the ten and prints the reason.
+
 ---
 
 ## Context and logging

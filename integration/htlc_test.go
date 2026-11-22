@@ -15,6 +15,7 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/address"
 	"github.com/soqucoin-labs/soqucoin-sdk/htlc"
 	"github.com/soqucoin-labs/soqucoin-sdk/keys"
+	"github.com/soqucoin-labs/soqucoin-sdk/rpc"
 	"github.com/soqucoin-labs/soqucoin-sdk/tx"
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
@@ -68,9 +69,95 @@ type swapBench struct {
 	used                        map[string]bool
 }
 
+// swapDeployments are the deployments of witness version 6 the contract runs
+// under, by the node's names for them.
+var swapDeployments = []string{"p2wsh_dilithium", "dilithium_keyhash", "v6_controlflow"}
+
+// lastVersionWithoutTheHeights is the node's number for release 2.6.1, the
+// last release that neither reports the activation heights of swapDeployments
+// nor takes -activationheight. A node does both from commit 8de57e851 of
+// soqucoin main, which builds under the same number until the next release.
+const lastVersionWithoutTheHeights = 2060100
+
+// swapCases says what a node of that version can do with the cases of a
+// swapBench. member is the activation_heights member of its getblockchaininfo
+// as the node printed it, nil when the reply carries none. Both results empty:
+// it runs them. skip set: the node carries no such member and is a release
+// from before the heights were reported, htlc.Fund refuses to fund through it,
+// and every case would fail for the node's age. fault set, and the case fails:
+// the node reports no version, or it is newer than those releases and carries
+// no member, or the member is no object, or one of the three is not in it in a
+// form the client reads. A height printed and not read is never a missing one:
+// only a reply without the member is a release.
+func swapCases(version int64, member json.RawMessage) (skip, fault string) {
+	switch {
+	case version <= 0:
+		// No version is no release: a skip needs the node's own word on it.
+		return "", fmt.Sprintf("the node reports no version (%d)", version)
+	case member == nil && version <= lastVersionWithoutTheHeights:
+		return fmt.Sprintf("the node (version %d) reports no activation heights; the swap contract cases need a build of soqucoin main from 8de57e851, which no release carries yet", version), ""
+	case member == nil:
+		return "", fmt.Sprintf("the node (version %d) reports no activation heights", version)
+	}
+	var printed map[string]json.RawMessage
+	if err := json.Unmarshal(member, &printed); err != nil || printed == nil {
+		return "", fmt.Sprintf("the node (version %d) prints activation_heights as %s, which is no object", version, member)
+	}
+	// The client's own reading of the member decides what a height is.
+	var read rpc.ActivationHeights
+	_ = read.UnmarshalJSON(member)
+	var missing []string
+	for _, name := range swapDeployments {
+		if _, ok := read[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return "", fmt.Sprintf("the node (version %d) reports no activation height the client reads for %s: %s", version, strings.Join(missing, ", "), member)
+	}
+	return "", ""
+}
+
+// needsTheHeights skips or fails the case as swapCases reads the node.
+func (b *swapBench) needsTheHeights() {
+	b.t.Helper()
+	ctx := context.Background()
+	raw, err := b.n.rpc.Call(ctx, "getblockchaininfo")
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	// The member as printed: the client's reading of it leaves out a height it
+	// cannot read, and that must not pass for a node that prints none.
+	var chain struct {
+		Heights json.RawMessage `json:"activation_heights"`
+	}
+	if err := json.Unmarshal(raw, &chain); err != nil {
+		b.t.Fatalf("getblockchaininfo cannot be read: %s (%v)", raw, err)
+	}
+	raw, err = b.n.rpc.Call(ctx, "getnetworkinfo")
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	// A pointer, so a reply without the member is not read as version 0.
+	var network struct {
+		Version *int64 `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &network); err != nil || network.Version == nil {
+		b.t.Fatalf("getnetworkinfo carries no version: %s (%v)", raw, err)
+	}
+	skip, fault := swapCases(*network.Version, chain.Heights)
+	if fault != "" {
+		b.t.Fatal(fault)
+	}
+	if skip != "" {
+		b.t.Skip(skip)
+	}
+}
+
 func newSwapBench(t *testing.T, nodeArgs ...string) *swapBench {
 	t.Helper()
 	b := &swapBench{t: t, n: startNode(t, nodeArgs...), keys: signers{}, used: map[string]bool{}}
+	b.needsTheHeights()
 	add := func() string {
 		m, addr := newKey(t)
 		b.keys[addr] = m
@@ -81,6 +168,54 @@ func newSwapBench(t *testing.T, nodeArgs ...string) *swapBench {
 	b.n.mine(b.stranger, int(types.Regtest.CoinbaseMaturity)+2)
 	b.scan = newScanner(b.n, b.hot)
 	return b
+}
+
+// The reading of the node that decides between a run, a skip and a failure,
+// held without a node: only a release from before the heights is skipped, and
+// such a release is a reply with no member at all.
+func TestTheSwapCasesAreSkippedOnlyOnAReleaseFromBeforeTheHeights(t *testing.T) {
+	const (
+		three = `{"p2wsh_dilithium":0,"dilithium_keyhash":0,"v6_controlflow":80}`
+		two   = `{"p2wsh_dilithium":0,"dilithium_keyhash":0}`
+	)
+	for _, c := range []struct {
+		name          string
+		version       int64
+		member        string // "" for a reply without the member
+		skips, faults bool
+	}{
+		{"a node that reports the three runs the cases", lastVersionWithoutTheHeights, three, false, false},
+		{"a later version that reports the three runs them", lastVersionWithoutTheHeights + 1, three, false, false},
+		{"release 2.6.1 with no member is skipped", lastVersionWithoutTheHeights, "", true, false},
+		{"an older release with no member is skipped", 2040000, "", true, false},
+		{"a later version with no member is at fault", lastVersionWithoutTheHeights + 1, "", false, true},
+		{"release 2.6.1 reporting two of the three is at fault", lastVersionWithoutTheHeights, two, false, true},
+		{"a later version reporting two of the three is at fault", lastVersionWithoutTheHeights + 1, two, false, true},
+		{"a node with no version and no member is at fault, never skipped", 0, "", false, true},
+		{"a node with no version is at fault whatever it reports", 0, three, false, true},
+		{"a negative version is at fault", -1, "", false, true},
+		{"a height printed as null is at fault, never skipped", lastVersionWithoutTheHeights,
+			`{"p2wsh_dilithium":null,"dilithium_keyhash":null,"v6_controlflow":null}`, false, true},
+		{"a height printed as a string is at fault", lastVersionWithoutTheHeights,
+			`{"p2wsh_dilithium":0,"dilithium_keyhash":0,"v6_controlflow":"80"}`, false, true},
+		{"a member that names none of the three is at fault", lastVersionWithoutTheHeights, `{}`, false, true},
+		{"a null member is at fault", lastVersionWithoutTheHeights, `null`, false, true},
+		{"a member that is no object is at fault", lastVersionWithoutTheHeights, `[0,0,80]`, false, true},
+	} {
+		var member json.RawMessage
+		if c.member != "" {
+			member = json.RawMessage(c.member)
+		}
+		skip, fault := swapCases(c.version, member)
+		if (skip != "") != c.skips || (fault != "") != c.faults {
+			t.Errorf("%s: skip %q, fault %q", c.name, skip, fault)
+		}
+	}
+	_, fault := swapCases(lastVersionWithoutTheHeights, json.RawMessage(two))
+	if at := strings.Index(fault, ": {"); at < 0 || !strings.Contains(fault[:at], "v6_controlflow") ||
+		strings.Contains(fault[:at], "p2wsh_dilithium") {
+		t.Errorf("the fault names what the node does not report and nothing else, then quotes the member: %q", fault)
+	}
 }
 
 func (b *swapBench) keyHash(addr string) [32]byte {
