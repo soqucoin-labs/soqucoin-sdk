@@ -87,11 +87,29 @@ func (c *Client) isSubscribed(addr string) bool {
 // listunspent follows: a reconnect over an unchanged address costs one call.
 // Otherwise the address is marked changed and refreshed by the same pass.
 func (c *Client) subscribe(ctx context.Context, addr string) error {
-	sh, err := address.AddressToScriptHash(c.hrp(), addr)
+	return c.subscribeUnder(ctx, c.hrp(), addr)
+}
+
+// subscribeUnder is subscribe for a prefix already read: the script hash is
+// derived under it and the status is recorded only when replyIsFor finds the
+// genesis check of the reply's connection recorded for it.
+func (c *Client) subscribeUnder(ctx context.Context, hrp, addr string) error {
+	sh, err := address.AddressToScriptHash(hrp, addr)
 	if err != nil {
 		return fmt.Errorf("subscribe %s: %w", addr, err)
 	}
 	raw, gen, err := c.callGen(ctx, "blockchain.scripthash.subscribe", []interface{}{sh})
+	if err == nil {
+		// As in refreshAddressUnder: the status of a server verified for
+		// another network is not recorded for this address.
+		err = c.replyIsFor(ctx, gen, hrp)
+		if errors.Is(err, ErrNotConnected) {
+			// The reply's connection was replaced and checked again during the
+			// call. commitSubscribe commits nothing from such a reply and
+			// reports no error; the next pass subscribes on the live one.
+			return nil
+		}
+	}
 	var status string
 	if err == nil {
 		var ok bool

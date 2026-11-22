@@ -303,7 +303,10 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (j
 // such an address and the gate in callGen the client's prefix can become
 // another network's. The gate then verifies the server for that prefix, and
 // the server's outputs for the same script would come back under an address
-// of the first network. The record of the genesis check is written only after
+// of the first network. The refresh and the subscribe of a tracked address
+// need it for the one sequence that leaves them there: the tracked set
+// emptied, the prefix changed and the address tracked again while the call is
+// in flight. The record of the genesis check is written only after
 // the server on that generation reported a genesis of the prefix's chain, so
 // a record that reads (gen, hrp) is true of the reply whenever it is read.
 //
