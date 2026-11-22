@@ -1028,9 +1028,10 @@ func TestFindSecretReadsTheMinedSpendOfTheOutpoint(t *testing.T) {
 
 	// A node that is behind its headers or in initial block download has not
 	// read the chain to its end: where it finds no spend it says so in place
-	// of ErrNoSpend, and a spend it does hold is returned all the same.
+	// of ErrNoSpend, and a spend it does hold is returned all the same. Each
+	// case sets both fields, so neither depends on the order the map is read in.
 	for name, behind := range map[string]func(){
-		"behind its headers":        func() { b.node.info.Headers = 9 },
+		"behind its headers":        func() { b.node.info.Headers, b.node.info.InitialSync = 9, false },
 		"in initial block download": func() { b.node.info.Headers, b.node.info.InitialSync = 8, true },
 	} {
 		behind()
