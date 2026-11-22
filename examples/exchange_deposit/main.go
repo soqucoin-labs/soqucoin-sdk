@@ -63,8 +63,8 @@ const (
 
 // requiredConfirmations returns the depth at which a deposit of this size may be
 // credited. A deposit below the value line is credited at standardDepth; a
-// deposit at or above it waits for types.MaxReorgDepth (288). A deposit is
-// final in the consensus sense one block later, at types.MaxReorgDepth + 1.
+// deposit at or above it waits for types.MaxReorgDepth (288), the depth from
+// which a synced node refuses a new header on a branch that would remove it.
 func requiredConfirmations(value int64) int64 {
 	if value < largeDeposit {
 		return standardDepth
