@@ -3,9 +3,12 @@
 package integration
 
 import (
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
 // The push scenarios believe the fake indexer, and that is only safe while the
@@ -27,7 +30,7 @@ import (
 // and the count drops, which fails here instead of leaving a test that asserts
 // nothing. It does not catch a single missed call site, and is not relied on
 // for that — the corpus is.
-const clientMethodFloor = 8
+const clientMethodFloor = 9
 
 func TestTheFakeIndexerAnswersEveryMethodTheClientSends(t *testing.T) {
 	sent := methodsTheClientSends(t)
@@ -53,6 +56,61 @@ func TestTheFakeIndexerHasNoHandlerTheClientNeverUses(t *testing.T) {
 	for m := range indexerMethods {
 		if !sent[m] {
 			t.Errorf("the fake indexer answers %s, which electrumx.Client no longer sends: remove the handler or the reader will read it as a path a scenario covers", m)
+		}
+	}
+}
+
+// The double's selection is the indexer's, case for case. The rows and the
+// kept lists are those of the indexer's own tests of bounded_utxos
+// (tests/server/test_utxo_cache.py at its commit 3c6dcb2), so a scenario that
+// reads a bounded list from the double reads what a server would send.
+func TestTheFakeIndexersBoundedSelectionIsTheIndexers(t *testing.T) {
+	row := func(tx byte, pos uint32, height, value int64) types.UTXO {
+		return types.UTXO{TxID: strings.Repeat("0", 62) + hex.EncodeToString([]byte{tx}), Vout: pos, Height: height, Value: value}
+	}
+	type kept struct {
+		tx     byte
+		pos    uint32
+		height int64
+	}
+	// Three confirmed outputs of one transaction and two pending of another.
+	passedOver := []types.UTXO{row(1, 0, 100, 50), row(1, 1, 100, 50), row(1, 2, 100, 50), row(2, 0, 0, 10), row(2, 1, 0, 11)}
+	cases := []struct {
+		name  string
+		rows  []types.UTXO
+		limit int
+		want  []kept
+	}{
+		{"a confirmed transaction that does not fit gives its places to a pending one that does",
+			passedOver, 2, []kept{{2, 1, 0}, {2, 0, 0}}},
+		{"the confirmed transaction fits and nothing pending is listed",
+			passedOver, 3, []kept{{1, 0, 100}, {1, 1, 100}, {1, 2, 100}}},
+		{"the place left goes to the next output of the walk",
+			passedOver, 4, []kept{{1, 0, 100}, {1, 1, 100}, {1, 2, 100}, {2, 1, 0}}},
+		{"no transaction fits one place",
+			passedOver, 1, []kept{{1, 0, 100}}},
+		{"the kept list is ordered by value whatever the height",
+			[]types.UTXO{row(1, 0, 100, 10), row(2, 0, 0, 1000), row(3, 0, 100, 5), row(4, 0, 0, 500)}, 3,
+			[]kept{{2, 0, 0}, {1, 0, 100}, {3, 0, 100}}},
+		{"places left after the walk go to confirmed outputs before larger pending ones",
+			[]types.UTXO{row(1, 0, 100, 100), row(2, 0, 100, 5), row(2, 1, 100, 5), row(2, 2, 100, 5), row(3, 0, 0, 1000), row(3, 1, 0, 1000), row(3, 2, 0, 1000)}, 2,
+			[]kept{{1, 0, 100}, {2, 0, 100}}},
+		{"a transaction keeps its outputs together while they fit",
+			[]types.UTXO{row(1, 0, 100, 50), row(1, 1, 100, 50), row(1, 2, 100, 50), row(2, 0, 100, 60), row(3, 0, 100, 40)}, 4,
+			[]kept{{2, 0, 100}, {1, 0, 100}, {1, 1, 100}, {1, 2, 100}}},
+		{"a list within the limit comes back as given",
+			[]types.UTXO{row(3, 0, 0, 5), row(1, 0, 100, 10)}, 2, []kept{{3, 0, 0}, {1, 0, 100}}},
+	}
+	for _, tc := range cases {
+		got := boundedUTXOs(append([]types.UTXO(nil), tc.rows...), tc.limit)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: kept %d outputs, want %d: %+v", tc.name, len(got), len(tc.want), got)
+			continue
+		}
+		for i, w := range tc.want {
+			if g := got[i]; g.TxID != row(w.tx, 0, 0, 0).TxID || g.Vout != w.pos || g.Height != w.height {
+				t.Errorf("%s: entry %d is %s:%d at height %d, want transaction %d:%d at height %d", tc.name, i, g.TxID[60:], g.Vout, g.Height, w.tx, w.pos, w.height)
+			}
 		}
 	}
 }

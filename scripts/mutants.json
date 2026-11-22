@@ -246,8 +246,8 @@
       "package": "./integration",
       "tags": "integration",
       "test": "TestTheFakeIndexerAnswersEveryMethodTheClientSends",
-      "find": "\t\"blockchain.transaction.broadcast\":  (*fakeIndexer).handleBroadcast,",
-      "replace": "\t\"blockchain.transaction.broadcast.absent\": (*fakeIndexer).handleBroadcast,",
+      "find": "\t\"blockchain.transaction.broadcast\":          (*fakeIndexer).handleBroadcast,",
+      "replace": "\t\"blockchain.transaction.broadcast.absent\":   (*fakeIndexer).handleBroadcast,",
       "why": "The push scenarios believe the fake indexer, so it has to answer every method electrumx.Client sends. A method the client sends and the fake does not answer meets 'unknown method', which the client reads as an error from the server, so a scenario reaching that path takes the error branch and reports success without exercising what it names. A double that has drifted from its client is worse than no double, because it is believed."
     },
     {
@@ -2772,6 +2772,97 @@
       "find": ". If the other chain already shows the secret, there is nothing to keep private: send those bytes at once with the node's sendrawtransaction\", err, t.TxID(), path)",
       "replace": "\", err, t.TxID(), path)",
       "why": "A payee whose secret the other chain already shows loses the output when it leaves the recorded claim unsent. The text for a claim held back says what that party does."
+    },
+    {
+      "id": "electrumx-bounded-list-shorter-than-the-count-accepted",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestABoundedReplyThatDoesNotAddUpIsRefused",
+      "find": "if want := min(total, int64(limit)); listed != want {",
+      "replace": "if want := min(total, int64(limit)); listed > want {",
+      "why": "A list shorter than min(total, limit) leaves out outputs the server could have listed. A caller that sweeps the listed outputs of an address would take the list for the largest of it while the server held back the ones it chose."
+    },
+    {
+      "id": "electrumx-bounded-list-longer-than-the-limit-accepted",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestABoundedReplyThatDoesNotAddUpIsRefused",
+      "find": "if want := min(total, int64(limit)); listed != want {",
+      "replace": "if want := min(total, int64(limit)); listed < want {",
+      "why": "The limit is what bounds the memory one read costs the caller. A server that lists more than was asked for, or more than its own count, is refused whole; accepting it hands the caller a list the two figures do not describe."
+    },
+    {
+      "id": "electrumx-bounded-total-value-below-the-list-accepted",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestABoundedReplyThatDoesNotAddUpIsRefused",
+      "find": "if value < sum || ceilings(extra) > rest {",
+      "replace": "if ceilings(extra) > rest {",
+      "why": "The listed outputs are part of the address, so its value is at least their sum. A total value below it, a negative one included, is a figure a caller would report as the balance of an address whose listed outputs alone are worth more."
+    },
+    {
+      "id": "electrumx-bounded-total-value-above-what-is-left-out-accepted",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestABoundedReplyThatDoesNotAddUpIsRefused",
+      "find": "if value < sum || ceilings(extra) > rest {",
+      "replace": "if value < sum || ceilings(extra) > rest+1 {",
+      "why": "An output left out of the list is worth at most the per-output ceiling, so the value past the listed sum is bounded by the count left out. One ceiling of slack accepts a total value above the list when nothing is left out, which is a balance no output accounts for."
+    },
+    {
+      "id": "electrumx-bounded-ceiling-count-rounds-down",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestABoundedReplyThatDoesNotAddUpIsRefused",
+      "find": "\tif v%types.MaxMoney > 0 {\n\t\tn++\n\t}\n",
+      "replace": "",
+      "why": "The count of outputs needed to hold a value rounds up: one shor past the listed sum needs one output left out. Rounding down accepts any excess below one ceiling with nothing left out."
+    },
+    {
+      "id": "electrumx-bounded-limit-above-the-servers-not-refused",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestListUnspentBoundedRefusesALimitOutsideOneToAThousand",
+      "find": "if limit < 1 || limit > MaxBoundedLimit {",
+      "replace": "if limit < 1 {",
+      "why": "The indexer serves 1 to 1,000 and answers an error for anything else. The client refuses such a limit before a request goes out, so a wrong limit costs no round trip and reads as the caller's error instead of the server's."
+    },
+    {
+      "id": "electrumx-size-refusal-matched-anywhere-in-the-message",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestTheSizeRefusalIsErrReplyTooLargeOnTheAddressRecord",
+      "find": "strings.HasPrefix(e.Message, tooLargePrefix)",
+      "replace": "strings.Contains(e.Message, tooLargePrefix)",
+      "why": "ErrReplyTooLarge tells an operator that no retry ends the failure and the address has to be consolidated. A message that merely carries the phrase is some other error, and matching it sends the operator to consolidate an address that is not over the limit."
+    },
+    {
+      "id": "electrumx-size-refusal-matches-every-sentinel",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestTheSizeRefusalIsErrReplyTooLargeOnTheAddressRecord",
+      "find": "return target == ErrReplyTooLarge && strings.HasPrefix(e.Message, tooLargePrefix)",
+      "replace": "return strings.HasPrefix(e.Message, tooLargePrefix)",
+      "why": "ServerError.Is answers for one sentinel. Answering for every target makes a size refusal match ErrNotConnected as well, which callers read as a lost connection and answer with a reconnect."
+    },
+    {
+      "id": "electrumx-server-error-returned-as-text",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestTheSizeRefusalIsErrReplyTooLargeOnTheAddressRecord",
+      "find": "return nil, newServerError(in.Error)",
+      "replace": "return nil, fmt.Errorf(\"electrumx error: %s\", string(in.Error))",
+      "why": "The error member reaches the caller as a *ServerError, so errors.Is finds the size refusal through RefreshAll and on the address record. As formatted text the refusal can be told from other failures only by matching the string."
+    },
+    {
+      "id": "harness-fake-indexer-bounded-selection-walks-pending-first",
+      "file": "integration/fake_electrumx_test.go",
+      "package": "./integration",
+      "tags": "integration",
+      "test": "TestTheFakeIndexersBoundedSelectionIsTheIndexers",
+      "find": "\tordered := append(confirmed, pending...)\n",
+      "replace": "\tordered := append(pending, confirmed...)\n",
+      "why": "The double answers listunspent_bounded with the indexer's selection, which walks confirmed outputs before pending ones. A double that chooses otherwise hands a scenario a list no server sends, and the scenario's result is believed."
     }
   ]
 }

@@ -87,14 +87,15 @@ type indexerHandler func(f *fakeIndexer, ic *indexerConn, req indexerRequest) (s
 // sends, read from its source, so a call site there with no handler here
 // fails the harness.
 var indexerMethods = map[string]indexerHandler{
-	"server.version":                    (*fakeIndexer).handleVersion,
-	"server.features":                   (*fakeIndexer).handleFeatures,
-	"server.ping":                       (*fakeIndexer).handlePing,
-	"blockchain.headers.subscribe":      (*fakeIndexer).handleHeadersSubscribe,
-	"blockchain.scripthash.subscribe":   (*fakeIndexer).handleScripthashSubscribe,
-	"blockchain.scripthash.listunspent": (*fakeIndexer).handleListUnspent,
-	"blockchain.scripthash.get_history": (*fakeIndexer).handleGetHistory,
-	"blockchain.transaction.broadcast":  (*fakeIndexer).handleBroadcast,
+	"server.version":                            (*fakeIndexer).handleVersion,
+	"server.features":                           (*fakeIndexer).handleFeatures,
+	"server.ping":                               (*fakeIndexer).handlePing,
+	"blockchain.headers.subscribe":              (*fakeIndexer).handleHeadersSubscribe,
+	"blockchain.scripthash.subscribe":           (*fakeIndexer).handleScripthashSubscribe,
+	"blockchain.scripthash.listunspent":         (*fakeIndexer).handleListUnspent,
+	"blockchain.scripthash.listunspent_bounded": (*fakeIndexer).handleListUnspentBounded,
+	"blockchain.scripthash.get_history":         (*fakeIndexer).handleGetHistory,
+	"blockchain.transaction.broadcast":          (*fakeIndexer).handleBroadcast,
 }
 
 // scripthashMethods are the methods whose first parameter is a scripthash.
@@ -104,9 +105,10 @@ var indexerMethods = map[string]indexerHandler{
 // for server.version, the raw transaction for transaction.broadcast, and
 // nothing at all for server.ping, server.features and headers.subscribe.
 var scripthashMethods = map[string]bool{
-	"blockchain.scripthash.subscribe":   true,
-	"blockchain.scripthash.listunspent": true,
-	"blockchain.scripthash.get_history": true,
+	"blockchain.scripthash.subscribe":           true,
+	"blockchain.scripthash.listunspent":         true,
+	"blockchain.scripthash.listunspent_bounded": true,
+	"blockchain.scripthash.get_history":         true,
 }
 
 func newFakeIndexer(t *testing.T, scan *scanner, addrs ...string) *fakeIndexer {
@@ -318,6 +320,110 @@ func (f *fakeIndexer) handleListUnspent(_ *indexerConn, req indexerRequest) (str
 		return "", &rpcError{code: 1, message: "internal"}
 	}
 	return string(b), nil
+}
+
+// handleListUnspentBounded answers as the indexer does from tag
+// soqucoin-1.19.0-3: at most limit of the address's outputs, chosen by
+// boundedUTXOs, with the count and the value of all of them. A limit outside
+// 1 to 1,000 gets the error the indexer sends, and the failList knob applies
+// as it does to listunspent.
+func (f *fakeIndexer) handleListUnspentBounded(_ *indexerConn, req indexerRequest) (string, *rpcError) {
+	sh := firstString(req)
+	var limit int
+	if len(req.Params) < 2 || json.Unmarshal(req.Params[1], &limit) != nil || limit < 1 || limit > electrumx.MaxBoundedLimit {
+		return "", &rpcError{code: 1, message: "limit must be an integer from 1 to 1,000"}
+	}
+	f.mu.Lock()
+	fail := f.failList[sh]
+	f.mu.Unlock()
+	if fail {
+		return "", &rpcError{code: 1, message: "indexer failure"}
+	}
+	utxos := f.utxosFor(sh)
+	var value int64
+	for i := range utxos {
+		value += utxos[i].Value
+	}
+	kept := boundedUTXOs(utxos, limit)
+	if kept == nil {
+		kept = []types.UTXO{}
+	}
+	b, err := json.Marshal(struct {
+		Outputs    []types.UTXO `json:"outputs"`
+		Total      int          `json:"total"`
+		TotalValue int64        `json:"total_value"`
+	}{kept, len(utxos), value})
+	if err != nil {
+		f.t.Errorf("marshal listunspent_bounded for %s: %v", sh, err)
+		return "", &rpcError{code: 1, message: "internal"}
+	}
+	return string(b), nil
+}
+
+// boundedUTXOs is the indexer's selection (bounded_utxos in its
+// server/utxo_cache.py at tag soqucoin-1.19.0-3). The rows come back as given
+// when they fit. Otherwise the confirmed rows are walked largest first, then
+// the pending ones largest first. A transaction's rows are taken together
+// when all of them still fit, and one with more rows than the places left is
+// passed over. Places still free are filled in the same order, and the kept
+// rows are returned largest first whatever their height. Equal values order
+// by transaction id, then by position.
+func boundedUTXOs(rows []types.UTXO, limit int) []types.UTXO {
+	if len(rows) <= limit {
+		return rows
+	}
+	largestFirst := func(set []types.UTXO) {
+		sort.SliceStable(set, func(i, j int) bool {
+			a, b := set[i], set[j]
+			if a.Value != b.Value {
+				return a.Value > b.Value
+			}
+			if a.TxID != b.TxID {
+				return a.TxID < b.TxID
+			}
+			return a.Vout < b.Vout
+		})
+	}
+	var confirmed, pending []types.UTXO
+	for _, r := range rows {
+		if r.Height > 0 {
+			confirmed = append(confirmed, r)
+		} else {
+			pending = append(pending, r)
+		}
+	}
+	largestFirst(confirmed)
+	largestFirst(pending)
+	ordered := append(confirmed, pending...)
+	byTx := map[string][]int{}
+	for i, r := range ordered {
+		byTx[r.TxID] = append(byTx[r.TxID], i)
+	}
+	kept := map[int]bool{}
+	for i, r := range ordered {
+		if len(kept) == limit {
+			break
+		}
+		if outs := byTx[r.TxID]; !kept[i] && len(kept)+len(outs) <= limit {
+			for _, j := range outs {
+				kept[j] = true
+			}
+		}
+	}
+	for i := range ordered {
+		if len(kept) == limit {
+			break
+		}
+		kept[i] = true
+	}
+	out := make([]types.UTXO, 0, limit)
+	for i, r := range ordered {
+		if kept[i] {
+			out = append(out, r)
+		}
+	}
+	largestFirst(out)
+	return out
 }
 
 // handleGetHistory answers with the transactions that created the address's

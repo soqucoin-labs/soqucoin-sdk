@@ -268,7 +268,8 @@ func (c *Client) Reconnect(ctx context.Context) error {
 }
 
 // Call sends a JSON-RPC request and returns its reply. This is exported for
-// advanced usage; prefer the typed methods.
+// advanced usage; prefer the typed methods. A reply that carries an error
+// member is returned as a *ServerError.
 //
 // Production lesson (PF-018b): Multiple goroutines (the refresher, sendmany,
 // consolidation) call this concurrently. Writes are serialised; reads belong
@@ -431,7 +432,7 @@ func (c *Client) await(ctx context.Context, id int64, p pendingCall, method stri
 	defer timer.Stop()
 	deliver := func(in incoming) (json.RawMessage, error) {
 		if len(in.Error) > 0 && string(in.Error) != "null" {
-			return nil, fmt.Errorf("electrumx error: %s", string(in.Error))
+			return nil, newServerError(in.Error)
 		}
 		if method == "blockchain.headers.subscribe" {
 			c.recordTipIfLive(p.gen, in.Result)
