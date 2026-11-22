@@ -126,13 +126,22 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 }
 
 // NotFinal is what the ceiling counts (deposit.Book): every credited deposit
-// that is not final yet. This ledger never sweeps, so that is what Pending
-// lists. A ledger that sweeps a deposit before it is final keeps it in this
-// list, and out of Pending, until the transaction that swept it has more than
-// 288 confirmations: a reorganisation that removes the deposit takes the
+// that is not final yet, whether or not it is still in Pending. This ledger
+// never sweeps, so the two lists hold the same deposits, and each is built on
+// its own: a ledger that sweeps a deposit before it is final takes it out of
+// Pending and keeps it here until the transaction that swept it has more than
+// 288 confirmations. A reorganisation that removes the deposit takes the
 // sweep with it.
-func (l *memLedger) NotFinal(ctx context.Context) ([]deposit.Deposit, error) {
-	return l.Pending(ctx)
+func (l *memLedger) NotFinal(context.Context) ([]deposit.Deposit, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []deposit.Deposit
+	for k, d := range l.credited {
+		if !l.final[k] {
+			out = append(out, d)
+		}
+	}
+	return out, nil
 }
 
 // safeguardChanged reports whether the safeguards hold back something else

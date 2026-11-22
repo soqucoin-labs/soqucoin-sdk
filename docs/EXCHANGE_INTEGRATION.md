@@ -573,10 +573,18 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	return nil
 }
 // NotFinal is what the ceiling counts: every credited deposit that is not
-// final yet. This ledger sweeps nothing, so that is what Pending lists; a
-// ledger that sweeps earlier keeps the swept deposit in this list. See below.
-func (l *memLedger) NotFinal(ctx context.Context) ([]deposit.Deposit, error) {
-	return l.Pending(ctx)
+// final yet, whether or not it is still in Pending. A ledger that sweeps a
+// deposit early takes it out of Pending and keeps it here; see below.
+func (l *memLedger) NotFinal(context.Context) ([]deposit.Deposit, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []deposit.Deposit
+	for k, d := range l.credited {
+		if !l.final[k] {
+			out = append(out, d)
+		}
+	}
+	return out, nil
 }
 
 func main() {
@@ -693,10 +701,11 @@ stays is a condition a human should see.
 
 The ceiling reads your records through `deposit.Book`, which has one method. `NotFinal` returns
 every credited deposit that is not final yet, as it was credited. If you spend no deposit before it
-is final, that is what `Pending` returns. A deposit you sweep earlier leaves `Pending` and stays in
-this list: a reorganisation that removes the deposit takes the sweep with it. Take it off when the
-sweep transaction has more than 288 confirmations on your node. The count is read from your records
-on every pass, so a restart loses nothing.
+is final, the list holds what `Pending` holds. A deposit you sweep earlier leaves `Pending` and
+stays in this list: a reorganisation that removes the deposit takes the sweep with it. Take it off
+when the sweep transaction has more than 288 confirmations on your node. Build the list on its own
+and not from `Pending`, so a swept deposit you forget keeps counting. The count is read from your
+records on every pass, so a restart loses nothing.
 
 The height in a record is not read. A reorganisation can move a credited deposit to a later block,
 and the Monitor marks it final from your node's own count of its depth. A deposit your node no
