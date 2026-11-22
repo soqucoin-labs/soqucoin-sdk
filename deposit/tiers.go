@@ -256,7 +256,8 @@ func (t *Tiers) Status() TiersStatus {
 
 // Refresh reads the node's chain tips, their proof of work and two hashrates,
 // and the Book's credited deposits. When any of them cannot be read the
-// reading is dropped and Hold holds every deposit until a Refresh succeeds.
+// reading is dropped, and every credit and every final mark waits until a
+// Refresh succeeds.
 func (t *Tiers) Refresh(ctx context.Context) error {
 	t.refreshMu.Lock()
 	defer t.refreshMu.Unlock()

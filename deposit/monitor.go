@@ -522,10 +522,11 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			}
 			if done {
 				// Credited. It enters the final set once the node, not the
-				// indexer, puts it past the horizon: until then, one gettxout
-				// per scan for an outpoint the ledger leaves out of Pending;
-				// after that, no question at all. An outpoint still in Pending
-				// is marked final by recheckPending when its turn comes.
+				// indexer, puts it past the horizon and the Safeguard does not
+				// hold the mark: until then, one gettxout per scan for an
+				// outpoint the ledger leaves out of Pending; after that, no
+				// question at all. An outpoint still in Pending is marked
+				// final by finalise when its turn comes.
 				if !pending[outpointKey(u.TxID, u.Vout)] {
 					out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 					if err != nil {
