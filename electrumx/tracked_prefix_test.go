@@ -332,3 +332,68 @@ func TestAReplyIsRefusedWhenItsConnectionWasReplacedAndTheReplacementLost(t *tes
 		t.Fatalf("the record after the refusal: %v, %v", at, rerr)
 	}
 }
+
+// A context that ends while the check of the reply waits for the connection
+// lock says nothing about the indexer. The caller gets its own context's
+// error and the address keeps the verdict it had, also when the reply's
+// connection was replaced meanwhile: recorded as a refusal, the replacement
+// would put a lost-connection error on an address the server had answered
+// clean, for a caller that only stopped waiting.
+func TestAContextThatEndsAtTheReplyCheckKeepsTheVerdictOfTheAddress(t *testing.T) {
+	a := craftAddr(t, 0x77)
+	sh := scripthashOf(t, a)
+	stub := newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
+		if req.Method == "blockchain.scripthash.listunspent" && firstParam(req) == sh {
+			return []string{reply(req.ID, `[]`)}
+		}
+		return []string{reply(req.ID, `null`)}
+	})
+	c := connect(t, stub)
+	if err := c.TrackAddresses([]string{a}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.refreshAddressUnder(context.Background(), types.Stagenet.HRP, a); err != nil {
+		t.Fatal(err)
+	}
+	clean, rerr := c.LastRefreshOf(a)
+	if clean.IsZero() || rerr != nil {
+		t.Fatalf("the record after a clean refresh: %v, %v", clean, rerr)
+	}
+
+	// The reply's connection is replaced and a newer one is live, as
+	// replacedWhileHeld leaves the client.
+	c.lockConnBlocking()
+	gen := c.gen
+	c.genesisGen = gen + 1
+	c.setLiveGen(gen + 1)
+	c.unlockConn()
+	c.mu.RLock()
+	seq := c.refreshed[a].seq
+	c.mu.RUnlock()
+
+	for _, ended := range []error{context.Canceled, context.DeadlineExceeded} {
+		err := c.refusedReply(a, gen, seq, c.refreshTicket.Add(1), ended)
+		if !errors.Is(err, ended) || errors.Is(err, ErrNotConnected) {
+			t.Fatalf("a check that ended with %v returned %v", ended, err)
+		}
+		at, rerr := c.LastRefreshOf(a)
+		if !at.Equal(clean) || rerr != nil {
+			t.Fatalf("after a check that ended with %v the record is %v, %v; it was %v, nil", ended, at, rerr, clean)
+		}
+		c.mu.RLock()
+		pending := c.changed[a]
+		c.mu.RUnlock()
+		if pending {
+			t.Fatalf("a check that ended with %v left a refresh pending", ended)
+		}
+	}
+
+	// A refusal in the same state is recorded as the replacement.
+	err := c.refusedReply(a, gen, seq, c.refreshTicket.Add(1), ErrNetworkMismatch)
+	if !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("a refused reply of a replaced connection: %v", err)
+	}
+	if _, rerr := c.LastRefreshOf(a); !errors.Is(rerr, ErrNotConnected) {
+		t.Fatalf("the record after the refusal: %v", rerr)
+	}
+}

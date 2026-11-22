@@ -559,7 +559,7 @@ func (c *Client) refreshAddressUnder(ctx context.Context, hrp, addr string) erro
 	// that was replaced and checked again is refused here too, and recorded as
 	// the replacement (recordRefreshFailure), as commitRefresh records it.
 	if rerr := c.replyIsFor(ctx, gen, hrp); rerr != nil {
-		return c.recordRefreshFailure(addr, gen, seqBefore, ticket, fmt.Errorf("listunspent: %w", rerr))
+		return c.refusedReply(addr, gen, seqBefore, ticket, rerr)
 	}
 
 	freshUTXOs, err := parseUnspent(result)
@@ -759,6 +759,22 @@ func (c *Client) staleReplyLocked(addr string, gen uint64) error {
 		return fmt.Errorf("%w: the connection was replaced before the listunspent reply for %s was handled", ErrNotConnected, addr)
 	}
 	return nil
+}
+
+// refusedReply records a listunspent reply that replyIsFor did not pass and
+// returns the error for the caller. A refusal goes on the address's record
+// (recordRefreshFailure). A context that ended while the check waited for the
+// connection lock is no refusal: nothing was learned about the reply or about
+// the indexer, so it is recorded as a call that ended is (recordRefresh), the
+// verdict on the address stands, and the caller gets its own context's error
+// whatever became of the connection meanwhile.
+func (c *Client) refusedReply(addr string, gen, seqBefore, ticket uint64, rerr error) error {
+	rerr = fmt.Errorf("listunspent: %w", rerr)
+	if endedErr(rerr) {
+		c.recordRefresh(addr, gen, seqBefore, ticket, rerr)
+		return rerr
+	}
+	return c.recordRefreshFailure(addr, gen, seqBefore, ticket, rerr)
 }
 
 // recordRefreshFailure records a reply that could not be used (one that does

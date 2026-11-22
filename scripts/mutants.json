@@ -2913,9 +2913,18 @@
       "file": "electrumx/client.go",
       "package": "./electrumx",
       "test": "TestARefreshOfATrackedAddressTakesNoSetFromAServerCheckedAgainstAnotherPrefix",
-      "find": "return c.recordRefreshFailure(addr, gen, seqBefore, ticket, fmt.Errorf(\"listunspent: %w\", rerr))",
-      "replace": "return fmt.Errorf(\"listunspent: %w\", rerr)",
+      "find": "return c.recordRefreshFailure(addr, gen, seqBefore, ticket, rerr)",
+      "replace": "return rerr",
       "why": "The refusal goes on the address's record, which is what the deposit monitor reads to skip an address the indexer has not answered for. Returned to the caller alone, the record keeps its last clean verdict and the address is credited from a set that was never refreshed."
+    },
+    {
+      "id": "electrumx-context-ended-at-the-reply-check-recorded-as-a-refusal",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAContextThatEndsAtTheReplyCheckKeepsTheVerdictOfTheAddress",
+      "find": "if endedErr(rerr) {",
+      "replace": "if false {",
+      "why": "A context that ends while the check of the reply waits for the connection lock says nothing about the indexer. Sent to recordRefreshFailure, it is recorded as the replacement when the reply's connection was replaced meanwhile: the caller gets a lost-connection error in place of its own context's, and an address the server had answered clean carries that error on its record."
     },
     {
       "id": "electrumx-tracked-subscribe-reply-not-checked-against-its-prefix",
