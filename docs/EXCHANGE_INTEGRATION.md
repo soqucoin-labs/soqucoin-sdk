@@ -518,27 +518,16 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-// smallDeposit and largeDeposit are the two value lines from Step 4, in
-// shors. The figures are placeholders: set them to the amounts of SOQ worth
-// about 100 USD and about 1,000 USD at your own price, and move them when the
-// price moves.
-const (
-	smallDeposit = 500_000 * types.ShorsPerSOQ
-	largeDeposit = 5_000_000 * types.ShorsPerSOQ
-)
-
-// requiredConfirmations is the policy from Step 4: 10 below the first value
-// line, 30 below the second, and types.MaxReorgDepth (288) at or above it,
-// the depth from which a synced node refuses a new header on a branch that
-// would remove the deposit.
-func requiredConfirmations(value int64) int64 {
-	switch {
-	case value < smallDeposit:
-		return 10
-	case value < largeDeposit:
-		return 30
-	}
-	return types.MaxReorgDepth
+// lines are the two value lines and the ceiling from Step 4, in shors. The
+// figures are placeholders: set them to the amounts of SOQ worth about 100 USD,
+// about 1,000 USD and about 10,000 USD at your own price, and move them with
+// Tiers.SetLines when the price moves. A deposit below the first line is
+// credited at 10 confirmations, one below the second at 30, and one at or
+// above it at types.MaxReorgDepth (288).
+var lines = deposit.TierLines{
+	SmallBelow: 500_000 * types.ShorsPerSOQ,
+	LargeFrom:  5_000_000 * types.ShorsPerSOQ,
+	Ceiling:    50_000_000 * types.ShorsPerSOQ,
 }
 
 // memLedger stands in for your database. Credit must be idempotent on the
@@ -583,6 +572,19 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	l.final[key(txid, vout)] = true
 	return nil
 }
+// CreditedSince is what the ceiling counts: every deposit credited in a block
+// at or above the height, an output you have swept included; see below.
+func (l *memLedger) CreditedSince(_ context.Context, height int64) ([]deposit.Deposit, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []deposit.Deposit
+	for _, d := range l.credited {
+		if d.Height >= height {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
 
 func main() {
 	depositAddresses := []string{"sq1p...", "sq1p..."} // one per user, from your database
@@ -613,13 +615,20 @@ func main() {
 	node.Network = types.Mainnet // RequireSynced refuses a node on any other chain
 
 	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}}
+	// The three tiers of Step 4 and their safeguards. Set both fields below:
+	// Required alone is the tiers without the safeguards.
+	tiers, err := deposit.NewTiers(node, ledger, lines)
+	if err != nil {
+		log.Fatalf("deposit tiers: %v", err)
+	}
 	monitor := &deposit.Monitor{
 		Cache:     elx,
 		Node:      node,
 		Network:   types.Mainnet, // coinbase maturity 288; Scan refuses a node on any other chain
 		Ledger:    ledger,
 		Addresses: func(context.Context) []string { return depositAddresses },
-		Required:  requiredConfirmations,
+		Required:  tiers.Required,
+		Safeguard: tiers,
 		OnAlert: func(kind deposit.AlertKind, msg string) {
 			// Route to your paging. Every alert here is a human's problem:
 			// indexer and node disagreeing, a credited deposit that vanished,
@@ -629,11 +638,17 @@ func main() {
 		Logger: logger, // receives the alerts when OnAlert is nil
 	}
 
+	var waiting bool
 	for range time.Tick(30 * time.Second) {
 		// Bound each pass so one stalled node call cannot outlive the interval.
 		passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		credited, err := monitor.Scan(passCtx)
 		cancel()
+		// Page when the safeguards start to hold deposits back, and when they stop.
+		if st := tiers.Status(); (st.Ahead != "" || st.Unsettled != "") != waiting {
+			waiting = !waiting
+			log.Printf("ALERT deposit_safeguard: every deposit waits: %q; the lower tiers wait for 288: %q", st.Ahead, st.Unsettled)
+		}
 		if err != nil {
 			log.Printf("scan: %v", err) // deposit.ErrPaused while the node or indexer is not current
 			continue
@@ -654,6 +669,35 @@ was final looks to the node exactly like one a reorganisation removed, gone from
 `Monitor` cannot tell the two apart: a swept output still in `Pending` raises `AlertDepositVanished`
 on every scan. Record the sweep in the ledger and leave the output out of `Pending`, or mark it
 final once the sweep transaction is.
+
+`deposit.Tiers` is the confirmation policy of Step 4 together with its safeguards. `Tiers.Required`
+gives the tier of a value: 10, 30 or 288 confirmations. As the Monitor's `Safeguard`, the same
+`Tiers` reads your node and your records once in every pass. It then holds back a deposit that has
+reached its tier in four cases:
+
+- **The ceiling.** A deposit below 288 confirmations waits when it would take the value credited
+  below 288 over `TierLines.Ceiling`. It is credited at 288. A credited deposit counts until it has
+  more than 288 confirmations, the depth at which the Monitor marks it final.
+- **An unsettled chain.** Every deposit below 288 confirmations waits while the chain is unsettled.
+  It is unsettled while your node's chain tips (`getchaintips`) show a branch of three or more
+  blocks beside the active chain, ending within the last 288 blocks. It is also unsettled while the
+  hashrate of the last 120 blocks is below half that of the last 1,440, or the node reports none.
+- **A branch with more work.** Every deposit waits, at any depth, while your node holds the headers
+  of a branch with more work than its chain. The branch is one that leaves the chain below the tip,
+  and its work is the `chainwork` of `getblockheader`. Your node follows such a branch once it has
+  the blocks.
+- **No reading.** Every deposit waits while the node or your records cannot be read, or the last
+  reading is older than `Tiers.MaxAge` (5 minutes by default).
+
+A held deposit raises no alert and is asked about again on the next pass. `Tiers.Status` says what
+is held back and why. Page when it changes, as the loop above does: a branch with more work that
+stays is a condition a human should see.
+
+The ceiling reads your records through `deposit.Book`, which has one method. `CreditedSince` returns
+every deposit credited in a block at or above a height, as it was credited. It keeps an output you
+have swept, which `Pending` leaves out: a reorganisation that removes the deposit takes the sweep
+with it. With a database this is one query on the height column. The count is read from your
+records on every pass, so a restart loses nothing.
 
 ---
 
@@ -1087,8 +1131,11 @@ cost. We suggest three safeguards with the two lower tiers:
    below half that of the last 1,440 (`getnetworkhashps 120` against `getnetworkhashps 1440`).
 3. **A withdrawal waits for the tier of the deposit behind it.**
 
-`examples/exchange_deposit` applies the three tiers. The ceiling reads your ledger and the fallback
-reads your node, so both are yours to wire.
+`deposit.Tiers` applies the three tiers and the first two safeguards (Step 2), and
+`examples/exchange_deposit` runs it. It reads a branch of three or more blocks beside the active
+chain as a reorganisation of that size, whether or not your node followed the branch. One header
+added on top of a branch the node left changes how the node lists it, so the two cannot be told
+apart. The third safeguard is in your own books.
 
 These figures are our recommendation for today. They follow how mining is distributed across pools
 now. We plan to lower the 288 tier as more pools mine SOQ, and this guide will carry the new figures
@@ -1101,8 +1148,9 @@ or more blocks below the tip (node `src/validation.cpp`, `ContextualCheckBlockHe
 that far down. The node applies the rule once, when a header is first accepted, and not during
 initial block download. A header it accepted while its branch was shallower is not judged again
 when its block arrives. 288 confirmations are therefore the depth of this rule. They are not
-unconditional finality. `deposit.Monitor` marks a credited deposit final one block later, at 289
-confirmations (`types.MaxReorgDepth + 1`).
+unconditional finality. `deposit.Tiers` covers that case: it credits nothing while your node holds
+the headers of a branch with more work than the chain it follows. `deposit.Monitor` marks a
+credited deposit final one block later, at 289 confirmations (`types.MaxReorgDepth + 1`).
 
 **Set your own thresholds against value at risk. The counts in the table are a floor.**
 

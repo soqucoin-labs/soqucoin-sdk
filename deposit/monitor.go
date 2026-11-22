@@ -129,6 +129,24 @@ type Deposit struct {
 // one block later.
 type Policy func(value int64) int64
 
+// Safeguard decides, from state it reads itself, whether a deposit that has
+// reached the depth Required gives for its value is credited on this pass.
+//
+// Refresh is called once in every pass, after the credited deposits have been
+// rechecked and before any new one is credited. An error ends the pass with
+// nothing new credited. Hold is then asked about each deposit the node has
+// confirmed, at every depth; true leaves it uncredited on this pass, with no
+// alarm, and the next pass asks again.
+//
+// It is separate from Required because Required is read again for a deposit
+// already credited: a credited output the node reports shallower than
+// Required is alarmed as regressed. A count that rose while the chain was
+// unsettled would alarm every deposit credited below it on every pass.
+type Safeguard interface {
+	Refresh(ctx context.Context) error
+	Hold(d Deposit) bool
+}
+
 // Monitor scans tracked addresses and credits verified deposits.
 type Monitor struct {
 	Cache     Cache
@@ -145,6 +163,13 @@ type Monitor struct {
 	// maturity applied and the node consulted cannot drift apart; a Monitor
 	// left with no Network over a regtest node is refused for that reason.
 	Network types.Network
+
+	// Safeguard, when set, reads its state once in every pass and is then
+	// asked about each deposit before it is credited (Safeguard). Tiers is the
+	// one this package supplies: the ceiling and the fallback that go with the
+	// two lower confirmation tiers, and a hold while the node knows of a
+	// branch with more work than its chain.
+	Safeguard Safeguard
 
 	// MaxCacheAge bounds how stale the indexer cache may be before a scan is
 	// skipped entirely (default 5 minutes). A stale cache is an outage, not
@@ -405,6 +430,13 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The safeguard reads its state after the recheck, which no reading of
+	// its own may hold back, and before the first new credit.
+	if m.Safeguard != nil {
+		if err := m.Safeguard.Refresh(ctx); err != nil {
+			return nil, fmt.Errorf("deposit: the safeguard could not read its state: %w", err)
+		}
+	}
 
 	// 4. Credit new deposits the node agrees with, skipping the addresses the
 	//    indexer has not refreshed within MaxCacheAge when it reports that.
@@ -503,6 +535,9 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			}
 			if !ok {
 				continue
+			}
+			if m.Safeguard != nil && m.Safeguard.Hold(d) {
+				continue // it waits, unalarmed, as an immature coinbase does
 			}
 			// The node has confirmed the output; the record lands whether or
 			// not the caller is still waiting, and a failure to record it is

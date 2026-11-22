@@ -58,6 +58,18 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	return nil
 }
 
+// CreditedSince makes the book a deposit.Book: every credit in a block at or
+// above the height, final or not.
+func (l *memLedger) CreditedSince(_ context.Context, height int64) ([]deposit.Deposit, error) {
+	var out []deposit.Deposit
+	for _, d := range l.credited {
+		if d.Height >= height {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
 // fixture: a node with a funded hot wallet (mature coinbase) and a deposit
 // address, plus the scanner tracking both.
 type fixture struct {
@@ -390,6 +402,11 @@ func TestRefusedInputsNeverReachTheNode(t *testing.T) {
 // inside the horizon (the chain is ~250 blocks tall, the horizon is 288), so
 // the node accepts it, and a coinbase cannot return to the mempool, so the
 // deposit is simply gone.
+//
+// deposit.Tiers reads the same node at each step: nothing held back on the
+// chain as mined, every deposit held while the node keeps a branch with more
+// work than the chain it follows, and the lower tiers sent to the horizon
+// once the chain has passed that branch and it still stands beside it.
 func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	f := setup(t)
 	led := newLedger()
@@ -398,6 +415,24 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("initial credit: %v %+v", err, got)
 	}
+	tiers, err := deposit.NewTiers(f.n.rpc, led, deposit.TierLines{SmallBelow: 1, LargeFrom: 2, Ceiling: types.MaxMoney})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reading := func(step string) deposit.TiersStatus {
+		t.Helper()
+		if err := tiers.Refresh(context.Background()); err != nil {
+			t.Fatalf("%s: Tiers could not read the node: %v", step, err)
+		}
+		st := tiers.Status()
+		if st.Tip != f.n.height() {
+			t.Fatalf("%s: Tiers reads the tip at %d, the node is at %d", step, st.Tip, f.n.height())
+		}
+		return st
+	}
+	if st := reading("the chain as mined"); st.Ahead != "" || st.Unsettled != "" {
+		t.Fatalf("on the chain as mined Tiers holds back: ahead %q, unsettled %q", st.Ahead, st.Unsettled)
+	}
 	depositBlock, err := f.n.rpc.GetBlockHash(context.Background(), got[0].Height)
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +440,28 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	if _, err := f.n.rpc.Call(context.Background(), "invalidateblock", depositBlock); err != nil {
 		t.Fatalf("invalidateblock: %v", err)
 	}
-	f.n.mine(f.hot, int(types.Regtest.CoinbaseMaturity)+10) // a longer chain without the deposit
+	// The node is back at block 5 and still holds the 66 blocks it left, which
+	// it lists as invalid. They extend its tip, so following them would remove
+	// nothing from its chain, and Tiers holds nothing back for them.
+	if st := reading("on the block below the branch"); st.Ahead != "" || st.Unsettled != "" {
+		t.Fatalf("with the branch on top of the tip Tiers holds back: ahead %q, unsettled %q", st.Ahead, st.Unsettled)
+	}
+	// Three blocks on, the branch stands beside the chain and carries more
+	// work than it: every deposit waits, at any depth.
+	f.n.mine(f.hot, 3)
+	deep := deposit.Deposit{TxID: strings.Repeat("ab", 32), Value: 1, Height: 1, Confirmations: 400}
+	if st := reading("beside the longer branch"); !strings.Contains(st.Ahead, "more work") || !tiers.Hold(deep) {
+		t.Fatalf("with a longer branch beside the chain Tiers reads ahead %q and holds a deposit at 400 confirmations: %v", st.Ahead, tiers.Hold(deep))
+	}
+	f.n.mine(f.hot, int(types.Regtest.CoinbaseMaturity)+7) // a longer chain without the deposit
+	// The chain has passed the branch, which ends inside the horizon: nothing
+	// is ahead, the chain is unsettled, and only the lower tiers wait.
+	if st := reading("past the branch"); st.Ahead != "" || !strings.Contains(st.Unsettled, "beside the active chain") {
+		t.Fatalf("past the branch Tiers reads ahead %q, unsettled %q", st.Ahead, st.Unsettled)
+	}
+	if tiers.Hold(deep) || !tiers.Hold(deposit.Deposit{TxID: strings.Repeat("cd", 32), Value: 1, Height: 60, Confirmations: 10}) {
+		t.Fatal("on the unsettled chain a deposit at 400 confirmations was held, or one at 10 was passed")
+	}
 	if err := f.scan.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}

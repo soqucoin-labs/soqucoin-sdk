@@ -66,6 +66,7 @@ options and the full walkthrough.
 | **Withdrawal state machine** | `withdraw.Engine`: idempotency keys, persist-before-broadcast, same-bytes retry on a lost reply, recovery without rebuilding |
 | **Batch payments** | `Engine.SubmitBatch`: up to 500 payees in one transaction and one durable intent, paid whole or refused; a pool's payout run or an exchange's batched withdrawals |
 | **Deposit crediting** | `deposit.Monitor`: credits only what your own node confirms; pauses while syncing or stale; alarms on a vanished credit |
+| **Confirmation tiers** | `deposit.Tiers`: 10, 30 and 288 confirmations by value, a ceiling on the value credited below 288, 288 for every deposit while the chain is unsettled, and no credit while your node holds a branch with more work than its chain |
 | **Circuit breaker** | Halts on systemic failures only (per-request errors never count), one probe, recovers; a reconciler trip halts it until an operator's `Reset` |
 | **Reconciliation** | Verifies the indexer cache against the node outpoint by outpoint, reading this process's own spends from the spent set; halts withdrawals on a mismatch |
 | **Webhook alerting** | Slack-compatible notifications for circuit breaker transitions |
