@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -56,10 +57,14 @@ type fakeBook struct {
 	list  []Deposit
 	err   error
 	asked int
+	onAsk func() // runs while the book is read, when set
 }
 
 func (b *fakeBook) NotFinal(context.Context) ([]Deposit, error) {
 	b.asked++
+	if b.onAsk != nil {
+		b.onAsk()
+	}
 	return b.list, b.err
 }
 
@@ -268,7 +273,8 @@ func TestTheCeilingCountsWhatTheBookListsAsNotFinal(t *testing.T) {
 // exchange's records it is past the horizon while the node has it 180 deep.
 // It still counts against the ceiling, so a new deposit that would pass the
 // ceiling waits. When the node puts the first one past the horizon the
-// Monitor marks it final, and the second is credited.
+// Monitor marks it final, and the second is credited on the pass after: the
+// pass that gives the mark read the count before it.
 func TestACreditedDepositAReorganisationMovedCountsUntilTheNodePutsItPastTheHorizon(t *testing.T) {
 	m, cache, node, led, al, a := setup(t)
 	chain := settled(node.tip)
@@ -302,11 +308,15 @@ func TestACreditedDepositAReorganisationMovedCountsUntilTheNodePutsItPastTheHori
 	}
 
 	// The node puts the first deposit past the horizon: final, and the room
-	// under the ceiling is free again.
+	// under the ceiling is free from the next reading.
 	node.tip = moved + types.MaxReorgDepth
 	chain.tips[0].Height = node.tip
 	node.outs[key(txA, 0)] = txout(t, a, 200, types.MaxReorgDepth+1, false)
 	node.outs[key(txB, 0)] = txout(t, a, 60, node.tip-cache.utxos[a][1].Height+1, false)
+	got, err = m.Scan(context.Background())
+	if err != nil || len(got) != 0 || !led.final[key(txA, 0)] {
+		t.Fatalf("the pass that marks the first deposit final: %v %+v, final %v", err, got, led.final[key(txA, 0)])
+	}
 	got, err = m.Scan(context.Background())
 	if err != nil || len(got) != 1 || got[0].TxID != txB {
 		t.Fatalf("with the first deposit final the second was not credited: %v %+v", err, got)
@@ -780,6 +790,8 @@ type recorder struct {
 	led        *fakeLedger
 	refreshErr error
 	hold       bool
+	holdFinal  bool
+	holdMarkOf map[string]bool // by txid: the final marks held when holdFinal is not set
 	calls      []string
 }
 
@@ -791,6 +803,20 @@ func (r *recorder) Refresh(context.Context) error {
 func (r *recorder) Hold(d Deposit) bool {
 	r.calls = append(r.calls, fmt.Sprintf("hold %s at %d", d.TxID[:1], d.Confirmations))
 	return r.hold
+}
+
+func (r *recorder) HoldFinal(d Deposit) bool {
+	r.calls = append(r.calls, fmt.Sprintf("final %s at %d under %q", d.TxID[:1], d.Confirmations, d.BestBlock))
+	return r.holdFinal || r.holdMarkOf[d.TxID]
+}
+
+// orderedLedger lists what is pending in the order of the transaction ids.
+type orderedLedger struct{ *fakeLedger }
+
+func (l orderedLedger) Pending(ctx context.Context) ([]Deposit, error) {
+	out, err := l.fakeLedger.Pending(ctx)
+	sort.Slice(out, func(i, j int) bool { return out[i].TxID < out[j].TxID })
+	return out, err
 }
 
 // The Monitor reads the safeguard once in a pass, after the credited deposits
@@ -849,11 +875,17 @@ func TestASafeguardThatCannotReadEndsThePassAfterTheRecheck(t *testing.T) {
 	led.credited[key(txB, 0)] = Deposit{TxID: txB, Vout: 0, Address: a, Value: 700, Height: 950, Confirmations: 30}
 	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 500, Height: 960, Address: a}}
 	node.outs[key(txA, 0)] = txout(t, a, 500, 41, false)
-	// txB is credited and the node no longer has it.
+	// txB is credited and the node no longer has it. A third is credited and
+	// the node has it past the horizon.
+	led.credited[key("cc", 0)] = Deposit{TxID: "cc", Vout: 0, Address: a, Value: 700, Height: 712, Confirmations: 30}
+	node.outs[key("cc", 0)] = txout(t, a, 700, types.MaxReorgDepth+1, false)
 
 	got, err := m.Scan(context.Background())
-	if !errors.Is(err, unread) || len(got) != 0 || len(led.credited) != 1 {
+	if !errors.Is(err, unread) || len(got) != 0 || len(led.credited) != 2 {
 		t.Fatalf("the pass returned %v with %d credited, want the safeguard's error and nothing new", err, len(got))
+	}
+	if len(led.final) != 0 || m.finalCount() != 0 {
+		t.Errorf("a deposit was marked final in a pass whose safeguard read nothing: %v", led.final)
 	}
 	if !strings.Contains(err.Error(), "safeguard") {
 		t.Errorf("the error does not say the safeguard failed: %v", err)
@@ -861,8 +893,8 @@ func TestASafeguardThatCannotReadEndsThePassAfterTheRecheck(t *testing.T) {
 	if al.count(AlertDepositVanished) != 1 {
 		t.Errorf("the vanished deposit was alarmed %d times before the safeguard ended the pass, want once", al.count(AlertDepositVanished))
 	}
-	if want := []string{"refresh with 1 credited"}; !reflect.DeepEqual(guard.calls, want) {
-		t.Errorf("the safeguard was called %v, want one Refresh and no Hold", guard.calls)
+	if want := []string{"refresh with 2 credited"}; !reflect.DeepEqual(guard.calls, want) {
+		t.Errorf("the safeguard was called %v, want one Refresh and no question", guard.calls)
 	}
 }
 
@@ -1030,5 +1062,357 @@ func TestHoldAsksForTheTipOfTheReading(t *testing.T) {
 	d.BestBlock = ""
 	if !tiers.Hold(d) {
 		t.Error("a deposit with no best block was passed on a reading whose tip has no hash")
+	}
+}
+
+// ── what is final ──────────────────────────────────────────────────────────
+
+// The attack the hold on the final mark is for. A deposit is credited at 10
+// confirmations. The node then takes the headers of a branch that leaves the
+// chain below the deposit and carries more work, and the blocks stay away
+// until the node counts the deposit past the horizon. A count alone would
+// mark it final there: the ledger would stop listing it, the ceiling would
+// stop counting it and no pass would ask the node about it again, so the
+// reorganisation that follows would remove it with no alarm. With the hold it
+// stays pending and counted, and the pass after the reorganisation alarms it.
+func TestACreditedDepositIsNotMarkedFinalWhileABranchWithMoreWorkIsKnown(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	chain := settled(node.tip)
+	node.best = "active"
+	tiers, _ := newTestTiers(t, chain, led)
+	m.Required, m.Safeguard = tiers.Required, tiers
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 50, Height: 991, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 50, SmallDepth, false)
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 1 {
+		t.Fatalf("the small deposit was not credited at 10 confirmations: %v %+v", err, got)
+	}
+
+	// The branch forks at 980, below the deposit's block, and its blocks are
+	// still away when the node has the deposit 289 deep.
+	node.tip = 991 + types.MaxReorgDepth
+	chain.tips[0].Height = node.tip
+	chain.with("side", 1100, 120, "headers-only", activeWork+1)
+	node.outs[key(txA, 0)] = txout(t, a, 50, types.MaxReorgDepth+1, false)
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := m.Scan(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if led.final[key(txA, 0)] || m.finalCount() != 0 {
+			t.Fatalf("pass %d marked the deposit final at 289 confirmations beside a branch with more work", pass)
+		}
+	}
+	if st := tiers.Status(); st.Exposed != 50 || !strings.Contains(st.Ahead, "more work") {
+		t.Fatalf("the deposit left the count, or the branch is not read: %+v", st)
+	}
+	if len(al.kinds) != 0 {
+		t.Fatalf("the wait raised %v", al.kinds)
+	}
+
+	// The blocks arrive. The node follows the branch, and the deposit is not
+	// in it.
+	chain.tips = []rpc.ChainTip{
+		{Height: 1100, Hash: "side", Status: rpc.ChainTipActive},
+		{Height: 991 + types.MaxReorgDepth, Hash: "active", BranchLen: 299, Status: "valid-fork"},
+	}
+	node.tip, node.best = 1100, "side"
+	delete(node.outs, key(txA, 0))
+	cache.utxos[a] = nil
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if al.count(AlertDepositVanished) != 1 {
+		t.Fatalf("the credited deposit the reorganisation removed was alarmed %d times, want once: %v", al.count(AlertDepositVanished), al.kinds)
+	}
+	if st := tiers.Status(); st.Exposed != 50 {
+		t.Errorf("the removed deposit left the count before the exchange settled its record: %+v", st)
+	}
+}
+
+// The mark is given at the tip of a reading that shows no branch ahead, and
+// not from a depth the node counted at another tip. The pass that gives it
+// still counts the deposit against the ceiling, since its reading came first;
+// the next one does not.
+func TestTheFinalMarkWaitsForAReadingAtTheTipTheDepthWasCountedFrom(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	chain := settled(node.tip)
+	tiers, _ := newTestTiers(t, chain, led)
+	m.Required, m.Safeguard = tiers.Required, tiers
+	led.credited[key(txA, 0)] = Deposit{TxID: txA, Vout: 0, Address: a, Value: 50, Height: 712, Confirmations: SmallDepth, BestBlock: "old"}
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 50, Height: 712, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 50, types.MaxReorgDepth+1, false)
+
+	// The reading is of the tip "active"; gettxout is answered from the block
+	// after it.
+	node.best = "next"
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if led.final[key(txA, 0)] || m.finalCount() != 0 {
+		t.Fatal("a depth counted at a tip the reading did not see marked the deposit final")
+	}
+
+	// Both at one tip.
+	chain.tips[0].Hash = "next"
+	chain.work["next"] = activeWork + 1
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !led.final[key(txA, 0)] || m.finalCount() != 1 {
+		t.Fatal("with the depth and the reading at one tip and no branch ahead, the deposit was not marked final")
+	}
+	if st := tiers.Status(); st.Exposed != 50 {
+		t.Errorf("the pass that marked the deposit read the count as %d, want 50: its reading came before the mark", st.Exposed)
+	}
+	asked := node.calls
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if st := tiers.Status(); st.Exposed != 0 || node.calls != asked {
+		t.Errorf("after the mark the count reads %d and the node was asked %d times, want 0 and 0", st.Exposed, node.calls-asked)
+	}
+	if len(al.kinds) != 0 {
+		t.Errorf("alerts %v", al.kinds)
+	}
+}
+
+// Before the Monitor marks a credited deposit final it asks the safeguard,
+// after the reading of that pass, with the depth and the best block the node
+// reported. One the safeguard holds stays pending and is asked about on every
+// pass; one it passes is marked in the ledger and asked about no more.
+func TestTheMonitorAsksTheSafeguardBeforeItMarksADepositFinal(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	guard := &recorder{led: led, holdFinal: true}
+	m.Safeguard = guard
+	node.best = "tip-1"
+	led.credited[key(txA, 0)] = Deposit{TxID: txA, Vout: 0, Address: a, Value: 700, Height: 712, Confirmations: 30, BestBlock: "old"}
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 700, Height: 712, Address: a}}
+
+	// At the horizon itself no mark is due, and the safeguard is not asked.
+	node.outs[key(txA, 0)] = txout(t, a, 700, types.MaxReorgDepth, false)
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"refresh with 1 credited"}; !reflect.DeepEqual(guard.calls, want) || len(led.final) != 0 {
+		t.Fatalf("at 288 confirmations the safeguard was called %v and the ledger marked %v", guard.calls, led.final)
+	}
+
+	node.outs[key(txA, 0)] = txout(t, a, 700, types.MaxReorgDepth+1, false)
+	asked := []string{"refresh with 1 credited", `final a at 289 under "tip-1"`}
+	for pass := 1; pass <= 2; pass++ {
+		guard.calls = nil
+		if _, err := m.Scan(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(guard.calls, asked) {
+			t.Fatalf("pass %d: the safeguard was called %v, want %v", pass, guard.calls, asked)
+		}
+		if led.final[key(txA, 0)] || m.finalCount() != 0 {
+			t.Fatalf("pass %d marked a deposit final that the safeguard holds", pass)
+		}
+	}
+
+	guard.holdFinal, guard.calls = false, nil
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(guard.calls, asked) || !led.final[key(txA, 0)] || m.finalCount() != 1 {
+		t.Fatalf("released, the deposit was not marked final (asked %v, ledger %v, set %d)", guard.calls, led.final, m.finalCount())
+	}
+	guard.calls = nil
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"refresh with 1 credited"}; !reflect.DeepEqual(guard.calls, want) {
+		t.Errorf("a deposit marked final was put to the safeguard again: %v", guard.calls)
+	}
+	if len(al.kinds) != 0 {
+		t.Errorf("alerts %v", al.kinds)
+	}
+}
+
+// A mark the safeguard holds does not keep the next deposit from its own.
+func TestAHeldFinalMarkDoesNotKeepAnotherDepositFromItsMark(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	m.Ledger = orderedLedger{led}
+	m.Safeguard = &recorder{led: led, holdMarkOf: map[string]bool{txA: true}}
+	for _, txid := range []string{txA, txB} {
+		led.credited[key(txid, 0)] = Deposit{TxID: txid, Vout: 0, Address: a, Value: 700, Height: 712, Confirmations: 30}
+		cache.utxos[a] = append(cache.utxos[a], types.UTXO{TxID: txid, Vout: 0, Value: 700, Height: 712, Address: a})
+		node.outs[key(txid, 0)] = txout(t, a, 700, types.MaxReorgDepth+1, false)
+	}
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if led.final[key(txA, 0)] || !led.final[key(txB, 0)] || m.finalCount() != 1 {
+		t.Errorf("the ledger marked %v and the set holds %d, want the second deposit alone", led.final, m.finalCount())
+	}
+	if len(al.kinds) != 0 {
+		t.Errorf("alerts %v", al.kinds)
+	}
+}
+
+// unmarkingLedger cannot record a final mark.
+type unmarkingLedger struct {
+	orderedLedger
+	err error
+}
+
+func (l unmarkingLedger) MarkFinal(context.Context, string, uint32) error { return l.err }
+
+// A ledger that cannot record the final mark is alarmed and ends the pass with
+// its error, and the deposit stays out of the Monitor's final set. Every
+// pending deposit was rechecked before the first mark, so one that vanished,
+// listed after the deposit whose mark failed, is alarmed in the same pass.
+func TestALedgerThatCannotMarkFinalEndsThePassAfterTheRecheck(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	away := errors.New("the database is away")
+	m.Ledger = unmarkingLedger{orderedLedger{led}, away}
+	for _, txid := range []string{txA, txB} {
+		led.credited[key(txid, 0)] = Deposit{TxID: txid, Vout: 0, Address: a, Value: 700, Height: 712, Confirmations: 30}
+		cache.utxos[a] = append(cache.utxos[a], types.UTXO{TxID: txid, Vout: 0, Value: 700, Height: 712, Address: a})
+	}
+	node.outs[key(txA, 0)] = txout(t, a, 700, types.MaxReorgDepth+1, false)
+	// The node no longer has txB.
+
+	got, err := m.Scan(context.Background())
+	if !errors.Is(err, away) || len(got) != 0 {
+		t.Fatalf("the pass returned %v and %+v, want the ledger's error", err, got)
+	}
+	if al.count(AlertLedgerError) != 1 || al.count(AlertDepositVanished) != 1 {
+		t.Errorf("alerts %v, want the ledger's error and the vanished deposit, once each", al.kinds)
+	}
+	if m.finalCount() != 0 {
+		t.Error("a deposit the ledger could not mark entered the final set")
+	}
+}
+
+// The same question is asked for a credited deposit the ledger leaves out of
+// Pending, before it enters the Monitor's own final set. One the safeguard
+// holds costs a question to the node on every pass, as it did within the
+// horizon.
+func TestACreditedDepositOutsidePendingEntersTheFinalSetOnlyWhenTheSafeguardPassesIt(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	m.Ledger = &sweepingLedger{fakeLedger: led, swept: map[string]bool{key(txA, 0): true}}
+	guard := &recorder{led: led, holdFinal: true}
+	m.Safeguard = guard
+	node.best = "tip-1"
+	led.credited[key(txA, 0)] = Deposit{TxID: txA, Vout: 0, Address: a, Value: 700, Height: 712, Confirmations: 30}
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 700, Height: 712, Address: a}}
+
+	// At the horizon itself the safeguard is not asked.
+	node.outs[key(txA, 0)] = txout(t, a, 700, types.MaxReorgDepth, false)
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"refresh with 1 credited"}; !reflect.DeepEqual(guard.calls, want) || m.finalCount() != 0 {
+		t.Fatalf("at 288 confirmations the safeguard was called %v and the set holds %d", guard.calls, m.finalCount())
+	}
+
+	node.outs[key(txA, 0)] = txout(t, a, 700, types.MaxReorgDepth+1, false)
+	asked := []string{"refresh with 1 credited", `final a at 289 under "tip-1"`}
+	for pass := 1; pass <= 2; pass++ {
+		guard.calls = nil
+		before := node.calls
+		if _, err := m.Scan(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(guard.calls, asked) {
+			t.Fatalf("pass %d: the safeguard was called %v, want %v", pass, guard.calls, asked)
+		}
+		if m.finalCount() != 0 || node.calls-before != 1 {
+			t.Fatalf("pass %d: the set holds %d and the node was asked %d times, want 0 and 1", pass, m.finalCount(), node.calls-before)
+		}
+	}
+
+	guard.holdFinal = false
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := node.calls
+	if _, err := m.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m.finalCount() != 1 || node.calls != before || len(led.final) != 0 {
+		t.Errorf("released: the set holds %d, the node was asked %d times more and the ledger marked %v", m.finalCount(), node.calls-before, led.final)
+	}
+	if len(al.kinds) != 0 {
+		t.Errorf("alerts %v", al.kinds)
+	}
+}
+
+// HoldFinal holds the final mark in the three cases that hold a deposit at any
+// depth and in no other: an unsettled chain and a full ceiling leave a deposit
+// past the horizon final, and the question counts nothing.
+func TestHoldFinalFollowsTheReadingAndNothingElse(t *testing.T) {
+	deep := dep(1, 50, 712, types.MaxReorgDepth+1)
+	other, none := deep, deep
+	other.BestBlock, none.BestBlock = "next", ""
+
+	tiers, clock := newTestTiers(t, settled(1000), &fakeBook{})
+	if !tiers.HoldFinal(deep) {
+		t.Fatal("a deposit was passed as final before any reading")
+	}
+	if err := tiers.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if tiers.HoldFinal(deep) {
+		t.Error("a fresh reading at the deposit's tip, with no branch ahead, holds the final mark")
+	}
+	if !tiers.HoldFinal(other) || !tiers.HoldFinal(none) {
+		t.Error("a depth counted at another tip, or at none, was passed as final")
+	}
+	*clock = clock.Add(DefaultTiersMaxAge)
+	if tiers.HoldFinal(deep) {
+		t.Error("a reading exactly MaxAge old was refused")
+	}
+	*clock = clock.Add(time.Nanosecond)
+	if !tiers.HoldFinal(deep) {
+		t.Error("a deposit was passed as final on a reading older than MaxAge")
+	}
+
+	ahead := refreshed(t, settled(1000).with("side", 990, 5, "headers-only", activeWork+1), &fakeBook{})
+	if !ahead.HoldFinal(deep) {
+		t.Error("a deposit was passed as final beside a branch with more work")
+	}
+
+	// Unsettled, and the ceiling taken whole by what the book lists.
+	full := refreshed(t, settled(1000).with("side", 999, 3, "valid-fork", activeWork-1),
+		&fakeBook{list: []Deposit{dep(9, testLines.Ceiling, 991, 10)}})
+	if st := full.Status(); st.Unsettled == "" || st.Ahead != "" || st.Exposed != testLines.Ceiling {
+		t.Fatalf("setup: %+v", st)
+	}
+	if full.HoldFinal(deep) {
+		t.Error("an unsettled chain or a full ceiling held the final mark of a deposit past the horizon")
+	}
+	if st := full.Status(); st.Exposed != testLines.Ceiling {
+		t.Errorf("the question moved the count to %d", st.Exposed)
+	}
+}
+
+// A reading is as old as its first answer. Here the book takes longer than
+// MaxAge to list the credited deposits, so the chain tips are that old when
+// the reading is kept, and Hold does not decide on it.
+func TestAReadingIsAsOldAsItsFirstAnswer(t *testing.T) {
+	book := &fakeBook{}
+	tiers, clock := newTestTiers(t, settled(1000), book)
+	began := *clock
+	book.onAsk = func() { *clock = clock.Add(DefaultTiersMaxAge + time.Nanosecond) }
+	if err := tiers.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := tiers.Status().ReadAt; !got.Equal(began) {
+		t.Errorf("the reading is stamped %v, want the moment it began, %v", got, began)
+	}
+	if !tiers.Hold(dep(1, 50, 991, 10)) || !tiers.Hold(dep(2, 5000, 1, 1000)) || !tiers.HoldFinal(dep(3, 50, 712, types.MaxReorgDepth+1)) {
+		t.Error("a reading whose chain tips are older than MaxAge decided")
+	}
+
+	// One that took exactly MaxAge is still good at the moment it is kept.
+	book.onAsk = func() { *clock = clock.Add(DefaultTiersMaxAge) }
+	if err := tiers.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if tiers.Hold(dep(2, 5000, 1, 1000)) {
+		t.Error("a reading exactly MaxAge old was refused")
 	}
 }

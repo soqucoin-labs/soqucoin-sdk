@@ -1365,8 +1365,8 @@
       "file": "deposit/tiers.go",
       "package": "./deposit",
       "test": "TestABranchWithMoreWorkHoldsEveryDepositAtAnyDepth",
-      "find": "\tif t.ahead != \"\" {\n\t\treturn true\n\t}\n\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
-      "replace": "\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif t.ahead != \"\" {\n\t\treturn true\n\t}\n",
+      "find": "\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "replace": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n",
       "why": "A branch with more work removes a deposit at any depth, so the hold comes before the depth is read. After it, a deposit at 288 confirmations is credited beside a branch that removes it."
     },
     {
@@ -1626,8 +1626,8 @@
       "file": "deposit/monitor.go",
       "package": "./deposit",
       "test": "TestASafeguardThatCannotReadEndsThePassAfterTheRecheck",
-      "find": "\tpending, err := m.recheckPending(ctx)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\t// The safeguard reads its state after the recheck, which no reading of\n\t// its own may hold back, and before the first new credit.\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n",
-      "replace": "\t// The safeguard reads its state after the recheck, which no reading of\n\t// its own may hold back, and before the first new credit.\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n\tpending, err := m.recheckPending(ctx)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n",
+      "find": "\tpending, deep, err := m.recheckPending(ctx)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\t// The safeguard reads its state after the recheck, which no reading of\n\t// its own may hold back, and before the first final mark and the first\n\t// new credit.\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n",
+      "replace": "\t// The safeguard reads its state after the recheck, which no reading of\n\t// its own may hold back, and before the first final mark and the first\n\t// new credit.\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n\tpending, deep, err := m.recheckPending(ctx)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n",
       "why": "The recheck of what is already credited runs whatever the safeguard can read. Behind the safeguard, a credited deposit that vanished is not alarmed while the safeguard fails."
     },
     {
@@ -3328,8 +3328,8 @@
       "file": "deposit/tiers.go",
       "package": "./deposit",
       "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
-      "find": "\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n",
-      "replace": "",
+      "find": "\treturn best == \"\" || best != t.tipHash // counted from a tip the reading was not taken at\n",
+      "replace": "\treturn false\n",
       "why": "The reading is taken once in a pass. A deposit the node reports under a later best block is judged against a chain state the reading never saw, and a branch the node took with that block is in no reading yet."
     },
     {
@@ -3337,8 +3337,8 @@
       "file": "deposit/tiers.go",
       "package": "./deposit",
       "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
-      "find": "\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
-      "replace": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n",
+      "find": "\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "replace": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n",
       "why": "A deposit at 288 confirmations is covered because the reading and its depth are at one tip: a branch that removes it then forks 288 or more below that tip. Read after the depth, the tip rule leaves the top tier to a reading of another tip."
     },
     {
@@ -3346,8 +3346,8 @@
       "file": "deposit/tiers.go",
       "package": "./deposit",
       "test": "TestHoldAsksForTheTipOfTheReading",
-      "find": "if d.BestBlock == \"\" || d.BestBlock != t.tipHash {",
-      "replace": "if d.BestBlock != t.tipHash {",
+      "find": "return best == \"\" || best != t.tipHash",
+      "replace": "return best != t.tipHash",
       "why": "A deposit that carries no best block is bound to no tip. Beside a reading whose tip has no hash the two would compare equal and the deposit would pass unbound."
     },
     {
@@ -3385,6 +3385,114 @@
       "find": "return (paged.Ahead != \"\") != (now.Ahead != \"\") || (paged.Unsettled != \"\") != (now.Unsettled != \"\")",
       "replace": "return (paged.Ahead != \"\" || paged.Unsettled != \"\") != (now.Ahead != \"\" || now.Unsettled != \"\")",
       "why": "A branch with more work can appear while the chain is already unsettled. Read as one condition, the two holds give no page when every deposit starts to wait, and none when that ends."
+    },
+    {
+      "id": "tiers-a-reading-is-stamped-when-it-ends",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestAReadingIsAsOldAsItsFirstAnswer",
+      "find": "\tt.readAt = began\n",
+      "replace": "\tbegan = t.clock()\n\tt.readAt = began\n",
+      "why": "A reading is as old as its first answer. Stamped when it ends, a reading whose chain tips are older than MaxAge is kept as fresh and decides for another MaxAge."
+    },
+    {
+      "id": "tiers-the-final-mark-is-never-held",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldFinalFollowsTheReadingAndNothingElse",
+      "find": "\treturn t.holdsAtAnyDepth(d.BestBlock)\n",
+      "replace": "\treturn false\n",
+      "why": "The node's count alone does not rule out a branch it took the headers of earlier. Without the hold a credited deposit is marked final beside such a branch and no pass asks about it again."
+    },
+    {
+      "id": "tiers-the-final-mark-waits-on-an-unsettled-chain",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldFinalFollowsTheReadingAndNothingElse",
+      "find": "\treturn t.holdsAtAnyDepth(d.BestBlock)\n",
+      "replace": "\treturn t.holdsAtAnyDepth(d.BestBlock) || t.unsettled != \"\"\n",
+      "why": "An unsettled chain sends the lower tiers to the horizon and holds nothing at it. Held there too, no credited deposit becomes final while a branch stands beside the chain, and the ceiling keeps counting all of them."
+    },
+    {
+      "id": "deposit-the-final-mark-does-not-ask-the-safeguard",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositIsNotMarkedFinalWhileABranchWithMoreWorkIsKnown",
+      "find": "\t\tif m.holdFinal(d) {\n\t\t\tcontinue\n\t\t}\n",
+      "replace": "",
+      "why": "A deposit the safeguard holds stays pending: rechecked, alarmed if it is gone, and counted. Marked on the count alone, it leaves the watch beside a branch that can still remove it."
+    },
+    {
+      "id": "deposit-a-held-final-mark-stops-the-ones-after-it",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestAHeldFinalMarkDoesNotKeepAnotherDepositFromItsMark",
+      "find": "\t\tif m.holdFinal(d) {\n\t\t\tcontinue\n\t\t}\n",
+      "replace": "\t\tif m.holdFinal(d) {\n\t\t\tbreak\n\t\t}\n",
+      "why": "Each deposit is asked about on its own. One whose depth was counted at another tip would otherwise keep every deposit listed after it from its mark."
+    },
+    {
+      "id": "deposit-the-final-set-does-not-ask-the-safeguard",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositOutsidePendingEntersTheFinalSetOnlyWhenTheSafeguardPassesIt",
+      "find": "\t\t\t\t\t\tif !m.holdFinal(reported) {\n\t\t\t\t\t\t\tm.markFinal(u.TxID, u.Vout, addr)\n\t\t\t\t\t\t}\n",
+      "replace": "\t\t\t\t\t\t_ = reported\n\t\t\t\t\t\tm.markFinal(u.TxID, u.Vout, addr)\n",
+      "why": "The Monitor's own final set ends every question about an outpoint. Entered on the count alone, a credited deposit outside Pending is asked about no more beside a branch that can still remove it."
+    },
+    {
+      "id": "deposit-the-final-mark-is-given-before-the-reading",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestASafeguardThatCannotReadEndsThePassAfterTheRecheck",
+      "find": "\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n\tif err := m.finalise(ctx, deep); err != nil {\n\t\treturn nil, err\n\t}\n",
+      "replace": "\tif err := m.finalise(ctx, deep); err != nil {\n\t\treturn nil, err\n\t}\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n",
+      "why": "The mark is decided on the reading of the same pass. Given before it, the safeguard answers from the pass before, and a pass whose safeguard reads nothing still marks deposits final."
+    },
+    {
+      "id": "deposit-the-final-question-carries-the-record",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestTheMonitorAsksTheSafeguardBeforeItMarksADepositFinal",
+      "find": "\t\t\tdeep = append(deep, Deposit{TxID: d.TxID, Vout: d.Vout, Address: d.Address, Value: d.Value,\n\t\t\t\tConfirmations: out.Confirmations, BestBlock: out.BestBlock})\n",
+      "replace": "\t\t\tdeep = append(deep, d)\n",
+      "why": "The safeguard compares the tip the node counted the depth from with the tip of its reading. The record carries the depth and the tip of the pass that credited the deposit, which say nothing about now."
+    },
+    {
+      "id": "deposit-the-final-set-question-carries-no-best-block",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositOutsidePendingEntersTheFinalSetOnlyWhenTheSafeguardPassesIt",
+      "find": "Confirmations: out.Confirmations, BestBlock: out.BestBlock}\n",
+      "replace": "Confirmations: out.Confirmations}\n",
+      "why": "Without the best block the safeguard cannot tell what tip the depth was counted from, and Tiers then holds the mark of every credited deposit outside Pending for good."
+    },
+    {
+      "id": "deposit-a-pending-deposit-is-marked-final-at-the-horizon",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestTheMonitorAsksTheSafeguardBeforeItMarksADepositFinal",
+      "find": "\t\tif out.Confirmations > types.MaxReorgDepth {\n\t\t\tdeep = append(",
+      "replace": "\t\tif out.Confirmations >= types.MaxReorgDepth {\n\t\t\tdeep = append(",
+      "why": "The horizon covers a deposit from 288 confirmations and the watch ends one block later. At 288 the mark would end it a block early."
+    },
+    {
+      "id": "deposit-the-final-set-takes-a-deposit-at-the-horizon",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositOutsidePendingEntersTheFinalSetOnlyWhenTheSafeguardPassesIt",
+      "find": "if out != nil && out.Confirmations > types.MaxReorgDepth {",
+      "replace": "if out != nil && out.Confirmations >= types.MaxReorgDepth {",
+      "why": "The final set takes an outpoint one block past the horizon, as the ledger's mark does. At 288 the questions about it would end a block early."
+    },
+    {
+      "id": "deposit-a-ledger-that-cannot-mark-final-is-passed-over",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestALedgerThatCannotMarkFinalEndsThePassAfterTheRecheck",
+      "find": "\t\t\tm.alert(AlertLedgerError, \"MarkFinal %s:%d: %v\", d.TxID, d.Vout, err)\n\t\t\treturn err\n",
+      "replace": "\t\t\tm.alert(AlertLedgerError, \"MarkFinal %s:%d: %v\", d.TxID, d.Vout, err)\n\t\t\tcontinue\n",
+      "why": "A final mark the ledger did not record is a failure of the exchange's own book. Passed over, the pass reports success while the book still lists the deposit as pending."
     }
   ]
 }

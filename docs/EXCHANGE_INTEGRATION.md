@@ -679,7 +679,8 @@ reached its tier in five cases:
 
 - **The ceiling.** A deposit below 288 confirmations waits when it would take the value credited
   below 288 over `TierLines.Ceiling`. It is credited at 288. A credited deposit counts until it is
-  final, which the Monitor marks when your node has it more than 288 deep.
+  final. The Monitor marks it final when your node has it more than 288 deep and `Tiers` does not
+  hold the mark, as described below the list.
 - **An unsettled chain.** Every deposit below 288 confirmations waits while the chain is unsettled.
   It is unsettled while your node's chain tips (`getchaintips`) show a branch of three or more
   blocks beside the active chain, ending within the last 288 blocks. It is also unsettled while the
@@ -693,19 +694,29 @@ reached its tier in five cases:
   block arrived between the two, and a branch that came with it is in no reading yet. Keep a pass
   shorter than the time between two blocks.
 - **No reading.** Every deposit waits while the node or your records cannot be read, or the last
-  reading is older than `Tiers.MaxAge` (5 minutes by default).
+  reading is older than `Tiers.MaxAge` (5 minutes by default). The age is counted from the moment
+  the reading began.
 
 A held deposit raises no alert and is asked about again on the next pass. `Tiers.Status` says what
 is held back and why. Page when it changes, as the loop above does: a branch with more work that
 stays is a condition a human should see.
 
+The same reading decides when a credited deposit is final. The Monitor asks `Tiers.HoldFinal`
+before it marks one. The mark waits in three of the five cases: a branch with more work, a reading
+of another tip, and no reading. A count of 289 alone would end the watch on a deposit beside a
+branch your node already holds the headers of. Until the mark the deposit stays in `Pending`. It is
+rechecked on every pass, alarmed if your node no longer has it, and counted against the ceiling. A
+deposit marked final in one pass leaves the ceiling's count at the next.
+
 The ceiling reads your records through `deposit.Book`, which has one method. `NotFinal` returns
 every credited deposit that is not final yet, as it was credited. If you spend no deposit before it
 is final, the list holds what `Pending` holds. A deposit you sweep earlier leaves `Pending` and
 stays in this list: a reorganisation that removes the deposit takes the sweep with it. Take it off
-when the sweep transaction has more than 288 confirmations on your node. Build the list on its own
-and not from `Pending`, so a swept deposit you forget keeps counting. The count is read from your
-records on every pass, so a restart loses nothing.
+when the sweep transaction has more than 288 confirmations on your node and `Tiers.HoldFinal` does
+not hold it. Ask with the `bestblock` your node gave with that count:
+`tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. Build the list on its own and not from
+`Pending`, so a swept deposit you forget keeps counting. The count is read from your records on
+every pass, so a restart loses nothing.
 
 The height in a record is not read. A reorganisation can move a credited deposit to a later block,
 and the Monitor marks it final from your node's own count of its depth. A deposit your node no
@@ -1163,7 +1174,8 @@ when its block arrives. 288 confirmations are therefore the depth of this rule. 
 unconditional finality. `deposit.Tiers` covers that case: it credits nothing while your node holds
 the headers of a branch with more work than the chain it follows. It takes that reading at the tip
 your node counted the deposit's depth from. `deposit.Monitor` marks a
-credited deposit final one block later, at 289 confirmations (`types.MaxReorgDepth + 1`).
+credited deposit final one block later, at 289 confirmations (`types.MaxReorgDepth + 1`). With
+`Tiers` as its safeguard it gives that mark only on such a reading with no branch ahead.
 
 **Set your own thresholds against value at risk. The counts in the table are a floor.**
 
@@ -1228,7 +1240,7 @@ depends on how those are scheduled.
 | `address` | **98.5%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
 | `utxo` | **91.1%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `rpc` | **88.1%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values, the chain tips, their work and the hashrate |
-| `deposit` | **96.4%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm, the three tiers with their ceiling, the unsettled chain, a branch with more work and the tip of the reading |
+| `deposit` | **97.2%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm, the three tiers with their ceiling, the unsettled chain, a branch with more work, the tip of the reading and the hold on the final mark |
 | `electrumx` | **92.2%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
 | `tx` | **92.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `htlc` | **99.1%** | Swap contract template against the node's vector, lock height encoding, parser refusals, claim and refund, spend verification, two spends a node mined, the funding builder, the activation rule and each refusal of the functions that ask a node |

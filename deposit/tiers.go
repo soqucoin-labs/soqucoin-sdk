@@ -74,12 +74,14 @@ type Book interface {
 	// returns. A deposit swept to the hot wallet earlier is still one a
 	// reorganisation can remove, and Ledger.Pending leaves it out: it stays in
 	// this list until the transaction that swept it has more than
-	// types.MaxReorgDepth confirmations on the exchange's node.
+	// types.MaxReorgDepth confirmations on the exchange's node and HoldFinal
+	// passes that count, asked with the best block the node gave with it.
 	//
 	// The Monitor marks an unspent deposit final from the node's own count of
-	// its depth (Ledger.MarkFinal). So a deposit a reorganisation moved to a
-	// later block is listed until it is that deep where it is now, and one
-	// the node no longer has is listed until the exchange settles its record.
+	// its depth, when HoldFinal passes it (Ledger.MarkFinal). So a deposit a
+	// reorganisation moved to a later block is listed until it is that deep
+	// where it is now, and one the node no longer has is listed until the
+	// exchange settles its record.
 	//
 	// The list holds a deposit from the moment Ledger.Credit returns: a copy
 	// of the records that lags leaves the ceiling short by what it has not
@@ -125,20 +127,30 @@ type Book interface {
 //     deposit is asked about again on the next pass, so a pass that runs
 //     longer than the time between two blocks credits little after the first.
 //   - every deposit while there is no reading, or the reading is older than
-//     MaxAge.
+//     MaxAge. A reading is as old as its first answer.
 //
 // With the reading and the depth at one tip, a deposit passed at
 // types.MaxReorgDepth confirmations is in a block that far below that tip. A
 // branch that would remove it forks deeper still: the node refuses every new
-// header on it from then on, and the headers it took before are in the
-// reading.
+// header on it while its chain is no shorter than at that tip, and the
+// headers it took before are in the reading.
+//
+// The same holds for the mark that ends the watch on a credited deposit. The
+// Monitor marks one final when the node has it more than types.MaxReorgDepth
+// deep and HoldFinal passes it. The holds for a branch with more work, for a
+// depth counted at another tip and for a missing or old reading apply; the
+// unsettled chain and the ceiling do not. A count of confirmations alone
+// would mark a deposit final beside a branch the node took the headers of
+// earlier; the ledger would stop listing it, and a reorganisation onto that
+// branch would remove it with no alarm. Held, it stays pending: rechecked on
+// every pass, alarmed if it is gone, and counted against the ceiling.
 //
 // The value credited below the horizon is read from the Book on every
 // Refresh: each deposit it lists as not final that was credited below
 // types.MaxReorgDepth confirmations counts, whatever height its record
-// carries. The Monitor marks a deposit final when the node has it more than
-// types.MaxReorgDepth deep. A restart loses nothing, since the count is the
-// Book's.
+// carries. A deposit marked final in a pass leaves the count at the next
+// one, whose reading no longer lists it. A restart loses nothing, since the
+// count is the Book's.
 //
 // One Tiers serves one Monitor, whose passes run one at a time. Required,
 // SetLines and Status are safe from any goroutine; a Refresh that runs while
@@ -151,11 +163,12 @@ type Book interface {
 // chain carries less work than it, for example the headers of a chain the node
 // took and then found invalid at its first block. That is a chain split, and
 // whether to credit through one is the exchange's decision: a Monitor without
-// this Safeguard credits again.
+// this Safeguard credits, and marks final, on the count alone.
 type Tiers struct {
-	// MaxAge bounds the age of the reading Hold decides on (default
-	// DefaultTiersMaxAge). It must exceed the time one pass of the Monitor
-	// takes, or the deposits a pass reaches last are held on every pass.
+	// MaxAge bounds the age of the reading Hold and HoldFinal decide on
+	// (default DefaultTiersMaxAge), counted from the moment the reading began.
+	// It must exceed the time a Refresh and one pass of the Monitor take
+	// together, or the deposits a pass reaches last are held on every pass.
 	MaxAge time.Duration
 
 	node ChainReader
@@ -170,7 +183,7 @@ type Tiers struct {
 
 	mu        sync.Mutex
 	lines     TierLines
-	readAt    time.Time // zero: no reading
+	readAt    time.Time // when the reading began; zero: no reading
 	tip       int64
 	tipHash   string // the active tip the reading was taken at
 	ahead     string // why every deposit waits, "" when none does for this
@@ -227,7 +240,7 @@ func (t *Tiers) Required(value int64) int64 {
 // TiersStatus is what the last Refresh read, for a log line, a dashboard or a
 // page.
 type TiersStatus struct {
-	ReadAt    time.Time // zero when there is no reading: every deposit waits
+	ReadAt    time.Time // when the reading began; zero when there is none: every deposit waits
 	Tip       int64     // the height of the node's active tip
 	Ahead     string    // why every deposit waits, "" when none does for this
 	Unsettled string    // why the lower tiers wait for types.MaxReorgDepth, "" when they do not
@@ -260,6 +273,8 @@ func (t *Tiers) refresh(ctx context.Context) error {
 	if t.node == nil || t.book == nil {
 		return errors.New("deposit: this Tiers was not made by NewTiers")
 	}
+	// The reading is as old as its first answer, however long the rest takes.
+	began := t.clock()
 	recent, err := t.node.GetNetworkHashPS(ctx, recentBlocks)
 	if err != nil {
 		return err
@@ -308,7 +323,7 @@ func (t *Tiers) refresh(ctx context.Context) error {
 	t.tip, t.tipHash = active.Height, active.Hash
 	t.ahead, t.unsettled = ahead, unsettled
 	t.counted, t.exposed = counted, exposed
-	t.readAt = t.clock()
+	t.readAt = began
 	return nil
 }
 
@@ -430,14 +445,8 @@ func addCapped(a, b int64) int64 {
 func (t *Tiers) Hold(d Deposit) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.readAt.IsZero() || t.clock().Sub(t.readAt) > t.maxAge() {
+	if t.holdsAtAnyDepth(d.BestBlock) {
 		return true
-	}
-	if t.ahead != "" {
-		return true
-	}
-	if d.BestBlock == "" || d.BestBlock != t.tipHash {
-		return true // its depth is counted from a tip the reading was not taken at
 	}
 	if d.Confirmations >= types.MaxReorgDepth {
 		return false
@@ -455,6 +464,33 @@ func (t *Tiers) Hold(d Deposit) bool {
 	t.exposed += d.Value
 	t.counted[key] = true
 	return false
+}
+
+// HoldFinal reports whether a credited deposit the node has more than
+// types.MaxReorgDepth deep stays not final on this pass: while there is no
+// reading or it is too old, while the node holds a branch with more work than
+// its chain, and when the node counted the depth from another tip than the
+// reading's. An unsettled chain and the ceiling hold no deposit at that depth,
+// and the question counts nothing. Of d it reads BestBlock alone, so an
+// exchange can ask it about a transaction of its own, such as the sweep of a
+// deposit, with the best block its node gave with the count.
+func (t *Tiers) HoldFinal(d Deposit) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.holdsAtAnyDepth(d.BestBlock)
+}
+
+// holdsAtAnyDepth reports whether the reading holds a deposit whatever its
+// depth. best is the best block the node counted that depth from. Called
+// under mu.
+func (t *Tiers) holdsAtAnyDepth(best string) bool {
+	if t.readAt.IsZero() || t.clock().Sub(t.readAt) > t.maxAge() {
+		return true
+	}
+	if t.ahead != "" {
+		return true
+	}
+	return best == "" || best != t.tipHash // counted from a tip the reading was not taken at
 }
 
 func (t *Tiers) maxAge() time.Duration {
