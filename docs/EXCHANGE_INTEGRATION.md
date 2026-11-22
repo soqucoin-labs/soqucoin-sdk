@@ -572,18 +572,11 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	l.final[key(txid, vout)] = true
 	return nil
 }
-// CreditedSince is what the ceiling counts: every deposit credited in a block
-// at or above the height, an output you have swept included; see below.
-func (l *memLedger) CreditedSince(_ context.Context, height int64) ([]deposit.Deposit, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var out []deposit.Deposit
-	for _, d := range l.credited {
-		if d.Height >= height {
-			out = append(out, d)
-		}
-	}
-	return out, nil
+// NotFinal is what the ceiling counts: every credited deposit that is not
+// final yet. This ledger sweeps nothing, so that is what Pending lists; a
+// ledger that sweeps earlier keeps the swept deposit in this list. See below.
+func (l *memLedger) NotFinal(ctx context.Context) ([]deposit.Deposit, error) {
+	return l.Pending(ctx)
 }
 
 func main() {
@@ -638,15 +631,16 @@ func main() {
 		Logger: logger, // receives the alerts when OnAlert is nil
 	}
 
-	var waiting bool
+	var ahead, unsettled bool // what the last page said is held back
 	for range time.Tick(30 * time.Second) {
 		// Bound each pass so one stalled node call cannot outlive the interval.
 		passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		credited, err := monitor.Scan(passCtx)
 		cancel()
-		// Page when the safeguards start to hold deposits back, and when they stop.
-		if st := tiers.Status(); (st.Ahead != "" || st.Unsettled != "") != waiting {
-			waiting = !waiting
+		// Page when either hold begins and when it ends, each on its own: a
+		// branch with more work can appear while the chain is already unsettled.
+		if st := tiers.Status(); (st.Ahead != "") != ahead || (st.Unsettled != "") != unsettled {
+			ahead, unsettled = st.Ahead != "", st.Unsettled != ""
 			log.Printf("ALERT deposit_safeguard: every deposit waits: %q; the lower tiers wait for 288: %q", st.Ahead, st.Unsettled)
 		}
 		if err != nil {
@@ -676,8 +670,8 @@ gives the tier of a value: 10, 30 or 288 confirmations. As the Monitor's `Safegu
 reached its tier in five cases:
 
 - **The ceiling.** A deposit below 288 confirmations waits when it would take the value credited
-  below 288 over `TierLines.Ceiling`. It is credited at 288. A credited deposit counts until it has
-  more than 288 confirmations, the depth at which the Monitor marks it final.
+  below 288 over `TierLines.Ceiling`. It is credited at 288. A credited deposit counts until it is
+  final, which the Monitor marks when your node has it more than 288 deep.
 - **An unsettled chain.** Every deposit below 288 confirmations waits while the chain is unsettled.
   It is unsettled while your node's chain tips (`getchaintips`) show a branch of three or more
   blocks beside the active chain, ending within the last 288 blocks. It is also unsettled while the
@@ -697,11 +691,16 @@ A held deposit raises no alert and is asked about again on the next pass. `Tiers
 is held back and why. Page when it changes, as the loop above does: a branch with more work that
 stays is a condition a human should see.
 
-The ceiling reads your records through `deposit.Book`, which has one method. `CreditedSince` returns
-every deposit credited in a block at or above a height, as it was credited. It keeps an output you
-have swept, which `Pending` leaves out: a reorganisation that removes the deposit takes the sweep
-with it. With a database this is one query on the height column. The count is read from your
-records on every pass, so a restart loses nothing.
+The ceiling reads your records through `deposit.Book`, which has one method. `NotFinal` returns
+every credited deposit that is not final yet, as it was credited. If you spend no deposit before it
+is final, that is what `Pending` returns. A deposit you sweep earlier leaves `Pending` and stays in
+this list: a reorganisation that removes the deposit takes the sweep with it. Take it off when the
+sweep transaction has more than 288 confirmations on your node. The count is read from your records
+on every pass, so a restart loses nothing.
+
+The height in a record is not read. A reorganisation can move a credited deposit to a later block,
+and the Monitor marks it final from your node's own count of its depth. A deposit your node no
+longer has keeps counting until you settle its record.
 
 ---
 

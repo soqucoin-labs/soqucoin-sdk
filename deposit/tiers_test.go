@@ -55,25 +55,17 @@ func (c *fakeChain) GetChainWork(_ context.Context, hash string) (*big.Int, erro
 type fakeBook struct {
 	list  []Deposit
 	err   error
-	asked []int64
+	asked int
 }
 
-func (b *fakeBook) CreditedSince(_ context.Context, height int64) ([]Deposit, error) {
-	b.asked = append(b.asked, height)
+func (b *fakeBook) NotFinal(context.Context) ([]Deposit, error) {
+	b.asked++
 	return b.list, b.err
 }
 
-// CreditedSince makes the test ledger a Book: every credit in a block at or
-// above the height, final or not.
-func (l *fakeLedger) CreditedSince(_ context.Context, height int64) ([]Deposit, error) {
-	var out []Deposit
-	for _, d := range l.credited {
-		if d.Height >= height {
-			out = append(out, d)
-		}
-	}
-	return out, nil
-}
+// NotFinal makes the test ledger a Book. It sweeps nothing, so what is not
+// final is what Pending lists.
+func (l *fakeLedger) NotFinal(ctx context.Context) ([]Deposit, error) { return l.Pending(ctx) }
 
 const activeWork = 1_000_000
 
@@ -231,11 +223,11 @@ func TestADepositPassedOnceIsCountedOnce(t *testing.T) {
 	}
 }
 
-// What the book lists counts until it has more than 288 confirmations, the
-// depth at which the Monitor marks a deposit final. A deposit credited at the
-// top tier never counts, one the book gives no height for counts while it is
-// listed, and one listed twice counts once.
-func TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon(t *testing.T) {
+// What the book lists as not final counts, whatever height it carries: the
+// height is the one a deposit was credited at, and a reorganisation can move
+// it to a later block. A deposit credited at the top tier never counts, and
+// one listed twice counts once.
+func TestTheCeilingCountsWhatTheBookListsAsNotFinal(t *testing.T) {
 	const tip = 5000
 	for _, c := range []struct {
 		name string
@@ -243,10 +235,10 @@ func TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon(t *testing.T) {
 		want int64
 	}{
 		{"nothing credited", nil, 0},
-		{"credited at 10 confirmations, now at 288", []Deposit{dep(1, 70, tip-287, 10)}, 70},
-		{"credited at 10 confirmations, now at 289", []Deposit{dep(1, 70, tip-288, 10)}, 0},
+		{"credited at 10 confirmations", []Deposit{dep(1, 70, tip-9, 10)}, 70},
 		{"credited at 287 confirmations", []Deposit{dep(1, 70, tip-9, 287)}, 70},
 		{"credited at the top tier", []Deposit{dep(1, 70, tip-9, 288)}, 0},
+		{"400 blocks down by its record and not final", []Deposit{dep(1, 70, tip-399, 10)}, 70},
 		{"no height in the book", []Deposit{dep(1, 70, 0, 10)}, 70},
 		{"no confirmations in the book", []Deposit{dep(1, 70, tip-9, 0)}, 70},
 		{"listed twice", []Deposit{dep(1, 70, tip-9, 10), dep(1, 70, tip-9, 10)}, 70},
@@ -259,8 +251,8 @@ func TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon(t *testing.T) {
 		if st := tiers.Status(); st.Exposed != c.want {
 			t.Errorf("%s: the value below the horizon reads %d, want %d", c.name, st.Exposed, c.want)
 		}
-		if !reflect.DeepEqual(book.asked, []int64{tip - 287}) {
-			t.Errorf("%s: the book was asked from %v, want from height %d, the lowest block not past the horizon", c.name, book.asked, tip-287)
+		if book.asked != 1 {
+			t.Errorf("%s: the book was asked %d times in one reading, want once", c.name, book.asked)
 		}
 		// A deposit the book lists is not held and not counted a second time.
 		if len(c.list) == 1 && c.want == 70 {
@@ -268,6 +260,59 @@ func TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon(t *testing.T) {
 				t.Errorf("%s: a deposit the book lists was held or counted twice (%d)", c.name, tiers.Status().Exposed)
 			}
 		}
+	}
+}
+
+// The attack the book's finality is for. A deposit is credited, a
+// reorganisation moves it to a later block, and by the height in the
+// exchange's records it is past the horizon while the node has it 180 deep.
+// It still counts against the ceiling, so a new deposit that would pass the
+// ceiling waits. When the node puts the first one past the horizon the
+// Monitor marks it final, and the second is credited.
+func TestACreditedDepositAReorganisationMovedCountsUntilTheNodePutsItPastTheHorizon(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	chain := settled(node.tip)
+	node.best = "active"
+	tiers, _ := newTestTiers(t, chain, led)
+	m.Required, m.Safeguard = tiers.Required, tiers
+	first := node.tip - StandardDepth + 1
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 200, Height: first, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 200, StandardDepth, false)
+	if got, err := m.Scan(context.Background()); err != nil || len(got) != 1 || got[0].Height != first {
+		t.Fatalf("the deposit of 200 was not credited at 30 confirmations: %v %+v", err, got)
+	}
+
+	// 289 blocks above the block in the records, the node has the deposit in
+	// a block 109 higher, 180 deep. A deposit of 60 reaches 10 confirmations.
+	node.tip = first + types.MaxReorgDepth
+	chain.tips[0].Height = node.tip
+	moved := first + 109
+	cache.utxos[a] = []types.UTXO{
+		{TxID: txA, Vout: 0, Value: 200, Height: moved, Address: a},
+		{TxID: txB, Vout: 0, Value: 60, Height: node.tip - SmallDepth + 1, Address: a},
+	}
+	node.outs[key(txA, 0)] = txout(t, a, 200, node.tip-moved+1, false)
+	node.outs[key(txB, 0)] = txout(t, a, 60, SmallDepth, false)
+	got, err := m.Scan(context.Background())
+	if err != nil || len(got) != 0 || len(led.credited) != 1 {
+		t.Fatalf("60 was credited on top of 200 under a ceiling of 250, the 200 being 180 deep on the node: %v %+v", err, got)
+	}
+	if st := tiers.Status(); st.Exposed != 200 || len(al.kinds) != 0 {
+		t.Fatalf("the value below the horizon reads %d, want 200; alerts %v", st.Exposed, al.kinds)
+	}
+
+	// The node puts the first deposit past the horizon: final, and the room
+	// under the ceiling is free again.
+	node.tip = moved + types.MaxReorgDepth
+	chain.tips[0].Height = node.tip
+	node.outs[key(txA, 0)] = txout(t, a, 200, types.MaxReorgDepth+1, false)
+	node.outs[key(txB, 0)] = txout(t, a, 60, node.tip-cache.utxos[a][1].Height+1, false)
+	got, err = m.Scan(context.Background())
+	if err != nil || len(got) != 1 || got[0].TxID != txB {
+		t.Fatalf("with the first deposit final the second was not credited: %v %+v", err, got)
+	}
+	if st := tiers.Status(); st.Exposed != 60 || !led.final[key(txA, 0)] || len(al.kinds) != 0 {
+		t.Errorf("after the first deposit is final: below the horizon %d (want 60), final %v, alerts %v", st.Exposed, led.final[key(txA, 0)], al.kinds)
 	}
 }
 

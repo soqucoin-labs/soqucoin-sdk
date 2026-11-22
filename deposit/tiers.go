@@ -44,8 +44,7 @@ type TierLines struct {
 	// between the two lines is credited at StandardDepth.
 	LargeFrom int64
 	// Ceiling is the most value that may be credited below
-	// types.MaxReorgDepth confirmations and not yet be past the horizon, at
-	// one time.
+	// types.MaxReorgDepth confirmations and not yet be final, at one time.
 	Ceiling int64
 }
 
@@ -69,14 +68,23 @@ type ChainReader interface {
 
 // Book is the part of the exchange's own records the ceiling reads.
 type Book interface {
-	// CreditedSince returns every deposit credited in a block at or above
-	// height, as it was credited (the Deposit that Ledger.Credit received),
-	// whether or not the exchange has spent the output since. A deposit swept
-	// to the hot wallet is still one a reorganisation can remove, so this
-	// list keeps what Ledger.Pending leaves out. It lists a deposit from the
-	// moment Ledger.Credit returns: a copy of the records that lags leaves the
-	// ceiling short by what it has not caught up with.
-	CreditedSince(ctx context.Context, height int64) ([]Deposit, error)
+	// NotFinal returns every credited deposit that is not final yet, as it
+	// was credited (the Deposit that Ledger.Credit received). For an exchange
+	// that spends no deposit before it is final, that is what Ledger.Pending
+	// returns. A deposit swept to the hot wallet earlier is still one a
+	// reorganisation can remove, and Ledger.Pending leaves it out: it stays in
+	// this list until the transaction that swept it has more than
+	// types.MaxReorgDepth confirmations on the exchange's node.
+	//
+	// The Monitor marks an unspent deposit final from the node's own count of
+	// its depth (Ledger.MarkFinal). So a deposit a reorganisation moved to a
+	// later block is listed until it is that deep where it is now, and one
+	// the node no longer has is listed until the exchange settles its record.
+	//
+	// The list holds a deposit from the moment Ledger.Credit returns: a copy
+	// of the records that lags leaves the ceiling short by what it has not
+	// caught up with.
+	NotFinal(ctx context.Context) ([]Deposit, error)
 }
 
 // Tiers applies the three confirmation tiers by value, and the safeguards that
@@ -109,8 +117,8 @@ type Book interface {
 //     followed: a header added on top of a branch that was left makes the two
 //     read alike, so both count.
 //   - a deposit below types.MaxReorgDepth confirmations that would take the
-//     value credited below that depth, and not yet past the horizon, over
-//     Ceiling. It is credited when it reaches types.MaxReorgDepth.
+//     value credited below that depth, and not yet final, over Ceiling. It is
+//     credited when it reaches types.MaxReorgDepth.
 //   - every deposit whose depth the node reported at another tip than the one
 //     the reading was taken at (Deposit.BestBlock). A block arrived between
 //     the two, and what the node took with it is in no reading yet. The
@@ -126,10 +134,11 @@ type Book interface {
 // reading.
 //
 // The value credited below the horizon is read from the Book on every
-// Refresh: each deposit it lists that was credited below types.MaxReorgDepth
-// confirmations counts until it has more than that, the depth at which the
-// Monitor marks a deposit final. A restart loses nothing, since the count is
-// the Book's.
+// Refresh: each deposit it lists as not final that was credited below
+// types.MaxReorgDepth confirmations counts, whatever height its record
+// carries. The Monitor marks a deposit final when the node has it more than
+// types.MaxReorgDepth deep. A restart loses nothing, since the count is the
+// Book's.
 //
 // One Tiers serves one Monitor, whose passes run one at a time. Required,
 // SetLines and Status are safe from any goroutine; a Refresh that runs while
@@ -222,7 +231,7 @@ type TiersStatus struct {
 	Tip       int64     // the height of the node's active tip
 	Ahead     string    // why every deposit waits, "" when none does for this
 	Unsettled string    // why the lower tiers wait for types.MaxReorgDepth, "" when they do not
-	Exposed   int64     // shors credited below types.MaxReorgDepth and not yet past the horizon
+	Exposed   int64     // shors credited below types.MaxReorgDepth and not yet final
 }
 
 // Status returns the state Hold decides on.
@@ -274,8 +283,10 @@ func (t *Tiers) refresh(ctx context.Context) error {
 	if unsettled == "" {
 		unsettled = readHashrate(recent, day)
 	}
-	// Everything credited in a block that is not yet past the horizon.
-	credited, err := t.book.CreditedSince(ctx, active.Height-types.MaxReorgDepth+1)
+	// Everything credited that the exchange's records do not hold as final.
+	// The height in a record is not read: a reorganisation can move a
+	// credited deposit to a later block, and the record keeps the old one.
+	credited, err := t.book.NotFinal(ctx)
 	if err != nil {
 		return fmt.Errorf("deposit: Tiers could not read the credited deposits: %w", err)
 	}
@@ -285,7 +296,6 @@ func (t *Tiers) refresh(ctx context.Context) error {
 		key := outpointKey(d.TxID, d.Vout)
 		switch {
 		case d.Confirmations >= types.MaxReorgDepth: // credited at the top tier
-		case d.Height > 0 && active.Height-d.Height+1 > types.MaxReorgDepth: // past the horizon
 		case counted[key]: // listed twice, counted once
 		default:
 			counted[key] = true

@@ -46,9 +46,9 @@ func TestTheExampleLinesGiveTheThreeTiers(t *testing.T) {
 	}
 }
 
-// The ledger lists for the ceiling every deposit credited in a block at or
-// above a height, the final ones among them, and none from below it.
-func TestTheLedgerListsWhatWasCreditedSinceAHeight(t *testing.T) {
+// The ledger lists for the ceiling every credited deposit that is not final,
+// whatever its height, and none that is.
+func TestTheLedgerListsWhatIsNotFinal(t *testing.T) {
 	ctx := context.Background()
 	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{},
 		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
@@ -63,16 +63,38 @@ func TestTheLedgerListsWhatWasCreditedSinceAHeight(t *testing.T) {
 	if err := ledger.MarkFinal(ctx, "bb", 0); err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		height int64
-		want   int
-	}{{100, 2}, {101, 1}, {200, 1}, {201, 0}} {
-		got, err := ledger.CreditedSince(ctx, tc.height)
-		if err != nil || len(got) != tc.want {
-			t.Errorf("credited since height %d: %d deposits (err %v), want %d", tc.height, len(got), err, tc.want)
-		}
+	got, err := ledger.NotFinal(ctx)
+	if err != nil || len(got) != 1 || got[0].TxID != "aa" {
+		t.Errorf("not final: %+v (err %v), want the deposit at height 100 alone", got, err)
 	}
 	if pending, _ := ledger.Pending(ctx); len(pending) != 1 {
 		t.Errorf("Pending lists %d, want the one that is not final", len(pending))
+	}
+}
+
+// A page goes out when either hold begins or ends, also while the other
+// lasts, and not when a hold only changes its wording.
+func TestThePageFollowsEachHoldOnItsOwn(t *testing.T) {
+	none := deposit.TiersStatus{}
+	unsettled := deposit.TiersStatus{Unsettled: "a branch of 3 blocks"}
+	both := deposit.TiersStatus{Unsettled: "a branch of 3 blocks", Ahead: "a branch with more work"}
+	ahead := deposit.TiersStatus{Ahead: "a branch with more work"}
+	for _, tc := range []struct {
+		name       string
+		paged, now deposit.TiersStatus
+		want       bool
+	}{
+		{"nothing held, nothing held", none, none, false},
+		{"the chain turns unsettled", none, unsettled, true},
+		{"a branch with more work appears on an unsettled chain", unsettled, both, true},
+		{"the branch is passed and the chain is still unsettled", both, unsettled, true},
+		{"the chain settles while the branch is ahead", both, ahead, true},
+		{"the branch is passed", ahead, none, true},
+		{"another reason for the same hold", unsettled, deposit.TiersStatus{Unsettled: "the hashrate fell"}, false},
+		{"a later reading of the same holds", both, deposit.TiersStatus{Unsettled: "x", Ahead: "y", Tip: 9, Exposed: 5}, false},
+	} {
+		if got := safeguardChanged(tc.paged, tc.now); got != tc.want {
+			t.Errorf("%s: a page %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

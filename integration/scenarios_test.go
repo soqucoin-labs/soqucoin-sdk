@@ -58,17 +58,9 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	return nil
 }
 
-// CreditedSince makes the book a deposit.Book: every credit in a block at or
-// above the height, final or not.
-func (l *memLedger) CreditedSince(_ context.Context, height int64) ([]deposit.Deposit, error) {
-	var out []deposit.Deposit
-	for _, d := range l.credited {
-		if d.Height >= height {
-			out = append(out, d)
-		}
-	}
-	return out, nil
-}
+// NotFinal makes the book a deposit.Book: it sweeps nothing, so what is not
+// final is what Pending lists.
+func (l *memLedger) NotFinal(ctx context.Context) ([]deposit.Deposit, error) { return l.Pending(ctx) }
 
 // fixture: a node with a funded hot wallet (mature coinbase) and a deposit
 // address, plus the scanner tracking both.

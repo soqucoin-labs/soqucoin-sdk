@@ -1472,46 +1472,19 @@
       "id": "tiers-a-top-tier-credit-counts-against-the-ceiling",
       "file": "deposit/tiers.go",
       "package": "./deposit",
-      "test": "TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon",
+      "test": "TestTheCeilingCountsWhatTheBookListsAsNotFinal",
       "find": "\t\tcase d.Confirmations >= types.MaxReorgDepth: // credited at the top tier\n",
       "replace": "",
       "why": "A deposit credited at 288 confirmations is not one the ceiling is for. Counted, one large deposit would fill the ceiling and send every small one to 288."
     },
     {
-      "id": "tiers-the-count-drops-a-deposit-at-288",
-      "file": "deposit/tiers.go",
-      "package": "./deposit",
-      "test": "TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon",
-      "find": "active.Height-d.Height+1 > types.MaxReorgDepth: // past the horizon",
-      "replace": "active.Height-d.Height+1 >= types.MaxReorgDepth: // past the horizon",
-      "why": "A credited deposit counts until it has more than 288 confirmations, the depth at which the Monitor marks it final. Dropped a block early, the room it held is given away while the Monitor still watches it."
-    },
-    {
-      "id": "tiers-the-count-never-drops-a-deposit",
-      "file": "deposit/tiers.go",
-      "package": "./deposit",
-      "test": "TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon",
-      "find": "\t\tcase d.Height > 0 && active.Height-d.Height+1 > types.MaxReorgDepth: // past the horizon\n",
-      "replace": "",
-      "why": "A deposit past the horizon no longer counts. Kept, a book that lists more than it was asked for would fill the ceiling with settled deposits."
-    },
-    {
       "id": "tiers-a-deposit-listed-twice-counts-twice",
       "file": "deposit/tiers.go",
       "package": "./deposit",
-      "test": "TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon",
+      "test": "TestTheCeilingCountsWhatTheBookListsAsNotFinal",
       "find": "\t\tcase counted[key]: // listed twice, counted once\n",
       "replace": "",
       "why": "An outpoint is one deposit however often the book lists it."
-    },
-    {
-      "id": "tiers-the-book-is-asked-from-the-wrong-height",
-      "file": "deposit/tiers.go",
-      "package": "./deposit",
-      "test": "TestTheCeilingCountsWhatTheBookListsUntilItIsPastTheHorizon",
-      "find": "active.Height-types.MaxReorgDepth+1)",
-      "replace": "active.Height-types.MaxReorgDepth+2)",
-      "why": "The book is asked from the lowest block that is not past the horizon. One block higher, the deposits of that block are left out of the count."
     },
     {
       "id": "tiers-the-amount-at-the-second-line-is-credited-at-30",
@@ -3394,6 +3367,24 @@
       "find": "CreditedAt: m.clock(), BestBlock: out.BestBlock,",
       "replace": "CreditedAt: m.clock(),",
       "why": "The best block of gettxout is the tip the node counted the depth from. A Deposit without it cannot be bound to a safeguard's reading, and Tiers then credits nothing."
+    },
+    {
+      "id": "tiers-a-credit-is-released-by-the-height-in-its-record",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositAReorganisationMovedCountsUntilTheNodePutsItPastTheHorizon",
+      "find": "\t\tcase counted[key]: // listed twice, counted once\n",
+      "replace": "\t\tcase d.Height > 0 && active.Height-d.Height+1 > types.MaxReorgDepth: // past the horizon by its record\n\t\tcase counted[key]: // listed twice, counted once\n",
+      "why": "The height in the exchange's record is the one a deposit was credited at. A reorganisation can move the deposit to a later block, and released by the old height it leaves the ceiling while the node has it far inside the horizon."
+    },
+    {
+      "id": "example-one-page-for-both-holds",
+      "file": "examples/exchange_deposit/main.go",
+      "package": "./examples/exchange_deposit",
+      "test": "TestThePageFollowsEachHoldOnItsOwn",
+      "find": "return (paged.Ahead != \"\") != (now.Ahead != \"\") || (paged.Unsettled != \"\") != (now.Unsettled != \"\")",
+      "replace": "return (paged.Ahead != \"\" || paged.Unsettled != \"\") != (now.Ahead != \"\" || now.Unsettled != \"\")",
+      "why": "A branch with more work can appear while the chain is already unsettled. Read as one condition, the two holds give no page when every deposit starts to wait, and none when that ends."
     }
   ]
 }

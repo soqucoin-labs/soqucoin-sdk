@@ -125,20 +125,22 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	return nil
 }
 
-// CreditedSince is what the ceiling counts (deposit.Book): every deposit
-// credited in a block at or above the height, as it was credited. Unlike
-// Pending it keeps an output you have swept, which a reorganisation can still
-// remove. In production this is one query on the height column.
-func (l *memLedger) CreditedSince(_ context.Context, height int64) ([]deposit.Deposit, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var out []deposit.Deposit
-	for _, d := range l.credited {
-		if d.Height >= height {
-			out = append(out, d)
-		}
-	}
-	return out, nil
+// NotFinal is what the ceiling counts (deposit.Book): every credited deposit
+// that is not final yet. This ledger never sweeps, so that is what Pending
+// lists. A ledger that sweeps a deposit before it is final keeps it in this
+// list, and out of Pending, until the transaction that swept it has more than
+// 288 confirmations: a reorganisation that removes the deposit takes the
+// sweep with it.
+func (l *memLedger) NotFinal(ctx context.Context) ([]deposit.Deposit, error) {
+	return l.Pending(ctx)
+}
+
+// safeguardChanged reports whether the safeguards hold back something else
+// than at the last page: every deposit (a branch with more work) or the lower
+// tiers (an unsettled chain), each on its own. One beginning while the other
+// lasts is a change, and so is one ending.
+func safeguardChanged(paged, now deposit.TiersStatus) bool {
+	return (paged.Ahead != "") != (now.Ahead != "") || (paged.Unsettled != "") != (now.Unsettled != "")
 }
 
 func main() {
@@ -217,7 +219,7 @@ func main() {
 
 	ticker := time.NewTicker(scanInterval)
 	defer ticker.Stop()
-	var waiting bool
+	var paged deposit.TiersStatus
 	for {
 		select {
 		case <-ctx.Done():
@@ -231,10 +233,10 @@ func main() {
 		credited, err := monitor.Scan(passCtx)
 		cancel()
 		// What the safeguards hold back is a human's problem too: page when
-		// the chain turns unsettled or a branch with more work appears, and
-		// again when it clears.
-		if st := tiers.Status(); (st.Ahead != "" || st.Unsettled != "") != waiting {
-			waiting = !waiting
+		// the chain turns unsettled, when a branch with more work appears,
+		// and when either clears.
+		if st := tiers.Status(); safeguardChanged(paged, st) {
+			paged = st
 			logger.Error("ALERT", "kind", "deposit_safeguard", "every_deposit_waits", st.Ahead,
 				"lower_tiers_wait_for_288", st.Unsettled, "tip", st.Tip, "below_the_horizon_shors", st.Exposed)
 		}
