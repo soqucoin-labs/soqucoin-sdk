@@ -934,15 +934,25 @@ func (c *Client) GetTip(ctx context.Context) (int64, error) {
 	return header.Height, nil
 }
 
-// GetHistory fetches transaction history for an address.
+// GetHistory fetches transaction history for an address. The address does
+// not have to be tracked. The client's prefix is read once, and the address
+// and the server's chain are both checked against that reading.
 func (c *Client) GetHistory(ctx context.Context, addr string) ([]TxHistoryEntry, error) {
-	scriptHash, err := address.AddressToScriptHash(c.hrp(), addr)
+	return c.getHistoryUnder(ctx, c.hrp(), addr)
+}
+
+// getHistoryUnder is GetHistory for a prefix already read (see replyIsFor).
+func (c *Client) getHistoryUnder(ctx context.Context, hrp, addr string) ([]TxHistoryEntry, error) {
+	scriptHash, err := address.AddressToScriptHash(hrp, addr)
 	if err != nil {
 		return nil, fmt.Errorf("address to script hash: %w", err)
 	}
 
-	result, err := c.call(ctx, "blockchain.scripthash.get_history", []interface{}{scriptHash})
+	result, gen, err := c.callGen(ctx, "blockchain.scripthash.get_history", []interface{}{scriptHash})
 	if err != nil {
+		return nil, fmt.Errorf("get_history: %w", err)
+	}
+	if err := c.replyIsFor(ctx, gen, hrp); err != nil {
 		return nil, fmt.Errorf("get_history: %w", err)
 	}
 

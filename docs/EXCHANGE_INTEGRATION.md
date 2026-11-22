@@ -111,15 +111,21 @@ Upstream `LICENCE` is unchanged.
 Tags name the revisions our own instances run. `soqucoin-1.19.0-3` (22 November 2026) adds
 `blockchain.scripthash.listunspent_bounded`. It answers at most 1,000 of an address's unspent outputs,
 with the count and value of all of them. When the address holds more than the limit asked for, it
-keeps confirmed outputs ahead of pending ones and larger ahead of smaller, and keeps one transaction's
-outputs together while they fit. For an address of 1,000 outputs or more it keeps an answer until the
+chooses in a fixed order: confirmed outputs largest first, then pending ones largest first. It takes
+a transaction's outputs together when all of them still fit. A transaction with more outputs than the
+places left is passed over, so the list can hold pending outputs while confirmed ones are left out.
+Read `height` on each entry. For an address of 1,000 outputs or more it keeps an answer until the
 next block is indexed or the address changes in the mempool. It may drop an answer sooner to stay
 within its memory.
 
 By default the indexer refuses a reply over 10,000,000 bytes (`MAX_SEND`). An output takes about 160
 bytes of a reply, so it refuses a `listunspent` of more than about 60,000 outputs. The SDK's client
-calls `listunspent`, so keep an address under that count by consolidating its outputs
-([UTXO Consolidation](#utxo-consolidation)).
+refreshes a tracked address with `listunspent`, so keep an address under that count by consolidating
+its outputs ([UTXO Consolidation](#utxo-consolidation)). An address over it is refused on every
+refresh. The error matches `electrumx.ErrReplyTooLarge` under `errors.Is`, from `RefreshAll` and on
+the address's record (`LastRefreshOf`). `Client.ListUnspentBounded` reads such an address through
+`listunspent_bounded`: at most 1,000 outputs, with the count and the value of all of them. Its answer
+stays out of the client's cache, so the balance and the coin selector do not see it.
 
 `soqucoin-1.19.0-2` (18 October 2026) carries the
 fix for the reorg undo path: a checkout from before it stops at the first mainnet reorg, height
