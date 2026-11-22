@@ -131,12 +131,12 @@ SDK reads or broadcasts goes through them.
 
 | | |
 |---|---|
-| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.6.1`**, the current release (published 29 October 2026). The release carries one consensus rule on mainnet, scheduled in 2.6.0: from block 67,000, expected about 26 November 2026 at the block rate of the week the release was tagged, every block must carry the chain id 0x5351 in its version. The rule changes nothing for a current node: every block in mainnet history from block 1 carries the id and every template a Soqucoin Core node builds carries it. A node still on 2.5.x at the height follows a block the upgraded network refuses, if such a block appears, for as long as that branch is the heavier one. Once that node's own chain is 288 or more blocks past the fork, every release refuses the network's headers however heavy the network's chain becomes, and a late upgrade alone does not recover the node. The operator runs `invalidateblock` on the hash of the block without the chain id, or replays the block files with `-reindex`; rebuilding the chainstate alone does neither. Upgrade every mainnet node before the height. The height can move later once, by a point release published no later than 16 November 2026; install it the day it appears. The peer-to-peer protocol version and the on-disk formats are those of 2.5.3, and the RPC interface gains one field (`chainid_required_height` in `getblockchaininfo`, 67000 on mainnet), so the upgrade is a replacement of the two programs with no reindex. A node on 2.6.0 moves to 2.6.1 by the same replacement. An explicit `blockmaxsize=750000`, the old default, should be removed: release 2.6.0 raised the default to 3000000 and an explicit value wins (the 2.6.0 release notes, "The default block template"). The release page carries Linux x64 and arm64 archives with `SHA256SUMS`; they bundle every library except glibc (2.35 or newer, per its `INSTALL.md`; on an older distribution, build from source). Install an archive after checking it against `SHA256SUMS`, or build the `v2.6.1` tag yourself per its `INSTALL.md` or `Dockerfile`. Every mainnet node we operate has run 2.6.1 since 31 October 2026. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a build of the `v2.5.0` tag commit (`9d3ceb4f2d0fe41`) before this SDK tag. Our own builds carry no published digest; one would identify our build machine as much as the software. |
+| Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.6.1`**, the current release (published 29 October 2026). The release carries one consensus rule on mainnet, scheduled in 2.6.0: from block 67,000, expected about 28 November 2026 at the block rate of the two weeks to 22 November, every block must carry the chain id 0x5351 in its version. The rule changes nothing for a current node: every block in mainnet history from block 1 carries the id and every template a Soqucoin Core node builds carries it. A node still on 2.5.x at the height follows a block the upgraded network refuses, if such a block appears, for as long as that branch is the heavier one. Once that node's own chain is 288 or more blocks past the fork, every release refuses the network's headers however heavy the network's chain becomes, and a late upgrade alone does not recover the node. The operator runs `invalidateblock` on the hash of the block without the chain id, or replays the block files with `-reindex`; rebuilding the chainstate alone does neither. Upgrade every mainnet node before the height. The height can move later once, by a point release published no later than 16 November 2026; install it the day it appears. The peer-to-peer protocol version and the on-disk formats are those of 2.5.3, and the RPC interface gains one field (`chainid_required_height` in `getblockchaininfo`, 67000 on mainnet), so the upgrade is a replacement of the two programs with no reindex. A node on 2.6.0 moves to 2.6.1 by the same replacement. An explicit `blockmaxsize=750000`, the old default, should be removed: release 2.6.0 raised the default to 3000000 and an explicit value wins (the 2.6.0 release notes, "The default block template"). The release page carries Linux x64 and arm64 archives with `SHA256SUMS`; they bundle every library except glibc (2.35 or newer, per its `INSTALL.md`; on an older distribution, build from source). Install an archive after checking it against `SHA256SUMS`, or build the `v2.6.1` tag yourself per its `INSTALL.md` or `Dockerfile`. Every mainnet node we operate has run 2.6.1 since 31 October 2026. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a build of the `v2.5.0` tag commit (`9d3ceb4f2d0fe41`) before this SDK tag. Our own builds carry no published digest; one would identify our build machine as much as the software. |
 | `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
 | `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every mainnet node we operate runs with it. |
 | `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC is plaintext. Bind it to localhost, where `rpc.Client` connects with no further setting. For a node on another host the client refuses the URL until `AllowRemote` is set (`rpc.ErrRemoteNode`), and with the flag set refuses `http://` to it (`rpc.ErrPlaintextRemote`); the route is a tunnel that ends on this machine or an `https://` TLS terminator in front of the node ([Security Guide](SECURITY.md#network-security)). Loopback is read from the URL as written, the name `localhost` or a dotted-quad or bracketed IPv6 literal in `127.0.0.0/8` or `::1`, and nothing is resolved: a Docker service name, `host.docker.internal` or a Kubernetes service is a remote host to the client and needs the same route. |
 | `stagenet=1` | For the staging network. Omit it for mainnet. |
-| `dbcache` | Our nodes run 512 MB; the node's default is 450. |
+| `dbcache` | The nodes in [Sizing, measured](#sizing-measured) run 512 MB; the node's default is 450. |
 
 Ports, as `types.Mainnet`, `types.Stagenet` and `types.Regtest` carry them (node
 `src/chainparams.cpp` and `src/chainparamsbase.cpp`):
@@ -175,20 +175,22 @@ the largest address history.
 
 ### Sizing, measured
 
-Stagenet on 2026-09-14 UTC at height 82,061, read from our nodes (`getblockchaininfo`,
-`systemctl show -p MemoryCurrent`, `du`):
+Mainnet on 2026-11-22 UTC at height 58,347, 39 days after block 1. The figures are read from the
+two hosts of ours that each run a mainnet node and an indexer (`getblockchaininfo`, `VmRSS` and
+`VmHWM` in `/proc/<pid>/status`, `du`):
 
 | | |
 |---|---|
-| Node data directory with `txindex=1` | 425 MB (`size_on_disk`), of which the chainstate is 532 KB |
-| `soqucoind` resident memory | 110 MB on a node serving RPC only, 340 MB on one also feeding an indexer, both at `dbcache=512` |
-| ElectrumX database (LevelDB) | 64 MB |
-| ElectrumX resident memory | 110 MB |
-| Hosts these were read from | 4 vCPU with 8 GB running node plus indexer; 8 vCPU with 16 GB |
+| Node data directory with `txindex=1` | 1,532 MiB (`du`). Block and undo files are 1,463 MiB of it (`size_on_disk`), the block and transaction index 27 MiB and the chainstate 28 MiB |
+| `soqucoind` resident memory | 1,001 MiB on one host and 1,439 MiB on the other. Each node had run 12 days at `dbcache=512`, feeding an indexer and serving RPC. The highest either reached is 1,983 MiB |
+| ElectrumX database (LevelDB) | 85 MiB |
+| ElectrumX resident memory | 124 MiB and 361 MiB. The highest either reached is 448 MiB |
+| Hosts these were read from | 4 vCPU with 8 GB running two nodes and two indexers, for mainnet and stagenet; 8 vCPU with 16 GB |
 
-Blocks arrive one a minute (`nPowTargetSpacing = 60`). Mainnet starts from its genesis block at
-launch, so it stays smaller than stagenet for months; plan storage from the stagenet figures and
-the growth you observe. We have not timed an initial sync on a reference host.
+Blocks arrive one a minute (`nPowTargetSpacing = 60`). Mainnet's block files grew by about 37 MiB
+a day on average over those 39 days. The rate follows transaction volume: a block that carries
+only its coinbase is about 1 KB. Plan storage from the growth you observe. We have not timed an
+initial sync on a reference host.
 
 ### Signing, measured
 
@@ -500,8 +502,8 @@ import (
 const largeDeposit = 10_000_000 * types.ShorsPerSOQ
 
 // requiredConfirmations is the policy from Step 4: 100 below the value line,
-// types.MaxReorgDepth (288) at or above it. A deposit is final in the
-// consensus sense one block later, at types.MaxReorgDepth + 1.
+// types.MaxReorgDepth (288) at or above it, the depth from which a synced
+// node refuses a new header on a branch that would remove the deposit.
 func requiredConfirmations(value int64) int64 {
 	if value < largeDeposit {
 		return 100
@@ -1025,7 +1027,7 @@ than to a rule of thumb carried over from another chain:
 
 | Parameter | Value | Meaning |
 |-----------|:-----:|---------|
-| `nMaxReorgDepth` | **288 blocks** (~4.8 h) | The chain's own finality horizon, exposed as `types.MaxReorgDepth`. Nodes reject headers building on a fork deeper than this, once they have finished initial download |
+| `nMaxReorgDepth` | **288 blocks** (~4.8 h) | The chain's own finality horizon, exposed as `types.MaxReorgDepth`. Once it has finished initial download, a node refuses a new header on a branch that forks from its chain 288 or more blocks below the tip |
 | `nCoinbaseMaturity` | **288 blocks** (~4.8 h) | Newly mined coins are unspendable until this depth, enforced by consensus. Exposed per network as `types.Network.CoinbaseMaturity` (mainnet 288, stagenet 288, regtest 60); `rpc.Client` and `deposit.Monitor` apply it from their `Network` field, mainnet when unset. `Monitor.Scan` asks the node for that chain on every pass and refuses one that reports another, mainnet included when `Network` is unset; `RequireChain` is part of `deposit.Node`, so a wrapper of your own around `*rpc.Client` forwards it or does not compile |
 
 Recommended thresholds:
@@ -1034,7 +1036,7 @@ Recommended thresholds:
 |----------|:-------------:|:----------------:|-----------|
 | Zero-confirmation display | 0 | instant | Show as *pending only*. Never credit |
 | Standard deposits, below your value line | 100 | ~1.7 h | The loss if one is reorganised is bounded by the line |
-| Large deposits, at or above your value line | **288** | ~4.8 h | The chain's finality horizon; final in the consensus sense at 289 |
+| Large deposits, at or above your value line | **288** | ~4.8 h | The chain's finality horizon: a synced node refuses a new header on a branch that would remove the deposit |
 | Mining / coinbase payouts | **288 minimum** | ~4.8 h | Consensus-enforced; the output cannot be spent earlier regardless of policy |
 | Withdrawal release | 288 | ~4.8 h | Do not release outbound value against inbound funds the chain does not yet treat as final |
 
@@ -1042,9 +1044,15 @@ The value line is yours to set. We suggest the amount of SOQ worth about 1,000 U
 price, moved when the price moves. State the line by value: a fixed number of SOQ drifts with the
 price until every deposit falls in one tier.
 
-288 is the credit count for a large deposit. It is not the wait for every deposit. It is also one
-short of the consensus guarantee: a synced node refuses a fork deeper than 288 blocks, so a deposit
-is final at 289 confirmations (`types.MaxReorgDepth + 1`). Use 289 where you need that guarantee.
+288 is the credit count for a large deposit. It is not the wait for every deposit. It is the depth
+of the consensus rule. A synced node refuses a new header on a branch that forks from its chain 288
+or more blocks below the tip (node `src/validation.cpp`, `ContextualCheckBlockHeader`:
+`nReorgDepth >= nMaxReorgDepth`). A branch that would remove a deposit with 288 confirmations forks
+that far down. The node applies the rule once, when a header is first accepted, and not during
+initial block download. A header it accepted while its branch was shallower is not judged again
+when its block arrives. 288 confirmations are therefore the depth of this rule. They are not
+unconditional finality. `deposit.Monitor` marks a credited deposit final one block later, at 289
+confirmations (`types.MaxReorgDepth + 1`).
 
 **Set your own thresholds against value at risk. The table is a floor, not a ceiling.**
 
@@ -1052,7 +1060,7 @@ is final at 289 confirmations (`types.MaxReorgDepth + 1`). Use 289 where you nee
 
 Two reasons, both worth understanding before tuning them down:
 
-1. **The chain declares its own finality at 288 blocks.** Crediting a large deposit at 6
+1. **The chain's own reorganisation rule is at 288 blocks.** Crediting a large deposit at 6
    confirmations means accepting reorganisation risk the protocol itself does not consider settled.
    Below 288 you are taking a position the chain has not taken.
 2. **Absolute hashrate matters more than block interval on a young chain.** Confirmation count is a

@@ -124,7 +124,9 @@ type Deposit struct {
 }
 
 // Policy returns the confirmations required before a deposit of this value is
-// credited. Exchanges scale it with value; MaxReorgDepth+1 is final.
+// credited. Exchanges scale it with value. The node's finality horizon covers
+// a deposit from types.MaxReorgDepth confirmations; the Monitor marks it final
+// one block later.
 type Policy func(value int64) int64
 
 // Monitor scans tracked addresses and credits verified deposits.

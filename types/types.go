@@ -147,12 +147,16 @@ const (
 )
 
 // MaxReorgDepth is the consensus finality horizon (chainparams nMaxReorgDepth):
-// a header building on a fork deeper than this is refused, so a block buried
-// by more than MaxReorgDepth blocks cannot be reorganised away by any amount
-// of hashrate. It is enforced when headers are accepted and not during a
-// node's initial block download, so it holds only for a node that has caught
-// up; deposit crediting must check that (rpc.RequireSynced). A deposit at
-// MaxReorgDepth + 1 confirmations is final in the consensus sense.
+// a node refuses a new header on a branch that forks from its chain
+// MaxReorgDepth or more blocks below the tip (ContextualCheckBlockHeader,
+// nReorgDepth >= nMaxReorgDepth), so a branch that arrives new does not remove
+// a block with MaxReorgDepth confirmations. The check runs once, when a header
+// is first accepted, and not during a node's initial block download; a header
+// the node accepted while its branch was shallower is not judged again when
+// its block arrives. The horizon is therefore no unconditional finality, and
+// it says nothing for a node that is still syncing: deposit crediting must
+// check that the node has caught up (rpc.RequireSynced). deposit.Monitor marks
+// a deposit final one block later, at MaxReorgDepth + 1 confirmations.
 const MaxReorgDepth int64 = 288
 
 // CoinbaseMaturity is mainnet's coinbase maturity, 288 confirmations.
