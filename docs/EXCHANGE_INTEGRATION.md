@@ -1048,7 +1048,10 @@ price until every deposit falls in one tier.
 of the consensus rule. A synced node refuses a new header on a branch that forks from its chain 288
 or more blocks below the tip (node `src/validation.cpp`, `ContextualCheckBlockHeader`:
 `nReorgDepth >= nMaxReorgDepth`). A branch that would remove a deposit with 288 confirmations forks
-that far down. `deposit.Monitor` marks a credited deposit final one block later, at 289
+that far down. The node applies the rule once, when a header is first accepted, and not during
+initial block download. A header it accepted while its branch was shallower is not judged again
+when its block arrives. 288 confirmations are therefore the depth of this rule. They are not
+unconditional finality. `deposit.Monitor` marks a credited deposit final one block later, at 289
 confirmations (`types.MaxReorgDepth + 1`).
 
 **Set your own thresholds against value at risk. The table is a floor, not a ceiling.**
@@ -1057,7 +1060,7 @@ confirmations (`types.MaxReorgDepth + 1`).
 
 Two reasons, both worth understanding before tuning them down:
 
-1. **The chain declares its own finality at 288 blocks.** Crediting a large deposit at 6
+1. **The chain's own reorganisation rule is at 288 blocks.** Crediting a large deposit at 6
    confirmations means accepting reorganisation risk the protocol itself does not consider settled.
    Below 288 you are taking a position the chain has not taken.
 2. **Absolute hashrate matters more than block interval on a young chain.** Confirmation count is a
