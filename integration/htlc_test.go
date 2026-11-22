@@ -82,8 +82,9 @@ const lastVersionWithoutTheHeights = 2060100
 // with the cases of a swapBench. Both results empty: it runs them. skip set:
 // the node is a release from before the heights were reported, htlc.Fund
 // refuses to fund through it, and every case would fail for the node's age.
-// fault set: the node reports some of the three and not the others, or it is
-// newer than those releases and reports none, and the case fails.
+// fault set: the node reports no version, or some of the three and not the
+// others, or it is newer than those releases and reports none, and the case
+// fails.
 func swapCases(version int64, heights map[string]int64) (skip, fault string) {
 	var missing []string
 	for _, name := range swapDeployments {
@@ -92,6 +93,9 @@ func swapCases(version int64, heights map[string]int64) (skip, fault string) {
 		}
 	}
 	switch {
+	case version <= 0:
+		// No version is no release: a skip needs the node's own word on it.
+		return "", fmt.Sprintf("the node reports no version (%d)", version)
 	case len(missing) == 0:
 		return "", ""
 	case len(missing) == len(swapDeployments) && version <= lastVersionWithoutTheHeights:
@@ -114,13 +118,14 @@ func (b *swapBench) needsTheHeights() {
 	if err != nil {
 		b.t.Fatal(err)
 	}
+	// A pointer, so a reply without the member is not read as version 0.
 	var network struct {
-		Version int64 `json:"version"`
+		Version *int64 `json:"version"`
 	}
-	if err := json.Unmarshal(raw, &network); err != nil {
-		b.t.Fatalf("getnetworkinfo: %v", err)
+	if err := json.Unmarshal(raw, &network); err != nil || network.Version == nil {
+		b.t.Fatalf("getnetworkinfo carries no version: %s (%v)", raw, err)
 	}
-	skip, fault := swapCases(network.Version, info.ActivationHeights)
+	skip, fault := swapCases(*network.Version, info.ActivationHeights)
 	if fault != "" {
 		b.t.Fatal(fault)
 	}
@@ -163,6 +168,9 @@ func TestTheSwapCasesAreSkippedOnlyOnAReleaseFromBeforeTheHeights(t *testing.T) 
 		{"a later version reporting none is at fault", lastVersionWithoutTheHeights + 1, nil, false, true},
 		{"release 2.6.1 reporting two of the three is at fault", lastVersionWithoutTheHeights, two, false, true},
 		{"a later version reporting two of the three is at fault", lastVersionWithoutTheHeights + 1, two, false, true},
+		{"a node with no version and no heights is at fault, never skipped", 0, nil, false, true},
+		{"a node with no version is at fault whatever it reports", 0, three, false, true},
+		{"a negative version is at fault", -1, nil, false, true},
 	} {
 		skip, fault := swapCases(c.version, c.heights)
 		if (skip != "") != c.skips || (fault != "") != c.faults {
