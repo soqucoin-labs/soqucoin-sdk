@@ -87,8 +87,8 @@ git diff 24865dc..soqucoin-1.19.0-3 -- src/
 Roughly 550 lines across eight files: the coin definitions (AuxPoW-aware headers), the AuxPoW
 transaction deserializer, asset and visibility derivation from the witness version, UTXO records
 carrying that metadata, and three protocol extensions. `get_multi_balance` answers per-asset balances
-and `listunspent_by_asset` answers the unspent outputs of one asset. `listunspent_bounded` answers the
-largest outputs of an address that holds many, with a cache of its answers.
+and `listunspent_by_asset` answers the unspent outputs of one asset. `listunspent_bounded` answers at
+most 1,000 outputs of an address that holds many, with a cache of its answers.
 
 You can confirm a clean checkout works before committing any effort to it:
 
@@ -110,11 +110,16 @@ Upstream `LICENCE` is unchanged.
 
 Tags name the revisions our own instances run. `soqucoin-1.19.0-3` (22 November 2026) adds
 `blockchain.scripthash.listunspent_bounded`. It answers at most 1,000 of an address's unspent outputs,
-confirmed first and largest first, with the count and value of all of them. For an address of 1,000
-outputs or more it keeps the answer until the address changes. By default the indexer refuses a reply
-over 10,000,000 bytes (`MAX_SEND`). An output takes about 160 bytes of a reply, so it refuses a
-`listunspent` of more than about 60,000 outputs. The SDK's client calls `listunspent`, so keep an
-address under that count by consolidating its outputs ([UTXO Consolidation](#utxo-consolidation)).
+with the count and value of all of them. When the address holds more than the limit asked for, it
+keeps confirmed outputs ahead of pending ones and larger ahead of smaller, and keeps one transaction's
+outputs together while they fit. For an address of 1,000 outputs or more it keeps an answer until the
+next block is indexed or the address changes in the mempool. It may drop an answer sooner to stay
+within its memory.
+
+By default the indexer refuses a reply over 10,000,000 bytes (`MAX_SEND`). An output takes about 160
+bytes of a reply, so it refuses a `listunspent` of more than about 60,000 outputs. The SDK's client
+calls `listunspent`, so keep an address under that count by consolidating its outputs
+([UTXO Consolidation](#utxo-consolidation)).
 
 `soqucoin-1.19.0-2` (18 October 2026) carries the
 fix for the reorg undo path: a checkout from before it stops at the first mainnet reorg, height
