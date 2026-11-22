@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -302,6 +303,184 @@ func TestABoundedReadWithNoPrefixOrAnotherNetworksAddressSendsNothing(t *testing
 	if n := wrongAsked.Load(); n != 0 {
 		t.Fatalf("%d bounded requests reached a server on another chain", n)
 	}
+}
+
+// SetHRP refuses a change of prefix only while addresses are tracked, and the
+// bounded read and the history read take an address the client does not
+// track. The prefix can therefore become another network's between the check
+// of the address and the genesis gate, which then passes the server for the
+// new prefix. A script hash carries nothing of the network, so the server's
+// answer for the script would come back under an address of the first
+// network: a stagenet server's outputs reported for a mainnet address.
+//
+// The two helpers take the prefix the address was read under, so this test
+// stands in that state without racing for it: the client is on the stagenet
+// prefix and connected to a stagenet server, and the address was read under
+// the mainnet prefix.
+func TestAReadUnderOnePrefixTakesNoAnswerFromAServerCheckedAgainstAnother(t *testing.T) {
+	a, mainnet, stub := twoNetworkStub(t, 0x66)
+	c := connect(t, stub.scriptedStub)
+	ctx := context.Background()
+
+	got, err := c.listUnspentBoundedUnder(ctx, types.Mainnet.HRP, mainnet, 2)
+	if !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("a bounded read of a mainnet address answered by a stagenet server: %v", err)
+	}
+	if len(got.Outputs) != 0 || got.Total != 0 || got.TotalValue != 0 {
+		t.Fatalf("the refused bounded read left %+v with the caller", got)
+	}
+	entries, err := c.getHistoryUnder(ctx, types.Mainnet.HRP, mainnet)
+	if !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("a history read of a mainnet address answered by a stagenet server: %v", err)
+	}
+	if entries != nil {
+		t.Fatalf("the refused history read left %+v with the caller", entries)
+	}
+	// Both requests went out and were answered: what is refused is the reply.
+	if b, h := stub.bounded.Load(), stub.history.Load(); b != 1 || h != 1 {
+		t.Fatalf("%d bounded and %d history requests reached the server, want one of each", b, h)
+	}
+
+	// The stagenet address of the same script is read as before.
+	got, err = c.ListUnspentBounded(ctx, a, 2)
+	if err != nil || len(got.Outputs) != 1 || got.Outputs[0].Address != a || got.Total != 1 || got.TotalValue != 100 {
+		t.Fatalf("the stagenet address on the stagenet client: %+v, %v", got, err)
+	}
+	entries, err = c.GetHistory(ctx, a)
+	if err != nil || len(entries) != 1 || entries[0].TxHash != txA || entries[0].Height != 10 {
+		t.Fatalf("the stagenet address's history on the stagenet client: %+v, %v", entries, err)
+	}
+}
+
+// The same state reached the way a deployment reaches it: one goroutine
+// changes the prefix of a client that tracks nothing while another reads. The
+// server is on stagenet, so no read of a mainnet address may be answered,
+// wherever the change lands.
+func TestNoMainnetAddressIsAnsweredByAStagenetServerWhileThePrefixChanges(t *testing.T) {
+	_, mainnet, stub := twoNetworkStub(t, 0x67)
+	c := connect(t, stub.scriptedStub)
+	ctx := context.Background()
+
+	stop := make(chan struct{})
+	flipped := make(chan struct{})
+	go func() {
+		defer close(flipped)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = c.SetHRP(types.Mainnet.HRP)
+			runtime.Gosched()
+			_ = c.SetHRP(types.Stagenet.HRP)
+			runtime.Gosched()
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-flipped
+	}()
+
+	for i := 0; i < 300; i++ {
+		if got, err := c.ListUnspentBounded(ctx, mainnet, 2); err == nil {
+			t.Fatalf("read %d: a stagenet server's outputs came back for a mainnet address: %+v", i, got)
+		}
+		if entries, err := c.GetHistory(ctx, mainnet); err == nil {
+			t.Fatalf("read %d: a stagenet server's history came back for a mainnet address: %+v", i, entries)
+		}
+	}
+}
+
+// The check behind both: a reply is accepted on the record of a genesis check
+// of its own connection against the prefix its address was read under, and on
+// no other record.
+func TestAReplyIsAcceptedOnlyOnTheCheckOfItsOwnConnectionAndPrefix(t *testing.T) {
+	ctx := context.Background()
+
+	// A client never checked holds an empty record, which is not a check of
+	// generation 0 against no prefix.
+	bare := NewClient("127.0.0.1:1", time.Second, nil)
+	if err := bare.replyIsFor(ctx, 0, ""); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("the empty record of a client never checked: %v", err)
+	}
+
+	_, _, stub := twoNetworkStub(t, 0x68)
+	c := connect(t, stub.scriptedStub)
+	_, gen, err := c.callGen(ctx, "server.ping", []interface{}{})
+	if err != nil || gen == 0 {
+		t.Fatalf("a call on the first connection: generation %d, %v", gen, err)
+	}
+	if err := c.replyIsFor(ctx, gen, types.Stagenet.HRP); err != nil {
+		t.Fatalf("the connection's own check: %v", err)
+	}
+	if err := c.replyIsFor(ctx, gen, types.Mainnet.HRP); !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("a prefix the server was not checked against: %v", err)
+	}
+
+	// After a reconnect the record is the new connection's. A reply that came
+	// over the old one is refused under the right prefix too, and as a lost
+	// connection: the next read answers.
+	if err := c.Reconnect(ctx); err != nil {
+		t.Fatalf("Reconnect: %v", err)
+	}
+	if err := c.replyIsFor(ctx, gen, types.Stagenet.HRP); !errors.Is(err, ErrNotConnected) || errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("a reply of the replaced connection: %v", err)
+	}
+	_, next, err := c.callGen(ctx, "server.ping", []interface{}{})
+	if err != nil || next == gen {
+		t.Fatalf("a call on the second connection: generation %d after %d, %v", next, gen, err)
+	}
+	if err := c.replyIsFor(ctx, next, types.Stagenet.HRP); err != nil {
+		t.Fatalf("the second connection's own check: %v", err)
+	}
+
+	// A context that has ended returns its own error and accepts nothing.
+	ended, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := c.replyIsFor(ended, next, types.Stagenet.HRP); !errors.Is(err, context.Canceled) {
+		t.Fatalf("an ended context: %v", err)
+	}
+}
+
+// twoNetworkStub is a stagenet server that holds one output and one history
+// entry for a script, with the stagenet and the mainnet address of that
+// script. The two addresses have one script hash.
+type networkStub struct {
+	*scriptedStub
+	bounded, history atomic.Int64
+}
+
+func twoNetworkStub(t *testing.T, fill byte) (stagenet, mainnet string, stub *networkStub) {
+	t.Helper()
+	stagenet = craftAddr(t, fill)
+	sh := scripthashOf(t, stagenet)
+	prog := make([]byte, 32)
+	for i := range prog {
+		prog[i] = fill
+	}
+	mainnet, err := address.Encode(types.Mainnet.HRP, 1, prog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := address.AddressToScriptHash(types.Mainnet.HRP, mainnet); err != nil || got != sh {
+		t.Fatalf("the mainnet address's script hash is %s, %v, and the stagenet one's is %s", got, err, sh)
+	}
+	stub = &networkStub{}
+	stub.scriptedStub = newScriptedStub(t, types.Stagenet.GenesisHash, func(req request) []string {
+		if firstParam(req) == sh {
+			switch req.Method {
+			case "blockchain.scripthash.listunspent_bounded":
+				stub.bounded.Add(1)
+				return []string{reply(req.ID, boundedReply("1", "100", boundedEntry(txA, 0, 100, 10)))}
+			case "blockchain.scripthash.get_history":
+				stub.history.Add(1)
+				return []string{reply(req.ID, `[{"tx_hash":"`+txA+`","height":10}]`)}
+			}
+		}
+		return []string{reply(req.ID, `null`)}
+	})
+	return stagenet, mainnet, stub
 }
 
 // The refusal an address over the reply limit gets is one an operator has to

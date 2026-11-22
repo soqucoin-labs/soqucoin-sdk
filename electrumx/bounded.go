@@ -89,7 +89,9 @@ type BoundedUnspent struct {
 // enters it, and addr does not have to be tracked. The client's network
 // prefix does have to be set, by SetHRP or by TrackAddresses, and addr has to
 // carry it. Otherwise the call is refused and no request goes out, because
-// the prefix is what the genesis check compares the server's chain with.
+// the prefix is what the genesis check compares the server's chain with. The
+// prefix is read once. A reply is returned only when the server it came from
+// was checked against that reading, whatever SetHRP does meanwhile.
 //
 // The figures are the indexer's. As with every output the indexer reports,
 // confirm an output with the node (gettxout) before crediting or spending it.
@@ -102,15 +104,24 @@ type BoundedUnspent struct {
 // list holds both is refused, and the next read answers. When the list does
 // not hold both, Total and TotalValue count that output twice until then.
 func (c *Client) ListUnspentBounded(ctx context.Context, addr string, limit int) (BoundedUnspent, error) {
+	return c.listUnspentBoundedUnder(ctx, c.hrp(), addr, limit)
+}
+
+// listUnspentBoundedUnder is ListUnspentBounded for a prefix already read
+// (see replyIsFor).
+func (c *Client) listUnspentBoundedUnder(ctx context.Context, hrp, addr string, limit int) (BoundedUnspent, error) {
 	if limit < 1 || limit > MaxBoundedLimit {
 		return BoundedUnspent{}, fmt.Errorf("electrumx: limit %d is outside 1 to %d", limit, MaxBoundedLimit)
 	}
-	scriptHash, err := address.AddressToScriptHash(c.hrp(), addr)
+	scriptHash, err := address.AddressToScriptHash(hrp, addr)
 	if err != nil {
 		return BoundedUnspent{}, fmt.Errorf("address to script hash: %w", err)
 	}
-	raw, err := c.call(ctx, "blockchain.scripthash.listunspent_bounded", []interface{}{scriptHash, limit})
+	raw, gen, err := c.callGen(ctx, "blockchain.scripthash.listunspent_bounded", []interface{}{scriptHash, limit})
 	if err != nil {
+		return BoundedUnspent{}, fmt.Errorf("listunspent_bounded: %w", err)
+	}
+	if err := c.replyIsFor(ctx, gen, hrp); err != nil {
 		return BoundedUnspent{}, fmt.Errorf("listunspent_bounded: %w", err)
 	}
 	answer, err := parseBounded(raw, limit)

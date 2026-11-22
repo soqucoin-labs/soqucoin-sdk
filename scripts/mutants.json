@@ -2855,6 +2855,51 @@
       "why": "The error member reaches the caller as a *ServerError, so errors.Is finds the size refusal through RefreshAll and on the address record. As formatted text the refusal can be told from other failures only by matching the string."
     },
     {
+      "id": "electrumx-reply-check-accepts-any-prefix-the-connection-was-checked-against",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestAReadUnderOnePrefixTakesNoAnswerFromAServerCheckedAgainstAnother",
+      "find": "case c.genesisHRP != hrp:",
+      "replace": "case c.genesisHRP == \"\":",
+      "why": "The genesis gate checks the server against the prefix the client holds when the request goes out. An address the client does not track is checked against the prefix held when the call began, and SetHRP can change it in between. A check that asks only whether the connection was verified returns a stagenet server's outputs under a mainnet address."
+    },
+    {
+      "id": "electrumx-reply-check-accepts-a-reply-of-a-replaced-connection",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestAReplyIsAcceptedOnlyOnTheCheckOfItsOwnConnectionAndPrefix",
+      "find": "case gen == 0 || c.genesisGen != gen:",
+      "replace": "case gen == 0:",
+      "why": "The record holds one check, of the latest connection verified. Once the connection is replaced the record says nothing about the server an earlier reply came from, so a matching prefix alone would accept a reply from a server the record does not describe."
+    },
+    {
+      "id": "electrumx-reply-check-accepts-the-empty-record",
+      "file": "electrumx/conn.go",
+      "package": "./electrumx",
+      "test": "TestAReplyIsAcceptedOnlyOnTheCheckOfItsOwnConnectionAndPrefix",
+      "find": "case gen == 0 || c.genesisGen != gen:",
+      "replace": "case c.genesisGen != gen:",
+      "why": "A client never checked holds generation 0 and no prefix. Read as a record, that pair equals the pair of a reply with no connection and no prefix, and the one check that guards an untracked address would pass with no server verified."
+    },
+    {
+      "id": "electrumx-bounded-read-checked-against-the-prefix-of-the-moment",
+      "file": "electrumx/bounded.go",
+      "package": "./electrumx",
+      "test": "TestAReadUnderOnePrefixTakesNoAnswerFromAServerCheckedAgainstAnother",
+      "find": "if err := c.replyIsFor(ctx, gen, hrp); err != nil {",
+      "replace": "if err := c.replyIsFor(ctx, gen, c.hrp()); err != nil {",
+      "why": "The address was decoded under one reading of the prefix. Checking the reply against a second reading compares the server with whatever the prefix has become, which is what the gate already did, and the outputs of another network's server come back under the address."
+    },
+    {
+      "id": "electrumx-history-read-checked-against-the-prefix-of-the-moment",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestAReadUnderOnePrefixTakesNoAnswerFromAServerCheckedAgainstAnother",
+      "find": "if err := c.replyIsFor(ctx, gen, hrp); err != nil {",
+      "replace": "if err := c.replyIsFor(ctx, gen, c.hrp()); err != nil {",
+      "why": "GetHistory takes an untracked address as the bounded read does. Checked against a second reading of the prefix, the history of another network's server for the same script comes back under the address."
+    },
+    {
       "id": "harness-fake-indexer-bounded-selection-walks-pending-first",
       "file": "integration/fake_electrumx_test.go",
       "package": "./integration",

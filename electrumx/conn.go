@@ -294,6 +294,40 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (j
 	return raw, err
 }
 
+// replyIsFor returns nil when a reply that came over connection generation gen
+// is from a server checked against prefix hrp, the prefix the request's
+// address was read under.
+//
+// A read of an address the client does not track needs this. SetHRP refuses a
+// change of prefix only while addresses are tracked, so between the check of
+// such an address and the gate in callGen the client's prefix can become
+// another network's. The gate then verifies the server for that prefix, and
+// the server's outputs for the same script would come back under an address
+// of the first network. The record of the genesis check is written only after
+// the server on that generation reported a genesis of the prefix's chain, so
+// a record that reads (gen, hrp) is true of the reply whenever it is read.
+//
+// Any other record refuses the reply. A record of another connection means the
+// reply's connection has been replaced and checked again since, and nothing
+// says what it was checked against: ErrNotConnected, as for a refresh reply
+// that outlived its connection (staleReplyLocked). Generation 0 is no
+// connection, so the empty record of a client never checked accepts nothing.
+// A record of the reply's connection under another prefix is the case above:
+// ErrNetworkMismatch.
+func (c *Client) replyIsFor(ctx context.Context, gen uint64, hrp string) error {
+	if err := c.lockConn(ctx); err != nil {
+		return err
+	}
+	defer c.unlockConn()
+	switch {
+	case gen == 0 || c.genesisGen != gen:
+		return fmt.Errorf("%w: the connection was replaced before the reply could be matched to its genesis check", ErrNotConnected)
+	case c.genesisHRP != hrp:
+		return fmt.Errorf("%w: the server was checked against prefix %q and the address was read under %q", ErrNetworkMismatch, c.genesisHRP, hrp)
+	}
+	return nil
+}
+
 // callGen is call reporting the connection generation the request went over,
 // for callers that record state per connection (subscriptions, freshness).
 //
