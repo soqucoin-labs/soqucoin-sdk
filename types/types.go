@@ -156,7 +156,8 @@ const (
 // its block arrives. The horizon is therefore no unconditional finality, and
 // it says nothing for a node that is still syncing: deposit crediting must
 // check that the node has caught up (rpc.RequireSynced). deposit.Monitor marks
-// a deposit final one block later, at MaxReorgDepth + 1 confirmations.
+// a deposit final one block later, at MaxReorgDepth + 1 confirmations, unless
+// its Safeguard holds the mark.
 const MaxReorgDepth int64 = 288
 
 // CoinbaseMaturity is mainnet's coinbase maturity, 288 confirmations.

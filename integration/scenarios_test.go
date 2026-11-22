@@ -58,6 +58,10 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	return nil
 }
 
+// NotFinal makes the book a deposit.Book: it sweeps nothing, so what is not
+// final is what Pending lists.
+func (l *memLedger) NotFinal(ctx context.Context) ([]deposit.Deposit, error) { return l.Pending(ctx) }
+
 // fixture: a node with a funded hot wallet (mature coinbase) and a deposit
 // address, plus the scanner tracking both.
 type fixture struct {
@@ -390,6 +394,14 @@ func TestRefusedInputsNeverReachTheNode(t *testing.T) {
 // inside the horizon (the chain is ~250 blocks tall, the horizon is 288), so
 // the node accepts it, and a coinbase cannot return to the mempool, so the
 // deposit is simply gone.
+//
+// deposit.Tiers reads the same node at each step: nothing held back on the
+// chain as mined, where the best block of a credit is the tip it read; a
+// deposit reported at a tip it has not read held until it reads again; every
+// deposit held while the node keeps a branch with more work than the chain it
+// follows; and the lower tiers sent to the horizon once the chain has passed
+// that branch and it still stands beside it. The final mark of a credited
+// deposit is held in the first three of those steps and not in the last.
 func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	f := setup(t)
 	led := newLedger()
@@ -398,6 +410,41 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("initial credit: %v %+v", err, got)
 	}
+	tiers, err := deposit.NewTiers(f.n.rpc, led, deposit.TierLines{SmallBelow: 1, LargeFrom: 2, Ceiling: types.MaxMoney})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reading := func(step string) deposit.TiersStatus {
+		t.Helper()
+		if err := tiers.Refresh(context.Background()); err != nil {
+			t.Fatalf("%s: Tiers could not read the node: %v", step, err)
+		}
+		st := tiers.Status()
+		if st.Tip != f.n.height() {
+			t.Fatalf("%s: Tiers reads the tip at %d, the node is at %d", step, st.Tip, f.n.height())
+		}
+		return st
+	}
+	// at is a deposit at that many confirmations whose depth the node
+	// reported at its tip of the moment.
+	at := func(txid string, confs int64) deposit.Deposit {
+		t.Helper()
+		best, err := f.n.rpc.GetBlockHash(context.Background(), f.n.height())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return deposit.Deposit{TxID: strings.Repeat(txid, 32), Value: 1, Height: 1, Confirmations: confs, BestBlock: best}
+	}
+	if st := reading("the chain as mined"); st.Ahead != "" || st.Unsettled != "" {
+		t.Fatalf("on the chain as mined Tiers holds back: ahead %q, unsettled %q", st.Ahead, st.Unsettled)
+	}
+	// The node names one tip in gettxout and in getchaintips: the best block
+	// of the Monitor's own credit is the tip Tiers read.
+	deep := at("ab", 400)
+	if got[0].BestBlock != deep.BestBlock || tiers.Hold(deep) || tiers.HoldFinal(deep) {
+		t.Fatalf("the credit carries best block %q, the tip is %q, and Tiers holds a deposit at 400 confirmations there: credit %v, final mark %v",
+			got[0].BestBlock, deep.BestBlock, tiers.Hold(deep), tiers.HoldFinal(deep))
+	}
 	depositBlock, err := f.n.rpc.GetBlockHash(context.Background(), got[0].Height)
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +452,34 @@ func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	if _, err := f.n.rpc.Call(context.Background(), "invalidateblock", depositBlock); err != nil {
 		t.Fatalf("invalidateblock: %v", err)
 	}
-	f.n.mine(f.hot, int(types.Regtest.CoinbaseMaturity)+10) // a longer chain without the deposit
+	// The node is back at block 5 and still holds the 66 blocks it left, which
+	// it lists as invalid. They extend its tip, so following them would remove
+	// nothing from its chain, and Tiers holds nothing back for them.
+	if st := reading("on the block below the branch"); st.Ahead != "" || st.Unsettled != "" {
+		t.Fatalf("with the branch on top of the tip Tiers holds back: ahead %q, unsettled %q", st.Ahead, st.Unsettled)
+	}
+	// Three blocks on, the branch stands beside the chain and carries more
+	// work than it: every deposit waits, at any depth.
+	f.n.mine(f.hot, 3)
+	// Until Tiers reads again, its reading is of the tip three blocks back,
+	// and a deposit the node reports at the new tip waits for that alone.
+	deep = at("ab", 400)
+	if st := tiers.Status(); st.Ahead != "" || !tiers.Hold(deep) || !tiers.HoldFinal(deep) {
+		t.Fatalf("before the next reading (ahead %q) a deposit reported at a tip Tiers has not read was passed, or marked final", st.Ahead)
+	}
+	if st := reading("beside the longer branch"); !strings.Contains(st.Ahead, "more work") || !tiers.Hold(deep) || !tiers.HoldFinal(deep) {
+		t.Fatalf("with a longer branch beside the chain Tiers reads ahead %q and holds a deposit at 400 confirmations: credit %v, final mark %v",
+			st.Ahead, tiers.Hold(deep), tiers.HoldFinal(deep))
+	}
+	f.n.mine(f.hot, int(types.Regtest.CoinbaseMaturity)+7) // a longer chain without the deposit
+	// The chain has passed the branch, which ends inside the horizon: nothing
+	// is ahead, the chain is unsettled, and only the lower tiers wait.
+	if st := reading("past the branch"); st.Ahead != "" || !strings.Contains(st.Unsettled, "beside the active chain") {
+		t.Fatalf("past the branch Tiers reads ahead %q, unsettled %q", st.Ahead, st.Unsettled)
+	}
+	if tiers.Hold(at("ab", 400)) || tiers.HoldFinal(at("ab", 400)) || !tiers.Hold(at("cd", 10)) {
+		t.Fatal("on the unsettled chain a deposit at 400 confirmations was held or kept from its final mark, or one at 10 was passed")
+	}
 	if err := f.scan.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}

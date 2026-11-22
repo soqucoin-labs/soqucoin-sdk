@@ -5,7 +5,8 @@
 //   - Connecting to ElectrumX over TLS and tracking deposit addresses
 //   - Crediting only what your own node confirms (value, destination, depth)
 //   - Pausing while the node is syncing or the indexer is stale
-//   - Applying a confirmation policy anchored to Soqucoin's finality horizon
+//   - Applying a confirmation policy anchored to Soqucoin's finality horizon,
+//     with the safeguards that go with its two lower tiers (deposit.Tiers)
 //   - Re-verifying credited deposits until they are final, and alarming if
 //     one disappears
 //
@@ -36,21 +37,26 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-// Confirmation tiers by the value of the deposit. types.MaxReorgDepth (288)
-// is the point at which the chain itself treats a deposit as settled. Below it
-// a reorganisation remains possible, and the two value lines bound what one
-// could cost. See docs/EXCHANGE_INTEGRATION.md for the table, the safeguards
-// that go with the two lower tiers, and the reasoning.
-const (
-	smallDepth    = 10 // ~10 min
-	standardDepth = 30 // ~30 min
-	// smallDeposit and largeDeposit are the two value lines, in shors. The
-	// figures here are placeholders. Set them to the amounts of SOQ worth
-	// about 100 USD and about 1,000 USD at your own price, or to the loss you
-	// accept on one deposit in each tier, and move them when the price moves.
-	smallDeposit = 500_000 * types.ShorsPerSOQ
-	largeDeposit = 5_000_000 * types.ShorsPerSOQ
-)
+// Confirmation tiers by the value of the deposit: deposit.SmallDepth (10)
+// below the first value line, deposit.StandardDepth (30) below the second and
+// types.MaxReorgDepth (288) at or above it, the point at which the chain
+// itself treats a deposit as settled. Below it a reorganisation remains
+// possible, and the two value lines bound what one could cost. See
+// docs/EXCHANGE_INTEGRATION.md for the table, the safeguards that go with the
+// two lower tiers, and the reasoning.
+//
+// The three figures are in shors and are placeholders. Set the two value lines
+// to the amounts of SOQ worth about 100 USD and about 1,000 USD at your own
+// price, or to the loss you accept on one deposit in each tier, and the
+// ceiling to about 10,000 USD. Move them with Tiers.SetLines when the price
+// moves.
+var lines = deposit.TierLines{
+	SmallBelow: 500_000 * types.ShorsPerSOQ,
+	LargeFrom:  5_000_000 * types.ShorsPerSOQ,
+	// The most that may be credited below 288 confirmations and not yet be
+	// past the horizon, across every deposit.
+	Ceiling: 50_000_000 * types.ShorsPerSOQ,
+}
 
 const (
 	electrumxHost = "localhost:50002"        // your indexer (TLS port)
@@ -63,21 +69,6 @@ const (
 	// the credit latency you choose.
 	scanInterval = 15 * time.Second
 )
-
-// requiredConfirmations returns the depth at which a deposit of this size may be
-// credited. A deposit below the first value line is credited at smallDepth and
-// one below the second at standardDepth. A deposit at or above the second line
-// waits for types.MaxReorgDepth (288), the depth from which a synced node
-// refuses a new header on a branch that would remove it.
-func requiredConfirmations(value int64) int64 {
-	switch {
-	case value < smallDeposit:
-		return smallDepth
-	case value < largeDeposit:
-		return standardDepth
-	}
-	return types.MaxReorgDepth
-}
 
 // memLedger stands in for your database, purely to keep the example
 // self-contained. It is lost on restart, and every deposit would then be
@@ -134,6 +125,33 @@ func (l *memLedger) MarkFinal(_ context.Context, txid string, vout uint32) error
 	return nil
 }
 
+// NotFinal is what the ceiling counts (deposit.Book): every credited deposit
+// that is not final yet, whether or not it is still in Pending. This ledger
+// never sweeps, so the two lists hold the same deposits, and each is built on
+// its own: a ledger that sweeps a deposit before it is final takes it out of
+// Pending and keeps it here until the transaction that swept it has more than
+// 288 confirmations. A reorganisation that removes the deposit takes the
+// sweep with it.
+func (l *memLedger) NotFinal(context.Context) ([]deposit.Deposit, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []deposit.Deposit
+	for k, d := range l.credited {
+		if !l.final[k] {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+// safeguardChanged reports whether the safeguards hold back something else
+// than at the last page: every deposit (a branch with more work) or the lower
+// tiers (an unsettled chain), each on its own. One beginning while the other
+// lasts is a change, and so is one ending.
+func safeguardChanged(paged, now deposit.TiersStatus) bool {
+	return (paged.Ahead != "") != (now.Ahead != "") || (paged.Unsettled != "") != (now.Unsettled != "")
+}
+
 func main() {
 	// One logger for the program and for every SDK component it builds; the
 	// SDK logs nothing unless it is given one.
@@ -182,13 +200,25 @@ func main() {
 	node.Network = network
 
 	ledger := &memLedger{credited: map[string]deposit.Deposit{}, final: map[string]bool{}, log: logger}
+
+	// The three tiers and their safeguards. Required is the tier of a value.
+	// As the Safeguard, the Tiers reads the node and the ledger on every pass
+	// and holds a deposit that would pass the ceiling, every deposit below 288
+	// confirmations while the chain is unsettled, and every deposit while the
+	// node holds a branch with more work than its chain. Set both fields:
+	// Required alone is the tiers without their safeguards.
+	tiers, err := deposit.NewTiers(node, ledger, lines)
+	if err != nil {
+		fatal("deposit tiers", err)
+	}
 	monitor := &deposit.Monitor{
 		Cache:     elx,
 		Node:      node,
 		Network:   network,
 		Ledger:    ledger,
 		Addresses: func(context.Context) []string { return depositAddresses },
-		Required:  requiredConfirmations,
+		Required:  tiers.Required,
+		Safeguard: tiers,
 		OnAlert: func(kind deposit.AlertKind, msg string) {
 			// Every alert is a human's problem: page on it.
 			logger.Error("ALERT", "kind", string(kind), "msg", msg)
@@ -198,6 +228,7 @@ func main() {
 
 	ticker := time.NewTicker(scanInterval)
 	defer ticker.Stop()
+	var paged deposit.TiersStatus
 	for {
 		select {
 		case <-ctx.Done():
@@ -210,6 +241,14 @@ func main() {
 		passCtx, cancel := context.WithTimeout(ctx, scanInterval)
 		credited, err := monitor.Scan(passCtx)
 		cancel()
+		// What the safeguards hold back is a human's problem too: page when
+		// the chain turns unsettled, when a branch with more work appears,
+		// and when either clears.
+		if st := tiers.Status(); safeguardChanged(paged, st) {
+			paged = st
+			logger.Error("ALERT", "kind", "deposit_safeguard", "every_deposit_waits", st.Ahead,
+				"lower_tiers_wait_for_288", st.Unsettled, "tip", st.Tip, "below_the_horizon_shors", st.Exposed)
+		}
 		if err != nil {
 			// deposit.ErrPaused while the node is syncing or the indexer is
 			// stale; nothing was credited. Node errors are returned as-is.

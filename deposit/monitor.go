@@ -112,7 +112,9 @@ type Ledger interface {
 // Deposit is a credited output. Height and Confirmations are the node's word
 // at the pass that credited it: the tip the pass read less the depth the node
 // reported, plus one. The indexer's height decides only whether an output is
-// asked about.
+// asked about. BestBlock is the node's best block when it reported
+// Confirmations (the bestblock of gettxout), which says what tip that depth is
+// counted from.
 type Deposit struct {
 	TxID          string
 	Vout          uint32
@@ -121,13 +123,41 @@ type Deposit struct {
 	Height        int64
 	Confirmations int64
 	CreditedAt    time.Time
+	BestBlock     string
 }
 
 // Policy returns the confirmations required before a deposit of this value is
 // credited. Exchanges scale it with value. The node's finality horizon covers
 // a deposit from types.MaxReorgDepth confirmations; the Monitor marks it final
-// one block later.
+// one block later, unless its Safeguard holds the mark.
 type Policy func(value int64) int64
+
+// Safeguard decides, from state it reads itself, whether a deposit that has
+// reached the depth Required gives for its value is credited on this pass,
+// and whether a credited one the node has past the horizon is marked final.
+//
+// Refresh is called once in every pass, after the credited deposits have been
+// rechecked and before any new one is credited. An error ends the pass with
+// nothing new credited and nothing marked final. Hold is then asked about
+// each deposit the node has confirmed, at every depth; true leaves it
+// uncredited on this pass, with no alarm, and the next pass asks again.
+//
+// HoldFinal is asked about each credited deposit the node reports more than
+// types.MaxReorgDepth deep. d carries the outpoint, the address and the
+// value, with the depth and the best block the node reported on this pass.
+// True leaves the deposit as it is, with no alarm: it is rechecked on every
+// pass, and alarmed if it is gone, until a pass marks it final. The count
+// alone does not rule out a branch the node took the headers of earlier.
+//
+// It is separate from Required because Required is read again for a deposit
+// already credited: a credited output the node reports shallower than
+// Required is alarmed as regressed. A count that rose while the chain was
+// unsettled would alarm every deposit credited below it on every pass.
+type Safeguard interface {
+	Refresh(ctx context.Context) error
+	Hold(d Deposit) bool
+	HoldFinal(d Deposit) bool
+}
 
 // Monitor scans tracked addresses and credits verified deposits.
 type Monitor struct {
@@ -145,6 +175,14 @@ type Monitor struct {
 	// maturity applied and the node consulted cannot drift apart; a Monitor
 	// left with no Network over a regtest node is refused for that reason.
 	Network types.Network
+
+	// Safeguard, when set, reads its state once in every pass and is then
+	// asked about each deposit before it is credited, and about each credited
+	// one before it is marked final (Safeguard). Tiers is the one this package
+	// supplies: the ceiling and the fallback that go with the two lower
+	// confirmation tiers, and a hold while the node knows of a branch with
+	// more work than its chain.
+	Safeguard Safeguard
 
 	// MaxCacheAge bounds how stale the indexer cache may be before a scan is
 	// skipped entirely (default 5 minutes). A stale cache is an outage, not
@@ -171,7 +209,8 @@ type Monitor struct {
 	// asked again about an output that can neither be un-credited nor
 	// reorganised away. An entry needs the ledger's word that the outpoint is
 	// credited (MarkFinal succeeded, or IsCredited said so) and the node's
-	// word that it is final (gettxout confirmations past MaxReorgDepth). The
+	// word that it is final (gettxout confirmations past MaxReorgDepth), which
+	// a Safeguard can hold back (Safeguard.HoldFinal). The
 	// indexer's word never adds one, and absence from Pending is not taken as
 	// finality: the Ledger contract lets Pending leave out outputs the
 	// exchange spent. A credited outpoint the ledger leaves out of Pending
@@ -401,8 +440,19 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 	}
 
 	// 3. Re-verify everything credited but not yet final.
-	pending, err := m.recheckPending(ctx)
+	pending, deep, err := m.recheckPending(ctx)
 	if err != nil {
+		return nil, err
+	}
+	// The safeguard reads its state after the recheck, which no reading of
+	// its own may hold back, and before the first final mark and the first
+	// new credit.
+	if m.Safeguard != nil {
+		if err := m.Safeguard.Refresh(ctx); err != nil {
+			return nil, fmt.Errorf("deposit: the safeguard could not read its state: %w", err)
+		}
+	}
+	if err := m.finalise(ctx, deep); err != nil {
 		return nil, err
 	}
 
@@ -472,10 +522,11 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			}
 			if done {
 				// Credited. It enters the final set once the node, not the
-				// indexer, puts it past the horizon: until then, one gettxout
-				// per scan for an outpoint the ledger leaves out of Pending;
-				// after that, no question at all. An outpoint still in Pending
-				// is marked final by recheckPending when its turn comes.
+				// indexer, puts it past the horizon and the Safeguard does not
+				// hold the mark: until then, one gettxout per scan for an
+				// outpoint the ledger leaves out of Pending; after that, no
+				// question at all. An outpoint still in Pending is marked
+				// final by finalise when its turn comes.
 				if !pending[outpointKey(u.TxID, u.Vout)] {
 					out, err := m.Node.GetTxOut(ctx, u.TxID, u.Vout, false)
 					if err != nil {
@@ -492,7 +543,11 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 						continue
 					}
 					if out != nil && out.Confirmations > types.MaxReorgDepth {
-						m.markFinal(u.TxID, u.Vout, addr)
+						reported := Deposit{TxID: u.TxID, Vout: u.Vout, Address: addr, Value: u.Value,
+							Confirmations: out.Confirmations, BestBlock: out.BestBlock}
+						if !m.holdFinal(reported) {
+							m.markFinal(u.TxID, u.Vout, addr)
+						}
 					}
 				}
 				continue
@@ -503,6 +558,9 @@ func (m *Monitor) Scan(ctx context.Context) ([]Deposit, error) {
 			}
 			if !ok {
 				continue
+			}
+			if m.Safeguard != nil && m.Safeguard.Hold(d) {
+				continue // it waits, unalarmed, as an immature coinbase does
 			}
 			// The node has confirmed the output; the record lands whether or
 			// not the caller is still waiting, and a failure to record it is
@@ -559,27 +617,30 @@ func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u ty
 	default:
 		return Deposit{
 			TxID: u.TxID, Vout: u.Vout, Address: addr, Value: u.Value, Height: tip - out.Confirmations + 1,
-			Confirmations: out.Confirmations, CreditedAt: m.clock(),
+			Confirmations: out.Confirmations, CreditedAt: m.clock(), BestBlock: out.BestBlock,
 		}, true, nil
 	}
 	return Deposit{}, false, nil
 }
 
 // recheckPending confirms every credited, non-final deposit still exists in
-// the node's UTXO set, and marks it final once the node puts it past the
-// horizon. A vanished output is a reorg or a lie; either way the exchange's
-// book now holds a credit with nothing behind it. It returns the set of
-// outpoints the ledger reported pending, so the scan can tell a credited
-// outpoint the ledger no longer watches from one still under watch.
-func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
+// the node's UTXO set. A vanished output is a reorg or a lie; either way the
+// exchange's book now holds a credit with nothing behind it. It returns the
+// set of outpoints the ledger reported pending, so the scan can tell a
+// credited outpoint the ledger no longer watches from one still under watch,
+// and the deposits the node puts past the horizon, each with the depth and
+// the best block of the node's answer, for finalise. It marks none itself:
+// every pending deposit is rechecked before the first is marked.
+func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, []Deposit, error) {
 	pending, err := m.Ledger.Pending(ctx)
 	if err != nil {
 		if !ended(ctx, err) {
 			m.alert(AlertLedgerError, "Pending: %v", err)
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	keys := make(map[string]bool, len(pending))
+	var deep []Deposit
 	for _, d := range pending {
 		keys[outpointKey(d.TxID, d.Vout)] = true
 		out, err := m.Node.GetTxOut(ctx, d.TxID, d.Vout, false)
@@ -591,7 +652,7 @@ func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 				m.alert(AlertLedgerError, "gettxout %s:%d refused by the node: %v", d.TxID, d.Vout, err)
 				continue
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		if out == nil {
 			// gettxout is nil for a SPENT output too. An exchange sweeping its
@@ -605,12 +666,33 @@ func (m *Monitor) recheckPending(ctx context.Context) (map[string]bool, error) {
 			continue
 		}
 		if out.Confirmations > types.MaxReorgDepth {
-			if err := m.Ledger.MarkFinal(context.WithoutCancel(ctx), d.TxID, d.Vout); err != nil {
-				m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
-				return nil, err
-			}
-			m.markFinal(d.TxID, d.Vout, d.Address)
+			deep = append(deep, Deposit{TxID: d.TxID, Vout: d.Vout, Address: d.Address, Value: d.Value,
+				Confirmations: out.Confirmations, BestBlock: out.BestBlock})
 		}
 	}
-	return keys, nil
+	return keys, deep, nil
+}
+
+// finalise marks final the credited deposits the recheck found past the
+// horizon. With a Safeguard it marks those the Safeguard does not hold; one
+// it holds stays in Pending, and the next pass rechecks it and asks again.
+func (m *Monitor) finalise(ctx context.Context, deep []Deposit) error {
+	for _, d := range deep {
+		if m.holdFinal(d) {
+			continue
+		}
+		if err := m.Ledger.MarkFinal(context.WithoutCancel(ctx), d.TxID, d.Vout); err != nil {
+			m.alert(AlertLedgerError, "MarkFinal %s:%d: %v", d.TxID, d.Vout, err)
+			return err
+		}
+		m.markFinal(d.TxID, d.Vout, d.Address)
+	}
+	return nil
+}
+
+// holdFinal reports whether the Safeguard holds the final mark of a credited
+// deposit the node has past the horizon. Without a Safeguard the node's count
+// decides.
+func (m *Monitor) holdFinal(d Deposit) bool {
+	return m.Safeguard != nil && m.Safeguard.HoldFinal(d)
 }

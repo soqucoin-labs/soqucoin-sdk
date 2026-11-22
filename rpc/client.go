@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -617,6 +618,108 @@ func (c *Client) GetBlockHash(ctx context.Context, height int64) (string, error)
 		return "", fmt.Errorf("parse blockhash: %w", err)
 	}
 	return hash, nil
+}
+
+// GetNetworkHashPS returns the node's estimate of the network's hashes per
+// second over the last blocks blocks (getnetworkhashps). A reply that is not a
+// number, or a negative one, is an error: null read into a float would be
+// zero, and zero is an answer the node can give.
+func (c *Client) GetNetworkHashPS(ctx context.Context, blocks int) (float64, error) {
+	result, err := c.Call(ctx, "getnetworkhashps", blocks)
+	if err != nil {
+		return 0, fmt.Errorf("getnetworkhashps: %w", err)
+	}
+	var rate *float64
+	if err := json.Unmarshal(result, &rate); err != nil {
+		return 0, fmt.Errorf("parse getnetworkhashps: %w", err)
+	}
+	if rate == nil || *rate < 0 {
+		return 0, fmt.Errorf("getnetworkhashps %d: the node reports no rate (%s)", blocks, result)
+	}
+	return *rate, nil
+}
+
+// ChainTipActive is the status getchaintips gives the tip of the active chain.
+const ChainTipActive = "active"
+
+// ChainTip is one entry of getchaintips: the tip of the active chain, or of a
+// branch the node holds headers for. BranchLen is the number of blocks from
+// the tip back to the active chain, 0 for the active tip, so the last block
+// the branch shares with the active chain is at Height - BranchLen.
+//
+// Status is the node's word on the tip alone: "active", or for a branch
+// "valid-fork" (fully validated, so active once), "valid-headers" (its blocks
+// are held and were never validated), "headers-only" (not all of its blocks
+// are held) or "invalid" (the tip, or a block below it, failed validation).
+// It says nothing certain of the blocks below the tip: one header added on
+// top of a branch changes the status the whole branch is listed under.
+type ChainTip struct {
+	Height    int64
+	Hash      string
+	BranchLen int64
+	Status    string
+}
+
+// GetChainTips returns every chain tip the node knows (getchaintips). A reply
+// with an entry that lacks a member or carries a negative height or length,
+// or without exactly one active tip, is an error: read as it stands, a
+// missing height would be 0 and a missing list would be a chain with no
+// branches.
+func (c *Client) GetChainTips(ctx context.Context) ([]ChainTip, error) {
+	result, err := c.Call(ctx, "getchaintips")
+	if err != nil {
+		return nil, fmt.Errorf("getchaintips: %w", err)
+	}
+	var printed []struct {
+		Height    *int64  `json:"height"`
+		Hash      *string `json:"hash"`
+		BranchLen *int64  `json:"branchlen"`
+		Status    *string `json:"status"`
+	}
+	if err := json.Unmarshal(result, &printed); err != nil {
+		return nil, fmt.Errorf("parse getchaintips: %w", err)
+	}
+	tips := make([]ChainTip, 0, len(printed))
+	active := 0
+	for i, p := range printed {
+		if p.Height == nil || p.Hash == nil || p.BranchLen == nil || p.Status == nil || *p.Height < 0 || *p.BranchLen < 0 {
+			return nil, fmt.Errorf("getchaintips: entry %d lacks a member or carries a negative height or length", i)
+		}
+		if *p.Status == ChainTipActive {
+			active++
+		}
+		tips = append(tips, ChainTip{Height: *p.Height, Hash: *p.Hash, BranchLen: *p.BranchLen, Status: *p.Status})
+	}
+	if active != 1 {
+		return nil, fmt.Errorf("getchaintips: %d active tips among %d entries, want one", active, len(tips))
+	}
+	return tips, nil
+}
+
+// GetChainWork returns the total proof of work of the chain that ends at the
+// block with this hash (the chainwork of getblockheader). The node gives it
+// for every header it holds, on its active chain or not, and the node follows
+// the valid chain with the most. A reply without the member, or with one that
+// is not a positive hexadecimal number, is an error.
+func (c *Client) GetChainWork(ctx context.Context, hash string) (*big.Int, error) {
+	result, err := c.Call(ctx, "getblockheader", hash, true)
+	if err != nil {
+		return nil, fmt.Errorf("getblockheader: %w", err)
+	}
+	var header struct {
+		ChainWork *string `json:"chainwork"`
+	}
+	if err := json.Unmarshal(result, &header); err != nil {
+		return nil, fmt.Errorf("parse getblockheader: %w", err)
+	}
+	if header.ChainWork == nil {
+		return nil, fmt.Errorf("getblockheader %s: the node reports no chainwork", hash)
+	}
+	work, ok := new(big.Int).SetString(*header.ChainWork, 16)
+	if !ok || work.Sign() <= 0 {
+		return nil, fmt.Errorf("getblockheader %s: chainwork %q is not a positive hexadecimal number", hash, *header.ChainWork)
+	}
+	return work, nil
 }
 
 // GetBlock returns the full block data for a given hash.

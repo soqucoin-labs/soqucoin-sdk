@@ -59,6 +59,7 @@ type fakeNode struct {
 	tip      int64
 	outs     map[string]*rpc.TxOut // "txid:vout"
 	calls    int
+	best     string // when set, the best block every gettxout answer carries
 }
 
 func (n *fakeNode) RequireChain(_ context.Context, want string) error {
@@ -85,7 +86,13 @@ func (n *fakeNode) RequireSynced(_ context.Context) error {
 func (n *fakeNode) GetBlockCount(_ context.Context) (int64, error) { return n.tip, nil }
 func (n *fakeNode) GetTxOut(_ context.Context, txid string, vout uint32, _ bool) (*rpc.TxOut, error) {
 	n.calls++
-	return n.outs[key(txid, vout)], nil
+	out := n.outs[key(txid, vout)]
+	if out != nil && n.best != "" {
+		stamped := *out
+		stamped.BestBlock = n.best
+		return &stamped, nil
+	}
+	return out, nil
 }
 
 type fakeLedger struct {

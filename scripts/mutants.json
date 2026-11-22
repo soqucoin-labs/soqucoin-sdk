@@ -1298,6 +1298,339 @@
       "why": "An address the indexer has never answered for is awaiting its first reply for one window, not stale; alarmed from the first pass, startup raises cache_stale on every pass until the indexer answers."
     },
     {
+      "id": "tiers-hold-does-not-count-what-it-passes",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestManySmallDepositsInOnePassAreCreditedOnlyUpToTheCeiling",
+      "find": "\tt.exposed += d.Value\n",
+      "replace": "\tt.exposed += 0\n",
+      "why": "A deposit passed below the horizon takes its value from the room under the ceiling at once. Without that, value split over many small deposits in one pass is all credited, whatever the ceiling."
+    },
+    {
+      "id": "tiers-ceiling-holds-a-deposit-that-reaches-it-exactly",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositExactlyAtTheCeilingPassesAndOneShorOverWaits",
+      "find": "d.Value > t.lines.Ceiling-t.exposed {",
+      "replace": "d.Value >= t.lines.Ceiling-t.exposed {",
+      "why": "The ceiling is the most that may be credited below the horizon, so a deposit that reaches it exactly is within it."
+    },
+    {
+      "id": "tiers-a-value-below-zero-passes-the-ceiling",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositExactlyAtTheCeilingPassesAndOneShorOverWaits",
+      "find": "if d.Value < 0 || d.Value > t.lines.Ceiling-t.exposed {",
+      "replace": "if d.Value > t.lines.Ceiling-t.exposed {",
+      "why": "A value below zero is no amount. Passed, it would lower the count and make room under the ceiling that is not there."
+    },
+    {
+      "id": "tiers-a-passed-deposit-is-counted-again",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositPassedOnceIsCountedOnce",
+      "find": "\tif t.counted[key] {\n\t\treturn false\n\t}\n",
+      "replace": "",
+      "why": "A deposit is asked about again when its credit did not land. Counted on every ask, it would fill the ceiling by itself and then hold itself."
+    },
+    {
+      "id": "tiers-a-deposit-at-the-horizon-is-held-by-the-ceiling",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositAtTheHorizonPassesWhateverTheCeiling",
+      "find": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "replace": "\tif d.Confirmations > types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "why": "The top tier is 288 confirmations and the safeguards of the lower tiers end there. Off by one, a deposit held under the ceiling waits a block longer than the tier it was sent to."
+    },
+    {
+      "id": "tiers-an-unsettled-chain-holds-nothing",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchOfThreeBlocksWithinTheHorizonSendsTheLowerTiersToTheHorizon",
+      "find": "\tif t.unsettled != \"\" {\n\t\treturn true\n\t}\n",
+      "replace": "",
+      "why": "While the chain is unsettled the two lower tiers wait for 288. Without the hold the fallback is read and never applied."
+    },
+    {
+      "id": "tiers-a-branch-with-more-work-holds-nothing",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchWithMoreWorkHoldsEveryDepositAtAnyDepth",
+      "find": "\tif t.ahead != \"\" {\n\t\treturn true\n\t}\n",
+      "replace": "",
+      "why": "The node follows a branch with more work once it has the blocks, and a deposit the branch leaves out is then gone. Without the hold it is credited beside that branch."
+    },
+    {
+      "id": "tiers-a-branch-with-more-work-holds-only-below-the-horizon",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchWithMoreWorkHoldsEveryDepositAtAnyDepth",
+      "find": "\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "replace": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n",
+      "why": "A branch with more work removes a deposit at any depth, so the hold comes before the depth is read. After it, a deposit at 288 confirmations is credited beside a branch that removes it."
+    },
+    {
+      "id": "tiers-an-old-reading-decides",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestNoReadingOrAnOldOneHoldsEveryDeposit",
+      "find": "if t.readAt.IsZero() || t.clock().Sub(t.readAt) > t.maxAge() {",
+      "replace": "if t.readAt.IsZero() {",
+      "why": "A reading says what the chain was when it was taken. Past MaxAge it is no word on the chain now, and a safeguard that stopped refreshing would pass deposits on it for good."
+    },
+    {
+      "id": "tiers-a-failed-refresh-keeps-the-old-reading",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestAnySourceThatCannotBeReadDropsTheReading",
+      "find": "\t\tt.readAt = time.Time{}\n",
+      "replace": "\t\t_ = time.Time{}\n",
+      "why": "A Refresh that failed has not read the chain. Keeping the reading before it would pass deposits on a state the node may have left."
+    },
+    {
+      "id": "tiers-the-heavier-branch-is-read-by-height",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchWithMoreWorkHoldsEveryDepositAtAnyDepth",
+      "find": "if ahead == \"\" && work.Cmp(own) > 0 {",
+      "replace": "if ahead == \"\" && work.Sign() > 0 && own.Sign() > 0 && b.Height > active.Height {",
+      "why": "Which chain the node follows is decided by work. A branch of fewer blocks can carry more, so a measure by height passes every deposit beside it."
+    },
+    {
+      "id": "tiers-a-branch-with-the-same-work-holds-every-deposit",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchWithMoreWorkHoldsEveryDepositAtAnyDepth",
+      "find": "if ahead == \"\" && work.Cmp(own) > 0 {",
+      "replace": "if ahead == \"\" && work.Cmp(own) >= 0 {",
+      "why": "A block that competes with the tip at its height carries the same work, and the node does not leave its chain for it. Held on equal work, every deposit would wait each time two miners find a block together."
+    },
+    {
+      "id": "tiers-headers-on-the-tip-read-as-a-branch",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHeadersOnTopOfTheActiveTipAreNoBranch",
+      "find": "\t\tif fork == active.Height {\n\t\t\tcontinue // headers on top of the active tip: nothing beside the chain\n\t\t}\n",
+      "replace": "",
+      "why": "Headers on top of the active tip remove nothing when the node follows them. Read as a branch, a node a few blocks behind would hold every deposit."
+    },
+    {
+      "id": "tiers-a-branch-of-three-is-not-unsettling",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchOfThreeBlocksWithinTheHorizonSendsTheLowerTiersToTheHorizon",
+      "find": "if c.BranchLen >= competingBranch && active.Height-c.Height < types.MaxReorgDepth {",
+      "replace": "if c.BranchLen > competingBranch && active.Height-c.Height < types.MaxReorgDepth {",
+      "why": "The fallback is ruled from a branch of three blocks. One block later it would miss the smallest case it is for."
+    },
+    {
+      "id": "tiers-the-unsettled-window-ends-a-block-early",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchOfThreeBlocksWithinTheHorizonSendsTheLowerTiersToTheHorizon",
+      "find": "if c.BranchLen >= competingBranch && active.Height-c.Height < types.MaxReorgDepth {",
+      "replace": "if c.BranchLen >= competingBranch && active.Height-c.Height < types.MaxReorgDepth-1 {",
+      "why": "The fallback lasts 288 blocks from the branch."
+    },
+    {
+      "id": "tiers-the-unsettled-window-never-ends",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestABranchOfThreeBlocksWithinTheHorizonSendsTheLowerTiersToTheHorizon",
+      "find": "if c.BranchLen >= competingBranch && active.Height-c.Height < types.MaxReorgDepth {",
+      "replace": "if c.BranchLen >= competingBranch {",
+      "why": "The fallback lasts 288 blocks. Without the end, every branch the node ever kept would hold the lower tiers at 288 for good."
+    },
+    {
+      "id": "tiers-half-the-hashrate-reads-as-unsettled",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestAHashrateBelowHalfOrUnreadableSendsTheLowerTiersToTheHorizon",
+      "find": "case recent < day/2:",
+      "replace": "case recent <= day/2:",
+      "why": "The rule is below half. At exactly half the chain is still read as settled."
+    },
+    {
+      "id": "tiers-a-fallen-hashrate-is-not-read",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestAHashrateBelowHalfOrUnreadableSendsTheLowerTiersToTheHorizon",
+      "find": "case recent < day/2:",
+      "replace": "case recent < day/4:",
+      "why": "A hashrate that fell below half of the day's is the sign the fallback reads. Set lower, a chain that lost most of its miners is still credited at 10."
+    },
+    {
+      "id": "tiers-an-unusable-hashrate-reads-as-settled",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestAHashrateBelowHalfOrUnreadableSendsTheLowerTiersToTheHorizon",
+      "find": "case !usable(recent) || !usable(day):",
+      "replace": "case !usable(recent):",
+      "why": "A node that gives no rate over the day has given nothing to compare the recent rate with. Read as settled, the fallback would be off whenever the node cannot say."
+    },
+    {
+      "id": "tiers-a-top-tier-credit-counts-against-the-ceiling",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestTheCeilingCountsWhatTheBookListsAsNotFinal",
+      "find": "\t\tcase d.Confirmations >= types.MaxReorgDepth: // credited at the top tier\n",
+      "replace": "",
+      "why": "A deposit credited at 288 confirmations is not one the ceiling is for. Counted, one large deposit would fill the ceiling and send every small one to 288."
+    },
+    {
+      "id": "tiers-a-deposit-listed-twice-counts-twice",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestTheCeilingCountsWhatTheBookListsAsNotFinal",
+      "find": "\t\tcase counted[key]: // listed twice, counted once\n",
+      "replace": "",
+      "why": "An outpoint is one deposit however often the book lists it."
+    },
+    {
+      "id": "tiers-the-amount-at-the-second-line-is-credited-at-30",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestTheTierOfAValueChangesAtTheTwoLines",
+      "find": "case value < 0 || value >= t.lines.LargeFrom:",
+      "replace": "case value < 0 || value > t.lines.LargeFrom:",
+      "why": "A deposit at the second value line belongs to the top tier."
+    },
+    {
+      "id": "tiers-the-amount-at-the-first-line-is-credited-at-10",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestTheTierOfAValueChangesAtTheTwoLines",
+      "find": "case value < t.lines.SmallBelow:",
+      "replace": "case value <= t.lines.SmallBelow:",
+      "why": "A deposit at the first value line belongs to the tier above it."
+    },
+    {
+      "id": "tiers-a-value-below-zero-is-credited-at-10",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestTheTierOfAValueChangesAtTheTwoLines",
+      "find": "case value < 0 || value >= t.lines.LargeFrom:",
+      "replace": "case value >= t.lines.LargeFrom:",
+      "why": "A value below zero is no amount and gets the deepest count, never the shallowest."
+    },
+    {
+      "id": "tiers-lines-out-of-order-are-taken",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestLinesThatAreNotPositiveOrOutOfOrderAreRefused",
+      "find": "\tcase l.SmallBelow > l.LargeFrom:\n\t\treturn fmt.Errorf(\"deposit: SmallBelow %d is above LargeFrom %d\", l.SmallBelow, l.LargeFrom)\n",
+      "replace": "",
+      "why": "With the first line above the second, a deposit between them would be read as large and as small at once; the lines are a mistake and are refused."
+    },
+    {
+      "id": "tiers-a-line-of-zero-is-taken",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestLinesThatAreNotPositiveOrOutOfOrderAreRefused",
+      "find": "case l.SmallBelow <= 0 || l.LargeFrom <= 0 || l.Ceiling <= 0:",
+      "replace": "case l.SmallBelow < 0 || l.LargeFrom < 0 || l.Ceiling < 0:",
+      "why": "A line of zero is a figure nobody set. A ceiling of zero holds every deposit, and a first line of zero leaves no small tier."
+    },
+    {
+      "id": "tiers-setlines-takes-lines-unchecked",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestLinesThatAreNotPositiveOrOutOfOrderAreRefused",
+      "find": "\tif err := lines.check(); err != nil {\n\t\treturn err\n\t}\n",
+      "replace": "",
+      "why": "SetLines is how the lines move when the price does, and NewTiers sets them through it. Unchecked, a mistaken figure replaces the lines in force."
+    },
+    {
+      "id": "tiers-setlines-keeps-the-old-lines",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestSetLinesMovesTheTiersAndTheCeiling",
+      "find": "\tt.lines = lines\n",
+      "replace": "\t_ = lines\n",
+      "why": "Lines that are accepted are the lines in force from then on."
+    },
+    {
+      "id": "tiers-the-work-of-a-tip-is-asked-on-every-pass",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestTheWorkOfATipIsAskedOnceAndAFailedPassKeepsWhatItRead",
+      "find": "\t\tif work, ok := t.work[hash]; ok {\n\t\t\treturn work, nil\n\t\t}\n",
+      "replace": "",
+      "why": "The work of a block never changes. Asked on every pass, a node with many old tips costs one call a tip a pass, and a pass that runs out of time over them never completes."
+    },
+    {
+      "id": "tiers-work-of-a-tip-no-longer-listed-is-kept",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestTheWorkOfATipIsAskedOnceAndAFailedPassKeepsWhatItRead",
+      "find": "\t\t\tdelete(t.work, hash) // no longer a tip\n",
+      "replace": "\t\t\t_ = hash // no longer a tip\n",
+      "why": "A tip the node no longer lists is not asked about again, so its work is dropped; kept, the record grows by one entry a block."
+    },
+    {
+      "id": "tiers-a-work-of-zero-is-taken",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestAWorkTheNodeDoesNotGiveFailsThePass",
+      "find": "if work == nil || work.Sign() <= 0 {",
+      "replace": "if work == nil || work.Sign() < 0 {",
+      "why": "Every chain carries work. A zero for the active tip would make every branch the heavier one, and a zero for a branch would hide one that is."
+    },
+    {
+      "id": "tiers-two-active-tips-are-read",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestChainTipsThatCannotBeReadFailThePass",
+      "find": "if found != 1 {",
+      "replace": "if found < 1 {",
+      "why": "The branches are measured against the one active tip. With two, the reading does not say which chain the node follows."
+    },
+    {
+      "id": "tiers-a-fork-point-above-the-tip-is-read",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestChainTipsThatCannotBeReadFailThePass",
+      "find": "if c.BranchLen <= 0 || fork < 0 || fork > active.Height {",
+      "replace": "if c.BranchLen <= 0 || fork < 0 {",
+      "why": "A branch cannot leave the active chain above its tip. A reading that says so is not the node's, and nothing is decided on it."
+    },
+    {
+      "id": "tiers-a-branch-of-no-length-is-read",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestChainTipsThatCannotBeReadFailThePass",
+      "find": "if c.BranchLen <= 0 || fork < 0 || fork > active.Height {",
+      "replace": "if fork < 0 || fork > active.Height {",
+      "why": "A tip that is not the active one is at least one block off the chain. A length of zero is a member the reader did not get, and it would read as no branch."
+    },
+    {
+      "id": "deposit-the-safeguard-is-not-asked",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestTheMonitorAsksTheSafeguardBeforeEveryCredit",
+      "find": "\t\t\tif m.Safeguard != nil && m.Safeguard.Hold(d) {\n\t\t\t\tcontinue // it waits, unalarmed, as an immature coinbase does\n\t\t\t}\n",
+      "replace": "",
+      "why": "The safeguard is asked about every deposit before it is credited. Unasked, the ceiling and the fallback are configured and never applied."
+    },
+    {
+      "id": "deposit-a-safeguard-that-cannot-read-is-passed-over",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestASafeguardThatCannotReadEndsThePassAfterTheRecheck",
+      "find": "\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n",
+      "replace": "\t\t_ = m.Safeguard.Refresh(ctx)\n",
+      "why": "A safeguard that could not read its state ends the pass, and the caller sees why nothing was credited."
+    },
+    {
+      "id": "deposit-the-safeguard-reads-before-the-recheck",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestASafeguardThatCannotReadEndsThePassAfterTheRecheck",
+      "find": "\tpending, deep, err := m.recheckPending(ctx)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\t// The safeguard reads its state after the recheck, which no reading of\n\t// its own may hold back, and before the first final mark and the first\n\t// new credit.\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n",
+      "replace": "\t// The safeguard reads its state after the recheck, which no reading of\n\t// its own may hold back, and before the first final mark and the first\n\t// new credit.\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n\tpending, deep, err := m.recheckPending(ctx)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n",
+      "why": "The recheck of what is already credited runs whatever the safeguard can read. Behind the safeguard, a credited deposit that vanished is not alarmed while the safeguard fails."
+    },
+    {
       "id": "rpc-null-result-quoted-as-an-empty-txid",
       "file": "rpc/client.go",
       "package": "./rpc",
@@ -2657,6 +2990,42 @@
       "why": "A null height leaves out its own name. The names printed beside it keep their heights."
     },
     {
+      "id": "rpc-a-hashrate-below-zero-is-taken",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestGetNetworkHashPSRefusesAReplyThatIsNoRate",
+      "find": "if rate == nil || *rate < 0 {",
+      "replace": "if rate == nil {",
+      "why": "A rate below zero is no rate. Passed on, it is compared with half of another as though the node had measured it."
+    },
+    {
+      "id": "rpc-two-active-chain-tips-are-taken",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestGetChainTipsRefusesAReplyItCannotReadWhole",
+      "find": "if active != 1 {",
+      "replace": "if active < 1 {",
+      "why": "A node follows one chain. A reply with two active tips does not say which, and every branch is measured against it."
+    },
+    {
+      "id": "rpc-a-chain-tip-below-zero-is-taken",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestGetChainTipsRefusesAReplyItCannotReadWhole",
+      "find": "p.Status == nil || *p.Height < 0 || *p.BranchLen < 0 {",
+      "replace": "p.Status == nil {",
+      "why": "A height or a length below zero is not the node's. Taken, the fork point computed from them is a block that does not exist."
+    },
+    {
+      "id": "rpc-a-chainwork-of-zero-is-taken",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestGetChainWorkRefusesAReplyWithoutAPositiveWork",
+      "find": "if !ok || work.Sign() <= 0 {",
+      "replace": "if !ok || work.Sign() < 0 {",
+      "why": "Every chain carries work. A zero would make every other chain the heavier one."
+    },
+    {
       "id": "htlc-claim-second-read-only-with-a-record",
       "file": "htlc/node.go",
       "package": "./htlc",
@@ -2953,6 +3322,177 @@
       "find": "\tordered := append(confirmed, pending...)\n",
       "replace": "\tordered := append(pending, confirmed...)\n",
       "why": "The double answers listunspent_bounded with the indexer's selection, which walks confirmed outputs before pending ones. A double that chooses otherwise hands a scenario a list no server sends, and the scenario's result is believed."
+    },
+    {
+      "id": "tiers-a-deposit-read-at-another-tip-is-passed",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
+      "find": "\treturn best == \"\" || best != t.tipHash // counted from a tip the reading was not taken at\n",
+      "replace": "\treturn false\n",
+      "why": "The reading is taken once in a pass. A deposit the node reports under a later best block is judged against a chain state the reading never saw, and a branch the node took with that block is in no reading yet."
+    },
+    {
+      "id": "tiers-a-deposit-at-the-horizon-skips-the-tip",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
+      "find": "\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "replace": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif t.holdsAtAnyDepth(d.BestBlock) {\n\t\treturn true\n\t}\n",
+      "why": "A deposit at 288 confirmations is covered because the reading and its depth are at one tip: a branch that removes it then forks 288 or more below that tip. Read after the depth, the tip rule leaves the top tier to a reading of another tip."
+    },
+    {
+      "id": "tiers-a-deposit-with-no-best-block-is-passed",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldAsksForTheTipOfTheReading",
+      "find": "return best == \"\" || best != t.tipHash",
+      "replace": "return best != t.tipHash",
+      "why": "A deposit that carries no best block is bound to no tip. Beside a reading whose tip has no hash the two would compare equal and the deposit would pass unbound."
+    },
+    {
+      "id": "tiers-the-reading-keeps-no-tip",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldAsksForTheTipOfTheReading",
+      "find": "t.tip, t.tipHash = active.Height, active.Hash",
+      "replace": "t.tip, t.tipHash = active.Height, \"\"",
+      "why": "The tip a reading was taken at is what a deposit's best block is compared with. A reading that keeps none holds every deposit on every pass."
+    },
+    {
+      "id": "deposit-the-deposit-carries-no-best-block",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
+      "find": "CreditedAt: m.clock(), BestBlock: out.BestBlock,",
+      "replace": "CreditedAt: m.clock(),",
+      "why": "The best block of gettxout is the tip the node counted the depth from. A Deposit without it cannot be bound to a safeguard's reading, and Tiers then credits nothing."
+    },
+    {
+      "id": "tiers-a-credit-is-released-by-the-height-in-its-record",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositAReorganisationMovedCountsUntilTheNodePutsItPastTheHorizon",
+      "find": "\t\tcase counted[key]: // listed twice, counted once\n",
+      "replace": "\t\tcase d.Height > 0 && active.Height-d.Height+1 > types.MaxReorgDepth: // past the horizon by its record\n\t\tcase counted[key]: // listed twice, counted once\n",
+      "why": "The height in the exchange's record is the one a deposit was credited at. A reorganisation can move the deposit to a later block, and released by the old height it leaves the ceiling while the node has it far inside the horizon."
+    },
+    {
+      "id": "example-one-page-for-both-holds",
+      "file": "examples/exchange_deposit/main.go",
+      "package": "./examples/exchange_deposit",
+      "test": "TestThePageFollowsEachHoldOnItsOwn",
+      "find": "return (paged.Ahead != \"\") != (now.Ahead != \"\") || (paged.Unsettled != \"\") != (now.Unsettled != \"\")",
+      "replace": "return (paged.Ahead != \"\" || paged.Unsettled != \"\") != (now.Ahead != \"\" || now.Unsettled != \"\")",
+      "why": "A branch with more work can appear while the chain is already unsettled. Read as one condition, the two holds give no page when every deposit starts to wait, and none when that ends."
+    },
+    {
+      "id": "tiers-a-reading-is-stamped-when-it-ends",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestAReadingIsAsOldAsItsFirstAnswer",
+      "find": "\tt.readAt = began\n",
+      "replace": "\tbegan = t.clock()\n\tt.readAt = began\n",
+      "why": "A reading is as old as its first answer. Stamped when it ends, a reading whose chain tips are older than MaxAge is kept as fresh and decides for another MaxAge."
+    },
+    {
+      "id": "tiers-the-final-mark-is-never-held",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldFinalFollowsTheReadingAndNothingElse",
+      "find": "\treturn t.holdsAtAnyDepth(d.BestBlock)\n",
+      "replace": "\treturn false\n",
+      "why": "The node's count alone does not rule out a branch it took the headers of earlier. Without the hold a credited deposit is marked final beside such a branch and no pass asks about it again."
+    },
+    {
+      "id": "tiers-the-final-mark-waits-on-an-unsettled-chain",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldFinalFollowsTheReadingAndNothingElse",
+      "find": "\treturn t.holdsAtAnyDepth(d.BestBlock)\n",
+      "replace": "\treturn t.holdsAtAnyDepth(d.BestBlock) || t.unsettled != \"\"\n",
+      "why": "An unsettled chain sends the lower tiers to the horizon and holds nothing at it. Held there too, no credited deposit becomes final while a branch stands beside the chain, and the ceiling keeps counting all of them."
+    },
+    {
+      "id": "deposit-the-final-mark-does-not-ask-the-safeguard",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositIsNotMarkedFinalWhileABranchWithMoreWorkIsKnown",
+      "find": "\t\tif m.holdFinal(d) {\n\t\t\tcontinue\n\t\t}\n",
+      "replace": "",
+      "why": "A deposit the safeguard holds stays pending: rechecked, alarmed if it is gone, and counted. Marked on the count alone, it leaves the watch beside a branch that can still remove it."
+    },
+    {
+      "id": "deposit-a-held-final-mark-stops-the-ones-after-it",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestAHeldFinalMarkDoesNotKeepAnotherDepositFromItsMark",
+      "find": "\t\tif m.holdFinal(d) {\n\t\t\tcontinue\n\t\t}\n",
+      "replace": "\t\tif m.holdFinal(d) {\n\t\t\tbreak\n\t\t}\n",
+      "why": "Each deposit is asked about on its own. One whose depth was counted at another tip would otherwise keep every deposit listed after it from its mark."
+    },
+    {
+      "id": "deposit-the-final-set-does-not-ask-the-safeguard",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositOutsidePendingEntersTheFinalSetOnlyWhenTheSafeguardPassesIt",
+      "find": "\t\t\t\t\t\tif !m.holdFinal(reported) {\n\t\t\t\t\t\t\tm.markFinal(u.TxID, u.Vout, addr)\n\t\t\t\t\t\t}\n",
+      "replace": "\t\t\t\t\t\t_ = reported\n\t\t\t\t\t\tm.markFinal(u.TxID, u.Vout, addr)\n",
+      "why": "The Monitor's own final set ends every question about an outpoint. Entered on the count alone, a credited deposit outside Pending is asked about no more beside a branch that can still remove it."
+    },
+    {
+      "id": "deposit-the-final-mark-is-given-before-the-reading",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestASafeguardThatCannotReadEndsThePassAfterTheRecheck",
+      "find": "\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n\tif err := m.finalise(ctx, deep); err != nil {\n\t\treturn nil, err\n\t}\n",
+      "replace": "\tif err := m.finalise(ctx, deep); err != nil {\n\t\treturn nil, err\n\t}\n\tif m.Safeguard != nil {\n\t\tif err := m.Safeguard.Refresh(ctx); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"deposit: the safeguard could not read its state: %w\", err)\n\t\t}\n\t}\n",
+      "why": "The mark is decided on the reading of the same pass. Given before it, the safeguard answers from the pass before, and a pass whose safeguard reads nothing still marks deposits final."
+    },
+    {
+      "id": "deposit-the-final-question-carries-the-record",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestTheMonitorAsksTheSafeguardBeforeItMarksADepositFinal",
+      "find": "\t\t\tdeep = append(deep, Deposit{TxID: d.TxID, Vout: d.Vout, Address: d.Address, Value: d.Value,\n\t\t\t\tConfirmations: out.Confirmations, BestBlock: out.BestBlock})\n",
+      "replace": "\t\t\tdeep = append(deep, d)\n",
+      "why": "The safeguard compares the tip the node counted the depth from with the tip of its reading. The record carries the depth and the tip of the pass that credited the deposit, which say nothing about now."
+    },
+    {
+      "id": "deposit-the-final-set-question-carries-no-best-block",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositOutsidePendingEntersTheFinalSetOnlyWhenTheSafeguardPassesIt",
+      "find": "Confirmations: out.Confirmations, BestBlock: out.BestBlock}\n",
+      "replace": "Confirmations: out.Confirmations}\n",
+      "why": "Without the best block the safeguard cannot tell what tip the depth was counted from, and Tiers then holds the mark of every credited deposit outside Pending for good."
+    },
+    {
+      "id": "deposit-a-pending-deposit-is-marked-final-at-the-horizon",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestTheMonitorAsksTheSafeguardBeforeItMarksADepositFinal",
+      "find": "\t\tif out.Confirmations > types.MaxReorgDepth {\n\t\t\tdeep = append(",
+      "replace": "\t\tif out.Confirmations >= types.MaxReorgDepth {\n\t\t\tdeep = append(",
+      "why": "The horizon covers a deposit from 288 confirmations and the watch ends one block later. At 288 the mark would end it a block early."
+    },
+    {
+      "id": "deposit-the-final-set-takes-a-deposit-at-the-horizon",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestACreditedDepositOutsidePendingEntersTheFinalSetOnlyWhenTheSafeguardPassesIt",
+      "find": "if out != nil && out.Confirmations > types.MaxReorgDepth {",
+      "replace": "if out != nil && out.Confirmations >= types.MaxReorgDepth {",
+      "why": "The final set takes an outpoint one block past the horizon, as the ledger's mark does. At 288 the questions about it would end a block early."
+    },
+    {
+      "id": "deposit-a-ledger-that-cannot-mark-final-is-passed-over",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestALedgerThatCannotMarkFinalEndsThePassAfterTheRecheck",
+      "find": "\t\t\tm.alert(AlertLedgerError, \"MarkFinal %s:%d: %v\", d.TxID, d.Vout, err)\n\t\t\treturn err\n",
+      "replace": "\t\t\tm.alert(AlertLedgerError, \"MarkFinal %s:%d: %v\", d.TxID, d.Vout, err)\n\t\t\tcontinue\n",
+      "why": "A final mark the ledger did not record is a failure of the exchange's own book. Passed over, the pass reports success while the book still lists the deposit as pending."
     }
   ]
 }
