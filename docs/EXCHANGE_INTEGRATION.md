@@ -512,17 +512,25 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-// largeDeposit is the value line from Step 4, in shors. The figure is a
-// placeholder: set it to the amount of SOQ worth about 1,000 USD at your own
-// price, and move it when the price moves.
-const largeDeposit = 10_000_000 * types.ShorsPerSOQ
+// smallDeposit and largeDeposit are the two value lines from Step 4, in
+// shors. The figures are placeholders: set them to the amounts of SOQ worth
+// about 100 USD and about 1,000 USD at your own price, and move them when the
+// price moves.
+const (
+	smallDeposit = 500_000 * types.ShorsPerSOQ
+	largeDeposit = 5_000_000 * types.ShorsPerSOQ
+)
 
-// requiredConfirmations is the policy from Step 4: 100 below the value line,
-// types.MaxReorgDepth (288) at or above it, the depth from which a synced
-// node refuses a new header on a branch that would remove the deposit.
+// requiredConfirmations is the policy from Step 4: 10 below the first value
+// line, 30 below the second, and types.MaxReorgDepth (288) at or above it,
+// the depth from which a synced node refuses a new header on a branch that
+// would remove the deposit.
 func requiredConfirmations(value int64) int64 {
-	if value < largeDeposit {
-		return 100
+	switch {
+	case value < smallDeposit:
+		return 10
+	case value < largeDeposit:
+		return 30
 	}
 	return types.MaxReorgDepth
 }
@@ -1031,7 +1039,7 @@ re-broadcasts, and re-broadcasting is the broadcaster's job.
 go run ./examples/exchange_split/watcher      -dir state -network stagenet -hot ssq1p... -electrumx 127.0.0.1:50001
 go run ./examples/exchange_split/signer       -dir state -network stagenet -state signer-state
 go run ./examples/exchange_split/broadcaster  -dir state -network stagenet -state broadcaster-state -confirmations 1
-# -confirmations 1 so the walk-through finishes in a minute; the default is types.MaxReorgDepth (288), Step 4's figure for withdrawal release
+# -confirmations 1 so the walk-through finishes in a minute; the default is types.MaxReorgDepth (288), Step 4's figure for a withdrawal you have sent
 ```
 
 ---
@@ -1051,14 +1059,34 @@ Recommended thresholds:
 | Use Case | Confirmations | Approximate Time | Rationale |
 |----------|:-------------:|:----------------:|-----------|
 | Zero-confirmation display | 0 | instant | Show as *pending only*. Never credit |
-| Standard deposits, below your value line | 100 | ~1.7 h | The loss if one is reorganised is bounded by the line |
-| Large deposits, at or above your value line | **288** | ~4.8 h | The chain's finality horizon: a synced node refuses a new header on a branch that would remove the deposit |
+| Small deposits, below your first value line | 10 | ~10 min | The loss if one is reorganised is bounded by the line |
+| Standard deposits, below your second value line | 30 | ~30 min | The same bound at a higher line and a deeper count |
+| Large deposits, at or above your second value line | **288** | ~4.8 h | The chain's finality horizon: a synced node refuses a new header on a branch that would remove the deposit |
 | Mining / coinbase payouts | **288 minimum** | ~4.8 h | Consensus-enforced; the output cannot be spent earlier regardless of policy |
-| Withdrawal release | 288 | ~4.8 h | Do not release outbound value against inbound funds the chain does not yet treat as final |
+| A withdrawal against a deposit | that deposit's tier | | Outbound value is released once the deposit behind it has reached its own tier |
+| A withdrawal you have sent | 288 | ~4.8 h | `withdraw.Engine` marks it Confirmed at `RequiredConfirmations`. The split example sets that to `types.MaxReorgDepth` |
 
-The value line is yours to set. We suggest the amount of SOQ worth about 1,000 USD at your own
-price, moved when the price moves. State the line by value: a fixed number of SOQ drifts with the
-price until every deposit falls in one tier.
+The two value lines are yours to set. We suggest the amounts of SOQ worth about 100 USD and about
+1,000 USD at your own price, moved when the price moves. State each line by value: a fixed number of
+SOQ drifts with the price until every deposit falls in one tier. A system that takes one figure can
+use 30 and hold deposits above the second line to 288.
+
+Below 288 confirmations a reorganisation remains possible, and the value lines bound what one could
+cost. We suggest three safeguards with the two lower tiers:
+
+1. **A ceiling on the value credited below 288 at one time.** About 10,000 USD across every deposit
+   that is credited and not yet 288 deep. A deposit that would pass the ceiling waits for 288.
+2. **288 for every deposit while the chain is unsettled.** That is the 288 blocks after a
+   reorganisation of three or more blocks. It is also any time the hashrate of the last 120 blocks is
+   below half that of the last 1,440 (`getnetworkhashps 120` against `getnetworkhashps 1440`).
+3. **A withdrawal waits for the tier of the deposit behind it.**
+
+`examples/exchange_deposit` applies the three tiers. The ceiling reads your ledger and the fallback
+reads your node, so both are yours to wire.
+
+These figures are our recommendation for today. They follow how mining is distributed across pools
+now. We plan to lower the 288 tier as more pools mine SOQ, and this guide will carry the new figures
+when they change.
 
 288 is the credit count for a large deposit. It is not the wait for every deposit. It is the depth
 of the consensus rule. A synced node refuses a new header on a branch that forks from its chain 288
@@ -1070,24 +1098,21 @@ when its block arrives. 288 confirmations are therefore the depth of this rule. 
 unconditional finality. `deposit.Monitor` marks a credited deposit final one block later, at 289
 confirmations (`types.MaxReorgDepth + 1`).
 
-**Set your own thresholds against value at risk. The table is a floor, not a ceiling.**
+**Set your own thresholds against value at risk. The counts in the table are a floor.**
 
-### Why these are higher than a typical Bitcoin-style table
+### Why the tiers are by value
 
-Two reasons, both worth understanding before tuning them down:
-
-1. **The chain's own reorganisation rule is at 288 blocks.** Crediting a large deposit at 6
-   confirmations means accepting reorganisation risk the protocol itself does not consider settled.
-   Below 288 you are taking a position the chain has not taken.
-2. **Absolute hashrate matters more than block interval on a young chain.** Confirmation count is a
-   proxy for accumulated work. Early in a chain's life, and while hashrate is concentrated among a
-   small number of mining participants, producing a competing chain of N blocks costs far less than
-   the same N blocks would cost on a mature network. Prefer depth over speed until sustained
-   third-party hashrate exists.
-
-If low-latency credit matters to your product, raise the value line or lower the standard count
-against your own risk budget and hold larger amounts to 288, rather than lowering the threshold
-uniformly.
+1. **The chain's own reorganisation rule is at 288 blocks.** Below 288 you are taking a position the
+   chain has not taken. Crediting a large deposit earlier means accepting reorganisation risk the
+   protocol itself does not consider settled.
+2. **A count between 10 and 287 buys little.** Against a miner with a minority of the hashrate, 10
+   confirmations already do the work. With a fifth of the hashrate, the chance of overtaking 10
+   blocks is about 0.1 percent, and for 30 blocks it is about 3 in a billion (the catch-up
+   probability of Nakamoto 2008, section 11). Against a party with most of the hashrate, no count
+   below 288 protects, and 100 is no better than 30.
+3. **So value is what bounds a loss below 288.** Hashrate is still concentrated among a small number
+   of mining participants. The ladder puts small amounts at small counts, holds large amounts to the
+   chain's own rule, and caps the total exposed at one time.
 
 ---
 

@@ -88,7 +88,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Balance at 100 confirmations, the count for standard deposits in the
+	// Balance at 30 confirmations, the count for standard deposits in the
 	// confirmation table (docs/EXCHANGE_INTEGRATION.md, Step 4). An error here
 	// decides the money question, so it is not discarded.
 	tipHeight, err := client.GetTip(ctx)
@@ -97,7 +97,7 @@ func main() {
 	}
 	// The indexer's view of the addresses. A payout budget comes from the
 	// selector against the spent set, never from this figure.
-	confirmed, unconfirmed := client.GetBalance(100, tipHeight)
+	confirmed, unconfirmed := client.GetBalance(30, tipHeight)
 	fmt.Printf("Confirmed:   %.8f SOQ\n", float64(confirmed)/float64(types.ShorsPerSOQ))
 	fmt.Printf("Unconfirmed: %.8f SOQ\n", float64(unconfirmed)/float64(types.ShorsPerSOQ))
 

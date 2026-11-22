@@ -9,11 +9,11 @@
 //   - Re-verifying credited deposits until they are final, and alarming if
 //     one disappears
 //
-// Confirmation thresholds follow the table in docs/EXCHANGE_INTEGRATION.md and
-// are anchored to Soqucoin's own finality horizon rather than to a threshold
-// carried over from another chain. Soqucoin targets 1-minute blocks and sets
-// nMaxReorgDepth = 288, so a Bitcoin-style 6 confirmations would credit about
-// six minutes into a window in which nodes still accept a reorganisation.
+// Confirmation thresholds follow the table in docs/EXCHANGE_INTEGRATION.md:
+// three tiers by the value of the deposit. Soqucoin targets 1-minute blocks
+// and sets nMaxReorgDepth = 288, the depth from which a synced node refuses a
+// branch that would remove a deposit. Below it a reorganisation remains
+// possible, so the two lower tiers are bounded by value.
 //
 // Usage:
 //
@@ -36,17 +36,20 @@ import (
 	"github.com/soqucoin-labs/soqucoin-sdk/types"
 )
 
-// Confirmation thresholds, anchored to consensus rather than to convention.
-// types.MaxReorgDepth (288) is the point at which the chain itself treats a
-// deposit as settled. Below it you are taking a position the chain has not
-// taken. See docs/EXCHANGE_INTEGRATION.md for the full table and reasoning.
+// Confirmation tiers by the value of the deposit. types.MaxReorgDepth (288)
+// is the point at which the chain itself treats a deposit as settled. Below it
+// a reorganisation remains possible, and the two value lines bound what one
+// could cost. See docs/EXCHANGE_INTEGRATION.md for the table, the safeguards
+// that go with the two lower tiers, and the reasoning.
 const (
-	standardDepth = 100 // ~1.7 h
-	// largeDeposit is the value line between the two tiers, in shors. The
-	// figure here is a placeholder. Set it to the amount of SOQ worth about
-	// 1,000 USD at your own price, or to the loss you accept on one deposit,
-	// and move it when the price moves.
-	largeDeposit = 10_000_000 * types.ShorsPerSOQ
+	smallDepth    = 10 // ~10 min
+	standardDepth = 30 // ~30 min
+	// smallDeposit and largeDeposit are the two value lines, in shors. The
+	// figures here are placeholders. Set them to the amounts of SOQ worth
+	// about 100 USD and about 1,000 USD at your own price, or to the loss you
+	// accept on one deposit in each tier, and move them when the price moves.
+	smallDeposit = 500_000 * types.ShorsPerSOQ
+	largeDeposit = 5_000_000 * types.ShorsPerSOQ
 )
 
 const (
@@ -62,11 +65,15 @@ const (
 )
 
 // requiredConfirmations returns the depth at which a deposit of this size may be
-// credited. A deposit below the value line is credited at standardDepth; a
-// deposit at or above it waits for types.MaxReorgDepth (288), the depth from
-// which a synced node refuses a new header on a branch that would remove it.
+// credited. A deposit below the first value line is credited at smallDepth and
+// one below the second at standardDepth. A deposit at or above the second line
+// waits for types.MaxReorgDepth (288), the depth from which a synced node
+// refuses a new header on a branch that would remove it.
 func requiredConfirmations(value int64) int64 {
-	if value < largeDeposit {
+	switch {
+	case value < smallDeposit:
+		return smallDepth
+	case value < largeDeposit:
 		return standardDepth
 	}
 	return types.MaxReorgDepth

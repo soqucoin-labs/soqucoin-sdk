@@ -97,10 +97,10 @@ client.Start(ctx) // subscribes to every address; ends with ctx or Stop
 
 // Credit through deposit.Monitor, which checks every candidate against your
 // own node before crediting; see docs/EXCHANGE_INTEGRATION.md Step 2. The
-// confirmation table credits a standard deposit at 100, never 6. The balance
-// is the indexer's view; what a payout can spend is what the selector accepts
-// against the spent set.
-confirmed, _ := client.GetBalance(100, tipHeight)
+// confirmation table credits a standard deposit at 30 and holds a large one
+// to 288. The balance is the indexer's view; what a payout can spend is what
+// the selector accepts against the spent set.
+confirmed, _ := client.GetBalance(30, tipHeight)
 ```
 
 Build and broadcast a payment:
