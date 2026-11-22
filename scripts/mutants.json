@@ -1365,8 +1365,8 @@
       "file": "deposit/tiers.go",
       "package": "./deposit",
       "test": "TestABranchWithMoreWorkHoldsEveryDepositAtAnyDepth",
-      "find": "\tif t.ahead != \"\" {\n\t\treturn true\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
-      "replace": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif t.ahead != \"\" {\n\t\treturn true\n\t}\n",
+      "find": "\tif t.ahead != \"\" {\n\t\treturn true\n\t}\n\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "replace": "\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif t.ahead != \"\" {\n\t\treturn true\n\t}\n",
       "why": "A branch with more work removes a deposit at any depth, so the hold comes before the depth is read. After it, a deposit at 288 confirmations is credited beside a branch that removes it."
     },
     {
@@ -3349,6 +3349,51 @@
       "find": "\tordered := append(confirmed, pending...)\n",
       "replace": "\tordered := append(pending, confirmed...)\n",
       "why": "The double answers listunspent_bounded with the indexer's selection, which walks confirmed outputs before pending ones. A double that chooses otherwise hands a scenario a list no server sends, and the scenario's result is believed."
+    },
+    {
+      "id": "tiers-a-deposit-read-at-another-tip-is-passed",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
+      "find": "\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n",
+      "replace": "",
+      "why": "The reading is taken once in a pass. A deposit the node reports under a later best block is judged against a chain state the reading never saw, and a branch the node took with that block is in no reading yet."
+    },
+    {
+      "id": "tiers-a-deposit-at-the-horizon-skips-the-tip",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
+      "find": "\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n",
+      "replace": "\tif d.Confirmations >= types.MaxReorgDepth {\n\t\treturn false\n\t}\n\tif d.BestBlock == \"\" || d.BestBlock != t.tipHash {\n\t\treturn true // its depth is counted from a tip the reading was not taken at\n\t}\n",
+      "why": "A deposit at 288 confirmations is covered because the reading and its depth are at one tip: a branch that removes it then forks 288 or more below that tip. Read after the depth, the tip rule leaves the top tier to a reading of another tip."
+    },
+    {
+      "id": "tiers-a-deposit-with-no-best-block-is-passed",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldAsksForTheTipOfTheReading",
+      "find": "if d.BestBlock == \"\" || d.BestBlock != t.tipHash {",
+      "replace": "if d.BestBlock != t.tipHash {",
+      "why": "A deposit that carries no best block is bound to no tip. Beside a reading whose tip has no hash the two would compare equal and the deposit would pass unbound."
+    },
+    {
+      "id": "tiers-the-reading-keeps-no-tip",
+      "file": "deposit/tiers.go",
+      "package": "./deposit",
+      "test": "TestHoldAsksForTheTipOfTheReading",
+      "find": "t.tip, t.tipHash = active.Height, active.Hash",
+      "replace": "t.tip, t.tipHash = active.Height, \"\"",
+      "why": "The tip a reading was taken at is what a deposit's best block is compared with. A reading that keeps none holds every deposit on every pass."
+    },
+    {
+      "id": "deposit-the-deposit-carries-no-best-block",
+      "file": "deposit/monitor.go",
+      "package": "./deposit",
+      "test": "TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass",
+      "find": "CreditedAt: m.clock(), BestBlock: out.BestBlock,",
+      "replace": "CreditedAt: m.clock(),",
+      "why": "The best block of gettxout is the tip the node counted the depth from. A Deposit without it cannot be bound to a safeguard's reading, and Tiers then credits nothing."
     }
   ]
 }

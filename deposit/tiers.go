@@ -73,7 +73,9 @@ type Book interface {
 	// height, as it was credited (the Deposit that Ledger.Credit received),
 	// whether or not the exchange has spent the output since. A deposit swept
 	// to the hot wallet is still one a reorganisation can remove, so this
-	// list keeps what Ledger.Pending leaves out.
+	// list keeps what Ledger.Pending leaves out. It lists a deposit from the
+	// moment Ledger.Credit returns: a copy of the records that lags leaves the
+	// ceiling short by what it has not caught up with.
 	CreditedSince(ctx context.Context, height int64) ([]Deposit, error)
 }
 
@@ -109,14 +111,30 @@ type Book interface {
 //   - a deposit below types.MaxReorgDepth confirmations that would take the
 //     value credited below that depth, and not yet past the horizon, over
 //     Ceiling. It is credited when it reaches types.MaxReorgDepth.
+//   - every deposit whose depth the node reported at another tip than the one
+//     the reading was taken at (Deposit.BestBlock). A block arrived between
+//     the two, and what the node took with it is in no reading yet. The
+//     deposit is asked about again on the next pass, so a pass that runs
+//     longer than the time between two blocks credits little after the first.
 //   - every deposit while there is no reading, or the reading is older than
 //     MaxAge.
+//
+// With the reading and the depth at one tip, a deposit passed at
+// types.MaxReorgDepth confirmations is in a block that far below that tip. A
+// branch that would remove it forks deeper still: the node refuses every new
+// header on it from then on, and the headers it took before are in the
+// reading.
 //
 // The value credited below the horizon is read from the Book on every
 // Refresh: each deposit it lists that was credited below types.MaxReorgDepth
 // confirmations counts until it has more than that, the depth at which the
 // Monitor marks a deposit final. A restart loses nothing, since the count is
 // the Book's.
+//
+// One Tiers serves one Monitor, whose passes run one at a time. Required,
+// SetLines and Status are safe from any goroutine; a Refresh that runs while
+// another pass is asking Hold can drop what that pass has counted against the
+// ceiling.
 //
 // Status says what the last reading holds back. A branch with more work that
 // stays, or an unsettled chain, is a condition a human should see: read Status
@@ -145,6 +163,7 @@ type Tiers struct {
 	lines     TierLines
 	readAt    time.Time // zero: no reading
 	tip       int64
+	tipHash   string // the active tip the reading was taken at
 	ahead     string // why every deposit waits, "" when none does for this
 	unsettled string // why the lower tiers wait for the horizon, "" when they do not
 	// counted holds the outpoints in exposed: those the Book listed at the
@@ -276,7 +295,8 @@ func (t *Tiers) refresh(ctx context.Context) error {
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.tip, t.ahead, t.unsettled = active.Height, ahead, unsettled
+	t.tip, t.tipHash = active.Height, active.Hash
+	t.ahead, t.unsettled = ahead, unsettled
 	t.counted, t.exposed = counted, exposed
 	t.readAt = t.clock()
 	return nil
@@ -405,6 +425,9 @@ func (t *Tiers) Hold(d Deposit) bool {
 	}
 	if t.ahead != "" {
 		return true
+	}
+	if d.BestBlock == "" || d.BestBlock != t.tipHash {
+		return true // its depth is counted from a tip the reading was not taken at
 	}
 	if d.Confirmations >= types.MaxReorgDepth {
 		return false

@@ -112,7 +112,9 @@ type Ledger interface {
 // Deposit is a credited output. Height and Confirmations are the node's word
 // at the pass that credited it: the tip the pass read less the depth the node
 // reported, plus one. The indexer's height decides only whether an output is
-// asked about.
+// asked about. BestBlock is the node's best block when it reported
+// Confirmations (the bestblock of gettxout), which says what tip that depth is
+// counted from.
 type Deposit struct {
 	TxID          string
 	Vout          uint32
@@ -121,6 +123,7 @@ type Deposit struct {
 	Height        int64
 	Confirmations int64
 	CreditedAt    time.Time
+	BestBlock     string
 }
 
 // Policy returns the confirmations required before a deposit of this value is
@@ -594,7 +597,7 @@ func (m *Monitor) verifyWithNode(ctx context.Context, addr, wantHex string, u ty
 	default:
 		return Deposit{
 			TxID: u.TxID, Vout: u.Vout, Address: addr, Value: u.Value, Height: tip - out.Confirmations + 1,
-			Confirmations: out.Confirmations, CreditedAt: m.clock(),
+			Confirmations: out.Confirmations, CreditedAt: m.clock(), BestBlock: out.BestBlock,
 		}, true, nil
 	}
 	return Deposit{}, false, nil

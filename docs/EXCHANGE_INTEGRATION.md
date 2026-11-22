@@ -673,7 +673,7 @@ final once the sweep transaction is.
 `deposit.Tiers` is the confirmation policy of Step 4 together with its safeguards. `Tiers.Required`
 gives the tier of a value: 10, 30 or 288 confirmations. As the Monitor's `Safeguard`, the same
 `Tiers` reads your node and your records once in every pass. It then holds back a deposit that has
-reached its tier in four cases:
+reached its tier in five cases:
 
 - **The ceiling.** A deposit below 288 confirmations waits when it would take the value credited
   below 288 over `TierLines.Ceiling`. It is credited at 288. A credited deposit counts until it has
@@ -686,6 +686,10 @@ reached its tier in four cases:
   of a branch with more work than its chain. The branch is one that leaves the chain below the tip,
   and its work is the `chainwork` of `getblockheader`. Your node follows such a branch once it has
   the blocks.
+- **A reading of another tip.** A deposit waits when your node reported its depth at another tip
+  than the one the reading was taken at (`Deposit.BestBlock`, the `bestblock` of `gettxout`). A
+  block arrived between the two, and a branch that came with it is in no reading yet. Keep a pass
+  shorter than the time between two blocks.
 - **No reading.** Every deposit waits while the node or your records cannot be read, or the last
   reading is older than `Tiers.MaxAge` (5 minutes by default).
 
@@ -1149,7 +1153,8 @@ that far down. The node applies the rule once, when a header is first accepted, 
 initial block download. A header it accepted while its branch was shallower is not judged again
 when its block arrives. 288 confirmations are therefore the depth of this rule. They are not
 unconditional finality. `deposit.Tiers` covers that case: it credits nothing while your node holds
-the headers of a branch with more work than the chain it follows. `deposit.Monitor` marks a
+the headers of a branch with more work than the chain it follows. It takes that reading at the tip
+your node counted the deposit's depth from. `deposit.Monitor` marks a
 credited deposit final one block later, at 289 confirmations (`types.MaxReorgDepth + 1`).
 
 **Set your own thresholds against value at risk. The counts in the table are a floor.**
@@ -1214,8 +1219,8 @@ depends on how those are scheduled.
 |---------|:--------:|-----------------|
 | `address` | **98.5%** | Bech32m encoding, checksum, v1/32-byte destination rule, network detection, node-derived vectors |
 | `utxo` | **91.1%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
-| `rpc` | **86.1%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
-| `deposit` | **93.9%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
+| `rpc` | **88.1%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values, the chain tips, their work and the hashrate |
+| `deposit` | **96.4%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm, the three tiers with their ceiling, the unsettled chain, a branch with more work and the tip of the reading |
 | `electrumx` | **92.2%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
 | `tx` | **92.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `htlc` | **99.1%** | Swap contract template against the node's vector, lock height encoding, parser refusals, claim and refund, spend verification, two spends a node mined, the funding builder, the activation rule and each refusal of the functions that ask a node |

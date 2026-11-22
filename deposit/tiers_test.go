@@ -115,9 +115,10 @@ func refreshed(t *testing.T, chain ChainReader, book Book) *Tiers {
 }
 
 // dep is deposit number n: its own outpoint, that value, in the block at
-// height, with that many confirmations.
+// height, with that many confirmations, as the node reported them at the tip
+// of a settled chain.
 func dep(n int, value, height, confs int64) Deposit {
-	return Deposit{TxID: fmt.Sprintf("%064x", n), Value: value, Height: height, Confirmations: confs}
+	return Deposit{TxID: fmt.Sprintf("%064x", n), Value: value, Height: height, Confirmations: confs, BestBlock: "active"}
 }
 
 // ── the ceiling ────────────────────────────────────────────────────────────
@@ -129,6 +130,7 @@ func dep(n int, value, height, confs int64) Deposit {
 func TestManySmallDepositsInOnePassAreCreditedOnlyUpToTheCeiling(t *testing.T) {
 	m, cache, node, led, al, a := setup(t)
 	chain := settled(node.tip)
+	node.best = "active"
 	tiers, _ := newTestTiers(t, chain, led)
 	m.Required, m.Safeguard = tiers.Required, tiers
 	var txids []string
@@ -826,6 +828,7 @@ func TestASafeguardThatCannotReadEndsThePassAfterTheRecheck(t *testing.T) {
 func TestAnUnsettledChainHoldsNewDepositsAndAlarmsNoCreditedOne(t *testing.T) {
 	m, cache, node, led, al, a := setup(t)
 	chain := settled(node.tip)
+	node.best = "active"
 	tiers, _ := newTestTiers(t, chain, led)
 	m.Required, m.Safeguard = tiers.Required, tiers
 	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 50, Height: 991, Address: a}}
@@ -869,6 +872,7 @@ func TestAnUnsettledChainHoldsNewDepositsAndAlarmsNoCreditedOne(t *testing.T) {
 func TestABranchWithMoreWorkStopsEveryCreditThroughTheMonitor(t *testing.T) {
 	m, cache, node, led, al, a := setup(t)
 	chain := settled(node.tip).with("side", node.tip-20, 2, "headers-only", activeWork+1)
+	node.best = "active"
 	tiers, _ := newTestTiers(t, chain, led)
 	m.Required, m.Safeguard = tiers.Required, tiers
 	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 5000, Height: 600, Address: a}}
@@ -882,10 +886,104 @@ func TestABranchWithMoreWorkStopsEveryCreditThroughTheMonitor(t *testing.T) {
 		t.Errorf("status %q, alerts %v", st.Ahead, al.kinds)
 	}
 	// The chain adds work and passes the branch.
-	chain.tips[0].Hash = "active-2"
+	chain.tips[0].Hash, node.best = "active-2", "active-2"
 	chain.work["active-2"] = activeWork + 2
 	got, err = m.Scan(context.Background())
 	if err != nil || len(got) != 1 {
 		t.Fatalf("with the chain ahead again the deposit was not credited: %v %+v", err, got)
+	}
+}
+
+// ── the tip of the reading ─────────────────────────────────────────────────
+
+// The attack the tip of the reading is for. The reading is taken once, before
+// the first credit of a pass. A block arrives after it and with it the headers
+// of a branch with more work, so the node reports the deposit at 288
+// confirmations under a best block the reading never saw. The pass credits
+// nothing, the next one reads the branch, and the deposit is credited when the
+// chain has passed it.
+func TestADepositReadAtATipTheReadingDidNotSeeWaitsForTheNextPass(t *testing.T) {
+	m, cache, node, led, al, a := setup(t)
+	chain := settled(node.tip)
+	tiers, _ := newTestTiers(t, chain, led)
+	m.Required, m.Safeguard = tiers.Required, tiers
+	cache.utxos[a] = []types.UTXO{{TxID: txA, Vout: 0, Value: 5000, Height: node.tip - types.MaxReorgDepth + 1, Address: a}}
+	node.outs[key(txA, 0)] = txout(t, a, 5000, types.MaxReorgDepth, false)
+	// The reading is of the tip "active"; gettxout is answered from the block
+	// after it.
+	node.best = "next"
+
+	got, err := m.Scan(context.Background())
+	if err != nil || len(got) != 0 || len(led.credited) != 0 {
+		t.Fatalf("a deposit the node reported at a tip the reading did not see was credited: %v %+v", err, got)
+	}
+	if st := tiers.Status(); st.Ahead != "" || st.Unsettled != "" || len(al.kinds) != 0 {
+		t.Fatalf("the reading of the old tip holds back (%q, %q) or the wait raised %v", st.Ahead, st.Unsettled, al.kinds)
+	}
+
+	// The next pass reads the new tip, and the branch beside it.
+	chain.tips[0].Hash = "next"
+	chain.work["next"] = activeWork + 1
+	chain.with("side", node.tip-10, 290, "headers-only", activeWork+2)
+	got, err = m.Scan(context.Background())
+	if err != nil || len(got) != 0 || len(led.credited) != 0 {
+		t.Fatalf("the deposit was credited beside the branch with more work: %v %+v", err, got)
+	}
+	if st := tiers.Status(); !strings.Contains(st.Ahead, "more work") {
+		t.Fatalf("the second reading does not show the branch: %+v", st)
+	}
+
+	// The chain passes the branch: the deposit is credited at the tip both
+	// readings are of.
+	chain.tips[0].Hash, node.best = "next-2", "next-2"
+	chain.work["next-2"] = activeWork + 3
+	got, err = m.Scan(context.Background())
+	if err != nil || len(got) != 1 || got[0].BestBlock != "next-2" {
+		t.Fatalf("with the chain ahead and one tip in both readings: %v %+v", err, got)
+	}
+	if len(al.kinds) != 0 {
+		t.Errorf("alerts %v", al.kinds)
+	}
+}
+
+// Hold passes a deposit only at the tip its reading was taken at, at every
+// depth, and a deposit already counted is no exception.
+func TestHoldAsksForTheTipOfTheReading(t *testing.T) {
+	tiers := refreshed(t, settled(1000), &fakeBook{list: []Deposit{dep(99, 20, 995, 10)}})
+	n := 0
+	for _, c := range []struct {
+		name, best string
+		held       bool
+	}{
+		{"the tip of the reading", "active", false},
+		{"another tip", "next", true},
+		{"no best block", "", true},
+	} {
+		for _, confs := range []int64{SmallDepth, types.MaxReorgDepth, 400} {
+			n++
+			d := dep(n, 50, 1000-confs+1, confs)
+			d.BestBlock = c.best
+			if got := tiers.Hold(d); got != c.held {
+				t.Errorf("%s, %d confirmations: held %v, want %v", c.name, confs, got, c.held)
+			}
+		}
+		counted := dep(99, 20, 995, 10)
+		counted.BestBlock = c.best
+		if got := tiers.Hold(counted); got != c.held {
+			t.Errorf("%s, a deposit the book lists: held %v, want %v", c.name, got, c.held)
+		}
+	}
+	if st := tiers.Status(); st.Exposed != 20+50 {
+		t.Errorf("the value below the horizon reads %d, want 70: the book's 20 and the one deposit passed below 288", st.Exposed)
+	}
+
+	// A reading whose tip has no hash binds no deposit to it.
+	chain := settled(1000)
+	chain.tips[0].Hash = ""
+	tiers = refreshed(t, chain, &fakeBook{})
+	d := dep(1, 50, 991, 10)
+	d.BestBlock = ""
+	if !tiers.Hold(d) {
+		t.Error("a deposit with no best block was passed on a reading whose tip has no hash")
 	}
 }
