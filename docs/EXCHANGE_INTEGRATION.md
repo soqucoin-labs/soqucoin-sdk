@@ -1105,14 +1105,17 @@ confirmations (`types.MaxReorgDepth + 1`).
 1. **The chain's own reorganisation rule is at 288 blocks.** Below 288 you are taking a position the
    chain has not taken. Crediting a large deposit earlier means accepting reorganisation risk the
    protocol itself does not consider settled.
-2. **A count between 10 and 287 buys little.** Against a miner with a minority of the hashrate, 10
-   confirmations already do the work. With a fifth of the hashrate, the chance of overtaking 10
-   blocks is about 0.1 percent, and for 30 blocks it is about 3 in a billion (the catch-up
-   probability of Nakamoto 2008, section 11). Against a party with most of the hashrate, no count
-   below 288 protects, and 100 is no better than 30.
-3. **So value is what bounds a loss below 288.** Hashrate is still concentrated among a small number
-   of mining participants. The ladder puts small amounts at small counts, holds large amounts to the
-   chain's own rule, and caps the total exposed at one time.
+2. **Below 288, what a count is worth depends on the share of hashrate against it.** The catch-up
+   probability of Nakamoto 2008, section 11, gives the figures. With a fifth of the hashrate, the
+   chance of overtaking 10 blocks is about 0.1 percent, and for 30 blocks it is about 3 in a billion.
+   With two fifths, it is about 36 percent at 10 blocks, 7.6 percent at 30 and 0.04 percent at 100.
+   Against a party with most of the hashrate, no count below 288 protects.
+3. **So value is what bounds a loss in the two lower tiers.** A count of 10 or 30 does not make a
+   deposit safe against a party with a large share. Hashrate is still concentrated among a small
+   number of mining participants, and hashrate of the same algorithm exists outside this chain. The
+   ladder therefore puts small amounts at small counts, holds large amounts to the chain's own rule,
+   and caps the total exposed at one time. An exchange that prefers depth to speed can raise the two
+   lower counts. Each added block lowers the odds against any minority share.
 
 ---
 
