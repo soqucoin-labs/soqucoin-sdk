@@ -1158,7 +1158,7 @@ Every package carries unit tests. The figures below are one run of `go test -cov
 commit this document ships with, library packages only: the `examples/` programs, `cmd/soq-htlc` and
 `internal/atomicfile` are in that run too and are not part of the API you integrate against.
 Re-run the command to check any row. Ten of the eleven reproduce exactly. The `electrumx`
-figure moved between 89.7 and 90.4 across fourteen runs on this commit, because several of its tests drive
+figure moved between 91.9 and 92.4 across fourteen runs on this commit, because several of its tests drive
 the reader goroutine, the ping loop and the refresher at once, and which branches run
 depends on how those are scheduled.
 
@@ -1168,7 +1168,7 @@ depends on how those are scheduled.
 | `utxo` | **91.1%** | Coin selection, smallest-first selection and its named empty result, persistent spent set, reservations and who holds them, restart survival of unconfirmed spends |
 | `rpc` | **86.1%** | Error kinds, outcome-resolving broadcast, synced-node gate, stale-UTXO filtering, loopback guard, fee estimate conversion and clamp, exact output values |
 | `deposit` | **93.9%** | Node cross-check before credit, pause conditions, per-address staleness, vanished-credit alarm |
-| `electrumx` | **90.1%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
+| `electrumx` | **92.2%** | Id-matched replies, notification routing, merge, refresh failures, a pass ending on a reply timeout, reply validation, per-address freshness, network inference, genesis check, TLS and the plaintext refusal |
 | `tx` | **92.0%** | Serialized weight, output floor, amount checks, fee caps, one-output sweep, txid byte order, BIP143 sighash, witness format, consensus format vectors |
 | `htlc` | **99.1%** | Swap contract template against the node's vector, lock height encoding, parser refusals, claim and refund, spend verification, two spends a node mined, the funding builder, the activation rule and each refusal of the functions that ask a node |
 | `keys` | **89.3%** | Keypair generation with the 0xFF guard, record consistency, keystore encryption under a passphrase and under an external key, the version 2 header's floor and tamper-evidence, a version 1 file read and rewritten, network-bound derivation, fail-closed load, node-derived vectors |
