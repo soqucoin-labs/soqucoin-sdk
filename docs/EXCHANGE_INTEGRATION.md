@@ -74,24 +74,26 @@ and we would rather you choose than discover it later:
 
 **We recommend Option A, and the software is published:**
 
-> **https://github.com/soqucoin-labs/electrumx**, branch `soqucoin`, tag **`soqucoin-1.19.0-2`** (18 October 2026)
+> **https://github.com/soqucoin-labs/electrumx**, branch `soqucoin`, tag **`soqucoin-1.19.0-3`** (22 November 2026)
 
 Upstream ElectrumX ships no Soqucoin coin definition, so that fork is what you need. It is based on
 a pinned upstream commit rather than tracking `master`, so the entire Soqucoin delta is reviewable
 in one command:
 
 ```bash
-git diff 24865dc..soqucoin-1.19.0-2 -- src/
+git diff 24865dc..soqucoin-1.19.0-3 -- src/
 ```
 
-Roughly 250 lines across five files: the coin definitions (AuxPoW-aware headers), the AuxPoW
+Roughly 550 lines across eight files: the coin definitions (AuxPoW-aware headers), the AuxPoW
 transaction deserializer, asset and visibility derivation from the witness version, UTXO records
-carrying that metadata, and one protocol extension (`get_multi_balance`) for per-asset balances.
+carrying that metadata, and three protocol extensions. `get_multi_balance` answers per-asset balances
+and `listunspent_by_asset` answers the unspent outputs of one asset. `listunspent_bounded` answers the
+largest outputs of an address that holds many, with a cache of its answers.
 
 You can confirm a clean checkout works before committing any effort to it:
 
 ```bash
-git clone -b soqucoin-1.19.0-2 https://github.com/soqucoin-labs/electrumx && cd electrumx
+git clone -b soqucoin-1.19.0-3 https://github.com/soqucoin-labs/electrumx && cd electrumx
 pip install .
 cd /tmp && python -c "
 from electrumx.lib.coins import Coin
@@ -106,7 +108,15 @@ in that repository documents the configuration. The mainnet coin class carries t
 ElectrumX client refuses a server whose reported genesis is not the chain its addresses belong to.
 Upstream `LICENCE` is unchanged.
 
-Tags name the revisions our own instances run. `soqucoin-1.19.0-2` (18 October 2026) carries the
+Tags name the revisions our own instances run. `soqucoin-1.19.0-3` (22 November 2026) adds
+`blockchain.scripthash.listunspent_bounded`. It answers at most 1,000 of an address's unspent outputs,
+confirmed first and largest first, with the count and value of all of them. For an address of 1,000
+outputs or more it keeps the answer until the address changes. By default the indexer refuses a reply
+over 10,000,000 bytes (`MAX_SEND`). An output takes about 160 bytes of a reply, so it refuses a
+`listunspent` of more than about 60,000 outputs. The SDK's client calls `listunspent`, so keep an
+address under that count by consolidating its outputs ([UTXO Consolidation](#utxo-consolidation)).
+
+`soqucoin-1.19.0-2` (18 October 2026) carries the
 fix for the reorg undo path: a checkout from before it stops at the first mainnet reorg, height
 7,434, and recovers on restart at the tag with no reindex. A running instance moves to a newer tag
 with a fetch of the tags, a checkout of the tag, a reinstall of the package into the environment its
@@ -156,7 +166,7 @@ rules without the check.
 ### The indexer
 
 The ElectrumX fork at [github.com/soqucoin-labs/electrumx](https://github.com/soqucoin-labs/electrumx),
-branch `soqucoin`, tag `soqucoin-1.19.0-2`, the revision our own instances run (the indexer section
+branch `soqucoin`, tag `soqucoin-1.19.0-3`, the revision our own instances run (the indexer section
 above). Configuration is in its `SOQUCOIN.md`:
 `COIN=Soqucoin`, `NET=stagenet` or `mainnet`, `DAEMON_URL` at your node's RPC. The default TCP
 service port is 50001 (`types.Network.ElectrumPort`); TLS is whatever port you terminate it on.
@@ -177,7 +187,8 @@ the largest address history.
 
 Mainnet on 2026-11-22 UTC at height 58,347, 39 days after block 1. The figures are read from the
 two hosts of ours that each run a mainnet node and an indexer (`getblockchaininfo`, `VmRSS` and
-`VmHWM` in `/proc/<pid>/status`, `du`):
+`VmHWM` in `/proc/<pid>/status`, `du`). The indexers ran `soqucoin-1.19.0-2` at that reading. The
+cache that `soqucoin-1.19.0-3` adds holds at most 50,000 outputs, about 25 MB:
 
 | | |
 |---|---|
