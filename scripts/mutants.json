@@ -2900,6 +2900,42 @@
       "why": "GetHistory takes an untracked address as the bounded read does. Checked against a second reading of the prefix, the history of another network's server for the same script comes back under the address."
     },
     {
+      "id": "electrumx-tracked-refresh-reply-not-checked-against-its-prefix",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestARefreshOfATrackedAddressTakesNoSetFromAServerCheckedAgainstAnotherPrefix",
+      "find": "if rerr := c.replyIsFor(ctx, gen, hrp); rerr != nil {",
+      "replace": "if rerr := error(nil); rerr != nil {",
+      "why": "The script hash of a tracked address is derived under one reading of the prefix and the gate reads it again. With the tracked set emptied, the prefix changed and the address tracked again during the call, the gate verifies another network's server; unchecked, that server's set for the script is committed under the address."
+    },
+    {
+      "id": "electrumx-tracked-refresh-refusal-leaves-no-record",
+      "file": "electrumx/client.go",
+      "package": "./electrumx",
+      "test": "TestARefreshOfATrackedAddressTakesNoSetFromAServerCheckedAgainstAnotherPrefix",
+      "find": "return c.recordRefreshFailure(addr, gen, seqBefore, ticket, fmt.Errorf(\"listunspent: %w\", rerr))",
+      "replace": "return fmt.Errorf(\"listunspent: %w\", rerr)",
+      "why": "The refusal goes on the address's record, which is what the deposit monitor reads to skip an address the indexer has not answered for. Returned to the caller alone, the record keeps its last clean verdict and the address is credited from a set that was never refreshed."
+    },
+    {
+      "id": "electrumx-tracked-subscribe-reply-not-checked-against-its-prefix",
+      "file": "electrumx/subscribe.go",
+      "package": "./electrumx",
+      "test": "TestASubscribeOfATrackedAddressTakesNoStatusFromAServerCheckedAgainstAnotherPrefix",
+      "find": "err = c.replyIsFor(ctx, gen, hrp)",
+      "replace": "err = nil",
+      "why": "A status equal to the last one seen marks the address's set current with no listunspent. Unchecked, the status another network's server holds for the script is recorded for the address, and the address reads as subscribed on that server's connection."
+    },
+    {
+      "id": "electrumx-subscribe-reply-of-a-replaced-connection-is-an-error",
+      "file": "electrumx/subscribe.go",
+      "package": "./electrumx",
+      "test": "TestAReplyOfAReplacedConnectionIsHandledAsTheCommitHandlesIt",
+      "find": "if errors.Is(err, ErrNotConnected) {",
+      "replace": "if errors.Is(err, ErrNetworkMismatch) {",
+      "why": "A subscribe reply whose connection was replaced during the call commits nothing and is no error: the next pass subscribes on the live connection. Taken as a failure, every reconnect during a pass puts a lost-connection error on the record of an address the live server has not been asked about, and a refusal for another network's server is returned as success."
+    },
+    {
       "id": "harness-fake-indexer-bounded-selection-walks-pending-first",
       "file": "integration/fake_electrumx_test.go",
       "package": "./integration",
