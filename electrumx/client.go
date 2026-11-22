@@ -520,7 +520,14 @@ func (c *Client) LastRefreshOf(addr string) (time.Time, error) {
 //  2. Removes UTXOs that ElectrumX no longer reports (confirmed spent)
 //  3. Adds new UTXOs that appeared since last refresh (change outputs, new coinbases)
 func (c *Client) refreshAddress(ctx context.Context, addr string) error {
-	scriptHash, err := address.AddressToScriptHash(c.hrp(), addr)
+	return c.refreshAddressUnder(ctx, c.hrp(), addr)
+}
+
+// refreshAddressUnder is refreshAddress for a prefix already read: the script
+// hash is derived under it and the reply is committed only when replyIsFor
+// finds the genesis check of the reply's connection recorded for it.
+func (c *Client) refreshAddressUnder(ctx context.Context, hrp, addr string) error {
+	scriptHash, err := address.AddressToScriptHash(hrp, addr)
 	if err != nil {
 		return fmt.Errorf("address to script hash: %w", err)
 	}
@@ -542,6 +549,17 @@ func (c *Client) refreshAddress(ctx context.Context, addr string) error {
 	if err != nil {
 		c.recordRefresh(addr, gen, seqBefore, ticket, fmt.Errorf("listunspent: %w", err))
 		return fmt.Errorf("listunspent: %w", err)
+	}
+	// The script hash was derived under hrp and the gate in callGen read the
+	// prefix again. The two readings differ only when the tracked set was
+	// emptied, the prefix changed and the address tracked again during the
+	// call; the server was then verified for another network, and its set for
+	// the script must not be committed under this address. The reply is
+	// refused whole, as one that cannot be parsed is. A reply of a connection
+	// that was replaced and checked again is refused here too, and recorded as
+	// the replacement (recordRefreshFailure), as commitRefresh records it.
+	if rerr := c.replyIsFor(ctx, gen, hrp); rerr != nil {
+		return c.refusedReply(addr, gen, seqBefore, ticket, rerr)
 	}
 
 	freshUTXOs, err := parseUnspent(result)
@@ -725,7 +743,8 @@ func (c *Client) recordRefresh(addr string, gen, seqBefore, ticket uint64, err e
 // holds mu, under which liveGen cannot move (setLiveGen), so the answer holds
 // for as long as the caller keeps the lock. The two sites that handle a
 // reply's content call it: commitRefresh before it writes the cache, and
-// recordRefreshFailure for a reply that could not be parsed.
+// recordRefreshFailure for a reply that could not be parsed or that
+// replyIsFor refused.
 //
 // Replaced is the case that matters: the newer connection's own subscribe
 // reply may already have committed for the address, and a set from before it
@@ -742,8 +761,25 @@ func (c *Client) staleReplyLocked(addr string, gen uint64) error {
 	return nil
 }
 
-// recordRefreshFailure records a reply that could not be used and returns
-// the error recorded, or nil for a reply a later refresh has superseded. A
+// refusedReply records a listunspent reply that replyIsFor did not pass and
+// returns the error for the caller. A refusal goes on the address's record
+// (recordRefreshFailure). A context that ended while the check waited for the
+// connection lock is no refusal: nothing was learned about the reply or about
+// the indexer, so it is recorded as a call that ended is (recordRefresh), the
+// verdict on the address stands, and the caller gets its own context's error
+// whatever became of the connection meanwhile.
+func (c *Client) refusedReply(addr string, gen, seqBefore, ticket uint64, rerr error) error {
+	rerr = fmt.Errorf("listunspent: %w", rerr)
+	if endedErr(rerr) {
+		c.recordRefresh(addr, gen, seqBefore, ticket, rerr)
+		return rerr
+	}
+	return c.recordRefreshFailure(addr, gen, seqBefore, ticket, rerr)
+}
+
+// recordRefreshFailure records a reply that could not be used (one that does
+// not parse, or one replyIsFor refused) and returns the error recorded, or
+// nil for a reply a later refresh has superseded. A
 // reply from a connection that has since been replaced is recorded as the
 // replacement, whatever it carried: the pass then ends like any lost
 // connection, and the address is not alarmed for a fault the replacement
