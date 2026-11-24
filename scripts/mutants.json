@@ -3390,10 +3390,10 @@
       "id": "tiers-a-reading-is-stamped-when-it-ends",
       "file": "deposit/tiers.go",
       "package": "./deposit",
-      "test": "TestAReadingIsAsOldAsItsFirstAnswer",
+      "test": "TestAReadingIsAsOldAsItsFirstQuestion",
       "find": "\tt.readAt = began\n",
       "replace": "\tbegan = t.clock()\n\tt.readAt = began\n",
-      "why": "A reading is as old as its first answer. Stamped when it ends, a reading whose chain tips are older than MaxAge is kept as fresh and decides for another MaxAge."
+      "why": "A reading is as old as its first question. Stamped when it ends, a reading whose chain tips are older than MaxAge is kept as fresh and decides for another MaxAge."
     },
     {
       "id": "tiers-the-final-mark-is-never-held",

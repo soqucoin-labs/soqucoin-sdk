@@ -719,9 +719,10 @@ is final, the list holds what `Pending` holds. A deposit you sweep earlier leave
 stays in this list: a reorganisation that removes the deposit takes the sweep with it. Take it off
 when the sweep transaction has more than 288 confirmations on your node and `Tiers.HoldFinal` does
 not hold it. Ask with the `bestblock` your node gave with that count:
-`tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. Build the list on its own and not from
-`Pending`, so a swept deposit you forget keeps counting. The count is read from your records on
-every pass, so a restart loses nothing.
+`tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. `gettxout` on an output of the sweep that is
+still unspent gives the count and the `bestblock` in one answer. With no `bestblock`, `HoldFinal`
+holds. Build the list on its own and not from `Pending`, so a swept deposit you forget keeps
+counting. The count is read from your records on every pass, so a restart loses nothing.
 
 The height in a record is not read. A reorganisation can move a credited deposit to a later block,
 and the Monitor marks it final from your node's own count of its depth. A deposit your node no

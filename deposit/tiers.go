@@ -127,7 +127,7 @@ type Book interface {
 //     deposit is asked about again on the next pass, so a pass that runs
 //     longer than the time between two blocks credits little after the first.
 //   - every deposit while there is no reading, or the reading is older than
-//     MaxAge. A reading is as old as its first answer.
+//     MaxAge. A reading is as old as its first question.
 //
 // With the reading and the depth at one tip, a deposit passed at
 // types.MaxReorgDepth confirmations is in a block that far below that tip. A
@@ -153,9 +153,9 @@ type Book interface {
 // count is the Book's.
 //
 // One Tiers serves one Monitor, whose passes run one at a time. Required,
-// SetLines and Status are safe from any goroutine; a Refresh that runs while
-// another pass is asking Hold can drop what that pass has counted against the
-// ceiling.
+// SetLines, Status and HoldFinal are safe from any goroutine; a Refresh that
+// runs while another pass is asking Hold can drop what that pass has counted
+// against the ceiling.
 //
 // Status says what the last reading holds back. A branch with more work that
 // stays, or an unsettled chain, is a condition a human should see: read Status
@@ -274,7 +274,7 @@ func (t *Tiers) refresh(ctx context.Context) error {
 	if t.node == nil || t.book == nil {
 		return errors.New("deposit: this Tiers was not made by NewTiers")
 	}
-	// The reading is as old as its first answer, however long the rest takes.
+	// The reading is as old as its first question, however long the rest takes.
 	began := t.clock()
 	recent, err := t.node.GetNetworkHashPS(ctx, recentBlocks)
 	if err != nil {

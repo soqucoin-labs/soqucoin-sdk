@@ -1389,10 +1389,10 @@ func TestHoldFinalFollowsTheReadingAndNothingElse(t *testing.T) {
 	}
 }
 
-// A reading is as old as its first answer. Here the book takes longer than
+// A reading is as old as its first question. Here the book takes longer than
 // MaxAge to list the credited deposits, so the chain tips are that old when
 // the reading is kept, and Hold does not decide on it.
-func TestAReadingIsAsOldAsItsFirstAnswer(t *testing.T) {
+func TestAReadingIsAsOldAsItsFirstQuestion(t *testing.T) {
 	book := &fakeBook{}
 	tiers, clock := newTestTiers(t, settled(1000), book)
 	began := *clock
