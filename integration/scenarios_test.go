@@ -830,8 +830,8 @@ func TestASweepWhoseOutputsAreAllSpentIsCountedPastTheHorizon(t *testing.T) {
 	// best block. Invalidating the block of the coinbase the deposit spends
 	// takes the deposit, the sweep and its spend out of the mempool, and the
 	// txindex still names the sweep's block. A chain mined to another address
-	// then passes the sweep's height, so the walk back from its tip ends at
-	// another block of that height.
+	// then passes the sweep's height, and the node reports the sweep's block
+	// off its active chain.
 	swept, err := f.n.rpc.GetBlockHash(ctx, sweptAt)
 	if err != nil {
 		t.Fatal(err)
@@ -856,6 +856,16 @@ func TestASweepWhoseOutputsAreAllSpentIsCountedPastTheHorizon(t *testing.T) {
 	}
 	if err := json.Unmarshal(raw, &found); err != nil || found.BlockHash != swept {
 		t.Fatalf("the node names block %q, %v, for the sweep; want its block off the chain, %s", found.BlockHash, err, swept)
+	}
+	raw, err = f.n.rpc.Call(ctx, "getblockheader", swept, true)
+	if err != nil {
+		t.Fatalf("getblockheader: %v", err)
+	}
+	var printed struct {
+		Confirmations int64 `json:"confirmations"`
+	}
+	if err := json.Unmarshal(raw, &printed); err != nil || printed.Confirmations != -1 {
+		t.Fatalf("the node prints %d confirmations, %v, with the sweep's block; want -1, off its active chain", printed.Confirmations, err)
 	}
 	if n, best, err := f.n.rpc.TxConfirmations(ctx, sweep.TxID()); err != nil || n != 0 || best != "" {
 		t.Fatalf("the sweep in a block off the chain of the best block: %d confirmations at %q, %v; want 0 and no best block", n, best, err)

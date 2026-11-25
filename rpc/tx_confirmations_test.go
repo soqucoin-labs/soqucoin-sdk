@@ -167,8 +167,11 @@ func TestTxConfirmationsPairsTheCountWithTheBestBlockWhenTheWalkEndsAtTheBlock(t
 		{"the block is above the best block", minedTx, best{tipT, 1000},
 			map[string]block{sweepBlock: {height: 1002, prev: onBranch('b', 1001), confirmations: -1}}, 0, "",
 			[]string{"getrawtransaction", "getblockchaininfo", "getblockheader " + sweepBlock}},
+		// The node reports the block off its active chain, so the walk is not
+		// taken, however far below the best block the branch left the chain.
 		{"the block left the chain 300 blocks down", minedTx, best{tipT, 1000},
-			mergeHeaders(line('a', onBranch('a', 690), 690, tipT, 1000), map[string]block{sweepBlock: {height: 701, prev: onBranch('b', 700), confirmations: -1}}), 0, "", nil},
+			mergeHeaders(line('a', onBranch('a', 690), 690, tipT, 1000), map[string]block{sweepBlock: {height: 701, prev: onBranch('b', 700), confirmations: -1}}), 0, "",
+			[]string{"getrawtransaction", "getblockchaininfo", "getblockheader " + sweepBlock}},
 		{"the transaction is in the mempool", `{"txid":"` + sweepTxID + `"}`, best{tipT, 1000}, nil, 0, "",
 			[]string{"getrawtransaction"}},
 	} {
@@ -217,9 +220,9 @@ func TestTxConfirmationsRefusesAHeaderItCannotRead(t *testing.T) {
 }
 
 // An error of the node on any read is passed on, with no count and no best
-// block. Without txindex=1 the node does not find a transaction whose outputs
-// are all spent, and says so. A header the walk asks for and the node does
-// not hold is an error too.
+// block. Without txindex=1 the node may not find a transaction whose outputs
+// are all spent, and then says so. A header the walk asks for and the node
+// does not hold is an error too.
 func TestTxConfirmationsPassesOnTheNodesError(t *testing.T) {
 	const notFound = `{"result":null,"error":{"code":-5,"message":"No such mempool transaction. Use -txindex to enable blockchain transaction queries"},"id":1}`
 	for _, failing := range []string{"getrawtransaction", "getblockchaininfo", "getblockheader"} {

@@ -3053,6 +3053,15 @@
       "why": "The block that holds the transaction is its first confirmation and the best block its last. One more would take a sweep off the list a block before the horizon."
     },
     {
+      "id": "rpc-a-block-the-node-reports-off-its-chain-is-walked",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockWhenTheWalkEndsAtTheBlock",
+      "find": "if offChain {",
+      "replace": "if offChain && false {",
+      "why": "A block the node reports off its active chain gets 0 with no walk. Walked, a sweep whose block left the chain costs one more header read with every block mined, for as long as it stays on the list."
+    },
+    {
       "id": "htlc-claim-second-read-only-with-a-record",
       "file": "htlc/node.go",
       "package": "./htlc",

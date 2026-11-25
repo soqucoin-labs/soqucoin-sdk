@@ -726,8 +726,9 @@ are all spent the node needs `txindex=1`, which this guide requires. Ask with th
 refreshes the reading, and ask only after a Scan that returns no error. The reading then lists
 every branch your node held while it counted. A sweep in the mempool or in a block off your node's
 active chain gives a count of 0 and no best block. Ask again on the next pass. With no best block
-`HoldFinal` holds. The method reads one block header for each confirmation, so ask once a pass for
-each sweep transaction, however many deposits it swept. Build the list on its own and not from
+`HoldFinal` holds. The method reads the header of the sweep's block and, when your node reports
+that block on its active chain, one header for each height above it up to the best block. So ask
+once a pass for each sweep transaction, however many deposits it swept. Build the list on its own and not from
 `Pending`, so a swept deposit you forget keeps counting. The count is read from your records on
 every pass, so a restart loses nothing.
 
