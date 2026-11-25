@@ -401,7 +401,8 @@ func TestRefusedInputsNeverReachTheNode(t *testing.T) {
 // deposit held while the node keeps a branch with more work than the chain it
 // follows; and the lower tiers sent to the horizon once the chain has passed
 // that branch and it still stands beside it. The final mark of a credited
-// deposit is held in the first three of those steps and not in the last.
+// deposit is held in the second and third of those steps, and not in the
+// first or the last.
 func TestReorgRemovingACreditedDepositIsAlarmed(t *testing.T) {
 	f := setup(t)
 	led := newLedger()
