@@ -3026,6 +3026,42 @@
       "why": "Every chain carries work. A zero would make every other chain the heavier one."
     },
     {
+      "id": "rpc-a-count-taken-at-another-tip-is-paired-with-the-best-block",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsRefusesACountTakenAtATallerTipBetweenTwoEqualReads",
+      "find": "n < 1 || n != before.Blocks-*header.Height+1 {",
+      "replace": "n < 1 {",
+      "why": "The node can move its tip to a taller branch and back between two calls. Two equal reads of the best block then bracket a count larger than the one the best block has."
+    },
+    {
+      "id": "rpc-two-best-blocks-that-differ-are-paired",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockOnlyWhenTheReadsAgree",
+      "find": "after.BestBlockHash != before.BestBlockHash ||",
+      "replace": "after.Blocks != before.Blocks ||",
+      "why": "Two reads at the same height can name two blocks. The count may then have been taken at the second, and it would be returned beside the first."
+    },
+    {
+      "id": "rpc-a-block-off-the-active-chain-gives-a-count",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockOnlyWhenTheReadsAgree",
+      "find": "n < 1 || n != before.Blocks",
+      "replace": "n != before.Blocks",
+      "why": "The node reports -1 for a block off its active chain, which is also the count the height gives for a block two above the tip."
+    },
+    {
+      "id": "rpc-a-count-is-paired-with-no-best-block",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockOnlyWhenTheReadsAgree",
+      "find": "if before.BestBlockHash == \"\" || after.BestBlockHash",
+      "replace": "if after.BestBlockHash",
+      "why": "A count with no best block is a count no tip vouches for. The method returns a count only beside the block it was counted at."
+    },
+    {
       "id": "htlc-claim-second-read-only-with-a-record",
       "file": "htlc/node.go",
       "package": "./htlc",
