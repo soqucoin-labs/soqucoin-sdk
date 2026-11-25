@@ -789,8 +789,8 @@ func TestASweepWhoseOutputsAreAllSpentIsCountedPastTheHorizon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// counted reads the pair, checks it against the node, and has Tiers read
-	// the same tip.
+	// counted reads the pair and checks it against the node. Then Tiers takes
+	// its reading, after the count, as the guide asks.
 	counted := func(step string) (int64, string) {
 		t.Helper()
 		n, best, err := f.n.rpc.TxConfirmations(ctx, sweep.TxID())

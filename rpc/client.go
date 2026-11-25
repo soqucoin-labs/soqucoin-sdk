@@ -488,17 +488,19 @@ type ScriptPubKey struct {
 // TxConfirmations returns the confirmations of the transaction txid and the
 // best block they were counted at: the pair gettxout gives for an unspent
 // output, for a transaction whose outputs may all be spent, such as the sweep
-// of a deposit. Ask deposit.Tiers.HoldFinal with that best block before the
-// count decides anything. The node needs txindex=1 to find a mined
-// transaction whose outputs are all spent.
+// of a deposit. Ask deposit.Tiers.HoldFinal with that best block, from a
+// reading taken after this call, before the count decides anything. That
+// reading lists every branch the node held while it counted. The node needs
+// txindex=1 to find a mined transaction whose outputs are all spent.
 //
 // No one call of the node gives the pair, so it reads the best block, the
 // header of the block that holds the transaction, and the best block again.
 // Between two calls the node can move its tip to a branch and back to the
 // same block, so two equal reads are not enough: the count must also be the
-// one the best block's height gives. When it is not, and for a transaction in
-// the mempool or in a block off the node's active chain, it returns 0 and no
-// best block. HoldFinal holds an empty best block; ask again on the next pass.
+// one the best block's height gives. When the two reads differ or the count
+// is not that one, and for a transaction in the mempool or in a block off the
+// node's active chain, it returns 0 and no best block. HoldFinal holds an
+// empty best block. Ask again on the next pass.
 func (c *Client) TxConfirmations(ctx context.Context, txid string) (confirmations int64, bestBlock string, err error) {
 	result, err := c.Call(ctx, "getrawtransaction", txid, true)
 	if err != nil {

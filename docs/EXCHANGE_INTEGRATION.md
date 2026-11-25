@@ -722,11 +722,13 @@ when the sweep transaction has more than 288 confirmations on your node and `Tie
 not hold it. `client.TxConfirmations(ctx, sweepTxID)` returns the count and the best block your
 node counted it at, whether or not the outputs of the sweep are spent. For a sweep whose outputs
 are all spent the node needs `txindex=1`, which this guide requires. Ask with that best block:
-`tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. A sweep in the mempool or in a block off your
-node's active chain gives a count of 0 and no best block. So does a read during which the tip
-moved. Ask again on the next pass. With no best block `HoldFinal` holds. Build the list on its own
-and not from `Pending`, so a swept deposit you forget keeps counting. The count is read from your
-records on every pass, so a restart loses nothing.
+`tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. Read the counts before `monitor.Scan`, which
+refreshes the reading, and ask only after a Scan that returns no error. The reading then lists
+every branch your node held while it counted. A sweep in the mempool or in a block off your node's
+active chain gives a count of 0 and no best block. So does a read that ends at another best block
+than it began at. Ask again on the next pass. With no best block `HoldFinal` holds. Build the list
+on its own and not from `Pending`, so a swept deposit you forget keeps counting. The count is read
+from your records on every pass, so a restart loses nothing.
 
 The height in a record is not read. A reorganisation can move a credited deposit to a later block,
 and the Monitor marks it final from your node's own count of its depth. A deposit your node no
