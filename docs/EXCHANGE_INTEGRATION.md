@@ -725,10 +725,11 @@ are all spent the node needs `txindex=1`, which this guide requires. Ask with th
 `tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. Read the counts before `monitor.Scan`, which
 refreshes the reading, and ask only after a Scan that returns no error. The reading then lists
 every branch your node held while it counted. A sweep in the mempool or in a block off your node's
-active chain gives a count of 0 and no best block. So does a read that ends at another best block
-than it began at. Ask again on the next pass. With no best block `HoldFinal` holds. Build the list
-on its own and not from `Pending`, so a swept deposit you forget keeps counting. The count is read
-from your records on every pass, so a restart loses nothing.
+active chain gives a count of 0 and no best block. Ask again on the next pass. With no best block
+`HoldFinal` holds. The method reads one block header for each confirmation, so ask once a pass for
+each sweep transaction, however many deposits it swept. Build the list on its own and not from
+`Pending`, so a swept deposit you forget keeps counting. The count is read from your records on
+every pass, so a restart loses nothing.
 
 The height in a record is not read. A reorganisation can move a credited deposit to a later block,
 and the Monitor marks it final from your node's own count of its depth. A deposit your node no

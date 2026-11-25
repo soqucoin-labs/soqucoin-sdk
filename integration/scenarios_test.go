@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -825,15 +826,38 @@ func TestASweepWhoseOutputsAreAllSpentIsCountedPastTheHorizon(t *testing.T) {
 	if n, best = counted("past the horizon"); n <= types.MaxReorgDepth || tiers.HoldFinal(deposit.Deposit{BestBlock: best}) {
 		t.Fatalf("past the horizon: %d confirmations, and HoldFinal holds the tip Tiers read: %v", n, tiers.HoldFinal(deposit.Deposit{BestBlock: best}))
 	}
-	// Off the active chain the sweep has no count and no best block.
-	block, err := f.n.rpc.GetBlockHash(ctx, sweptAt)
+	// In a block off the chain of the best block the sweep has no count and no
+	// best block. Invalidating the block of the coinbase the deposit spends
+	// takes the deposit, the sweep and its spend out of the mempool, and the
+	// txindex still names the sweep's block. A chain mined to another address
+	// then passes the sweep's height, so the walk back from its tip ends at
+	// another block of that height.
+	swept, err := f.n.rpc.GetBlockHash(ctx, sweptAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.n.rpc.Call(ctx, "invalidateblock", block); err != nil {
+	funded, err := f.n.rpc.GetBlockHash(ctx, coin.Height)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.n.rpc.Call(ctx, "invalidateblock", funded); err != nil {
 		t.Fatalf("invalidateblock: %v", err)
 	}
+	f.n.mine(f.dep, int(sweptAt+2-f.n.height()))
+	if now, err := f.n.rpc.GetBlockHash(ctx, sweptAt); err != nil || now == swept {
+		t.Fatalf("the block at the sweep's height is %s, %v; want another block than the sweep's", now, err)
+	}
+	raw, err := f.n.rpc.Call(ctx, "getrawtransaction", sweep.TxID(), true)
+	if err != nil {
+		t.Fatalf("getrawtransaction: %v", err)
+	}
+	var found struct {
+		BlockHash string `json:"blockhash"`
+	}
+	if err := json.Unmarshal(raw, &found); err != nil || found.BlockHash != swept {
+		t.Fatalf("the node names block %q, %v, for the sweep; want its block off the chain, %s", found.BlockHash, err, swept)
+	}
 	if n, best, err := f.n.rpc.TxConfirmations(ctx, sweep.TxID()); err != nil || n != 0 || best != "" {
-		t.Fatalf("the sweep off the active chain: %d confirmations at %q, %v; want 0 and no best block", n, best, err)
+		t.Fatalf("the sweep in a block off the chain of the best block: %d confirmations at %q, %v; want 0 and no best block", n, best, err)
 	}
 }

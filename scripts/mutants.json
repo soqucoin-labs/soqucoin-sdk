@@ -3026,40 +3026,31 @@
       "why": "Every chain carries work. A zero would make every other chain the heavier one."
     },
     {
-      "id": "rpc-a-count-taken-at-another-tip-is-paired-with-the-best-block",
+      "id": "rpc-a-block-off-the-best-blocks-chain-gives-a-count",
       "file": "rpc/client.go",
       "package": "./rpc",
-      "test": "TestTxConfirmationsRefusesACountTakenAtATallerTipBetweenTwoEqualReads",
-      "find": "n < 1 || n != before.Blocks-*header.Height+1 {",
-      "replace": "n < 1 {",
-      "why": "The node can move its tip to a taller branch and back between two calls. Two equal reads of the best block then bracket a count larger than the one the best block has."
+      "test": "TestTxConfirmationsRefusesABlockOffTheBestBlocksChain",
+      "find": "if hash != tx.BlockHash {",
+      "replace": "if hash == \"\" {",
+      "why": "The end of the walk is what shows the transaction's block is on the best block's chain. Without it a block on a branch the best block does not hold gets the count the two heights give."
     },
     {
-      "id": "rpc-two-best-blocks-that-differ-are-paired",
+      "id": "rpc-the-walk-stops-a-block-short",
       "file": "rpc/client.go",
       "package": "./rpc",
-      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockOnlyWhenTheReadsAgree",
-      "find": "after.BestBlockHash != before.BestBlockHash ||",
-      "replace": "after.Blocks != before.Blocks ||",
-      "why": "Two reads at the same height can name two blocks. The count may then have been taken at the second, and it would be returned beside the first."
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockWhenTheWalkEndsAtTheBlock",
+      "find": "for h := info.Blocks; h > height; h-- {",
+      "replace": "for h := info.Blocks; h > height+1; h-- {",
+      "why": "The walk must stop at the height of the transaction's block. A block short, it compares the block above it, and a block on the chain gets no count."
     },
     {
-      "id": "rpc-a-block-off-the-active-chain-gives-a-count",
+      "id": "rpc-the-count-is-one-too-many",
       "file": "rpc/client.go",
       "package": "./rpc",
-      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockOnlyWhenTheReadsAgree",
-      "find": "n < 1 || n != before.Blocks",
-      "replace": "n != before.Blocks",
-      "why": "The node reports -1 for a block off its active chain, which is also the count the height gives for a block two above the tip."
-    },
-    {
-      "id": "rpc-a-count-is-paired-with-no-best-block",
-      "file": "rpc/client.go",
-      "package": "./rpc",
-      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockOnlyWhenTheReadsAgree",
-      "find": "if before.BestBlockHash == \"\" || after.BestBlockHash",
-      "replace": "if after.BestBlockHash",
-      "why": "A count with no best block is a count no tip vouches for. The method returns a count only beside the block it was counted at."
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockWhenTheWalkEndsAtTheBlock",
+      "find": "return info.Blocks - height + 1, info.BestBlockHash, nil",
+      "replace": "return info.Blocks - height + 2, info.BestBlockHash, nil",
+      "why": "The block that holds the transaction is its first confirmation and the best block its last. One more would take a sweep off the list a block before the horizon."
     },
     {
       "id": "htlc-claim-second-read-only-with-a-record",

@@ -491,16 +491,20 @@ type ScriptPubKey struct {
 // of a deposit. Ask deposit.Tiers.HoldFinal with that best block, from a
 // reading taken after this call, before the count decides anything. That
 // reading lists every branch the node held while it counted. The node needs
-// txindex=1 to find a mined transaction whose outputs are all spent.
+// txindex=1 to find a mined transaction whose outputs are all spent, or one in
+// a block off its active chain. Without it the node gives an error instead.
 //
-// No one call of the node gives the pair, so it reads the best block, the
-// header of the block that holds the transaction, and the best block again.
-// Between two calls the node can move its tip to a branch and back to the
-// same block, so two equal reads are not enough: the count must also be the
-// one the best block's height gives. When the two reads differ or the count
-// is not that one, and for a transaction in the mempool or in a block off the
-// node's active chain, it returns 0 and no best block. HoldFinal holds an
-// empty best block. Ask again on the next pass.
+// No one call of the node gives the pair. It reads the best block and its
+// height in one answer, and the height of the block that holds the
+// transaction. Then it walks back from the best block by the previous-block
+// links of the headers to that height. A block's height and the block before
+// it never change, so a tip the node moves to and back between two calls
+// does not reach the result. The count, the difference of the two heights
+// plus one, stands only when the walk ends at the transaction's block. For a
+// transaction in the mempool, or in a block off the chain of the best block,
+// it returns 0 and no best block, which HoldFinal holds. Ask again on the
+// next pass. It reads one header for each confirmation, so a count of 289
+// costs 291 calls of the node.
 func (c *Client) TxConfirmations(ctx context.Context, txid string) (confirmations int64, bestBlock string, err error) {
 	result, err := c.Call(ctx, "getrawtransaction", txid, true)
 	if err != nil {
@@ -515,34 +519,45 @@ func (c *Client) TxConfirmations(ctx context.Context, txid string) (confirmation
 	if tx.BlockHash == "" {
 		return 0, "", nil // in the mempool, in no block yet
 	}
-	before, err := c.GetBlockchainInfo(ctx)
+	info, err := c.GetBlockchainInfo(ctx)
 	if err != nil {
 		return 0, "", err
 	}
-	result, err = c.Call(ctx, "getblockheader", tx.BlockHash, true)
+	height, _, err := c.blockHeader(ctx, tx.BlockHash)
+	if err != nil {
+		return 0, "", err
+	}
+	hash := info.BestBlockHash
+	for h := info.Blocks; h > height; h-- {
+		if _, hash, err = c.blockHeader(ctx, hash); err != nil {
+			return 0, "", err
+		}
+	}
+	if hash != tx.BlockHash {
+		return 0, "", nil // off the chain of the best block
+	}
+	return info.Blocks - height + 1, info.BestBlockHash, nil
+}
+
+// blockHeader returns the height of the block with this hash and the hash of
+// the block before it, empty for the genesis block. Neither changes once the
+// node holds the header, whatever its tip.
+func (c *Client) blockHeader(ctx context.Context, hash string) (height int64, prev string, err error) {
+	result, err := c.Call(ctx, "getblockheader", hash, true)
 	if err != nil {
 		return 0, "", fmt.Errorf("getblockheader: %w", err)
 	}
 	var header struct {
-		Confirmations *int64 `json:"confirmations"`
-		Height        *int64 `json:"height"`
+		Height *int64 `json:"height"`
+		Prev   string `json:"previousblockhash"`
 	}
 	if err := json.Unmarshal(result, &header); err != nil {
 		return 0, "", fmt.Errorf("parse getblockheader: %w", err)
 	}
-	if header.Confirmations == nil || header.Height == nil {
-		return 0, "", fmt.Errorf("getblockheader %s: the node reports no confirmations or no height", tx.BlockHash)
+	if header.Height == nil {
+		return 0, "", fmt.Errorf("getblockheader %s: the node reports no height", hash)
 	}
-	after, err := c.GetBlockchainInfo(ctx)
-	if err != nil {
-		return 0, "", err
-	}
-	n := *header.Confirmations
-	if before.BestBlockHash == "" || after.BestBlockHash != before.BestBlockHash ||
-		n < 1 || n != before.Blocks-*header.Height+1 {
-		return 0, "", nil
-	}
-	return n, before.BestBlockHash, nil
+	return *header.Height, header.Prev, nil
 }
 
 // GetBlockCount returns the current chain tip height.
