@@ -14,7 +14,8 @@
 // transaction, two withdrawals that cannot share an input, refused inputs, a
 // reorganisation that removes a credited deposit, retries past the reservation
 // TTL, a txid mismatch, a broadcast cancelled while the node holds the reply,
-// and the push model: a deposit the indexer pushes, a notification it drops, a
+// a swept deposit whose outputs are all spent, counted past the horizon, and
+// the push model: a deposit the indexer pushes, a notification it drops, a
 // reconnect across an outage, and one address it fails.
 //
 // The indexer role is played by a small in-test block scanner, and for the

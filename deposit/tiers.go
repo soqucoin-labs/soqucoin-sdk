@@ -474,7 +474,9 @@ func (t *Tiers) Hold(d Deposit) bool {
 // reading's. An unsettled chain and the ceiling hold no deposit at that depth,
 // and the question counts nothing. Of d it reads BestBlock alone, so an
 // exchange can ask it about a transaction of its own, such as the sweep of a
-// deposit, with the best block its node gave with the count.
+// deposit, with the best block its node gave with the count. For a
+// transaction whose outputs are all spent, rpc.Client.TxConfirmations gives
+// the two.
 func (t *Tiers) HoldFinal(d Deposit) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

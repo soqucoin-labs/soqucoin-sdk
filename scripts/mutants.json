@@ -3026,6 +3026,42 @@
       "why": "Every chain carries work. A zero would make every other chain the heavier one."
     },
     {
+      "id": "rpc-a-block-off-the-best-blocks-chain-gives-a-count",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsRefusesABlockOffTheBestBlocksChain",
+      "find": "if hash != tx.BlockHash {",
+      "replace": "if hash == \"\" {",
+      "why": "The end of the walk is what shows the transaction's block is on the best block's chain. Without it a block on a branch the best block does not hold gets the count the two heights give."
+    },
+    {
+      "id": "rpc-the-walk-stops-a-block-short",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockWhenTheWalkEndsAtTheBlock",
+      "find": "for h := info.Blocks; h > height; h-- {",
+      "replace": "for h := info.Blocks; h > height+1; h-- {",
+      "why": "The walk must stop at the height of the transaction's block. A block short, it compares the block above it, and a block on the chain gets no count."
+    },
+    {
+      "id": "rpc-the-count-is-one-too-many",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockWhenTheWalkEndsAtTheBlock",
+      "find": "return info.Blocks - height + 1, info.BestBlockHash, nil",
+      "replace": "return info.Blocks - height + 2, info.BestBlockHash, nil",
+      "why": "The block that holds the transaction is its first confirmation and the best block its last. One more would take a sweep off the list a block before the horizon."
+    },
+    {
+      "id": "rpc-a-block-the-node-reports-off-its-chain-is-walked",
+      "file": "rpc/client.go",
+      "package": "./rpc",
+      "test": "TestTxConfirmationsPairsTheCountWithTheBestBlockWhenTheWalkEndsAtTheBlock",
+      "find": "if offChain {",
+      "replace": "if offChain && false {",
+      "why": "A block the node reports off its active chain gets 0 with no walk. Walked, a sweep whose block left the chain costs one more header read with every block mined, for as long as it stays on the list."
+    },
+    {
       "id": "htlc-claim-second-read-only-with-a-record",
       "file": "htlc/node.go",
       "package": "./htlc",

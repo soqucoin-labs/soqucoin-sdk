@@ -153,7 +153,7 @@ SDK reads or broadcasts goes through them.
 | | |
 |---|---|
 | Software | `soqucoind` from [github.com/soqucoin/soqucoin](https://github.com/soqucoin/soqucoin) at tag **`v2.6.1`**, the current release (published 29 October 2026). The release carries one consensus rule on mainnet, scheduled in 2.6.0: from block 67,000, expected about 28 November 2026 at the block rate of the two weeks to 22 November, every block must carry the chain id 0x5351 in its version. The rule changes nothing for a current node: every block in mainnet history from block 1 carries the id and every template a Soqucoin Core node builds carries it. A node still on 2.5.x at the height follows a block the upgraded network refuses, if such a block appears, for as long as that branch is the heavier one. Once that node's own chain is 288 or more blocks past the fork, every release refuses the network's headers however heavy the network's chain becomes, and a late upgrade alone does not recover the node. The operator runs `invalidateblock` on the hash of the block without the chain id, or replays the block files with `-reindex`; rebuilding the chainstate alone does neither. Upgrade every mainnet node before the height. The height can move later once, by a point release published no later than 16 November 2026; install it the day it appears. The peer-to-peer protocol version and the on-disk formats are those of 2.5.3, and the RPC interface gains one field (`chainid_required_height` in `getblockchaininfo`, 67000 on mainnet), so the upgrade is a replacement of the two programs with no reindex. A node on 2.6.0 moves to 2.6.1 by the same replacement. An explicit `blockmaxsize=750000`, the old default, should be removed: release 2.6.0 raised the default to 3000000 and an explicit value wins (the 2.6.0 release notes, "The default block template"). The release page carries Linux x64 and arm64 archives with `SHA256SUMS`; they bundle every library except glibc (2.35 or newer, per its `INSTALL.md`; on an older distribution, build from source). Install an archive after checking it against `SHA256SUMS`, or build the `v2.6.1` tag yourself per its `INSTALL.md` or `Dockerfile`. Every mainnet node we operate has run 2.6.1 since 31 October 2026. The golden transaction vector in the tests is the v2.3.0 node's decode; the integration harness ran against a build of the `v2.5.0` tag commit (`9d3ceb4f2d0fe41`) before this SDK tag. Our own builds carry no published digest; one would identify our build machine as much as the software. |
-| `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
+| `txindex=1` | **Required, and set before the first start**; adding it later means rebuilding the chainstate with `-reindex-chainstate`. `withdraw.RPCConfirmer`, `rpc.Client.TxConfirmations` and the lost-reply check in `rpc.Client` ask the node for a transaction by id with `getrawtransaction`. Without the index the node finds a mined transaction only through its UTXO set (`src/validation.cpp`, `GetTransaction` with `fAllowSlow`), so once every output has been spent, the recipient's and then your change, the transaction reads as unknown and the withdrawal never settles in the engine's view. |
 | `disablewallet=1` | The node's wallet is not part of this integration (see [Integration model](#integration-model-read-this-first)). Every mainnet node we operate runs with it. |
 | `server=1` plus `rpcauth` (or `rpcuser` and `rpcpassword`) | The node's RPC is plaintext. Bind it to localhost, where `rpc.Client` connects with no further setting. For a node on another host the client refuses the URL until `AllowRemote` is set (`rpc.ErrRemoteNode`), and with the flag set refuses `http://` to it (`rpc.ErrPlaintextRemote`); the route is a tunnel that ends on this machine or an `https://` TLS terminator in front of the node ([Security Guide](SECURITY.md#network-security)). Loopback is read from the URL as written, the name `localhost` or a dotted-quad or bracketed IPv6 literal in `127.0.0.0/8` or `::1`, and nothing is resolved: a Docker service name, `host.docker.internal` or a Kubernetes service is a remote host to the client and needs the same route. |
 | `stagenet=1` | For the staging network. Omit it for mainnet. |
@@ -245,14 +245,15 @@ SOQUCOIND=/path/to/soqucoind make integration   # a soqucoind build, v2.3.0 or l
 ```
 
 The harness starts a throwaway regtest node, mines to SDK-generated addresses, and drives the same
-`deposit` and `withdraw` packages this guide uses through sixteen scenarios. Nine cover deposits and withdrawals: a deposit credited only
-after the node confirms it, a withdrawal built, signed, broadcast, mined and confirmed, a lost
-broadcast reply survived with exactly one payment, two withdrawals that cannot share an input,
-refused inputs (a USDSOQ-form destination, an amount below the relay floor, a fee-rate typo) that
-never reach the node, a reorganisation that removes a credited deposit and raises the alarm,
-retries past the reservation TTL that keep their inputs, a node that accepts the bytes under a
-different txid with the inputs held, and a broadcast whose context is cancelled while the node
-holds the reply, recovered after a restart with exactly one payment.
+`deposit` and `withdraw` packages this guide uses through seventeen scenarios. Ten cover deposits
+and withdrawals. A deposit is credited only after the node confirms it. A withdrawal is built,
+signed, broadcast, mined and confirmed. A lost broadcast reply is survived with exactly one payment.
+Two withdrawals cannot share an input. Refused inputs (a USDSOQ-form destination, an amount below
+the relay floor, a fee-rate typo) never reach the node. A reorganisation that removes a credited
+deposit raises the alarm. Retries past the reservation TTL keep their inputs. A node that accepts
+the bytes under a different txid leaves the inputs held. A broadcast whose context is cancelled
+while the node holds the reply is recovered after a restart with exactly one payment. A swept
+deposit whose outputs are all spent is counted past the horizon with `TxConfirmations`.
 
 Four more cover the push model the `electrumx` client uses: a deposit the indexer pushes, credited
 after the node check with exactly one `listunspent` behind it; a notification the indexer never
@@ -718,11 +719,18 @@ every credited deposit that is not final yet, as it was credited. If you spend n
 is final, the list holds what `Pending` holds. A deposit you sweep earlier leaves `Pending` and
 stays in this list: a reorganisation that removes the deposit takes the sweep with it. Take it off
 when the sweep transaction has more than 288 confirmations on your node and `Tiers.HoldFinal` does
-not hold it. Ask with the `bestblock` your node gave with that count:
-`tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. `gettxout` on an output of the sweep that is
-still unspent gives the count and the `bestblock` in one answer. With no `bestblock`, `HoldFinal`
-holds. Build the list on its own and not from `Pending`, so a swept deposit you forget keeps
-counting. The count is read from your records on every pass, so a restart loses nothing.
+not hold it. `client.TxConfirmations(ctx, sweepTxID)` returns the count and the best block your
+node counted it at, whether or not the outputs of the sweep are spent. For a sweep whose outputs
+are all spent the node needs `txindex=1`, which this guide requires. Ask with that best block:
+`tiers.HoldFinal(deposit.Deposit{BestBlock: best})`. Read the counts before `monitor.Scan`, which
+refreshes the reading, and ask only after a Scan that returns no error. The reading then lists
+every branch your node held while it counted. A sweep in the mempool or in a block off your node's
+active chain gives a count of 0 and no best block. Ask again on the next pass. With no best block
+`HoldFinal` holds. The method reads the header of the sweep's block and, when your node reports
+that block on its active chain, one header for each height above it up to the best block. So ask
+once a pass for each sweep transaction, however many deposits it swept. Build the list on its own and not from
+`Pending`, so a swept deposit you forget keeps counting. The count is read from your records on
+every pass, so a restart loses nothing.
 
 The height in a record is not read. A reorganisation can move a credited deposit to a later block,
 and the Monitor marks it final from your node's own count of its depth. A deposit your node no

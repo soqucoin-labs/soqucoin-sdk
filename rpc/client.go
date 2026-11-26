@@ -485,6 +485,91 @@ type ScriptPubKey struct {
 	Address string `json:"address,omitempty"`
 }
 
+// TxConfirmations returns the confirmations of the transaction txid and the
+// best block they were counted at: the pair gettxout gives for an unspent
+// output, for a transaction whose outputs may all be spent, such as the sweep
+// of a deposit. Ask deposit.Tiers.HoldFinal with that best block, from a
+// reading taken after this call, before the count decides anything. That
+// reading lists every branch the node held while it counted. The node needs
+// txindex=1 to be sure of finding a mined transaction whose outputs are all
+// spent, or one in a block off its active chain. Without it the node may not
+// find one, and the method then returns the node's error.
+//
+// No one call of the node gives the pair. It reads the best block and its
+// height in one answer, then the header of the block that holds the
+// transaction. Unless the node reports that block off its active chain, it
+// walks back from the best block by the previous-block links of the headers
+// to the height of that block. A block's height and the block before it never
+// change, so a tip the node moves to and back between two calls does not
+// reach the result. The count, the difference of the two heights plus one,
+// stands only when the walk ends at the transaction's block. It returns 0 and
+// no best block, which HoldFinal holds, when the transaction is in the
+// mempool or the node reports its block off the active chain. It does the
+// same when the walk ends at another block. Ask again on the next pass. The
+// walk reads one header for each height above the transaction's block up to
+// the best block, so a count of 289 costs 291 calls of the node. A block the
+// node reports off its active chain costs three.
+func (c *Client) TxConfirmations(ctx context.Context, txid string) (confirmations int64, bestBlock string, err error) {
+	result, err := c.Call(ctx, "getrawtransaction", txid, true)
+	if err != nil {
+		return 0, "", fmt.Errorf("getrawtransaction: %w", err)
+	}
+	var tx struct {
+		BlockHash string `json:"blockhash"`
+	}
+	if err := json.Unmarshal(result, &tx); err != nil {
+		return 0, "", fmt.Errorf("parse getrawtransaction: %w", err)
+	}
+	if tx.BlockHash == "" {
+		return 0, "", nil // in the mempool, in no block yet
+	}
+	info, err := c.GetBlockchainInfo(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	height, _, offChain, err := c.blockHeader(ctx, tx.BlockHash)
+	if err != nil {
+		return 0, "", err
+	}
+	if offChain {
+		return 0, "", nil // the node reports the block off its active chain
+	}
+	hash := info.BestBlockHash
+	for h := info.Blocks; h > height; h-- {
+		if _, hash, _, err = c.blockHeader(ctx, hash); err != nil {
+			return 0, "", err
+		}
+	}
+	if hash != tx.BlockHash {
+		return 0, "", nil // off the chain of the best block
+	}
+	return info.Blocks - height + 1, info.BestBlockHash, nil
+}
+
+// blockHeader returns the height of the block with this hash and the hash of
+// the block before it, empty for the genesis block. Neither changes once the
+// node holds the header, whatever its tip. offChain is true when the node
+// prints a count of -1 with the header: the block was off its active chain
+// when it answered. A header with no count leaves it false.
+func (c *Client) blockHeader(ctx context.Context, hash string) (height int64, prev string, offChain bool, err error) {
+	result, err := c.Call(ctx, "getblockheader", hash, true)
+	if err != nil {
+		return 0, "", false, fmt.Errorf("getblockheader: %w", err)
+	}
+	var header struct {
+		Height        *int64 `json:"height"`
+		Prev          string `json:"previousblockhash"`
+		Confirmations int64  `json:"confirmations"`
+	}
+	if err := json.Unmarshal(result, &header); err != nil {
+		return 0, "", false, fmt.Errorf("parse getblockheader: %w", err)
+	}
+	if header.Height == nil {
+		return 0, "", false, fmt.Errorf("getblockheader %s: the node reports no height", hash)
+	}
+	return *header.Height, header.Prev, header.Confirmations < 0, nil
+}
+
 // GetBlockCount returns the current chain tip height.
 func (c *Client) GetBlockCount(ctx context.Context) (int64, error) {
 	result, err := c.Call(ctx, "getblockcount")

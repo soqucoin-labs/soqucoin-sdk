@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -735,5 +736,138 @@ func TestCancelledBroadcastPaysOnce(t *testing.T) {
 	}
 	if got := rs.GetUTXOs(recipient); len(got) != 1 || got[0].Value != amount {
 		t.Fatalf("recipient has %+v; a cancelled broadcast must never produce a second payment", got)
+	}
+}
+
+// 14. A deposit swept into the hot wallet is final when the sweep is past the
+// horizon. Once the hot wallet spends the sweep's one output, gettxout has
+// nothing of the sweep left to report. TxConfirmations gives its count and the
+// best block it was counted at, and Tiers.HoldFinal answers for that block.
+func TestASweepWhoseOutputsAreAllSpentIsCountedPastTheHorizon(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	depKeys, depAddr := newKey(t)
+	// sendWhole spends one output whole to an address and has the node take it.
+	sendWhole := func(step string, in types.UTXO, to string, signer tx.Signer) *tx.Transaction {
+		t.Helper()
+		spk, err := address.ScriptFor(to)
+		if err != nil {
+			t.Fatal(err)
+		}
+		built, err := tx.BuildSignedSweep([]types.UTXO{in}, spk, types.RecommendedFeeRate, signer)
+		if err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		if got, err := f.n.rpc.SendRawTransaction(ctx, built.SerializeHex()); err != nil || got != built.TxID() {
+			t.Fatalf("%s: the node took %q, %v; want %s", step, got, err, built.TxID())
+		}
+		return built
+	}
+	var coin types.UTXO
+	for _, u := range f.scan.GetUTXOs(f.hot) {
+		if u.Height <= 5 { // the first coinbases, past maturity
+			coin = u
+			break
+		}
+	}
+	if coin.TxID == "" {
+		t.Fatal("no mature coinbase in the hot wallet")
+	}
+	dep := sendWhole("the deposit", coin, depAddr, f.hotKeys)
+	f.n.mine(f.hot, 1)
+	sweep := sendWhole("the sweep", types.UTXO{TxID: dep.TxID(), Vout: 0, Value: dep.Outputs[0].Value, Address: depAddr}, f.hot, depKeys)
+	if n, best, err := f.n.rpc.TxConfirmations(ctx, sweep.TxID()); err != nil || n != 0 || best != "" {
+		t.Fatalf("the sweep in the mempool: %d confirmations at %q, %v; want 0 and no best block", n, best, err)
+	}
+	f.n.mine(f.hot, 1)
+	sweptAt := f.n.height()
+	sendWhole("the spend of the sweep", types.UTXO{TxID: sweep.TxID(), Vout: 0, Value: sweep.Outputs[0].Value, Address: f.hot}, f.hot, f.hotKeys)
+	f.n.mine(f.hot, int(types.MaxReorgDepth)-1)
+	if out, err := f.n.rpc.GetTxOut(ctx, sweep.TxID(), 0, true); err != nil || out != nil {
+		t.Fatalf("gettxout on the sweep's one output: %+v, %v; want nothing, the output is spent", out, err)
+	}
+	tiers, err := deposit.NewTiers(f.n.rpc, newLedger(), deposit.TierLines{SmallBelow: 1, LargeFrom: 2, Ceiling: types.MaxMoney})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// counted reads the pair and checks it against the node. Then Tiers takes
+	// its reading, after the count, as the guide asks.
+	counted := func(step string) (int64, string) {
+		t.Helper()
+		n, best, err := f.n.rpc.TxConfirmations(ctx, sweep.TxID())
+		if err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		height := f.n.height()
+		tip, err := f.n.rpc.GetBlockHash(ctx, height)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != height-sweptAt+1 || best != tip {
+			t.Fatalf("%s: %d confirmations at %s; the sweep is at %d and the tip at %d is %s", step, n, best, sweptAt, height, tip)
+		}
+		if err := tiers.Refresh(ctx); err != nil {
+			t.Fatalf("%s: Tiers could not read the node: %v", step, err)
+		}
+		return n, best
+	}
+	n, best := counted("at the horizon")
+	if n != types.MaxReorgDepth || tiers.HoldFinal(deposit.Deposit{BestBlock: best}) {
+		t.Fatalf("at the horizon: %d confirmations, and HoldFinal holds the tip Tiers read: %v", n, tiers.HoldFinal(deposit.Deposit{BestBlock: best}))
+	}
+	f.n.mine(f.hot, 1)
+	if err := tiers.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The pair read a block ago names a tip that is no longer the node's.
+	if !tiers.HoldFinal(deposit.Deposit{BestBlock: best}) {
+		t.Fatal("HoldFinal passed a best block one block below the tip Tiers read")
+	}
+	if n, best = counted("past the horizon"); n <= types.MaxReorgDepth || tiers.HoldFinal(deposit.Deposit{BestBlock: best}) {
+		t.Fatalf("past the horizon: %d confirmations, and HoldFinal holds the tip Tiers read: %v", n, tiers.HoldFinal(deposit.Deposit{BestBlock: best}))
+	}
+	// In a block off the chain of the best block the sweep has no count and no
+	// best block. Invalidating the block of the coinbase the deposit spends
+	// takes the deposit, the sweep and its spend out of the mempool, and the
+	// txindex still names the sweep's block. A chain mined to another address
+	// then passes the sweep's height, and the node reports the sweep's block
+	// off its active chain.
+	swept, err := f.n.rpc.GetBlockHash(ctx, sweptAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	funded, err := f.n.rpc.GetBlockHash(ctx, coin.Height)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.n.rpc.Call(ctx, "invalidateblock", funded); err != nil {
+		t.Fatalf("invalidateblock: %v", err)
+	}
+	f.n.mine(f.dep, int(sweptAt+2-f.n.height()))
+	if now, err := f.n.rpc.GetBlockHash(ctx, sweptAt); err != nil || now == swept {
+		t.Fatalf("the block at the sweep's height is %s, %v; want another block than the sweep's", now, err)
+	}
+	raw, err := f.n.rpc.Call(ctx, "getrawtransaction", sweep.TxID(), true)
+	if err != nil {
+		t.Fatalf("getrawtransaction: %v", err)
+	}
+	var found struct {
+		BlockHash string `json:"blockhash"`
+	}
+	if err := json.Unmarshal(raw, &found); err != nil || found.BlockHash != swept {
+		t.Fatalf("the node names block %q, %v, for the sweep; want its block off the chain, %s", found.BlockHash, err, swept)
+	}
+	raw, err = f.n.rpc.Call(ctx, "getblockheader", swept, true)
+	if err != nil {
+		t.Fatalf("getblockheader: %v", err)
+	}
+	var printed struct {
+		Confirmations int64 `json:"confirmations"`
+	}
+	if err := json.Unmarshal(raw, &printed); err != nil || printed.Confirmations != -1 {
+		t.Fatalf("the node prints %d confirmations, %v, with the sweep's block; want -1, off its active chain", printed.Confirmations, err)
+	}
+	if n, best, err := f.n.rpc.TxConfirmations(ctx, sweep.TxID()); err != nil || n != 0 || best != "" {
+		t.Fatalf("the sweep in a block off the chain of the best block: %d confirmations at %q, %v; want 0 and no best block", n, best, err)
 	}
 }
